@@ -185,7 +185,45 @@ const pbAudio = $('#pb-audio');
 function openItem(it) {
   if (it.kind === 'movie' || it.kind === 'show') openVideo(it);
   else if (it.kind === 'music' || it.kind === 'audiobook') playAudio(it);
-  // ebook / comic handled by dedicated readers later
+  else if (it.kind === 'comic') openComic(it);
+  // ebook reader later
+}
+
+// ---------- comic reader ----------
+let comic = null; // { it, pages, page }
+
+async function openComic(it) {
+  const pages = await (await fetch(`/api/comic/${it.id}/pages`)).json();
+  if (!Array.isArray(pages) || !pages.length) return;
+  comic = { it, pages, page: 0 };
+  $('#cm-title').textContent = it.title;
+  $('#comic-modal').classList.add('on');
+  resumeFor(it.id).then(p => { if (p) showComicPage(Math.min(Math.floor(p.position), pages.length - 1)); else showComicPage(0); });
+}
+
+function showComicPage(n) {
+  if (!comic) return;
+  comic.page = Math.max(0, Math.min(n, comic.pages.length - 1));
+  $('#cm-img').src = `/api/comic/${comic.it.id}/page/${comic.page}`;
+  $('#cm-pageinfo').textContent = `${comic.page + 1} / ${comic.pages.length}`;
+  $('#cm-prev').disabled = comic.page === 0;
+  $('#cm-next').disabled = comic.page === comic.pages.length - 1;
+  syncProgress(comic.it.id, comic.page); // progress = page index per schema
+}
+
+$('#cm-prev').onclick = () => comic && showComicPage(comic.page - 1);
+$('#cm-next').onclick = () => comic && showComicPage(comic.page + 1);
+$('#cm-close').onclick = closeComic;
+document.addEventListener('keydown', e => {
+  if (!$('#comic-modal').classList.contains('on')) return;
+  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); comic && showComicPage(comic.page + 1); }
+  else if (e.key === 'ArrowLeft') { e.preventDefault(); comic && showComicPage(comic.page - 1); }
+  else if (e.key === 'Escape') closeComic();
+});
+function closeComic() {
+  $('#comic-modal').classList.remove('on');
+  if (comic) { syncProgress(comic.it.id, comic.page); comic = null; }
+  $('#cm-img').src = '';
 }
 
 function playAudio(it) {

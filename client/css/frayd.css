@@ -252,3 +252,24 @@ body.auth {
 #video-modal .modal-head .t { font-weight: 700; font-size: 17px; }
 #vm-close { background: none; border: none; color: #fff; font-size: 26px; line-height: 1; }
 #player, .plyr { border-radius: 12px; overflow: hidden; }
+
+/* ===== comic reader ===== */
+#comic-modal {
+  position: fixed; inset: 0; z-index: 100; background: #0D0E12;
+  display: none; flex-direction: column; align-items: center; padding: 12px;
+}
+#comic-modal.on { display: flex; }
+#comic-modal .comic-head {
+  width: 100%; max-width: 900px; display: flex; justify-content: space-between;
+  align-items: center; color: #8A8F9E; font-size: 14px; margin-bottom: 8px;
+}
+#comic-modal .comic-head .t { color: #fff; font-weight: 700; }
+#cm-close { background: none; border: none; color: #fff; font-size: 26px; line-height: 1; }
+#cm-img { max-width: min(92vw, 900px); max-height: 78vh; object-fit: contain; border-radius: 8px; }
+.comic-nav { margin-top: 10px; display: flex; gap: 16px; }
+.comic-nav button {
+  background: #16181E; color: #fff; border: 1px solid #2a2d36; border-radius: 999px;
+  padding: 8px 22px; cursor: pointer; font-size: 14px;
+}
+.comic-nav button:hover { background: #5B46F6; border-color: #5B46F6; }
+.comic-nav button:disabled { opacity: .35; cursor: default; background: #16181E; border-color: #2a2d36; }

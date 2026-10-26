@@ -413,6 +413,12 @@ fn mime_guess(p: &str) -> String {
         "webm" => "video/webm",
         "epub" => "application/epub+zip",
         "cbz" => "application/vnd.comicbook+zip",
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "avif" => "image/avif",
+        "bmp" => "image/bmp",
         _ => "application/octet-stream",
     }
     .into()
