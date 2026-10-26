@@ -4,89 +4,151 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Frayd</title>
-<style>
-  :root { --bg:#121212; --panel:#1e1e1e; --fg:#e6e6e6; --accent:#4a9eff; }
-  * { box-sizing:border-box; margin:0; }
-  body { background:var(--bg); color:var(--fg); font:15px system-ui,sans-serif; padding:24px; }
-  h1 { margin-bottom:16px; font-weight:600; }
-  #grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:12px; }
-  .card { background:var(--panel); border-radius:10px; padding:14px; cursor:pointer; }
-  .card:hover { outline:1px solid var(--accent); }
-  .card .kind { color:var(--accent); font-size:12px; text-transform:uppercase; letter-spacing:.5px; }
-  .card .title { font-weight:600; margin:4px 0; }
-  .card .author { color:#999; font-size:13px; }
-  .card .resume { margin-top:8px; font-size:12px; color:#4a9eff; }
-  audio,video { width:100%; margin-top:12px; }
-  #player { position:sticky; bottom:0; background:var(--panel); padding:12px; border-radius:10px 10px 0 0; display:none; }
-</style>
+<link rel="stylesheet" href="vendor/plyr/plyr.min.css">
+<link rel="stylesheet" href="css/frayd.css">
 </head>
 <body>
-<h1>Frayd</h1>
-<div id="grid"></div>
-<div id="player"><span id="ptitle"></span><button id="close">✕</button><audio id="audio" controls></audio></div>
-<script>
-const IDENTITY = localStorage.frayd_identity ||
-  (localStorage.frayd_identity = location.hostname + ':' + crypto.randomUUID());
 
-async function loadLibrary() {
-  const items = await (await fetch('/api/library')).json();
-  const grid = document.getElementById('grid');
-  for (const it of items) {
-    const card = document.createElement('div');
-    card.className = 'card';
-    card.innerHTML = `<div class="kind">${it.kind}</div>
-      <div class="title">${it.title}</div>
-      <div class="author">${it.author ?? ''}</div><div class="resume"></div>`;
-    // fetch resume point
-    fetch(`/api/progress/${it.id}?identity=${encodeURIComponent(IDENTITY)}`)
-      .then(r => r.ok ? r.json() : null)
-      .then(p => {
-        if (p && p.position > 5) {
-          const m = Math.floor(p.position / 60), s = Math.floor(p.position % 60);
-          card.querySelector('.resume').textContent = `▶ resume ${m}:${String(s).padStart(2,'0')}`;
-        }
-      });
-    card.onclick = () => play(it);
-    grid.appendChild(card);
-  }
-}
+<!-- ============ LOGIN ============ -->
+<div id="login" style="display:none">
+  <div class="auth-brand">
+    <h1>FRAYD</h1>
+    <p>Your media, everywhere on your network</p>
+  </div>
 
-function play(it) {
-  const player = document.getElementById('player');
-  const audio = document.getElementById('audio');
-  document.getElementById('ptitle').textContent = it.title;
-  player.style.display = 'block';
-  audio.src = `/api/stream/${it.id}`;
-  fetch(`/api/progress/${it.id}?identity=${encodeURIComponent(IDENTITY)}`)
-    .then(r => r.ok ? r.json() : null)
-    .then(p => { if (p && p.position > 5) audio.currentTime = p.position; });
-  audio.play();
+  <form class="auth-card" id="login-form" autocomplete="on">
+    <h2>Sign in</h2>
+    <div class="auth-error" id="auth-error"></div>
 
-  // heartbeat progress every 10s + on pause
-  let last = 0;
-  audio.addEventListener('timeupdate', () => {
-    if (audio.currentTime - last >= 10) {
-      last = audio.currentTime;
-      sync(it.id, audio.currentTime);
-    }
-  });
-  audio.addEventListener('pause', () => sync(it.id, audio.currentTime));
-}
+    <div class="field">
+      <label for="email">Email</label>
+      <div class="input-wrap">
+        <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/></svg>
+        <input id="email" type="email" placeholder="you@example.com" required>
+      </div>
+    </div>
 
-function sync(mediaId, position) {
-  fetch('/api/progress', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ identity: IDENTITY, media_id: mediaId, position })
-  });
-}
+    <div class="field">
+      <label for="password">Password <a href="#" onclick="return false">Forgot?</a></label>
+      <div class="input-wrap">
+        <svg class="icon" viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+        <input id="password" type="password" placeholder="••••••••" required>
+        <button type="button" class="reveal" id="pw-toggle" aria-label="Show password">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6Z"/><circle cx="12" cy="12" r="3"/></svg>
+        </button>
+      </div>
+    </div>
 
-document.getElementById('close').onclick = () => {
-  document.getElementById('audio').pause();
-  document.getElementById('player').style.display = 'none';
-};
+    <div class="row-between">
+      <label style="display:flex;align-items:center;gap:8px">
+        <input type="checkbox" id="remember" style="accent-color:#5B46F6"> Remember me
+      </label>
+    </div>
 
-loadLibrary();
-</script>
+    <button type="submit" class="btn-primary">Sign in</button>
+
+    <div class="divider">or continue with</div>
+
+    <div class="social-row">
+      <button type="button" class="btn-social" onclick="return false">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="#fff"><path d="M21.35 11.1h-9.17v2.73h6.51c-.33 3.81-3.5 5.44-6.5 5.44C8.36 19.27 5 16.25 5 12c0-4.1 3.2-7.27 7.2-7.27 3.09 0 4.9 1.97 4.9 1.97L19 4.72S16.56 2 12.1 2C6.42 2 2.03 6.8 2.03 12c0 5.05 4.13 10 10.22 10 5.35 0 9.25-3.67 9.25-9.09 0-1.15-.15-1.81-.15-1.81Z"/></svg>
+        Google
+      </button>
+      <button type="button" class="btn-social" onclick="return false">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="#fff"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm6.6 7.6-5.7 7.4c-.4.5-1.1.5-1.5.1l-3.9-3.9a.9.9 0 1 1 1.3-1.3l3.1 3.1 5-6.5a.9.9 0 0 1 1.7.5v.6Z"/></svg>
+        SSO
+      </button>
+    </div>
+  </form>
+
+  <div class="auth-footer">
+    On your home network? <a href="#" id="guest">Continue as guest</a>
+  </div>
+</div>
+
+<!-- ============ APP SHELL ============ -->
+<div id="app">
+  <nav id="sidebar">
+    <div class="brand">FRAYD</div>
+    <button class="nav-item active" data-kind="all">
+      <svg class="icon" viewBox="0 0 24 24"><path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1h-5v-6h-6v6H4a1 1 0 0 1-1-1Z"/></svg>
+      Dashboard</button>
+    <button class="nav-item" data-kind="movie">
+      <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m10 9 5 3-5 3Z"/></svg>
+      Movies</button>
+    <button class="nav-item" data-kind="music">
+      <svg class="icon" viewBox="0 0 24 24"><path d="M9 18V6l11-2v12"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="17.5" cy="16" r="2.5"/></svg>
+      Music</button>
+    <button class="nav-item" data-kind="audiobook">
+      <svg class="icon" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
+      Audiobooks</button>
+    <div class="nav-section">Library</div>
+    <button class="nav-item" data-kind="ebook">
+      <svg class="icon" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20V4H6.5A2.5 2.5 0 0 0 4 6.5v13ZM4 19.5A2.5 2.5 0 0 0 6.5 22H20v-5"/></svg>
+      Ebooks</button>
+    <button class="nav-item" data-kind="comic">
+      <svg class="icon" viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M4 9h16M4 15h16M10 3v18"/></svg>
+      Comics</button>
+  </nav>
+
+  <header id="topbar">
+    <div id="search">
+      <svg class="icon" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      <input type="search" placeholder="Search your library…">
+    </div>
+    <button id="bell" aria-label="Notifications">
+      <svg class="icon" viewBox="0 0 24 24" width="20" height="20"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0"/></svg>
+    </button>
+    <button id="add-media">
+      <svg class="icon" viewBox="0 0 24 24" style="stroke:#fff"><path d="M12 5v14M5 12h14"/></svg>
+      Add media</button>
+  </header>
+
+  <main id="main">
+    <div id="hero"></div>
+  </main>
+
+  <!-- bottom persistent player (audio) -->
+  <div id="playerbar">
+    <div id="pb-thumb"></div>
+    <div id="pb-meta">
+      <div class="t" id="pb-title">—</div>
+      <div class="s" id="pb-sub"></div>
+    </div>
+    <div class="pb-center">
+      <div class="pb-controls">
+        <button class="pb-btn" aria-label="Previous">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M18 5v14L8 12ZM6 5v14"/></svg></button>
+        <button class="pb-play" id="pb-play">▶</button>
+        <button class="pb-btn" aria-label="Next">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M6 5v14l10-7ZM18 5v14"/></svg></button>
+      </div>
+      <div class="pb-track">
+        <span class="time" id="pb-cur">0:00</span>
+        <div class="pb-bar" id="pb-bar"><div class="fill" id="pb-fill"></div></div>
+        <span class="time" id="pb-dur">0:00</span>
+      </div>
+    </div>
+    <div class="pb-right">
+      <svg class="icon" viewBox="0 0 24 24" style="stroke:#8A8F9E"><path d="M11 5 6 9H2v6h4l5 4V5ZM15.5 8.5a5 5 0 0 1 0 7"/></svg>
+      <div class="pb-vol" id="pb-vol"><div class="fill"></div></div>
+      <button id="pb-close" aria-label="Close player">✕</button>
+    </div>
+  </div>
+
+  <!-- video modal (Plyr) -->
+  <div id="video-modal">
+    <div class="modal-inner">
+      <div class="modal-head">
+        <span class="t" id="vm-title"></span>
+        <button id="vm-close" aria-label="Close">✕</button>
+      </div>
+      <video id="plyr-video" playsinline controls></video>
+    </div>
+  </div>
+</div>
+
+<script src="vendor/plyr/plyr.min.js"></script>
+<script src="js/app.js"></script>
 </body>
 </html>

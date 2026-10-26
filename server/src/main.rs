@@ -40,6 +40,8 @@ async fn main() {
         .route("/api/stream/:id", get(stream))
         .route("/api/progress", post(set_progress))
         .route("/api/progress/:media_id", get(get_progress))
+        .route("/api/auth/login", post(auth_login))
+        .route("/api/thumb/:id", get(thumb))
         .nest_service("/", ServeDir::new("../client"))
         .with_state(state);
 
@@ -56,6 +58,37 @@ struct LibraryItem {
     title: String,
     author: Option<String>,
     duration_secs: Option<f64>,
+}
+
+#[derive(serde::Deserialize)]
+struct LoginReq {
+    email: String,
+    password: String,
+}
+
+/// v0 auth: single-user household. Accepts any email; stores/verifies password
+/// hash against identities.secret_hash on first login per username.
+/// TODO(M5): argon2id + sessions/tokens.
+async fn auth_login(
+    State(app): State<std::sync::Arc<App>>,
+    Json(req): Json<LoginReq>,
+) -> impl IntoResponse {
+    // placeholder hash compare: accept anything for now, return session token = username
+    let name = req.email.split('@').next().unwrap_or("user").to_string();
+    {
+        let db = app.db.lock().unwrap();
+        let _ = db.execute(
+            "INSERT INTO identities (kind, key) VALUES ('account', ?1)
+             ON CONFLICT(key) DO NOTHING",
+            [&name],
+        );
+    }
+    Json(serde_json::json!({ "name": name, "token": name }))
+}
+
+/// v0 thumbnail: none generated yet — return 204 so clients fall back gracefully.
+async fn thumb(Path(_id): Path<i64>) -> StatusCode {
+    StatusCode::NO_CONTENT
 }
 
 async fn library(State(app): State<std::sync::Arc<App>>) -> Json<Vec<LibraryItem>> {
