@@ -18,6 +18,10 @@ use tower_http::services::fs::ServeDir;
 
 pub struct App {
     pub db: Mutex<Connection>,
+    /// Library root from FRAYD_LIBRARY (scan target).
+    pub library: Option<PathBuf>,
+    /// True while a scan is running (single scan at a time).
+    pub scanning: std::sync::atomic::AtomicBool,
 }
 
 #[tokio::main]
@@ -26,27 +30,31 @@ async fn main() {
 
     let db_path = std::env::var("FRAYD_DB").unwrap_or_else(|_| "frayd.db".into());
     let db = store::open(&db_path);
-    let state = std::sync::Arc::new(App { db: Mutex::new(db) });
+    let library = std::env::var("FRAYD_LIBRARY").ok().map(PathBuf::from);
+    let state = std::sync::Arc::new(App {
+        db: Mutex::new(db),
+        library: library.clone(),
+        scanning: std::sync::atomic::AtomicBool::new(false),
+    });
 
     // optional immediate scan
-    if let Ok(lib) = std::env::var("FRAYD_LIBRARY") {
-        let st = state.clone();
-        tokio::task::spawn_blocking(move || {
-            let db = st.db.lock().unwrap();
-            let thumbs = thumbs_dir();
-            let n = scanner::scan(&db, PathBuf::from(&lib), Some(&thumbs));
-            tracing::info!("scan complete: {n} items");
-        });
+    if let Some(lib) = library {
+        state
+            .scanning
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        run_scan(state.clone(), lib);
     }
 
     let app = Router::new()
-        .route("/api/library", get(library))
+        .route("/api/library", get(library_handler))
         .route("/api/stream/:id", get(stream))
         .route("/api/progress", post(set_progress))
         .route("/api/progress/:media_id", get(get_progress))
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/logout", post(auth_logout))
         .route("/api/thumb/:id", get(thumb))
+        .route("/api/scan", post(trigger_scan))
+        .route("/api/scan/status", get(scan_status))
         .route("/api/comic/:id/pages", get(comic_pages))
         .route("/api/comic/:id/page/:n", get(comic_page))
         .route("/api/epub/:id/spine", get(epub_spine))
@@ -304,6 +312,48 @@ fn cache_page_list(db: &Connection, id: i64, path: &std::path::Path) -> Option<V
     Some(names)
 }
 
+/// Spawn a background library scan. Caller must have set `scanning` = true
+/// via compare_exchange; this just runs the scan and clears the flag after.
+fn run_scan(state: std::sync::Arc<App>, lib: PathBuf) {
+    tokio::task::spawn_blocking(move || {
+        let db = state.db.lock().unwrap();
+        let thumbs = thumbs_dir();
+        let n = scanner::scan(&db, lib, Some(&thumbs));
+        state
+            .scanning
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        tracing::info!("scan complete: {n} items");
+    });
+}
+
+/// POST /api/scan → trigger library rescan. 202 if started, 409 if busy.
+async fn trigger_scan(State(app): State<std::sync::Arc<App>>) -> StatusCode {
+    use std::sync::atomic::Ordering;
+    let Some(lib) = app.library.clone() else {
+        return StatusCode::NOT_IMPLEMENTED; // no FRAYD_LIBRARY configured
+    };
+    match app.scanning.compare_exchange(
+        false,
+        true,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    ) {
+        Ok(_) => {
+            run_scan(app, lib);
+            StatusCode::ACCEPTED
+        }
+        Err(_) => StatusCode::CONFLICT,
+    }
+}
+
+/// GET /api/scan/status → { scanning: bool }
+async fn scan_status(State(app): State<std::sync::Arc<App>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "scanning": app.scanning.load(std::sync::atomic::Ordering::SeqCst),
+        "library_configured": app.library.is_some(),
+    }))
+}
+
 /// GET /api/epub/:id/asset/OEBPS/images/x.png → raw zip entry bytes.
 /// Path traversal guard: reject absolute paths, "..", backslashes.
 async fn epub_asset(
@@ -426,7 +476,7 @@ async fn media_path(app: &std::sync::Arc<App>, id: i64) -> Option<String> {
         .ok()
 }
 
-async fn library(State(app): State<std::sync::Arc<App>>) -> Json<Vec<LibraryItem>> {
+async fn library_handler(State(app): State<std::sync::Arc<App>>) -> Json<Vec<LibraryItem>> {
     let db = app.db.lock().unwrap();
     let mut stmt = db
         .prepare("SELECT id, kind, title, author, duration_secs FROM media ORDER BY kind, title")

@@ -80,6 +80,36 @@ $('#guest').onclick = (e) => {
   enterApp();
 };
 
+// ---------- scan trigger ----------
+const ADD_BTN_HTML = $('#add-media').innerHTML;
+$('#add-media').onclick = async () => {
+  const btn = $('#add-media');
+  if (btn.disabled) return;
+  btn.disabled = true;
+  btn.textContent = 'Scanning…';
+  try {
+    const r = await fetch('/api/scan', { method: 'POST', headers: authHeaders() });
+    if (r.status === 202) {
+      // poll status until idle, then refresh library
+      const poll = setInterval(async () => {
+        const { scanning } = await (await fetch('/api/scan/status')).json();
+        if (scanning) return;
+        clearInterval(poll);
+        LIBRARY = await (await fetch('/api/library')).json();
+        renderLibrary();
+        btn.disabled = false;
+        btn.innerHTML = ADD_BTN_HTML;
+      }, 1500);
+    } else {
+      btn.disabled = false;
+      btn.innerHTML = ADD_BTN_HTML;
+    }
+  } catch {
+    btn.disabled = false;
+    btn.innerHTML = ADD_BTN_HTML;
+  }
+};
+
 // ---------- nav ----------
 document.querySelectorAll('.nav-item').forEach(btn => {
   btn.onclick = () => {
