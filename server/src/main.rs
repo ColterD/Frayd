@@ -1,5 +1,6 @@
 mod auth;
 mod comic;
+mod epub;
 mod scanner;
 mod store;
 
@@ -48,6 +49,8 @@ async fn main() {
         .route("/api/thumb/:id", get(thumb))
         .route("/api/comic/:id/pages", get(comic_pages))
         .route("/api/comic/:id/page/:n", get(comic_page))
+        .route("/api/epub/:id/spine", get(epub_spine))
+        .route("/api/epub/:id/chunk/:n", get(epub_chunk))
         .nest_service("/", ServeDir::new("../client"))
         .with_state(state);
 
@@ -298,6 +301,92 @@ fn cache_page_list(db: &Connection, id: i64, path: &std::path::Path) -> Option<V
         rusqlite::params![v.to_string(), id],
     );
     Some(names)
+}
+
+/// GET /api/epub/:id/spine → [chunk hrefs] in reading order.
+async fn epub_spine(
+    State(app): State<std::sync::Arc<App>>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let Some(path) = media_path(&app, id).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match tokio::task::spawn_blocking(move || epub::epub_spine(std::path::Path::new(&path)))
+        .await
+        .ok()
+        .flatten()
+    {
+        Some(spine) => Json(spine).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// GET /api/epub/:id/chunk/:n → XHTML bytes of nth spine item, sandboxed MIME.
+async fn epub_chunk(
+    State(app): State<std::sync::Arc<App>>,
+    Path((id, n)): Path<(i64, i64)>,
+) -> impl IntoResponse {
+    let Some(path) = media_path(&app, id).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let name = {
+        let db = app.db.lock().unwrap();
+        let meta: Option<String> = db
+            .query_row("SELECT meta_json FROM media WHERE id = ?1", [id], |r| r.get(0))
+            .ok()
+            .flatten();
+        let spine: Option<Vec<String>> = meta
+            .as_deref()
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+            .and_then(|v| v.get("spine").cloned())
+            .and_then(|p| serde_json::from_value(p).ok());
+        match spine {
+            Some(s) => s.get(n as usize).cloned(),
+            None => {
+                drop(db);
+                let db = app.db.lock().unwrap();
+                cache_spine(&db, id, std::path::Path::new(&path))
+                    .and_then(|s| s.get(n as usize).cloned())
+            }
+        }
+    };
+    let Some(name) = name else { return StatusCode::NOT_FOUND.into_response() };
+    match tokio::task::spawn_blocking(move || {
+        epub::read_zip_entry(std::path::Path::new(&path), &name)
+    })
+    .await
+    .ok()
+    .flatten()
+    {
+        Some(bytes) => (
+            [(header::CONTENT_TYPE, "application/xhtml+xml"),
+             (header::CACHE_CONTROL, "private, max-age=86400"),
+             (header::CONTENT_SECURITY_POLICY,
+              "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:")],
+            bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// Compute + persist spine into meta_json.spine. Returns hrefs.
+fn cache_spine(db: &Connection, id: i64, path: &std::path::Path) -> Option<Vec<String>> {
+    let spine = epub::epub_spine(path)?;
+    let meta: Option<String> = db
+        .query_row("SELECT meta_json FROM media WHERE id = ?1", [id], |r| r.get(0))
+        .ok()
+        .flatten();
+    let mut v: serde_json::Value = meta
+        .as_deref()
+        .and_then(|m| serde_json::from_str(m).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    v["spine"] = serde_json::json!(spine);
+    let _ = db.execute(
+        "UPDATE media SET meta_json = ?1 WHERE id = ?2",
+        rusqlite::params![v.to_string(), id],
+    );
+    Some(spine)
 }
 
 async fn media_path(app: &std::sync::Arc<App>, id: i64) -> Option<String> {
