@@ -10,6 +10,7 @@ tower-http = { version = "0.5", features = ["fs", "trace"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
 walkdir = "2"
 tokio-util = { version = "0.7", features = ["io"] }
 uuid = { version = "1", features = ["v4"] }

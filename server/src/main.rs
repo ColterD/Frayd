@@ -1,4 +1,5 @@
 mod auth;
+mod comic;
 mod scanner;
 mod store;
 
@@ -10,7 +11,7 @@ use axum::{
     Json, Router,
 };
 use rusqlite::{Connection, OptionalExtension};
-use std::path::PathBuf;
+use std::path::{Path as StdPath, PathBuf};
 use std::sync::Mutex;
 use tower_http::services::fs::ServeDir;
 
@@ -31,7 +32,8 @@ async fn main() {
         let st = state.clone();
         tokio::task::spawn_blocking(move || {
             let db = st.db.lock().unwrap();
-            let n = scanner::scan(&db, PathBuf::from(&lib));
+            let thumbs = thumbs_dir();
+            let n = scanner::scan(&db, PathBuf::from(&lib), Some(&thumbs));
             tracing::info!("scan complete: {n} items");
         });
     }
@@ -44,6 +46,8 @@ async fn main() {
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/logout", post(auth_logout))
         .route("/api/thumb/:id", get(thumb))
+        .route("/api/comic/:id/pages", get(comic_pages))
+        .route("/api/comic/:id/page/:n", get(comic_page))
         .nest_service("/", ServeDir::new("../client"))
         .with_state(state);
 
@@ -172,9 +176,134 @@ fn resolve_identity(
     Err(StatusCode::UNAUTHORIZED)
 }
 
-/// v0 thumbnail: none generated yet — return 204 so clients fall back gracefully.
-async fn thumb(Path(_id): Path<i64>) -> StatusCode {
-    StatusCode::NO_CONTENT
+/// Thumbs cache dir: $FRAYD_THUMBS or "thumbs" next to the db file.
+fn thumbs_dir() -> PathBuf {
+    if let Ok(t) = std::env::var("FRAYD_THUMBS") {
+        return PathBuf::from(t);
+    }
+    let db_path = std::env::var("FRAYD_DB").unwrap_or_else(|_| "frayd.db".into());
+    StdPath::new(&db_path)
+        .parent()
+        .unwrap_or(StdPath::new("."))
+        .join("thumbs")
+}
+
+/// Serve extracted thumbnail. 204 when none (client falls back gracefully).
+async fn thumb(
+    State(app): State<std::sync::Arc<App>>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let path: Option<String> = {
+        let db = app.db.lock().unwrap();
+        db.query_row("SELECT thumb_path FROM media WHERE id = ?1", [id], |r| r.get(0))
+            .ok()
+    };
+    let Some(path) = path else { return StatusCode::NO_CONTENT.into_response() };
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
+            [(header::CONTENT_TYPE, "image/jpeg"),
+             (header::CACHE_CONTROL, "public, max-age=86400, immutable")],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
+/// GET /api/comic/:id/pages → ["p001.jpg", ...] natural-sorted.
+async fn comic_pages(
+    State(app): State<std::sync::Arc<App>>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let Some(path) = media_path(&app, id).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match tokio::task::spawn_blocking(move || comic::comic_pages(std::path::Path::new(&path)))
+        .await
+        .ok()
+        .flatten()
+    {
+        Some(pages) => {
+            let names: Vec<&str> = pages.iter().map(|(n, _)| n.as_str()).collect();
+            Json(names).into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// GET /api/comic/:id/page/:n → image bytes for nth (0-based) page.
+async fn comic_page(
+    State(app): State<std::sync::Arc<App>>,
+    Path((id, n)): Path<(i64, i64)>,
+) -> impl IntoResponse {
+    let Some(path) = media_path(&app, id).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let name = {
+        let db = app.db.lock().unwrap();
+        let meta: Option<String> = db
+            .query_row("SELECT meta_json FROM media WHERE id = ?1", [id], |r| r.get(0))
+            .ok()
+            .flatten();
+        // page list cached in meta_json.pages; recompute if absent
+        let pages: Option<Vec<String>> = meta
+            .as_deref()
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+            .and_then(|v| v.get("pages").cloned())
+            .and_then(|p| serde_json::from_value(p).ok());
+        match pages {
+            Some(p) => p.get(n as usize).cloned(),
+            None => {
+                drop(db);
+                let db = app.db.lock().unwrap();
+                cache_page_list(&db, id, std::path::Path::new(&path))
+                    .and_then(|list| list.get(n as usize).cloned())
+            }
+        }
+    };
+    let Some(name) = name else { return StatusCode::NOT_FOUND.into_response() };
+    let mime = mime_guess(&name);
+    match tokio::task::spawn_blocking(move || {
+        comic::read_zip_entry(std::path::Path::new(&path), &name)
+    })
+    .await
+    .ok()
+    .flatten()
+    {
+        Some(bytes) => (
+            [(header::CONTENT_TYPE, mime),
+             (header::CACHE_CONTROL, "private, max-age=86400".to_string())],
+            bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// Compute + persist page list into meta_json.pages. Returns names.
+fn cache_page_list(db: &Connection, id: i64, path: &std::path::Path) -> Option<Vec<String>> {
+    let pages = comic::comic_pages(path)?;
+    let names: Vec<String> = pages.into_iter().map(|(n, _)| n).collect();
+    let meta: Option<String> = db
+        .query_row("SELECT meta_json FROM media WHERE id = ?1", [id], |r| r.get(0))
+        .ok()
+        .flatten();
+    let mut v: serde_json::Value = meta
+        .as_deref()
+        .and_then(|m| serde_json::from_str(m).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    v["pages"] = serde_json::json!(names);
+    let _ = db.execute(
+        "UPDATE media SET meta_json = ?1 WHERE id = ?2",
+        rusqlite::params![v.to_string(), id],
+    );
+    Some(names)
+}
+
+async fn media_path(app: &std::sync::Arc<App>, id: i64) -> Option<String> {
+    let db = app.db.lock().unwrap();
+    db.query_row("SELECT path FROM media WHERE id = ?1", [id], |r| r.get(0))
+        .ok()
 }
 
 async fn library(State(app): State<std::sync::Arc<App>>) -> Json<Vec<LibraryItem>> {
