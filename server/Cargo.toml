@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-axum = { version = "0.7", features = ["http2", "macros"] }
+axum = { version = "0.7", features = ["http2", "macros", "ws"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.5", features = ["fs", "trace"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
@@ -20,6 +20,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 argon2 = "0.5"
 rand = "0.8"
+futures = "0.3.34"
 
 [profile.release]
 opt-level = 2

@@ -1,10 +1,12 @@
 mod auth;
 mod comic;
 mod epub;
+mod party;
 mod scanner;
 mod store;
 
 use axum::{
+    extract::ws::WebSocketUpgrade,
     extract::{Path, Query, State},
     http::{header, StatusCode},
     response::IntoResponse,
@@ -13,7 +15,7 @@ use axum::{
 };
 use rusqlite::{Connection, OptionalExtension};
 use std::path::{Path as StdPath, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tower_http::services::fs::ServeDir;
 
 pub struct App {
@@ -22,6 +24,8 @@ pub struct App {
     pub library: Option<PathBuf>,
     /// True while a scan is running (single scan at a time).
     pub scanning: std::sync::atomic::AtomicBool,
+    /// Active listening party (single party — household scale).
+    pub party: Arc<party::Party>,
 }
 
 #[tokio::main]
@@ -35,6 +39,7 @@ async fn main() {
         db: Mutex::new(db),
         library: library.clone(),
         scanning: std::sync::atomic::AtomicBool::new(false),
+        party: Arc::new(party::Party::new()),
     });
 
     // optional immediate scan
@@ -55,6 +60,8 @@ async fn main() {
         .route("/api/thumb/:id", get(thumb))
         .route("/api/scan", post(trigger_scan))
         .route("/api/scan/status", get(scan_status))
+        .route("/api/party", post(party_create))
+        .route("/api/party/:code/ws", get(party_ws))
         .route("/api/comic/:id/pages", get(comic_pages))
         .route("/api/comic/:id/page/:n", get(comic_page))
         .route("/api/epub/:id/spine", get(epub_spine))
@@ -346,6 +353,57 @@ async fn trigger_scan(State(app): State<std::sync::Arc<App>>) -> StatusCode {
         }
         Err(_) => StatusCode::CONFLICT,
     }
+}
+
+#[derive(serde::Deserialize)]
+struct PartyCreateReq {
+    /// Identity key (token-derived or LAN fallback).
+    identity: String,
+}
+
+/// POST /api/party → { code } — host starts a party.
+async fn party_create(
+    State(app): State<std::sync::Arc<App>>,
+    Json(req): Json<PartyCreateReq>,
+) -> impl IntoResponse {
+    let code = app.party.create(&req.identity);
+    (StatusCode::OK, Json(serde_json::json!({ "code": code })))
+}
+
+/// GET /api/party/:code/ws — join party socket. Identity via ?identity= or Bearer.
+async fn party_ws(
+    State(app): State<std::sync::Arc<App>>,
+    Path(code): Path<String>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    // validate: party exists + code matches
+    let code_ok = app
+        .party
+        .code
+        .lock()
+        .unwrap()
+        .as_deref()
+        .map(|c| c.eq_ignore_ascii_case(&code))
+        .unwrap_or(false);
+    if !code_ok {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    // resolve identity: token first, LAN fallback
+    let key = {
+        let db = app.db.lock().unwrap();
+        match resolve_identity(&db, &headers, q.get("identity").map(|s| s.as_str())) {
+            Ok(id) => db
+                .query_row("SELECT key FROM identities WHERE id = ?1", [id], |r| r.get(0))
+                .unwrap_or_else(|_| format!("anon-{id}")),
+            Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+        }
+    };
+    let is_host = app.party.is_host(&key);
+    ws.on_upgrade(move |socket| party::member_socket(app.party.clone(), socket, key, is_host))
+        .into_response()
 }
 
 /// GET /api/scan/status → { scanning: bool }
