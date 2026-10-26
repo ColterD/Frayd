@@ -1,3 +1,4 @@
+mod auth;
 mod scanner;
 mod store;
 
@@ -8,7 +9,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tower_http::services::fs::ServeDir;
@@ -41,6 +42,7 @@ async fn main() {
         .route("/api/progress", post(set_progress))
         .route("/api/progress/:media_id", get(get_progress))
         .route("/api/auth/login", post(auth_login))
+        .route("/api/auth/logout", post(auth_logout))
         .route("/api/thumb/:id", get(thumb))
         .nest_service("/", ServeDir::new("../client"))
         .with_state(state);
@@ -73,17 +75,101 @@ async fn auth_login(
     State(app): State<std::sync::Arc<App>>,
     Json(req): Json<LoginReq>,
 ) -> impl IntoResponse {
-    // placeholder hash compare: accept anything for now, return session token = username
+    let db = app.db.lock().unwrap();
+    let exists: Option<i64> = db
+        .query_row(
+            "SELECT id FROM identities WHERE kind='account' AND key = ?1",
+            [&req.email],
+            |r| r.get(0),
+        )
+        .ok();
+
+    let identity_id = match exists {
+        Some(id) => {
+            // existing account: verify password
+            match auth::verify_login(&db, &req.email, &req.password) {
+                Ok(true) => id,
+                _ => {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        Json(serde_json::json!({ "error": "invalid credentials" })),
+                    )
+                }
+            }
+        }
+        None => {
+            // first login mints the account (household bootstrap)
+            if let Err(e) = auth::create_account(&db, &req.email, &req.password) {
+                tracing::warn!("account create failed: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": "account creation failed" })),
+                );
+            }
+            db.query_row(
+                "SELECT id FROM identities WHERE kind='account' AND key = ?1",
+                [&req.email],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+    };
+
+    let token = match auth::create_session(&db, identity_id) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("session create failed: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "session creation failed" })),
+            );
+        }
+    };
     let name = req.email.split('@').next().unwrap_or("user").to_string();
-    {
+    (StatusCode::OK, Json(serde_json::json!({ "name": name, "token": token })))
+}
+
+async fn auth_logout(
+    State(app): State<std::sync::Arc<App>>,
+    headers: axum::http::HeaderMap,
+) -> StatusCode {
+    if let Some(token) = bearer_token(&headers) {
         let db = app.db.lock().unwrap();
-        let _ = db.execute(
-            "INSERT INTO identities (kind, key) VALUES ('account', ?1)
-             ON CONFLICT(key) DO NOTHING",
-            [&name],
-        );
+        auth::delete_session(&db, &token);
     }
-    Json(serde_json::json!({ "name": name, "token": name }))
+    StatusCode::NO_CONTENT
+}
+
+/// Extract bearer token from Authorization header.
+fn bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .map(|s| s.to_string())
+}
+
+/// Resolve identity for a request: Bearer token first, fall back to ?identity= query.
+fn resolve_identity(
+    db: &Connection,
+    headers: &axum::http::HeaderMap,
+    query_identity: Option<&str>,
+) -> Result<i64, StatusCode> {
+    if let Some(token) = bearer_token(headers) {
+        if let Some(id) = auth::identity_from_token(db, &token) {
+            return Ok(id);
+        }
+    }
+    if let Some(key) = query_identity {
+        // LAN fallback: hostname-keyed device identity
+        return db
+            .query_row("SELECT id FROM identities WHERE key = ?1", [key], |r| r.get(0))
+            .optional()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::NOT_FOUND);
+    }
+    Err(StatusCode::UNAUTHORIZED)
 }
 
 /// v0 thumbnail: none generated yet — return 204 so clients fall back gracefully.
@@ -205,61 +291,50 @@ fn mime_guess(p: &str) -> String {
 
 #[derive(serde::Deserialize)]
 struct ProgressIn {
-    identity: String,
+    identity: Option<String>,
     media_id: i64,
     position: f64,
 }
 
 async fn set_progress(
     State(app): State<std::sync::Arc<App>>,
+    headers: axum::http::HeaderMap,
     Json(p): Json<ProgressIn>,
 ) -> StatusCode {
     let db = app.db.lock().unwrap();
-    let ident_id: Option<i64> = db
-        .query_row("SELECT id FROM identities WHERE key = ?1", [&p.identity], |r| r.get(0))
-        .ok();
-    let ident_id = match ident_id {
-        Some(id) => id,
-        None => {
-            let key = &p.identity;
-            if db
-                .execute(
-                    "INSERT INTO identities (kind, key) VALUES ('device', ?1)",
-                    [key],
-                )
-                .is_err()
-            {
-                return StatusCode::INTERNAL_SERVER_ERROR;
-            }
-            db.last_insert_rowid()
-        }
+    let ident_id = match resolve_identity(&db, &headers, p.identity.as_deref()) {
+        Ok(id) => id,
+        Err(s) => return s,
     };
-    let _ = db.execute(
+    if let Err(e) = db.execute(
         "INSERT INTO progress (identity_id, media_id, position, updated_at)
          VALUES (?1, ?2, ?3, unixepoch())
          ON CONFLICT(identity_id, media_id)
          DO UPDATE SET position = ?3, updated_at = unixepoch()",
         rusqlite::params![ident_id, p.media_id, p.position],
-    );
+    ) {
+        tracing::warn!("set_progress failed (media_id={}): {e}", p.media_id);
+        return StatusCode::NOT_FOUND;
+    }
     StatusCode::NO_CONTENT
 }
 
 async fn get_progress(
     State(app): State<std::sync::Arc<App>>,
     Path(media_id): Path<i64>,
+    headers: axum::http::HeaderMap,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let identity = match q.get("identity") {
-        Some(i) => i,
-        None => return (StatusCode::BAD_REQUEST, "missing identity".to_string()),
-    };
     let db = app.db.lock().unwrap();
+    let ident_id = match resolve_identity(&db, &headers, q.get("identity").map(|s| s.as_str())) {
+        Ok(id) => id,
+        Err(s) => return (s, "unauthorized".to_string()),
+    };
     let pos: Option<(f64, i64)> = db
         .query_row(
             "SELECT p.position, p.updated_at FROM progress p
-             JOIN identities i ON i.id = p.identity_id
-             WHERE i.key = ?1 AND p.media_id = ?2",
-            rusqlite::params![identity, media_id],
+             WHERE identity_id = ?1 AND p.media_id = ?2",
+            rusqlite::params![ident_id, media_id],
             |r| -> rusqlite::Result<(f64, i64)> {
                 Ok((r.get(0)?, r.get(1)?))
             },

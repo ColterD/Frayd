@@ -27,6 +27,13 @@ CREATE TABLE IF NOT EXISTS identities (
   created_at INTEGER DEFAULT (unixepoch())
 );
 
+CREATE TABLE IF NOT EXISTS sessions (
+  token TEXT PRIMARY KEY,            -- random 128-bit hex
+  identity_id INTEGER NOT NULL REFERENCES identities(id),
+  created_at INTEGER DEFAULT (unixepoch()),
+  expires_at INTEGER NOT NULL        -- unixepoch(); sliding window, refreshed on use
+);
+
 CREATE TABLE IF NOT EXISTS progress (
   identity_id INTEGER NOT NULL REFERENCES identities(id),
   media_id INTEGER NOT NULL REFERENCES media(id),

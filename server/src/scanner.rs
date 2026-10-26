@@ -2,6 +2,7 @@ use rusqlite::Connection;
 use std::path::Path;
 use walkdir::WalkDir;
 
+#[allow(dead_code)] // used by ad-hoc scans/tests
 pub fn open(path: &str) -> Connection {
     let db = Connection::open(path).expect("open db");
     db.execute_batch(include_str!("../schema.sql")).expect("schema");

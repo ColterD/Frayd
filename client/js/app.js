@@ -13,6 +13,11 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c =>
 
 // ---------- identity / auth ----------
 let IDENTITY = localStorage.frayd_identity;
+function authHeaders(extra = {}) {
+  const h = { ...extra };
+  if (localStorage.frayd_token) h['Authorization'] = 'Bearer ' + localStorage.frayd_token;
+  return h;
+}
 let account = null;
 
 async function tryResume() {
@@ -64,6 +69,7 @@ $('#pw-toggle').onclick = () => {
   p.type = p.type === 'password' ? 'text' : 'password';
 };
 $('#logout').onclick = () => {
+  fetch('/api/auth/logout', { method: 'POST', headers: authHeaders() }).catch(() => {});
   account = null;
   delete localStorage.frayd_token;
   location.reload();
@@ -104,7 +110,7 @@ function filterKind(kind, query) {
 }
 
 function resumeFor(id) {
-  return fetch(`/api/progress/${id}?identity=${encodeURIComponent(IDENTITY)}`)
+  return fetch(`/api/progress/${id}`, { headers: authHeaders() })
     .then(r => r.ok ? r.json() : null).catch(() => null);
 }
 
@@ -213,7 +219,7 @@ function trackProgress(media, it) {
 function syncProgress(mediaId, position) {
   fetch('/api/progress', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ identity: IDENTITY, media_id: mediaId, position })
   });
 }
