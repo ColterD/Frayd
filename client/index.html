@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Frayd</title>
+<style>
+  :root { --bg:#121212; --panel:#1e1e1e; --fg:#e6e6e6; --accent:#4a9eff; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--fg); font:15px system-ui,sans-serif; padding:24px; }
+  h1 { margin-bottom:16px; font-weight:600; }
+  #grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:12px; }
+  .card { background:var(--panel); border-radius:10px; padding:14px; cursor:pointer; }
+  .card:hover { outline:1px solid var(--accent); }
+  .card .kind { color:var(--accent); font-size:12px; text-transform:uppercase; letter-spacing:.5px; }
+  .card .title { font-weight:600; margin:4px 0; }
+  .card .author { color:#999; font-size:13px; }
+  .card .resume { margin-top:8px; font-size:12px; color:#4a9eff; }
+  audio,video { width:100%; margin-top:12px; }
+  #player { position:sticky; bottom:0; background:var(--panel); padding:12px; border-radius:10px 10px 0 0; display:none; }
+</style>
+</head>
+<body>
+<h1>Frayd</h1>
+<div id="grid"></div>
+<div id="player"><span id="ptitle"></span><button id="close">✕</button><audio id="audio" controls></audio></div>
+<script>
+const IDENTITY = localStorage.frayd_identity ||
+  (localStorage.frayd_identity = location.hostname + ':' + crypto.randomUUID());
+
+async function loadLibrary() {
+  const items = await (await fetch('/api/library')).json();
+  const grid = document.getElementById('grid');
+  for (const it of items) {
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `<div class="kind">${it.kind}</div>
+      <div class="title">${it.title}</div>
+      <div class="author">${it.author ?? ''}</div><div class="resume"></div>`;
+    // fetch resume point
+    fetch(`/api/progress/${it.id}?identity=${encodeURIComponent(IDENTITY)}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(p => {
+        if (p && p.position > 5) {
+          const m = Math.floor(p.position / 60), s = Math.floor(p.position % 60);
+          card.querySelector('.resume').textContent = `▶ resume ${m}:${String(s).padStart(2,'0')}`;
+        }
+      });
+    card.onclick = () => play(it);
+    grid.appendChild(card);
+  }
+}
+
+function play(it) {
+  const player = document.getElementById('player');
+  const audio = document.getElementById('audio');
+  document.getElementById('ptitle').textContent = it.title;
+  player.style.display = 'block';
+  audio.src = `/api/stream/${it.id}`;
+  fetch(`/api/progress/${it.id}?identity=${encodeURIComponent(IDENTITY)}`)
+    .then(r => r.ok ? r.json() : null)
+    .then(p => { if (p && p.position > 5) audio.currentTime = p.position; });
+  audio.play();
+
+  // heartbeat progress every 10s + on pause
+  let last = 0;
+  audio.addEventListener('timeupdate', () => {
+    if (audio.currentTime - last >= 10) {
+      last = audio.currentTime;
+      sync(it.id, audio.currentTime);
+    }
+  });
+  audio.addEventListener('pause', () => sync(it.id, audio.currentTime));
+}
+
+function sync(mediaId, position) {
+  fetch('/api/progress', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ identity: IDENTITY, media_id: mediaId, position })
+  });
+}
+
+document.getElementById('close').onclick = () => {
+  document.getElementById('audio').pause();
+  document.getElementById('player').style.display = 'none';
+};
+
+loadLibrary();
+</script>
+</body>
+</html>
