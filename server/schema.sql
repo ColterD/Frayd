@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS media (
   size_bytes INTEGER,
   mtime_secs INTEGER,
   meta_json TEXT,            -- chapters, tags, page lists, etc.
+  thumb_path TEXT,
   created_at INTEGER DEFAULT (unixepoch())
 );
 CREATE INDEX IF NOT EXISTS idx_media_kind ON media(kind);
