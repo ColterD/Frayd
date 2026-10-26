@@ -51,6 +51,7 @@ async fn main() {
         .route("/api/comic/:id/page/:n", get(comic_page))
         .route("/api/epub/:id/spine", get(epub_spine))
         .route("/api/epub/:id/chunk/:n", get(epub_chunk))
+        .route("/api/epub/:id/asset/*path", get(epub_asset))
         .nest_service("/", ServeDir::new("../client"))
         .with_state(state);
 
@@ -301,6 +302,36 @@ fn cache_page_list(db: &Connection, id: i64, path: &std::path::Path) -> Option<V
         rusqlite::params![v.to_string(), id],
     );
     Some(names)
+}
+
+/// GET /api/epub/:id/asset/OEBPS/images/x.png → raw zip entry bytes.
+/// Path traversal guard: reject absolute paths, "..", backslashes.
+async fn epub_asset(
+    State(app): State<std::sync::Arc<App>>,
+    Path((id, path)): Path<(i64, String)>,
+) -> impl IntoResponse {
+    if path.starts_with('/') || path.contains("..") || path.contains('\\') {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Some(mpath) = media_path(&app, id).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mime = mime_guess(&path);
+    match tokio::task::spawn_blocking(move || {
+        epub::read_zip_entry(std::path::Path::new(&mpath), &path)
+    })
+    .await
+    .ok()
+    .flatten()
+    {
+        Some(bytes) => (
+            [(header::CONTENT_TYPE, mime),
+             (header::CACHE_CONTROL, "private, max-age=86400".to_string())],
+            bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// GET /api/epub/:id/spine → [chunk hrefs] in reading order.

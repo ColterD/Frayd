@@ -245,10 +245,23 @@ async function openEbook(it) {
   resumeFor(it.id).then(p => { if (p) showChunk(Math.min(Math.floor(p.position), spine.length - 1)); else showChunk(0); });
 }
 
-function showChunk(n) {
+async function showChunk(n) {
   if (!ebook) return;
   ebook.chunk = Math.max(0, Math.min(n, ebook.spine.length - 1));
-  $('#em-frame').src = `/api/epub/${ebook.it.id}/chunk/${ebook.chunk}`;
+  const chunkUrl = ebook.spine[ebook.chunk]; // zip-relative path
+  const base = chunkUrl.includes('/') ? chunkUrl.slice(0, chunkUrl.lastIndexOf('/') + 1) : '';
+  try {
+    let html = await (await fetch(`/api/epub/${ebook.it.id}/chunk/${ebook.chunk}`)).text();
+    // rewrite relative src/href to asset endpoint (skip absolute, data:, #anchors, mailto)
+    html = html.replace(/(src|href)="([^"]*)"/g, (m, attr, url) => {
+      if (/^(https?:|data:|#|mailto:|javascript:)/i.test(url)) return m;
+      const resolved = base + url.replace(/^\.\//, '');
+      return `${attr}="/api/epub/${ebook.it.id}/asset/${resolved}"`;
+    });
+    $('#em-frame').srcdoc = html;
+  } catch {
+    $('#em-frame').srcdoc = '<p style="font-family:sans-serif;color:#333">Failed to load chapter.</p>';
+  }
   $('#em-pageinfo').textContent = `${ebook.chunk + 1} / ${ebook.spine.length}`;
   $('#em-prev').disabled = ebook.chunk === 0;
   $('#em-next').disabled = ebook.chunk === ebook.spine.length - 1;
