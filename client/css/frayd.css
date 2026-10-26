@@ -273,3 +273,14 @@ body.auth {
 }
 .comic-nav button:hover { background: #5B46F6; border-color: #5B46F6; }
 .comic-nav button:disabled { opacity: .35; cursor: default; background: #16181E; border-color: #2a2d36; }
+
+/* ===== ebook reader (shared head/nav classes w/ comic) ===== */
+#ebook-modal {
+  position: fixed; inset: 0; z-index: 100; background: #0D0E12;
+  display: none; flex-direction: column; align-items: center; padding: 12px;
+}
+#ebook-modal.on { display: flex; }
+#em-frame {
+  width: min(92vw, 760px); height: 78vh; background: #f5f2ea;
+  border: none; border-radius: 8px;
+}

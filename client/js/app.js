@@ -186,7 +186,7 @@ function openItem(it) {
   if (it.kind === 'movie' || it.kind === 'show') openVideo(it);
   else if (it.kind === 'music' || it.kind === 'audiobook') playAudio(it);
   else if (it.kind === 'comic') openComic(it);
-  // ebook reader later
+  else if (it.kind === 'ebook') openEbook(it);
 }
 
 // ---------- comic reader ----------
@@ -220,10 +220,48 @@ document.addEventListener('keydown', e => {
   else if (e.key === 'ArrowLeft') { e.preventDefault(); comic && showComicPage(comic.page - 1); }
   else if (e.key === 'Escape') closeComic();
 });
+// ebook shares arrow/escape handling via separate listener
+document.addEventListener('keydown', e => {
+  if (!$('#ebook-modal').classList.contains('on')) return;
+  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); ebook && showChunk(ebook.chunk + 1); }
+  else if (e.key === 'ArrowLeft') { e.preventDefault(); ebook && showChunk(ebook.chunk - 1); }
+  else if (e.key === 'Escape') closeEbook();
+});
 function closeComic() {
   $('#comic-modal').classList.remove('on');
   if (comic) { syncProgress(comic.it.id, comic.page); comic = null; }
   $('#cm-img').src = '';
+}
+
+// ---------- ebook reader ----------
+let ebook = null; // { it, spine, chunk }
+
+async function openEbook(it) {
+  const spine = await (await fetch(`/api/epub/${it.id}/spine`)).json();
+  if (!Array.isArray(spine) || !spine.length) return;
+  ebook = { it, spine, chunk: 0 };
+  $('#em-title').textContent = it.title;
+  $('#ebook-modal').classList.add('on');
+  resumeFor(it.id).then(p => { if (p) showChunk(Math.min(Math.floor(p.position), spine.length - 1)); else showChunk(0); });
+}
+
+function showChunk(n) {
+  if (!ebook) return;
+  ebook.chunk = Math.max(0, Math.min(n, ebook.spine.length - 1));
+  $('#em-frame').src = `/api/epub/${ebook.it.id}/chunk/${ebook.chunk}`;
+  $('#em-pageinfo').textContent = `${ebook.chunk + 1} / ${ebook.spine.length}`;
+  $('#em-prev').disabled = ebook.chunk === 0;
+  $('#em-next').disabled = ebook.chunk === ebook.spine.length - 1;
+  syncProgress(ebook.it.id, ebook.chunk);
+}
+
+$('#em-prev').onclick = () => ebook && showChunk(ebook.chunk - 1);
+$('#em-next').onclick = () => ebook && showChunk(ebook.chunk + 1);
+$('#em-close').onclick = closeEbook;
+function closeEbook() {
+  $('#ebook-modal').classList.remove('on');
+  if (ebook) { syncProgress(ebook.it.id, ebook.chunk); ebook = null; }
+  $('#em-frame').src = 'about:blank';
 }
 
 function playAudio(it) {
