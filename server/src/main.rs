@@ -76,6 +76,8 @@ struct LibraryItem {
     title: String,
     author: Option<String>,
     duration_secs: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    synopsis: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -479,7 +481,11 @@ async fn media_path(app: &std::sync::Arc<App>, id: i64) -> Option<String> {
 async fn library_handler(State(app): State<std::sync::Arc<App>>) -> Json<Vec<LibraryItem>> {
     let db = app.db.lock().unwrap();
     let mut stmt = db
-        .prepare("SELECT id, kind, title, author, duration_secs FROM media ORDER BY kind, title")
+        .prepare(
+            "SELECT id, kind, title, author, duration_secs,
+                    json_extract(meta_json, '$.synopsis')
+             FROM media ORDER BY kind, title",
+        )
         .unwrap();
     let items = stmt
         .query_map([], |r| {
@@ -489,6 +495,7 @@ async fn library_handler(State(app): State<std::sync::Arc<App>>) -> Json<Vec<Lib
                 title: r.get(2)?,
                 author: r.get(3)?,
                 duration_secs: r.get(4)?,
+                synopsis: r.get(5)?,
             })
         })
         .unwrap()

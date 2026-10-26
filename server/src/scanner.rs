@@ -41,6 +41,17 @@ fn extract_thumb(src: &Path, kind: &str, media_id: i64, thumbs_dir: &Path) -> Op
     }
 }
 
+/// Read one format-level metadata tag (title, synopsis, description, ...).
+fn ffprobe_tag(src: &str, tag: &str) -> Option<String> {
+    let out = Command::new("ffprobe")
+        .args(["-v", "quiet", "-show_entries", &format!("format_tags={tag}"),
+               "-of", "csv=p=0", src])
+        .output()
+        .ok()?;
+    let s = std::str::from_utf8(&out.stdout).ok()?.trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
 fn ffprobe_duration(src: &str) -> Option<f64> {
     let out = Command::new("ffprobe")
         .args(["-v", "quiet", "-show_entries", "format=duration",
@@ -104,11 +115,30 @@ pub fn scan(db: &Connection, root: std::path::PathBuf, thumbs_dir: Option<&Path>
             .unwrap_or(0);
         count += updated;
 
-        // thumbnails: for new items (video poster / audio cover art)
+        // metadata + thumbnails: for new items
         if updated > 0 && is_new {
             let id = db.last_insert_rowid();
+            let path_pb = path.to_path_buf();
+            let kind_owned = kind.to_string();
+            // probing is slow — off the insert path is fine here (scan is already blocking)
+            let dur = ffprobe_duration(&path_str);
+            let title_tag = ffprobe_tag(&path_str, "title");
+            let synopsis = ffprobe_tag(&path_str, "synopsis")
+                .or_else(|| ffprobe_tag(&path_str, "description"));
+            let _ = db.execute(
+                "UPDATE media SET duration_secs = ?1,
+                   title = CASE WHEN ?2 != '' THEN ?2 ELSE title END,
+                   meta_json = json_set(COALESCE(meta_json,'{}'), '$.synopsis', ?3)
+                 WHERE id = ?4",
+                rusqlite::params![
+                    dur,
+                    title_tag.unwrap_or_default(),
+                    synopsis.unwrap_or_default(),
+                    id
+                ],
+            );
             if let Some(thumbs) = &thumbs_dir {
-                if let Some(t) = extract_thumb(path, kind, id, thumbs) {
+                if let Some(t) = extract_thumb(&path_pb, &kind_owned, id, thumbs) {
                     let _ = db.execute(
                         "UPDATE media SET thumb_path = ?1 WHERE id = ?2",
                         rusqlite::params![t, id],

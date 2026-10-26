@@ -193,19 +193,36 @@ function renderRows(items) {
   if (!items.length) main.appendChild(el('p', '', '<br>No media found. Set FRAYD_LIBRARY and restart the server.'));
 }
 
+function fmtDuration(s) {
+  if (!s) return '';
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} min`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
 function renderHero(it) {
   const hero = $('#hero');
   hero.style.display = 'block';
+  const verb = ['movie', 'show'].includes(it.kind) ? 'Play' : it.kind === 'comic' || it.kind === 'ebook' ? 'Read' : 'Listen';
+  const blurb = it.synopsis || `Resume where you left off, or start fresh — progress syncs across your devices.`;
+  const tags = [it.kind, fmtDuration(it.duration_secs), it.author].filter(Boolean)
+    .map(t => `<span class="tag">${esc(t)}</span>`).join('');
   hero.innerHTML = `
-    <div class="hero-tags"><span class="tag">${esc(it.kind)}</span>${it.author ? `<span class="tag">${esc(it.author)}</span>` : ''}</div>
+    <div class="hero-backdrop" id="hero-backdrop"></div>
+    <div class="hero-tags">${tags}</div>
     <div class="hero-copy">
       <h2>${esc(it.title)}</h2>
-      <p>Resume where you left off, or start fresh — progress syncs across your devices.</p>
+      <p>${esc(blurb)}</p>
       <div class="cta-row">
-        <button class="btn-play" id="hero-play">▶ Play</button>
+        <button class="btn-play" id="hero-play">▶ ${verb}</button>
         <button class="btn-ghost" id="hero-info">More info</button>
       </div>
     </div>`;
+  // backdrop: full thumb, blurred + darkened behind copy
+  const bd = $('#hero-backdrop');
+  const img = new Image();
+  img.onload = () => { bd.style.backgroundImage = `url(${img.src})`; hero.classList.add('has-backdrop'); };
+  img.src = `/api/thumb/${it.id}`;
   $('#hero-play').onclick = () => openItem(it);
 }
 
