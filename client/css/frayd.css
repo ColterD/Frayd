@@ -288,3 +288,40 @@ body.auth {
   width: min(92vw, 760px); height: 78vh; background: #f5f2ea;
   border: none; border-radius: 8px;
 }
+
+/* ===== party panel ===== */
+#party-modal {
+  position: fixed; inset: 0; z-index: 100; background: rgba(5,5,8,.92);
+  display: none; align-items: center; justify-content: center; padding: 4vh 4vw;
+}
+#party-modal.on { display: flex; }
+#party-modal .party-inner { width: 100%; max-width: 460px; background: #15161c; border: 1px solid #262833; border-radius: 12px; padding: 16px; }
+#party-modal .modal-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+#party-modal .modal-head .t { font-weight: 700; font-size: 17px; }
+#pt-close { background: none; border: none; color: #fff; font-size: 22px; }
+#party-stage button {
+  background: #5B46F6; color: #fff; border: none; border-radius: 8px;
+  padding: 8px 14px; cursor: pointer; font-size: 14px;
+}
+#party-stage button:hover { background: #7047EB; }
+#party-stage > button { display: block; width: 100%; margin-bottom: 12px; padding: 12px; font-weight: 600; }
+.party-join { display: flex; gap: 8px; }
+.party-join input {
+  flex: 1; background: #0D0E12; border: 1px solid #262833; border-radius: 8px;
+  color: #fff; padding: 10px 12px; font-size: 16px; letter-spacing: 4px; text-transform: uppercase;
+}
+.party-code { margin-bottom: 12px; color: #8A8F9E; }
+.party-code b { color: #fff; letter-spacing: 2px; }
+.party-now { background: #0D0E12; border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+.party-now .t { font-weight: 600; }
+.party-now .s, .party-queue .s { color: #8A8F9E; font-size: 13px; }
+.party-host-controls { display: flex; gap: 8px; margin-top: 10px; }
+.party-sec { color: #8A8F9E; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; margin: 12px 0 6px; }
+.party-queue { list-style: none; margin: 0; padding: 0; }
+.party-queue li {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px; border-radius: 6px; margin-bottom: 4px; background: #1a1c24;
+}
+.party-queue li button { margin-left: auto; padding: 4px 10px; font-size: 12px; }
+.party-empty, .party-error { color: #8A8F9E; margin-bottom: 10px; }
+.party-error { color: #f66; }
