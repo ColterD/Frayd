@@ -118,7 +118,24 @@ document.querySelectorAll('.nav-item').forEach(btn => {
     filterKind(btn.dataset.kind);
   };
 });
-$('#search input').addEventListener('input', (e) => filterKind(null, e.target.value));
+let searchTimer;
+$('#search input').addEventListener('input', (e) => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => serverSearch(e.target.value), 250);
+});
+
+async function serverSearch(q) {
+  if (!q) { filterKind(currentKind()); return; }
+  try {
+    const results = await (await fetch(`/api/library?q=${encodeURIComponent(q)}`)).json();
+    renderRows(results);
+  } catch { filterKind(currentKind(), q); }
+}
+
+function currentKind() {
+  const active = document.querySelector('.nav-item.active');
+  return active ? active.dataset.kind : 'all';
+}
 
 // ---------- library ----------
 let LIBRARY = [];

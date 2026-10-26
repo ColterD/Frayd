@@ -478,17 +478,21 @@ async fn media_path(app: &std::sync::Arc<App>, id: i64) -> Option<String> {
         .ok()
 }
 
-async fn library_handler(State(app): State<std::sync::Arc<App>>) -> Json<Vec<LibraryItem>> {
+async fn library_handler(
+    State(app): State<std::sync::Arc<App>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Json<Vec<LibraryItem>> {
     let db = app.db.lock().unwrap();
-    let mut stmt = db
-        .prepare(
-            "SELECT id, kind, title, author, duration_secs,
-                    json_extract(meta_json, '$.synopsis')
-             FROM media ORDER BY kind, title",
-        )
-        .unwrap();
+    let filter = q.get("q").map(|s| format!("%{}%", s.replace('%', "").replace('_', "")));
+    let sql = "SELECT id, kind, title, author, duration_secs,
+                      json_extract(meta_json, '$.synopsis')
+               FROM media
+               WHERE (?1 IS NULL OR title LIKE ?1 OR author LIKE ?1
+                      OR json_extract(meta_json, '$.synopsis') LIKE ?1)
+               ORDER BY kind, title";
+    let mut stmt = db.prepare(sql).unwrap();
     let items = stmt
-        .query_map([], |r| {
+        .query_map(rusqlite::params![filter], |r| {
             Ok(LibraryItem {
                 id: r.get(0)?,
                 kind: r.get(1)?,
