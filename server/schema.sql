@@ -4,16 +4,18 @@ PRAGMA journal_mode = WAL;
 
 CREATE TABLE IF NOT EXISTS media (
   id INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL CHECK (kind IN ('audiobook','ebook','comic','movie','music','episode')),
+  kind TEXT NOT NULL CHECK (kind IN ('audiobook','ebook','comic','manga','movie','music','episode')),
   path TEXT NOT NULL UNIQUE,
   title TEXT NOT NULL,
   subtitle TEXT,
   author TEXT,
+  series TEXT,
   duration_secs REAL,
   size_bytes INTEGER,
   mtime_secs INTEGER,
   meta_json TEXT,            -- chapters, tags, page lists, etc.
   thumb_path TEXT,
+  transcode_path TEXT,
   created_at INTEGER DEFAULT (unixepoch())
 );
 CREATE INDEX IF NOT EXISTS idx_media_kind ON media(kind);
@@ -42,6 +44,19 @@ CREATE TABLE IF NOT EXISTS progress (
   completed INTEGER NOT NULL DEFAULT 0,
   updated_at INTEGER,
   PRIMARY KEY (identity_id, media_id)
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL                -- JSON
+);
+
+-- Per-identity library visibility. Empty table or no row = see everything.
+-- allowed_kinds: NULL = all kinds; else JSON array of kinds visible.
+CREATE TABLE IF NOT EXISTS user_perms (
+  identity_id INTEGER PRIMARY KEY REFERENCES identities(id),
+  is_admin INTEGER NOT NULL DEFAULT 0,
+  allowed_kinds TEXT                  -- NULL = all; else JSON ["movie","music",...]
 );
 
 CREATE TABLE IF NOT EXISTS albums (

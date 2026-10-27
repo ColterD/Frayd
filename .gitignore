@@ -7,3 +7,7 @@ node_modules/
 *.txt
 *.bat
 *.sh
+DONOTUPLOAD/
+server/thumbs/
+server/frayd.db
+server/frayd.db-*

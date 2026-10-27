@@ -49,17 +49,51 @@ const PartyUI = (() => {
     if (msg.type === 'state') {
       if (typeof msg.is_host === 'boolean') isHost = msg.is_host;
       state = msg.state;
+      if (isHost) { hookHost(); followMediaChangeOnly(); } else followState();
       render(code);
     } else if (msg.type === 'request') {
       pending.push(msg);
+      render(code);
+    } else if (msg.type === 'members') {
+      members = msg.members || [];
       render(code);
     } else if (msg.type === 'ended') {
       renderEnded();
     }
   }
   let pending = [];
+  let members = [];
 
   function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+
+  // ---- guest follow: drive local audio player from host state ----
+  let hostLoadedMedia = null;
+  const DRIFT = 1.5; // seconds — resync beyond this
+
+  function followState() {
+    if (typeof window.partyFollow !== 'function') return;
+    if (state && state.media_id != null) {
+      window.partyFollow(state.media_id, state.title, state.position, state.playing, state.updated_at);
+    }
+  }
+
+  // host: only load tracks the party state changed to (skip/queue-advance) —
+  // never follow play/pause/seek (those originate from host's own player events)
+  function followMediaChangeOnly() {
+    const id = state?.media_id;
+    if (id != null && id !== hostLoadedMedia && typeof window.partyFollow === 'function') {
+      hostLoadedMedia = id;
+      window.partyFollow(id, state.title, 0, state.playing, state.updated_at);
+    }
+  }
+
+  // ---- host hooks: local player actions become party state ----
+  function hookHost() {
+    if (hookHost.done) return;
+    hookHost.done = true;
+    if (typeof window.partyHostHook === 'function') window.partyHostHook(send);
+    window.partySend = send;
+  }
 
   function nowPlaying() {
     if (!state) return '<div class="party-empty">Nothing playing.</div>';
@@ -74,6 +108,17 @@ const PartyUI = (() => {
       </div>`;
     }
     return html + '</div>';
+  }
+
+  function membersHtml() {
+    const me = identity();
+    const list = isHost ? [me + ' (host)', ...members.filter(m => !m.endsWith('(host)'))] : members;
+    if (!list.length) return '';
+    return `<div class="party-sec">Members · ${list.length}</div><ul class="party-queue">` +
+      list.map(m => {
+        const isMe = m === me || (isHost && m === me + ' (host)');
+        return `<li class="${isMe ? 'me' : ''}">${esc(m)}${isMe ? ' <span class="s">(you)</span>' : ''}</li>`;
+      }).join('') + '</ul>';
   }
 
   function queueHtml() {
@@ -116,6 +161,7 @@ const PartyUI = (() => {
     stage.innerHTML = `
       <div class="party-code">Code: <b>${esc(code)}</b> <span class="s">${isHost ? '(you are host)' : '(guest)'}</span></div>
       ${nowPlaying()}
+      ${membersHtml()}
       ${queueHtml()}
       ${requestsHtml()}
       ${libraryPickerHtml()}`;
@@ -143,7 +189,7 @@ const PartyUI = (() => {
     $('#party-stage').insertAdjacentHTML('afterbegin', `<div class="party-error">${esc(msg)}</div>`);
   }
   function renderEnded() {
-    ws = null; isHost = false; state = null; pending = [];
+    ws = null; isHost = false; state = null; pending = []; members = [];
     render();
     renderError('Party ended');
   }

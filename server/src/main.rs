@@ -1,4 +1,5 @@
 mod auth;
+mod transcode;
 mod comic;
 mod epub;
 mod party;
@@ -14,12 +15,15 @@ use axum::{
     Json, Router,
 };
 use rusqlite::{Connection, OptionalExtension};
+use std::process::Command;
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::{Arc, Mutex};
 use tower_http::services::fs::ServeDir;
 
 pub struct App {
     pub db: Mutex<Connection>,
+    /// Path to the SQLite file (transcode thread reopens its own handle).
+    pub db_path: String,
     /// Library root from FRAYD_LIBRARY (scan target).
     pub library: Option<PathBuf>,
     /// True while a scan is running (single scan at a time).
@@ -32,11 +36,24 @@ pub struct App {
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let db_path = std::env::var("FRAYD_DB").unwrap_or_else(|_| "frayd.db".into());
+    // default paths relative to this source dir so cwd doesn't matter (env overrides)
+    let default_db = concat!(env!("CARGO_MANIFEST_DIR"), "/frayd.db");
+    let db_path = std::env::var("FRAYD_DB").unwrap_or_else(|_| default_db.into());
     let db = store::open(&db_path);
-    let library = std::env::var("FRAYD_LIBRARY").ok().map(PathBuf::from);
+    // Library root: env FRAYD_LIBRARY > settings.library_path (persistent, set via admin UI)
+    let library: Option<PathBuf> = std::env::var("FRAYD_LIBRARY").ok().map(PathBuf::from).or_else(|| {
+        let raw: Option<String> = db
+            .query_row("SELECT value FROM settings WHERE key='library_path'", [], |r| r.get(0))
+            .ok();
+        raw.and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
+            .and_then(|v| v.as_str().map(String::from))
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    });
+
     let state = std::sync::Arc::new(App {
         db: Mutex::new(db),
+        db_path: db_path.clone(),
         library: library.clone(),
         scanning: std::sync::atomic::AtomicBool::new(false),
         party: Arc::new(party::Party::new()),
@@ -57,6 +74,9 @@ async fn main() {
         .route("/api/progress/:media_id", get(get_progress))
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/logout", post(auth_logout))
+        .route("/api/auth/me", get(auth_me))
+        .route("/api/admin/perms", get(list_perms).post(set_perm))
+        .route("/api/admin/settings", get(get_settings).post(set_setting))
         .route("/api/thumb/:id", get(thumb))
         .route("/api/scan", post(trigger_scan))
         .route("/api/scan/status", get(scan_status))
@@ -65,15 +85,84 @@ async fn main() {
         .route("/api/comic/:id/pages", get(comic_pages))
         .route("/api/comic/:id/page/:n", get(comic_page))
         .route("/api/epub/:id/spine", get(epub_spine))
+        .route("/api/epub/:id/toc", get(epub_toc))
         .route("/api/epub/:id/chunk/:n", get(epub_chunk))
         .route("/api/epub/:id/asset/*path", get(epub_asset))
-        .nest_service("/", ServeDir::new("../client"))
-        .with_state(state);
+        .route("/api/annotations/:id", get(list_annotations))
+        .route("/api/annotations", post(create_annotation))
+        .route("/api/annotations", axum::routing::delete(delete_annotation))
+        .nest_service("/", ServeDir::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../client")))
+        .with_state(state.clone());
 
-    let addr = "0.0.0.0:8484";
+    // Port: FRAYD_PORT env > settings.port > 8484
+    let port: u16 = std::env::var("FRAYD_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .or_else(|| {
+            let db = state.db.lock().unwrap();
+            let raw: Option<String> = db
+                .query_row("SELECT value FROM settings WHERE key='port'", [], |r| r.get(0))
+                .ok();
+            raw.and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
+                .and_then(|v| v.as_u64().map(|p| p as u16))
+        })
+        .unwrap_or(8484);
+    let addr = format!("0.0.0.0:{port}");
     tracing::info!("frayd listening on {addr}");
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+
+    // setting helper: read a bool from settings table
+    let setting_bool = |key: &str| -> bool {
+        let db = state.db.lock().unwrap();
+        let raw: Option<String> = db
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0))
+            .ok();
+        matches!(raw.and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok()), Some(serde_json::Value::Bool(true)))
+    };
+
+    // UPnP port forward (best-effort, needs `upnpc` binary; router must have UPnP on)
+    if std::env::var("FRAYD_UPNP").map(|v| v == "1").unwrap_or(false) || setting_bool("upnp") {
+        let ext = port; // same external port
+        std::thread::spawn(move || {
+            match Command::new("upnpc")
+                .args(["-a", "", &ext.to_string(), &ext.to_string(), "tcp", "900"])
+                .status()
+            {
+                Ok(s) if s.success() => tracing::info!("upnp: forwarded external {ext} → tcp {ext}"),
+                _ => tracing::warn!("upnp: forward failed (router UPnP off or upnpc missing?)"),
+            }
+        });
+    }
+
+    // HTTPS: FRAYD_CERT + FRAYD_KEY env (PEM files) → rustls; else plain HTTP
+    let env_cert = std::env::var("FRAYD_CERT").ok();
+    let env_key = std::env::var("FRAYD_KEY").ok();
+    let setting_str = |key: &str| -> Option<String> {
+        let db = state.db.lock().unwrap();
+        let raw: Option<String> = db
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0))
+            .ok();
+        raw.and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
+            .and_then(|v| v.as_str().map(String::from))
+            .filter(|s| !s.is_empty())
+    };
+    if let (Some(cert), Some(key)) = (
+        env_cert.or_else(|| setting_str("tls_cert")),
+        env_key.or_else(|| setting_str("tls_key")),
+    ) {
+        tracing::info!("tls: loading cert {cert}");
+        rustls::crypto::ring::default_provider().install_default().expect("crypto provider");
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+            .await
+            .expect("tls config");
+        let sock: std::net::SocketAddr = addr.parse().unwrap();
+        axum_server::bind_rustls(sock, tls)
+            .serve(app.into_make_service())
+            .await
+            .unwrap();
+    } else {
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        axum::serve(listener, app).await.unwrap();
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -85,6 +174,7 @@ struct LibraryItem {
     duration_secs: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     synopsis: Option<String>,
+    series: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -140,6 +230,13 @@ async fn auth_login(
         }
     };
 
+    // first account ever = admin (bootstrap); grant if no admin exists yet
+    let _ = db.execute(
+        "INSERT OR IGNORE INTO user_perms (identity_id, is_admin) 
+         SELECT ?1, 1 WHERE NOT EXISTS (SELECT 1 FROM user_perms WHERE is_admin = 1)",
+        [identity_id],
+    );
+
     let token = match auth::create_session(&db, identity_id) {
         Ok(t) => t,
         Err(e) => {
@@ -151,7 +248,17 @@ async fn auth_login(
         }
     };
     let name = req.email.split('@').next().unwrap_or("user").to_string();
-    (StatusCode::OK, Json(serde_json::json!({ "name": name, "token": token })))
+    let is_admin: i64 = db
+        .query_row(
+            "SELECT is_admin FROM user_perms WHERE identity_id = ?1",
+            [identity_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "name": name, "token": token, "is_admin": is_admin != 0 })),
+    )
 }
 
 async fn auth_logout(
@@ -187,12 +294,20 @@ fn resolve_identity(
         }
     }
     if let Some(key) = query_identity {
-        // LAN fallback: hostname-keyed device identity
-        return db
+        // LAN fallback: hostname-keyed device identity, auto-created on first use
+        let existing: Option<i64> = db
             .query_row("SELECT id FROM identities WHERE key = ?1", [key], |r| r.get(0))
-            .optional()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .ok_or(StatusCode::NOT_FOUND);
+            .ok();
+        return match existing {
+            Some(id) => Ok(id),
+            None => db
+                .execute(
+                    "INSERT INTO identities (kind, key) VALUES ('device', ?1)",
+                    [key],
+                )
+                .map(|_| db.last_insert_rowid())
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR),
+        };
     }
     Err(StatusCode::UNAUTHORIZED)
 }
@@ -202,7 +317,9 @@ fn thumbs_dir() -> PathBuf {
     if let Ok(t) = std::env::var("FRAYD_THUMBS") {
         return PathBuf::from(t);
     }
-    let db_path = std::env::var("FRAYD_DB").unwrap_or_else(|_| "frayd.db".into());
+    let db_path = std::env::var("FRAYD_DB").unwrap_or_else(|_| {
+        concat!(env!("CARGO_MANIFEST_DIR"), "/frayd.db").into()
+    });
     StdPath::new(&db_path)
         .parent()
         .unwrap_or(StdPath::new("."))
@@ -327,7 +444,7 @@ fn run_scan(state: std::sync::Arc<App>, lib: PathBuf) {
     tokio::task::spawn_blocking(move || {
         let db = state.db.lock().unwrap();
         let thumbs = thumbs_dir();
-        let n = scanner::scan(&db, lib, Some(&thumbs));
+        let n = scanner::scan(&db, state.db_path.clone(), lib, Some(&thumbs));
         state
             .scanning
             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -338,8 +455,19 @@ fn run_scan(state: std::sync::Arc<App>, lib: PathBuf) {
 /// POST /api/scan → trigger library rescan. 202 if started, 409 if busy.
 async fn trigger_scan(State(app): State<std::sync::Arc<App>>) -> StatusCode {
     use std::sync::atomic::Ordering;
-    let Some(lib) = app.library.clone() else {
-        return StatusCode::NOT_IMPLEMENTED; // no FRAYD_LIBRARY configured
+    // re-read: env > settings.library_path (so admin UI changes work without restart)
+    let lib = app.library.clone().or_else(|| {
+        let db = app.db.lock().unwrap();
+        let raw: Option<String> = db
+            .query_row("SELECT value FROM settings WHERE key='library_path'", [], |r| r.get(0))
+            .ok();
+        raw.and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
+            .and_then(|v| v.as_str().map(String::from))
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    });
+    let Some(lib) = lib else {
+        return StatusCode::NOT_IMPLEMENTED; // no library configured
     };
     match app.scanning.compare_exchange(
         false,
@@ -462,6 +590,29 @@ async fn epub_spine(
     }
 }
 
+/// GET /api/epub/:id/toc → [{title, spine_idx}] in reading order.
+async fn epub_toc(
+    State(app): State<std::sync::Arc<App>>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let Some(path) = media_path(&app, id).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match tokio::task::spawn_blocking(move || epub::epub_toc(std::path::Path::new(&path)))
+        .await
+        .ok()
+        .flatten()
+    {
+        Some(toc) => Json(
+            toc.into_iter()
+                .map(|(title, spine_idx)| serde_json::json!({ "title": title, "spine_idx": spine_idx }))
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 /// GET /api/epub/:id/chunk/:n → XHTML bytes of nth spine item, sandboxed MIME.
 async fn epub_chunk(
     State(app): State<std::sync::Arc<App>>,
@@ -538,17 +689,39 @@ async fn media_path(app: &std::sync::Arc<App>, id: i64) -> Option<String> {
 
 async fn library_handler(
     State(app): State<std::sync::Arc<App>>,
+    headers: axum::http::HeaderMap,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Json<Vec<LibraryItem>> {
     let db = app.db.lock().unwrap();
+    // per-identity kind visibility: NULL row/no row = see all; else only listed kinds
+    let allowed: Option<Vec<String>> = resolve_identity(&db, &headers, q.get("identity").map(|s| s.as_str()))
+        .ok()
+        .and_then(|iid| {
+            db.query_row("SELECT allowed_kinds FROM user_perms WHERE identity_id = ?1", [iid], |r| r.get::<_, Option<String>>(0))
+                .ok()
+                .flatten()
+                .and_then(|s| serde_json::from_str(&s).ok())
+        });
+    let kinds_clause = allowed.as_ref().map(|ks| {
+        (
+            format!(
+                " AND kind IN ({})",
+                ks.iter().map(|k| format!("'{}'", k.replace('\'', ""))).collect::<Vec<_>>().join(",")
+            ),
+            (),
+        )
+    });
     let filter = q.get("q").map(|s| format!("%{}%", s.replace('%', "").replace('_', "")));
-    let sql = "SELECT id, kind, title, author, duration_secs,
-                      json_extract(meta_json, '$.synopsis')
-               FROM media
-               WHERE (?1 IS NULL OR title LIKE ?1 OR author LIKE ?1
-                      OR json_extract(meta_json, '$.synopsis') LIKE ?1)
-               ORDER BY kind, title";
-    let mut stmt = db.prepare(sql).unwrap();
+    let sql = format!(
+        "SELECT id, kind, title, author, duration_secs,
+                json_extract(meta_json, '$.synopsis'), series
+         FROM media
+         WHERE (?1 IS NULL OR title LIKE ?1 OR author LIKE ?1
+                OR json_extract(meta_json, '$.synopsis') LIKE ?1){}
+         ORDER BY kind, title",
+        kinds_clause.as_ref().map(|(c, _)| c.as_str()).unwrap_or("")
+    );
+    let mut stmt = db.prepare(&sql).unwrap();
     let items = stmt
         .query_map(rusqlite::params![filter], |r| {
             Ok(LibraryItem {
@@ -558,6 +731,7 @@ async fn library_handler(
                 author: r.get(3)?,
                 duration_secs: r.get(4)?,
                 synopsis: r.get(5)?,
+                series: r.get(6)?,
             })
         })
         .unwrap()
@@ -574,7 +748,7 @@ async fn stream(
     let (path, _size): (String, i64) = {
         let db = app.db.lock().unwrap();
         db.query_row(
-            "SELECT path, size_bytes FROM media WHERE id = ?1",
+            "SELECT COALESCE(transcode_path, path), size_bytes FROM media WHERE id = ?1",
             [id],
             |r| -> rusqlite::Result<(String, i64)> {
                 Ok((r.get(0)?, r.get(1)?))
@@ -618,7 +792,7 @@ async fn stream(
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header(header::CONTENT_TYPE, mime)
                 .header(header::ACCEPT_RANGES, "bytes")
-                .header(header::CONTENT_RANGE, format!("bytes {start}-{}/{len}", size - 1))
+                .header(header::CONTENT_RANGE, format!("bytes {start}-{}/{size}", size - 1))
                 .header(header::CONTENT_LENGTH, len)
                 .body(axum::body::Body::from_stream(stream))
                 .unwrap()
@@ -644,7 +818,8 @@ async fn stream(
 
 fn mime_guess(p: &str) -> String {
     match p.rsplit('.').next().unwrap_or("") {
-        "m4b" | "m4a" | "mp4" => "audio/mp4",
+        "mp4" => "video/mp4",
+        "m4b" | "m4a" => "audio/mp4",
         "mp3" => "audio/mpeg",
         "flac" => "audio/flac",
         "opus" | "ogg" => "audio/ogg",
@@ -722,5 +897,272 @@ async fn get_progress(
         None => (StatusCode::NOT_FOUND, "{}".to_string()),
     }
 }
+
+
+
+// ---------- annotations (highlights + bookmarks) ----------
+
+#[derive(serde::Deserialize)]
+struct AnnotationIn {
+    media_id: i64,
+    kind: String, // highlight | bookmark
+    spine_idx: i64,
+    cfi: String,
+    text: Option<String>,
+    color: Option<String>,
+    note: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct AnnotationOut {
+    id: i64,
+    kind: String,
+    spine_idx: i64,
+    cfi: String,
+    text: Option<String>,
+    color: Option<String>,
+    note: Option<String>,
+}
+
+async fn list_annotations(
+    State(app): State<std::sync::Arc<App>>,
+    Path(id): Path<i64>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let db = app.db.lock().unwrap();
+    let ident_id = match resolve_identity(&db, &headers, q.get("identity").map(|s| s.as_str())) {
+        Ok(v) => v,
+        Err(s) => return (s, "[]".to_string()),
+    };
+    let mut stmt = db
+        .prepare(
+            "SELECT id, kind, spine_idx, cfi, text, color, note
+             FROM annotations WHERE identity_id = ?1 AND media_id = ?2 ORDER BY spine_idx, cfi",
+        )
+        .unwrap();
+    let items = stmt
+        .query_map(rusqlite::params![ident_id, id], |r| {
+            Ok(AnnotationOut {
+                id: r.get(0)?,
+                kind: r.get(1)?,
+                spine_idx: r.get(2)?,
+                cfi: r.get(3)?,
+                text: r.get(4)?,
+                color: r.get(5)?,
+                note: r.get(6)?,
+            })
+        })
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    (StatusCode::OK, serde_json::to_string(&items).unwrap_or_else(|_| "[]".into()))
+}
+
+async fn create_annotation(
+    State(app): State<std::sync::Arc<App>>,
+    headers: axum::http::HeaderMap,
+    Json(a): Json<AnnotationIn>,
+) -> StatusCode {
+    let db = app.db.lock().unwrap();
+    let ident_id = match resolve_identity(&db, &headers, None) {
+        Ok(v) => v,
+        Err(s) => return s,
+    };
+    match db.execute(
+        "INSERT INTO annotations (identity_id, media_id, kind, spine_idx, cfi, text, color, note)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(identity_id, media_id, cfi) DO UPDATE SET
+           text = ?6, color = ?7, note = ?8",
+        rusqlite::params![
+            ident_id,
+            a.media_id,
+            a.kind,
+            a.spine_idx,
+            a.cfi,
+            a.text,
+            a.color,
+            a.note
+        ],
+    ) {
+        Ok(_) => StatusCode::CREATED,
+        Err(e) => {
+            tracing::warn!("create_annotation failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+async fn delete_annotation(
+    State(app): State<std::sync::Arc<App>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> StatusCode {
+    let db = app.db.lock().unwrap();
+    let ident_id = match resolve_identity(&db, &headers, q.get("identity").map(|s| s.as_str())) {
+        Ok(v) => v,
+        Err(s) => return s,
+    };
+    let ann_id: i64 = match q.get("ann_id").and_then(|v| v.parse().ok()) {
+        Some(v) => v,
+        None => return StatusCode::BAD_REQUEST,
+    };
+    match db.execute(
+        "DELETE FROM annotations WHERE id = ?1 AND identity_id = ?2",
+        rusqlite::params![ann_id, ident_id],
+    ) {
+        Ok(n) if n > 0 => StatusCode::NO_CONTENT,
+        _ => StatusCode::NOT_FOUND,
+    }
+}
+
+/// Admin guard: resolve identity, check is_admin. Returns ident id or Err(status).
+fn require_admin(db: &Connection, headers: &axum::http::HeaderMap, qid: Option<&str>) -> Result<i64, StatusCode> {
+    let iid = resolve_identity(db, headers, qid).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let admin: i64 = db
+        .query_row("SELECT is_admin FROM user_perms WHERE identity_id = ?1", [iid], |r| r.get(0))
+        .unwrap_or(0);
+    if admin == 0 { Err(StatusCode::FORBIDDEN) } else { Ok(iid) }
+}
+
+/// GET /api/admin/perms → [{identity_id, key, is_admin, allowed_kinds}]
+async fn list_perms(
+    State(app): State<std::sync::Arc<App>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let db = app.db.lock().unwrap();
+    if require_admin(&db, &headers, q.get("identity").map(|s| s.as_str())).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let mut stmt = db
+        .prepare(
+            "SELECT i.id, i.key, COALESCE(p.is_admin, 0), p.allowed_kinds
+             FROM identities i LEFT JOIN user_perms p ON p.identity_id = i.id
+             WHERE i.kind = 'account' ORDER BY i.key",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([], |r| {
+            let kinds: Option<String> = r.get(3)?;
+            Ok(serde_json::json!({
+                "identity_id": r.get::<_, i64>(0)?,
+                "key": r.get::<_, String>(1)?,
+                "is_admin": r.get::<_, i64>(2)? != 0,
+                "allowed_kinds": kinds.and_then(|k| serde_json::from_str::<Vec<String>>(&k).ok()),
+            }))
+        })
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    Json(rows).into_response()
+}
+
+/// POST /api/admin/perms {identity_id, is_admin?, allowed_kinds?: [..]|null}
+async fn set_perm(
+    State(app): State<std::sync::Arc<App>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+    Json(body): Json<serde_json::Value>,
+) -> StatusCode {
+    let db = app.db.lock().unwrap();
+    if require_admin(&db, &headers, q.get("identity").map(|s| s.as_str())).is_err() {
+        return StatusCode::FORBIDDEN;
+    }
+    let Some(iid) = body["identity_id"].as_i64() else { return StatusCode::BAD_REQUEST };
+    // demoting last admin blocked
+    if body["is_admin"] == serde_json::json!(false) {
+        let admins: i64 = db.query_row("SELECT COUNT(*) FROM user_perms WHERE is_admin = 1 AND identity_id != ?1", [iid], |r| r.get(0)).unwrap_or(0);
+        if admins == 0 { return StatusCode::CONFLICT; }
+    }
+    let kinds_json: Option<String> = match body.get("allowed_kinds") {
+        Some(v) if v.is_null() => None,
+        Some(v) if v.is_array() => Some(v.to_string()),
+        _ => None, // not provided: leave unchanged
+    };
+    let admin_chg = body.get("is_admin").and_then(|v| v.as_bool());
+    let _ = db.execute(
+        "INSERT INTO user_perms (identity_id, is_admin, allowed_kinds) VALUES (?1, ?2, ?3)
+         ON CONFLICT(identity_id) DO UPDATE SET
+           is_admin = COALESCE(?2, is_admin),
+           allowed_kinds = COALESCE(?3, allowed_kinds)",
+        rusqlite::params![iid, admin_chg.map(|b| b as i64), kinds_json],
+    );
+    StatusCode::NO_CONTENT
+}
+
+/// GET /api/admin/settings → {key: value,...}
+async fn get_settings(
+    State(app): State<std::sync::Arc<App>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let db = app.db.lock().unwrap();
+    if require_admin(&db, &headers, q.get("identity").map(|s| s.as_str())).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let mut stmt = db.prepare("SELECT key, value FROM settings").unwrap();
+    let mut map = serde_json::Map::new();
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .unwrap()
+        .filter_map(Result::ok);
+    for (k, v) in rows {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&v) {
+            map.insert(k, parsed);
+        }
+    }
+    Json(serde_json::Value::Object(map)).into_response()
+}
+
+/// POST /api/admin/settings {key: value}
+async fn set_setting(
+    State(app): State<std::sync::Arc<App>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+    Json(body): Json<serde_json::Value>,
+) -> StatusCode {
+    let db = app.db.lock().unwrap();
+    if require_admin(&db, &headers, q.get("identity").map(|s| s.as_str())).is_err() {
+        return StatusCode::FORBIDDEN;
+    }
+    let Some(serde_json::Value::Object(map)) = Some(body) else { return StatusCode::BAD_REQUEST };
+    for (k, v) in map {
+        let _ = db.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
+            rusqlite::params![k, v.to_string()],
+        );
+    }
+    StatusCode::NO_CONTENT
+}
+
+
+/// GET /api/auth/me → {name, is_admin} for session resume (Bearer token).
+async fn auth_me(
+    State(app): State<std::sync::Arc<App>>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let db = app.db.lock().unwrap();
+    let Some(token) = bearer_token(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Ok(iid) = resolve_identity(&db, &headers, None) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    // token validity is implied by resolve_identity; get key + admin flag
+    let key: String = db
+        .query_row(
+            "SELECT i.key FROM identities i JOIN sessions s ON s.identity_id = i.id WHERE s.token = ?1",
+            [token],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|_| "user".into());
+    let admin: i64 = db
+        .query_row("SELECT is_admin FROM user_perms WHERE identity_id = ?1", [iid], |r| r.get(0))
+        .unwrap_or(0);
+    let name = key.split('@').next().unwrap_or("user").to_string();
+    Json(serde_json::json!({ "name": name, "is_admin": admin != 0 })).into_response()
+}
+
 
 

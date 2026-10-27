@@ -26,6 +26,15 @@ pub struct Party {
     pub members: StdMutex<Vec<(String, Tx)>>,
 }
 
+impl Party {
+    /// Names: host first, then guests. For members-list UI.
+    pub fn member_names(&self, host: &str) -> Vec<String> {
+        let mut v = vec![format!("{host} (host)")];
+        v.extend(self.guests.lock().unwrap().iter().cloned());
+        v
+    }
+}
+
 #[derive(Default, Clone, serde::Serialize)]
 pub struct PlaybackState {
     pub media_id: Option<i64>,
@@ -34,7 +43,7 @@ pub struct PlaybackState {
     pub playing: bool,
     /// Queue of approved media ids (after current).
     pub queue: Vec<QueueItem>,
-    #[serde(skip)]
+    /// Server unix-sec at last state change — guests use it for live drift.
     pub updated_at: i64,
 }
 
@@ -179,6 +188,10 @@ pub async fn member_socket(party: Arc<Party>, socket: WebSocket, key: String, is
     if sink.send(Message::Text(snapshot.to_string())).await.is_err() {
         return;
     }
+    if !is_host {
+        let names = party.member_names(party.host.lock().unwrap().as_deref().unwrap_or("host"));
+        party.broadcast(&serde_json::json!({ "type": "members", "members": names }));
+    }
 
     // outbound pump: server→client
     let out_task = tokio::spawn(async move {
@@ -224,6 +237,8 @@ pub async fn member_socket(party: Arc<Party>, socket: WebSocket, key: String, is
         party.end();
     } else {
         party.guests.lock().unwrap().remove(&key);
+        let names = party.member_names(party.host.lock().unwrap().as_deref().unwrap_or("host"));
+        party.broadcast(&serde_json::json!({ "type": "members", "members": names }));
     }
     out_task.abort();
 }
