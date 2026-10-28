@@ -61,13 +61,18 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
   const startedAt = Date.now();
   const deadline = startedAt + 15000;
   const portFile = join(profile, 'DevToolsActivePort');
-  while (!existsSync(portFile)) {
+  let port;
+  while (true) {
     if (browser.exitCode !== null || browser.signalCode !== null) throw new Error('Owned browser exited before cache setup');
     if (Date.now() >= deadline) throw new Error('Owned browser did not expose its cache-control endpoint');
+    if (existsSync(portFile)) {
+      const contents = readFileSync(portFile, 'utf8');
+      const firstLine = contents.split('\n')[0].trim();
+      port = contents.includes('\n') && /^\d+$/.test(firstLine) ? Number(firstLine) : NaN;
+      if (Number.isInteger(port) && port >= 1 && port <= 65535) break;
+    }
     await delay(20);
   }
-  const port = Number(readFileSync(portFile, 'utf8').split('\n')[0]);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid owned browser cache-control port');
   const response = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(3000) });
   if (!response.ok) throw new Error('Owned browser page discovery failed');
   const pages = (await response.json()).filter(page => page.type === 'page');
@@ -126,6 +131,9 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
   }
 }
 async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, cacheSetup = configureOwnedBrowserCache } = {}) {
+  if (Number(process.versions.node.split('.')[0]) < 22 || typeof WebSocket !== 'function') {
+    throw new Error('Browser regressions require Node.js 22+ with the global WebSocket API');
+  }
   let browser;
   let profile;
   let timer;
@@ -313,7 +321,7 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
       cacheControl = cacheSession.receipt;
       return result;
     })(), exited, timedOut]);
-    const expectedCases = 25;
+    const expectedCases = 29;
     const complete = observed.cases.length === expectedCases
       && new Set(observed.cases.map(item => item.name)).size === expectedCases
       && observed.cases.every(item => item.status === 'PASS')

@@ -929,3 +929,33 @@ test('inactive audio events cannot overwrite video party playback during a switc
   audio.emit('seeked');
   assert.equal(socket.sent.length, 1);
 });
+
+for (const kind of ['music', 'movie']) {
+  for (const retained of [false, true]) {
+    test(`external YouTube to ${retained ? 'retained' : 'fresh'} ${kind} pauses external playback and restores native presentation`, async () => {
+      const b = browser();
+      const sends = [];
+      b.context.partySend = value => sends.push(value);
+      b.context.external = { paused: false, pauses: 0 };
+      b.run(`LIBRARY = [{ id: 9, kind: ${JSON.stringify(kind)} }];
+        partyFollowId = ${retained ? 9 : 'null'};
+        partyPlaybackKind = 'external';
+        ytPlayer = { pauseVideo() {
+          external.paused = true; external.pauses++;
+          if (partyPlaybackKind === 'external') partySend({ type: 'pause' });
+        } };`);
+      b.nodes.get('#video-modal').classList.add('on', 'yt');
+      b.run('partyFollow(9, "Native", 24, true, Date.now()/1000, { preserveActiveVideo: true })');
+      await settle();
+      assert.equal(b.context.external.paused, true);
+      assert.equal(b.context.external.pauses, 1);
+      assert.deepEqual(sends, []);
+      const modal = b.nodes.get('#video-modal');
+      assert.equal(modal.classList.contains('yt'), false);
+      assert.equal(modal.classList.contains('on'), kind === 'movie');
+      const media = b.nodes.get(kind === 'movie' ? '#plyr-video' : '#pb-audio');
+      assert.equal(media.paused, false);
+      assert.ok(media.currentTime >= 24 && media.currentTime < 26);
+    });
+  }
+}

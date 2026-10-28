@@ -6,7 +6,7 @@ const { spawn } = require('node:child_process');
 if (process.argv.includes('--version')) {
   console.log('Frayd controlled child-writer fixture');
 } else {
-  const profile = process.argv.find(arg => arg.startsWith('--user-data-dir=')).split('=')[1];
+  const profile = process.argv.find(arg => arg.startsWith('--user-data-dir=')).slice('--user-data-dir='.length);
   const child = spawn(process.execPath, ['-e', `
     const fs = require('node:fs');
     const path = require('node:path');

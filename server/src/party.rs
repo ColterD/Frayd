@@ -117,6 +117,8 @@ impl Party {
         }
         let position = msg["position"].as_f64().filter(|p| p.is_finite() && *p >= 0.0);
         let mut st = self.state.lock().unwrap();
+        // Concurrent callers can capture timestamps before acquiring this lock.
+        let timestamp = timestamp.max(st.updated_at);
         // Preserve elapsed playback before replacing the timeline's reference time.
         if st.playing {
             st.position += timestamp.saturating_sub(st.updated_at).max(0) as f64;
@@ -290,6 +292,42 @@ mod tests {
             ..Default::default()
         };
         party
+    }
+
+    #[test]
+    fn out_of_order_timestamps_do_not_double_count_elapsed_playback() {
+        let party = playing_party();
+        let mut timeline = Vec::new();
+        for timestamp in [120, 110, 120, 130] {
+            assert!(party.host_update_at(&json!({"type": "approve", "title": "Next"}), timestamp));
+            let state = party.state.lock().unwrap();
+            timeline.push((state.position, state.updated_at));
+        }
+        assert_eq!(timeline, [(30.0, 120), (30.0, 120), (30.0, 120), (40.0, 130)]);
+        assert_eq!(party.state.lock().unwrap().queue.len(), 4);
+    }
+
+    #[test]
+    fn stale_pause_play_and_seek_preserve_positions_and_monotonic_time() {
+        let party = playing_party();
+        for (message, timestamp, expected_position, expected_playing, expected_time) in [
+            (json!({"type": "pause"}), 120, 30.0, false, 120),
+            (json!({"type": "approve", "title": "Next"}), 110, 30.0, false, 120),
+            (json!({"type": "play"}), 115, 30.0, true, 120),
+            (json!({"type": "seek", "position": 5.0}), 119, 5.0, true, 120),
+            (json!({"type": "pause"}), 130, 15.0, false, 130),
+            (json!({"type": "play", "position": 2.0}), 125, 2.0, true, 130),
+            (json!({"type": "pause", "position": 1.0}), 129, 1.0, false, 130),
+            (json!({"type": "play"}), 140, 1.0, true, 140),
+            (json!({"type": "load", "media_id": 3}), 135, 0.0, true, 140),
+            (json!({"type": "skip"}), 139, 0.0, true, 140),
+            (json!({"type": "pause"}), 150, 10.0, false, 150),
+        ] {
+            assert!(party.host_update_at(&message, timestamp));
+            let state = party.state.lock().unwrap();
+            assert_eq!((state.position, state.playing, state.updated_at),
+                (expected_position, expected_playing, expected_time), "{message} at {timestamp}");
+        }
     }
 
     #[test]

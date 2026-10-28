@@ -2,7 +2,7 @@
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
 const { createServer } = require('node:http');
-const { mkdtempSync, readFileSync, existsSync, rmSync, writeFileSync } = require('node:fs');
+const { mkdtempSync, readFileSync, existsSync, rmSync, writeFileSync, mkdirSync } = require('node:fs');
 const { join, resolve, dirname } = require('node:path');
 const { tmpdir } = require('node:os');
 const { once } = require('node:events');
@@ -13,7 +13,9 @@ const { stopBrowserGroup } = require('./browser-regression.cjs');
 const executable = join(__dirname, 'fixtures/browser-child-writer.cjs');
 
 test('PID-only cleanup leaves a profile writer; owned process-group cleanup stops it before removal', { timeout: 8000 }, async () => {
-  const profile = mkdtempSync(join(tmpdir(), 'frayd-cleanup-oracle-'));
+  const ownedParent = mkdtempSync(join(tmpdir(), 'frayd-cleanup-oracle-'));
+  const profile = join(ownedParent, 'frayd=ci/profile');
+  mkdirSync(profile, { recursive: true });
   let resolveReady;
   const ready = new Promise(resolve => { resolveReady = resolve; });
   const server = createServer(async (request, response) => {
@@ -27,10 +29,11 @@ test('PID-only cleanup leaves a profile writer; owned process-group cleanup stop
     { detached: true, stdio: 'ignore' });
   let readyTimer;
   try {
-    await Promise.race([ready, new Promise((_, reject) => {
+    const reported = await Promise.race([ready, new Promise((_, reject) => {
       readyTimer = setTimeout(() => reject(new Error('Child-writer fixture did not become ready within 2 seconds')), 2000);
     })]);
     clearTimeout(readyTimer);
+    assert.equal(reported.profile, profile, 'Launcher preserves the complete owned profile path');
     const stopped = once(browser, 'exit');
     browser.kill('SIGKILL'); // Original runner behavior: only the launcher exits.
     await stopped;
@@ -52,7 +55,7 @@ test('PID-only cleanup leaves a profile writer; owned process-group cleanup stop
     await stopBrowserGroup(browser);
     server.closeAllConnections();
     await new Promise(resolve => server.close(resolve));
-    rmSync(profile, { recursive: true, force: true });
+    rmSync(ownedParent, { recursive: true, force: true });
   }
 });
 
@@ -224,5 +227,46 @@ setInterval(() => {}, 1000);
   } finally {
     if (invocation.exitCode === null) invocation.kill('SIGKILL');
     rmSync(fixtureDirectory, { recursive: true, force: true });
+  }
+});
+
+
+test('cache discovery waits for a complete valid port and stops on exit or deadline', async () => {
+  const source = readFileSync(join(__dirname, 'browser-regression.cjs'), 'utf8');
+  const start = source.indexOf('async function configureOwnedBrowserCache(');
+  const end = source.indexOf('async function main(', start);
+  for (const scenario of ['complete', 'exit', 'deadline']) {
+    let now = 0;
+    let reads = 0;
+    const browser = { exitCode: null, signalCode: null };
+    const fetched = [];
+    const context = {
+      Date: { now: () => now }, join, AbortSignal,
+      existsSync: () => true,
+      readFileSync: () => ['', '12', '12partial\n/unused', '70000\n/unused', '32123\n/unused'][Math.min(reads++, 4)],
+      async delay() {
+        now += scenario === 'deadline' ? 15000 : 20;
+        if (scenario === 'exit') browser.exitCode = 7;
+      },
+      async fetch(url) { fetched.push(url); throw new Error('valid discovery reached'); },
+    };
+    const configure = vm.runInNewContext(source.slice(start, end) + '\nconfigureOwnedBrowserCache;', context);
+    await assert.rejects(configure({ profile: '/owned/profile', fixtureUrl: 'unused', browser }),
+      scenario === 'complete' ? /valid discovery reached/ : scenario === 'exit' ? /exited before cache setup/ : /did not expose/);
+    assert.deepEqual(fetched, scenario === 'complete' ? ['http://127.0.0.1:32123/json/list'] : []);
+  }
+});
+
+test('browser runner rejects unsupported Node and missing global WebSocket before starting resources', async () => {
+  const source = readFileSync(join(__dirname, 'browser-regression.cjs'), 'utf8');
+  const start = source.indexOf('async function main(');
+  const end = source.indexOf('module.exports =', start);
+  for (const scenario of [{ node: '20.0.0', WebSocket: class {} }, { node: '22.0.0', WebSocket: undefined }]) {
+    const main = vm.runInNewContext(source.slice(start, end) + '\nmain;', {
+      process: { versions: { node: scenario.node } }, WebSocket: scenario.WebSocket,
+      rmSync() {}, evidenceDir: 'unused', configureOwnedBrowserCache() {},
+      createServer() { throw new Error('Unsupported runtime started fixture resources'); },
+    });
+    await assert.rejects(main(), /require Node.js 22\+ with the global WebSocket API/);
   }
 });

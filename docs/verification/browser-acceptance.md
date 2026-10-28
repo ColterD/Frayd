@@ -5,7 +5,30 @@
 This records bounded manual acceptance using an isolated library and database.
 It does not authorize deployment or qualify arbitrary media, browsers or public hosting.
 
-## Current checkpoint (6810 / 5926)
+## Current review follow-up
+
+Full review [5688243622](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5688243622)
+published five Minor issues. Native follow now retires the external player after
+transferring playback ownership and clears its modal class. Host/guest controls
+exercise fresh and retained native audio/video with the YouTube API mocked;
+actual external YouTube playback is not qualified. Party updates clamp captured
+timestamps under the state lock, preventing stale updates from counting elapsed
+playback twice. The pinned Rust test/build target passes 53 tests, Clippy and
+release compilation with existing warnings in unchanged code.
+
+The browser harness waits for a complete valid port field, preserves equals signs
+in owned profile paths, and requires Node 22+ with global WebSocket. CI selects
+and verifies its preinstalled Node 22.23.4 entry without adding an action dependency.
+The frozen client/harness passes 97 Node tests and 29 actual-DOM cases.
+The [review ledger](coderabbit-follow-up.md) records all 53 published dispositions.
+Current hosted outcomes, source/image binding and any remaining manual gates are
+reported in the [draft PR](https://github.com/ColterD/Frayd/pull/2).
+
+These source changes require a new immutable app image. The retained `5926`
+interactive results below remain historical; they do not qualify the changed
+app and server. No merge or live deployment is authorized.
+
+## Reader-ready checkpoint (6810 / 5926)
 
 Checked 2026-10-28. Tested source `6810cc2488bc1a6a0284ff2bdf140d43bd2a1fd5`
 builds app `sha256:5926bed415ff0455796396218dc1851a1139818fb40588b84561666c424fa8fe`
@@ -13,7 +36,7 @@ with proxy `sha256:70c8658365d70d40979de2f191387b2e5e08bea22b44f960c0e77f751f67f
 The app script is `d676ea713c0975ea5a3236ea98e1bb6e98f11b9c4ab7823d6c1165a5dee29646`.
 All 31 build, 19 verification and 20 backend inputs match the tested commit.
 
-The current harness passes 91 Node tests, 20 Python tests and 25 real-DOM cases,
+That checkpoint passed 90 Node tests, 20 Python tests and 25 real-DOM cases,
 including five native H.264 decoding controls and parser-gated reader restoration.
 The normal build reuses the qualified 51-test Rust/Clippy/release stage after
 confirming identical backend inputs and output binary; it is not fresh Rust

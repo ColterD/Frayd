@@ -19,7 +19,7 @@ Use a disposable media directory for development. Native runs have no Compose ne
 
 ## Canonical checks
 
-From the repository root, with Node.js, Python 3.11+, Docker Engine and Compose:
+From the repository root, with Node.js 22+, Python 3.11+, Docker Engine and Compose:
 
 ```sh
 node --check client/js/app.js
@@ -29,6 +29,8 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 docker compose config --quiet
 git diff --check
 ```
+
+CI selects its preinstalled Node.js 22.23.4 x64 toolcache entry and verifies the exact executable version before adding it to the job PATH. A missing or changed cache entry fails the job; updating this CI version requires checking the runner image and the official Node release. Local checks support Node.js 22+ with the global WebSocket API.
 
 For the Linux x86_64 hash-locked lint environment, create a temporary directory and retain its path for cleanup:
 
@@ -75,7 +77,7 @@ The automated suite does not substitute for the [manual browser acceptance matri
 
 ### Real DOM regression
 
-With an existing Chrome/Chromium executable on PATH, run:
+With Node.js 22+ (the global WebSocket API is required) and an existing Chrome/Chromium executable on PATH, run:
 
 ```sh
 node tests/browser-regression.cjs

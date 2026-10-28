@@ -452,6 +452,73 @@
     }
     return observations;
   });
+  for (const isHost of [true, false]) for (const kind of ['music', 'movie']) {
+    await run(`${isHost ? 'host' : 'guest'} external YouTube to fresh and retained ${kind} stops external playback`, async () => {
+      const originalYT = window.YT;
+      const originalReady = ytReady;
+      const observations = [];
+      let mock;
+      window.YT = { Player: function (id, config) {
+        mock = { state: 2, position: 0, pauses: 0,
+          seekTo(position) { this.position = position; },
+          getCurrentTime() { return this.position; },
+          getPlayerState() { return this.state; },
+          playVideo() { this.state = 1; config.events.onStateChange({ data: 1 }); },
+          pauseVideo() { this.pauses++; this.state = 2; config.events.onStateChange({ data: 2 }); },
+          destroy() {},
+        };
+        queueMicrotask(() => config.events.onReady());
+        return mock;
+      } };
+      ytReady = true;
+      try {
+        for (const retained of [false, true]) {
+          PartyUI.close();
+          delete window.partySend;
+          LIBRARY = [{ id: 10, kind: 'movie' }, { id: 11, kind: 'music' }];
+          const id = kind === 'movie' ? 10 : 11;
+          partyFollowId = retained ? id : null;
+          const native = kind === 'movie' ? plyr.media : document.getElementById('pb-audio');
+          native.src = `/api/stream/${id}`;
+          Object.defineProperty(native, 'readyState', { configurable: true, value: 1 });
+          native.pause();
+          PartyUI.open();
+          document.getElementById('party-code-input').value = 'ABCD';
+          document.getElementById('pt-join').click();
+          socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: isHost,
+            state: { external_url: `mock-${kind}-${isHost}-${retained}`, title: 'Mock YouTube',
+              media_id: null, queue: [], position: 0, playing: true, updated_at: Date.now() / 1000 } }) });
+          await delay(0);
+          equal(mock.state, 1, 'Mock YouTube is playing before native transition');
+          const modal = document.getElementById('video-modal');
+          check(modal.classList.contains('yt'), 'External presentation is active');
+          socket.sent.length = 0;
+          socket.onmessage({ data: JSON.stringify({ type: 'state',
+            state: { external_url: null, media_id: id, title: 'Native fixture', queue: [],
+              position: 24, playing: true, updated_at: Date.now() / 1000 } }) });
+          equal(mock.state, 2, 'Native transition pauses mock YouTube');
+          equal(mock.pauses, 1, 'External player paused once');
+          check(!socket.sent.some(command => command.type === 'pause'), 'External pause cannot broadcast a stale host pause');
+          check(!modal.classList.contains('yt'), 'Native player presentation is restored');
+          equal(modal.classList.contains('on'), kind === 'movie', 'Native modal visibility');
+          equal(native.paused, false, 'Native playback follows playing state');
+          const expectedPosition = isHost ? 0 : 24;
+          check(native.currentTime >= expectedPosition && native.currentTime < expectedPosition + 2,
+            'Native position follows role authority');
+          observations.push({ retained, externalPauses: mock.pauses, nativePlaying: !native.paused,
+            position: native.currentTime, modalOpen: modal.classList.contains('on'), youtubeClass: false });
+        }
+        return { observations, productionPartyStateHandler: true, mockedYouTubeAPI: true, actualYouTubePlayback: false };
+      } finally {
+        PartyUI.close();
+        clearInterval(window._ytSeekTimer);
+        ytPlayer = null;
+        ytId = null;
+        ytReady = originalReady;
+        window.YT = originalYT;
+      }
+    });
+  }
   // End a party through its production state handler before the native control.
   PartyUI.open();
   document.getElementById('party-code-input').value = 'ABCD';

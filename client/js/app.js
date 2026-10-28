@@ -984,6 +984,9 @@ window.partyFollow = (mediaId, title, position, playing, updatedAt, options = {}
   const expected = () => position + (playing ? Math.max(0, Date.now() / 1000 - updatedAt) : 0);
   const priorPlaybackKind = partyPlaybackKind;
   partyPlaybackKind = isVideoId(mediaId) ? 'video' : 'audio';
+  // Transfer ownership before pausing so YouTube callbacks cannot echo a stale pause.
+  if (priorPlaybackKind === 'external') ytPlayer?.pauseVideo();
+  $('#video-modal').classList.remove('yt');
   // video: load into Plyr modal, mirror play/pause/seek on the <video> element
   if (isVideoId(mediaId)) {
     const video = plyr.media;
