@@ -44,6 +44,10 @@ function signalGroup(pid, signal) {
  */
 async function stopBrowserGroup(browser) {
   if (!browser?.pid) return;
+  /**
+   * Poll process-group liveness rather than the launcher PID: a leader can exit while
+   * descendants still write the profile. Only confirmed group absence permits deletion.
+   */
   async function waitForExit(milliseconds) {
     const deadline = Date.now() + milliseconds;
     while (signalGroup(browser.pid, 0)) {
@@ -85,6 +89,10 @@ async function bounded(promise, message, milliseconds = 3000) {
 async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
   const startedAt = Date.now();
   const deadline = startedAt + 15000;
+  /**
+   * Return time left on the single startup deadline; advancing to another phase or
+   * retrying discovery never resets it. Reject before starting work after expiration.
+   */
   function remainingStartupBudget() {
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw new Error('Owned browser startup deadline exceeded');
@@ -162,6 +170,10 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
   socket.addEventListener('error', () => {
     for (const waiter of pending.values()) waiter.reject(new Error('Owned browser cache protocol connection failed'));
   });
+  /**
+   * Send one bootstrap command on the owned protocol session and correlate its reply
+   * by ID. Always remove the pending entry; failures propagate without command retry.
+   */
   async function rpc(method, params = {}) {
     const rpcBudget = remainingStartupBudget();
     const id = ++sequence;
@@ -172,6 +184,10 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
     } finally { pending.delete(id); }
   }
   const receipt = { cacheDisabled: false, browserCacheCleared: false, configuredBeforeFixtureNavigation: false, protocolClosed: false };
+  /**
+   * Close only this owned protocol session after tests, keeping its cache overrides
+   * active until then. Teardown has a separate three-second bound, outside startup.
+   */
   async function close() {
     if (socket.readyState !== WebSocket.CLOSED) {
       const closed = new Promise(resolve => socket.addEventListener('close', resolve, { once: true }));
@@ -232,6 +248,10 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
   const unexpectedRequests = [];
   const nativeRequests = [];
   const mediaGateEvents = [];
+  /**
+   * Clear ownership of the held native stream before waking its waiters. Repeated
+   * driver or cleanup releases are harmless and report whether a gate was released.
+   */
   function releaseMedia(reason) {
     const gate = heldMedia;
     heldMedia = null;

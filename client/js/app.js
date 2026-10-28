@@ -931,7 +931,8 @@ const YT_DRIFT = 3;
  * Player callbacks must match the active instance; late readiness cannot take playback
  * back from native media. Readiness applies the latest request for that video; queued
  * API callbacks for superseded videos cannot create players. Host events broadcast only
- * while external playback owns it.
+ * while external playback owns it. Native players pause after ownership transfers so
+ * their pause events cannot overwrite external party state.
  * @param {string} vid YouTube video ID supplied by the party state.
  * @param {string} title Display title for the external stream.
  * @param {number} position Host position at updatedAt, in seconds.
@@ -941,6 +942,8 @@ const YT_DRIFT = 3;
  */
 window.partyFollowExternal = (vid, title, position, playing, updatedAt, isHostOwn) => {
   partyPlaybackKind = 'external';
+  pbAudio.pause();
+  plyr.pause();
   ytDesired = { vid, position, playing, updatedAt };
   const expected = () => ytDesired.position
     + (ytDesired.playing ? Math.max(0, Date.now() / 1000 - ytDesired.updatedAt) : 0);

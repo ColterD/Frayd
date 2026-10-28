@@ -482,13 +482,18 @@
           const native = kind === 'movie' ? plyr.media : document.getElementById('pb-audio');
           native.src = `/api/stream/${id}`;
           Object.defineProperty(native, 'readyState', { configurable: true, value: 1 });
-          native.pause();
+          partyPlaybackKind = kind === 'movie' ? 'video' : 'audio';
+          await native.play();
+          equal(native.paused, false, 'Native player is running before external handoff');
           PartyUI.open();
           document.getElementById('party-code-input').value = 'ABCD';
           document.getElementById('pt-join').click();
           socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: isHost,
             state: { external_url: `mock-${kind}-${isHost}-${retained}-${readyBeforeTransition}`, title: 'Mock YouTube',
               media_id: null, queue: [], position: 0, playing: true, updated_at: Date.now() / 1000 } }) });
+          equal(document.getElementById('pb-audio').paused, true, 'External handoff pauses native audio');
+          equal(plyr.paused, true, 'External handoff pauses native video');
+          check(!socket.sent.some(command => command.type === 'pause'), 'Native pause cannot broadcast a stale host pause');
           if (readyBeforeTransition) mock.emitReady();
           equal(mock.state, readyBeforeTransition ? 1 : 2, 'External mock has the expected readiness and playback');
           const modal = document.getElementById('video-modal');
@@ -511,7 +516,7 @@
           const expectedPosition = isHost ? 0 : 24;
           check(native.currentTime >= expectedPosition && native.currentTime < expectedPosition + 2,
             'Native position follows role authority');
-          observations.push({ retained, readyBeforeTransition, externalPauses: mock.pauses, nativePlaying: !native.paused,
+          observations.push({ retained, readyBeforeTransition, nativePausedForExternal: true, externalPauses: mock.pauses, nativePlaying: !native.paused,
             position: native.currentTime, modalOpen: modal.classList.contains('on'), youtubeClass: false });
         }
         const pendingId = `latest-state-${kind}-${isHost}`;

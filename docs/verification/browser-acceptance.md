@@ -8,10 +8,12 @@ It does not authorize deployment or qualify arbitrary media, browsers or public 
 ## Current review follow-up
 
 Full review [5688243622](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5688243622)
-and incremental review [5688495119](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5688495119)
-are accounted for in the [56-entry ledger](coderabbit-follow-up.md).
+and incremental reviews [5688495119](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5688495119)
+and [5688787475](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5688787475)
+are accounted for in the [59-entry ledger](coderabbit-follow-up.md).
 Native follow retires external playback after transferring ownership and clears
-its modal class. Separate API/player readiness, current-player checks and latest
+its modal class. External follow likewise pauses native audio/video after taking
+ownership, without broadcasting stale native pause events. Separate API/player readiness, current-player checks and latest
 desired state prevent unready calls, stale native restarts and lost pause/seek
 updates. Host/guest controls exercise fresh and retained audio/video with a mocked
 YouTube API; actual external YouTube playback remains unqualified.
@@ -19,7 +21,7 @@ YouTube API; actual external YouTube playback remains unqualified.
 Party updates clamp captured timestamps under the state lock, preventing stale
 updates from counting elapsed playback twice. The pinned Rust target passes
 53 tests, Clippy and release compilation; warnings in unchanged code remain.
-The frozen client/harness passes 105 Node tests and 29 actual-DOM cases, including
+The frozen client/harness passes 107 Node tests and 29 actual-DOM cases, including
 real native decoding, parser-gated reader restoration and real protocol setup
 after an injected initial transport failure. Owned HTTP nonresponse and early
 exit controls verify bounded failure and cleanup.

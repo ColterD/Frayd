@@ -1039,3 +1039,25 @@ test('late API readiness creates only the latest requested video and ignores nat
     }
   }
 });
+
+for (const nativeKind of ['audio', 'video']) {
+  test(`native ${nativeKind} to external playback pauses native players without a stale host command`, async () => {
+    const b = browser();
+    const players = youtubePlayerFixture(b);
+    const sends = [];
+    b.context.partySend = command => sends.push(command);
+    b.run(`partyHostHook(partySend); partyPlaybackKind = ${JSON.stringify(nativeKind)};
+      ${nativeKind === 'audio' ? 'pbAudio' : 'plyr'}.play()`);
+    await settle();
+    assert.equal(b.run(`${nativeKind === 'audio' ? 'pbAudio' : 'plyr'}.paused`), false);
+    sends.length = 0;
+    b.run('partyFollowExternal("external", "External", 20, false, Date.now()/1000, true)');
+    players[0].emitReady();
+    await settle();
+    assert.equal(b.run('pbAudio.paused'), true);
+    assert.equal(b.run('plyr.paused'), true);
+    assert.deepEqual(sends, []);
+    assert.deepEqual(players[0].calls, [['seek', 20]]);
+    assert.equal(b.run('partyPlaybackKind'), 'external');
+  });
+}
