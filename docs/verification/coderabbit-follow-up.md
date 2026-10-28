@@ -1,10 +1,11 @@
 # CodeRabbit follow-up verification
 
 Updated 2026-10-28 UTC for [fork draft PR #2](https://github.com/ColterD/Frayd/pull/2).
-This ledger accounts for **19 CodeRabbit issue/diagnostic entries**: the original
+This ledger accounts for **23 CodeRabbit issue/diagnostic entries**: the original
 12, two initial PR #2 documentation comments, two subsequent cleanup findings,
 one outside-diff cache finding, one unverified wording diagnostic and the final
-full-review index finding. Summary-only
+full-review index finding, the later count-consistency comment and three final
+documentation/harness comments. Summary-only
 risks and GitHub CodeQL alerts are recorded separately, not added to that count.
 PR #2 remains draft and unmerged. No deployment is qualified or authorized here.
 
@@ -16,7 +17,8 @@ PR #2 remains draft and unmerged. No deployment is qualified or authorized here.
 | Initial PR #2 review | [5677483709](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5677483709), documentation-only head `64b546ee712a88292c625028a5867c56755177c0`. |
 | First implementation review | [5677717042](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5677717042), head `247ff29fa3771b19e7996b005616475523a2400b`. Two new Minor findings; hosted documentation coverage 100%, 39 functions across 12 files, nine unsupported skips. |
 | Earlier completed review | [5677830358](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5677830358), head `3b7a5f590bc914ff39f68894be6bdff0d3561617`, submitted 2026-10-28T04:34:52Z, publication batch 1/1 complete. One outside-diff Minor and one unverified Minor diagnostic. |
-| Latest completed full review | [5678108505](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5678108505), head `67bf71a79a50419047f9899354698e3e37f363ef`, publication batch 1/1. One Minor index finding; zero outside-diff, nitpick or tool warnings. Hosted documentation coverage 100%, 47 functions across 12 files, ten unsupported skips. |
+| Earlier whole-PR full review | [5678108505](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5678108505), head `67bf71a79a50419047f9899354698e3e37f363ef`, publication batch 1/1. One Minor index finding; zero outside-diff, nitpick or tool warnings. Hosted documentation coverage 100%, 47 functions across 12 files, ten unsupported skips. |
+| Whole-PR review on `5451980` | [5678577205](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5678577205), head `54519804a27f5139b7ee54c10b604e898af355d9`, batch 1/1, 24 selected files and one SVG excluded. Three Minor documentation/harness issues; zero outside-diff items, nitpicks or tool diagnostics. Coverage 100%, 54 functions across 12 files, ten unsupported skips. |
 | Upstream synchronization | Upstream `kattiest/Frayd` commit `540b87acea05304c767a151d47456fceaaf7b29a` merged into fork main at `49de065f3fb0875425f5467b87ae161b43d7914e`, and into the PR branch at `fafad69434a5893cb1d1dbbcbdf56d87f0aab05b`. |
 | Security patch already on fork main | PR-branch patch `b840753a9cabb680b94733ae7a58b6b303619d17` was cherry-picked to fork main as `2789f37e55148e0ee69e7bba6bb5ee30b5f49225`. This fixes the original four EPUB-message sender-boundary findings in source; all four default-branch alerts now report fixed, not dismissed. It does not merge PR #2. |
 | Combined foundation | Implementation `6af4c15` and ancestry-only merge `a6af5f5` include upstream synchronization, hygiene, cache/publication corrections and explicit ingestion trust. Fork main received the narrow ingestion patch at `a7a6dabccce971992d1ed47b00ef66f74811e6e7`. The pre-index app image below passes 28 Rust tests and full runtime qualification; the latest index follow-up passes 29 Rust tests, Clippy and release build. Post-index image/review results are recorded in the PR body; browser evidence stays tied to the unchanged client hash. |
@@ -39,7 +41,7 @@ latest Rust run passed 26 unit plus six archive-reader tests (exit 0), Clippy
 22 tests after the merge. Final normal-image build and runtime qualification also pass;
 31 build, nine verification and 20 backend inputs match with zero drift.
 
-## All 18 CodeRabbit dispositions
+## CodeRabbit dispositions
 
 Severity is the original published severity. “Historical pass” describes the
 bounded source/image scenario recorded below; the new combined runtime still needs
@@ -58,14 +60,18 @@ qualification. A resolved review thread and a passing check are separate evidenc
 | [CR-09](https://github.com/ColterD/Frayd/pull/1#pullrequestreview-5677254865) | Trivial | Baseline diagnostics failed. Tests now expose byte/text stderr and preserve the original error through cleanup errors; a real synthetic executable exits 23 with its diagnostic intact. Cleanup failure after success stays fatal. | Subprocess pass; no actual Docker outage induced. |
 | [CR-10](https://github.com/ColterD/Frayd/pull/1#pullrequestreview-5677254865) | Trivial | Original ignore rules failed. Real context export excludes synthetic `.env` variants and installer sentinels while retaining normal JS; runtime checks image/HTTP exclusion. | Historical Docker pass; repeat context/runtime checks on new build. |
 | D-01 | Warning | Original B905 reproduced. Explicit `zip(..., strict=True)` passes selected Ruff rules; mismatched package/result counts remain fatal. | Local and historical hosted lint pass. |
-| D-02 | Warning | Latest completed hosted review reports **100.00% >=80.00%**, 47 functions across 12 files, ten unsupported skips, on `67bf71a`. Threshold unchanged. | Passed for that SHA; next combined-head coverage pending. Exact 12 analyzed filenames are undisclosed; selected files are not the coverage-file list. |
+| D-02 | Warning | Confirmed hosted review coverage is **100.00% >=80.00%**, 54 functions across 12 files, ten unsupported skips, on `5451980`. Threshold unchanged. | Qualified for that SHA; current-head coverage is recorded in the PR body. Exact 12 analyzed filenames are undisclosed; selected files are not the coverage-file list. |
 | [PR2-DOC-01](https://github.com/ColterD/Frayd/pull/2#discussion_r4396630072) | Minor | Explicit oracle now requires successful proxy-facing liveness/library/progress before, during and after the blocked probe, followed by scan completion. Historical harness rerun exercised all phases. | Documentation and historical verification gap closed; separate from CR-02's Major code severity. |
 | [PR2-DOC-02](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5677483709) | Trivial | Explicit oracle preserves cached page names, page-index archive lookup, IDs, metadata and progress after upgrade/rescan. Populated legacy startup refreshed two rows; explicit rescan returned HTTP 202 then idle. All 19 HTTP/eight DB assertions passed after each. | Historical pass for unchanged archives; NEXT-01 covers archive replacement. |
 | [FRESH-01](https://github.com/ColterD/Frayd/pull/2#discussion_r4396816530) | Minor | Old cleanup missed a real stopped labelled container. Corrected all-state listing rejects it; removal restores clean checks. Red regression followed by 14 passing Python tests and lint. | Hosted thread resolved/outdated, marked addressed in `3b7a5f5`; historical runtime cleanup passed. |
 | [FRESH-02](https://github.com/ColterD/Frayd/pull/2#discussion_r4396816549) | Minor | Two failed jobs originally left four registry rows. Corrected tests require zero per-job row/directory growth across repeat failure while retaining neighbors/legacy artifacts; historical 24 Rust tests and runtime passed. | Hosted thread resolved/outdated, marked addressed in `3b7a5f5`. Later publication-failure risk is separate below. |
 | [NEXT-01](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5677830358) | Minor, outside diff | Valid: persisted comic pages can outlive source mtime/size changes. Required oracle replaces an archive, rescans, verifies added page listing/index bytes while retaining ID/progress/other metadata. | Corrected in the final 28-test suite and real combined-image HTTP replacement test. Seconds-granularity mtime plus size does not detect replacements preserving both values. |
 | [NEXT-D01](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5677830358) | Minor, unverified tool diagnostic | Report requested “Ubuntu-hosted” wording but explicitly could not confirm its finding. Ledger uses **“hosted run on Ubuntu”** and records the actual historical workflow outcome below. | Wording clarified; diagnostic validity is not claimed. |
-| [FULL-01](https://github.com/ColterD/Frayd/pull/2#discussion_r4397136686) | Minor, performance | Reconciliation probes lack indexes for `media(transcode_path)` and `transcode_artifacts(owner_media_id)`. Verify backfill, conflict and cleanup query plans on several thousand converted rows. | Both idempotent indexes are added. Bundled SQLite 3.45.0 plans switch the correlated scans to covering-index searches on a 3,000-source fixture; schema/semantic checks and all 29 Rust tests pass. Thread stays open until the follow-up review passes. |
+| [FULL-01](https://github.com/ColterD/Frayd/pull/2#discussion_r4397136686) | Minor, performance | Reconciliation probes lack indexes for `media(transcode_path)` and `transcode_artifacts(owner_media_id)`. Verify backfill, conflict and cleanup query plans on several thousand converted rows. | Both idempotent indexes are added. Bundled SQLite 3.45.0 plans switch the correlated scans to covering-index searches on a 3,000-source fixture; schema/semantic checks and all 29 Rust tests pass. Thread was marked addressed and resolved on `b2a8504`; plan and retention proof remain recorded. |
+| [DOC-COUNT](https://github.com/ColterD/Frayd/pull/2#discussion_r4397295290) | Minor, documentation | Delayed full review `5678313526` on `b2a8504` found a stale 18-entry section heading while the table contained 19 entries. | The section heading is count-free; this finding is included in the reconciled 23-entry total and table. A one-shot count validation checks the declared total against actual rows. |
+| [DOC-ALERT-GATE](https://github.com/ColterD/Frayd/pull/2#discussion_r4397497064) | Minor, documentation | Alert 13 was already disposed, but a remaining-acceptance bullet still named it as pending. | Removed from active gates; the approved disposition, source/parser/recorder rationale and historical state remain recorded. |
+| [DOC-QA-SCOPE](https://github.com/ColterD/Frayd/pull/2#discussion_r4397497073) | Minor, conditional future scope | Use neutral QA image names and restore upstream checkout instructions before an upstream merge. | Neutral names adopted. The active fork checkout is deliberately retained for this owner-authorized fork-only draft because upstream lacks these fixes. Restoring the upstream checkout is a future upstream-contribution handoff condition, not an unmet gate in this round. |
+| [QA-READY](https://github.com/ColterD/Frayd/pull/2#discussion_r4397497091) | Minor, harness reliability | Readiness must retry raw transport resets/disconnects/timeouts alongside HTTP assertion failures until its bounded deadline. | Explicit OSError retry passes recovery/exhaustion cases across seven error variants; all 16 Python tests and the full default-image integration pass. Product runtime source is unchanged. |
 
 The latest full review selected 24 files and excluded one deleted SVG. The earlier
 `3b7a5f5` review selected five files and skipped `tests/test_integration.py` as
@@ -77,7 +83,7 @@ and two diagnostics; CR-07/08 share a comment but are separate requirements.
 
 ## Summary-only risks and separate security work
 
-These are outside the 18-entry CodeRabbit count:
+These summary observations and security records are separate from the formal entries above:
 
 - **Prolonged DB lock:** cleanup must retain provenance if ownership cannot be
   validated. Historical follow-up tests held a lock beyond the normal busy timeout
@@ -201,7 +207,8 @@ docker compose config --quiet
 git diff --check
 ```
 
-The latest recorded client/Python counts are 22/14 passing respectively, exit 0.
+The current client/Python counts are 22/16 passing respectively, exit 0; the
+extra Python cases cover readiness transport recovery and bounded exhaustion.
 VM tests execute full scripts with synthetic browser/network boundaries; they do
 not establish actual browser sandbox behavior. CI now runs both client suites.
 
@@ -219,8 +226,8 @@ and OSV were checked with no indexed advisory returned. Source-to-wheel
 reproducibility was not established. Remove only the created temporary directory.
 
 ```sh
-docker build --progress plain -t frayd-pr2-qa:local .
-docker build -f Dockerfile.proxy -t frayd-pr2-proxy-qa:local .
+docker build --progress plain -t frayd-qa:local .
+docker build -f Dockerfile.proxy -t frayd-proxy-qa:local .
 docker run --rm --network none --read-only --tmpfs /tmp --entrypoint nginx frayd-pr2-proxy-qa:local -t
 python3 scripts/check-build-context.py
 python3 -u scripts/integration.py
@@ -233,21 +240,16 @@ audit queries current OSV; the historical 209-package clean result and exact
 block-buffer 0.10.4 publisher-range exception do not predict future advisories.
 CI repeats syntax/client/Python/lint/Compose/build/context/integration/audit checks.
 
-Remaining acceptance gates:
+Acceptance checks and current remote record:
 
-1. Obtain final-head hosted checks, CodeQL and a completed CodeRabbit review,
+1. Final acceptance requires hosted checks, CodeQL and a completed CodeRabbit review,
    including documentation coverage >=80%. The automatic incremental run on
    `9f3b700` was skipped before analysis; its findings/coverage are unavailable.
    The displayed 100% result belongs to `3b7a5f5`, not the skipped or final head.
-   A documented full-review command is the next probe. Review conversations stay
+   Later full-review publications are linked above and the current result is in
+   the PR body. Review conversations stay
    open until their complete acceptance oracles and fresh-review gate pass.
-2. Record the remaining CodeQL alert 13 disposition explicitly. Alerts 1-4 and
-   11-12 report fixed through source changes; alert 13 still flags the intended
-   HTTP(S) URL argument after the explicit option terminator. Its source/parser/
-   recorder evidence is retained. The owner approved a false-positive disposition;
-   the full rationale and current remote state are recorded in the PR body. This
-   does not label it fixed by a source change or authorize query suppression.
-3. Retain draft status until owner acceptance. Deployment, production restart,
+2. Retain draft status until owner acceptance. Deployment, production restart,
    real-data migration, arbitrary codecs and full watch-party behavior remain
    outside the qualification recorded here.
 
@@ -332,8 +334,9 @@ The full review on `67bf71a` did not repeat the original 18 entries. It reported
 one new Minor index issue, tracked as FULL-01 above, and no nitpicks or tool
 warnings. Its passing title check still described the former title as too broad;
 the PR title will be made specific to scan responsiveness and transcode isolation
-with explicit fork-draft scope. Existing nine PR #2 threads were resolved; the
-new index thread remains open until its full acceptance gate passes.
+with explicit fork-draft scope. The index thread was subsequently marked
+addressed and resolved on `b2a8504`, bringing that snapshot to ten resolved
+threads; the delayed documentation-count comment is tracked separately.
 
 ## Indexed reconciliation follow-up
 
@@ -355,8 +358,8 @@ queries are unchanged; the Rust change is the regression test only.
 All 29 Rust tests, Clippy, release build and whitespace checks pass. These are
 query-plan and semantic observations, not a universal scan-latency benchmark.
 The post-index immutable build/runtime and next full review are separate gates
-whose latest results are recorded in the PR body. The index thread remains open
-until that acceptance is complete. The chosen title now names scan responsiveness,
+whose latest results are recorded in the PR body. The index thread is resolved
+and marked addressed on `b2a8504`. The chosen title now names scan responsiveness,
 transcode isolation and fork-draft scope, addressing the qualitative title feedback.
 
 ## Validated summary observation: converted-source freshness
@@ -391,3 +394,34 @@ fixture replacement and remain intact.
 The new harness is included in the existing CI integration command. Its changes
 and the source-version fix require final-head CI and review acceptance; prior
 zero-comment results are not relabeled as a review of this new code.
+
+The delayed full review `5678313526` on `b2a8504` published a documentation-count
+comment after the initial bounded review inventory closed. It is retained as
+DOC-COUNT above. The count-free disposition heading avoids repeating an embedded
+number; the declared total and actual table rows are checked together. This
+metadata-only correction does not change any runtime/build verification input.
+
+## Final documentation and harness dispositions
+
+The `5451980` whole-PR review did not repeat the converted-source freshness risk.
+It raised three Minor items, all tracked above. Alert 13 is absent from active
+acceptance gates; its approved false-positive rationale and history are retained.
+QA image defaults, CI build tags and repeatable commands use neutral names. The
+README checkout continues to target the actual fork branch under the owner's
+explicit fork-only work order. Current upstream `540b87a` lacks this PR's cache
+and scanner fixes, so substituting its default branch now would reproduce a
+different program. Restore upstream installation instructions when preparing an
+actual upstream contribution; that future condition does not block this fork
+draft. Readiness transport retry is covered by focused red/green unit cases and
+the disposable integration run, while all 32 Rust runtime tests remain unchanged.
+
+The final readiness/default-name follow-up is verified: the old catch failed
+eight raw transport-error subcases, and the corrected helper passes seven error
+variants across recovery and exhaustion while retaining its 20-second deadline
+and last-cause diagnostic. Python 16/16 and configured Ruff pass. Neutral aliases
+were verified absent before being assigned to the exact qualified application
+and proxy IDs; no unknown image was overwritten. The integration command without
+image flags passes, including both conversion generations and restart/progress
+persistence. All 31 image, nine verification and 20 backend bindings match, and
+all disposable containers, networks and volumes are removed. No runtime rebuild
+is required for these harness/documentation-only changes.

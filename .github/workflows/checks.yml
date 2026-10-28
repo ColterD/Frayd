@@ -26,8 +26,8 @@ jobs:
         run: docker compose config --quiet
       - name: Locked Rust tests, Clippy, release build and runtime images
         run: |
-          docker build -t frayd-pr2-qa:local .
-          docker build -f Dockerfile.proxy -t frayd-pr2-proxy-qa:local .
+          docker build -t frayd-qa:local .
+          docker build -f Dockerfile.proxy -t frayd-proxy-qa:local .
       - name: Disposable HTTP and persistence integration
         run: |
           python3 scripts/check-build-context.py

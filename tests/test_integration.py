@@ -1,5 +1,6 @@
 """Failure-boundary regressions for the disposable Docker integration runner."""
 import contextlib
+import http.client
 import importlib.util
 import io
 import os
@@ -7,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -98,6 +100,45 @@ class CleanupInventoryTests(unittest.TestCase):
             integration.assert_project_removed('frayd-cleanup-fixture')
         self.assertEqual(caught.exception.args[0],
                          ('container', 'frayd-cleanup-fixture', b'stopped-fixture'))
+
+
+class ReadinessTests(unittest.TestCase):
+    """Keep transient network recovery bounded without hiding terminal failures."""
+
+    @staticmethod
+    def transient_errors():
+        """Build raw and urllib-wrapped errors emitted by the HTTP request stack."""
+        return (OSError('socket reset'), ConnectionResetError('peer reset'),
+                TimeoutError('socket timed out'), http.client.RemoteDisconnected('peer disconnected'),
+                urllib.error.URLError('connection refused'),
+                urllib.error.HTTPError('/api/health', 503, 'unavailable', None, None),
+                AssertionError('health status was 503 instead of 200'))
+
+    def test_transient_failure_retries_then_accepts_success(self):
+        """Every supported transport/status failure can recover on the next probe."""
+        for error in self.transient_errors():
+            with (
+                self.subTest(error_type=type(error).__name__),
+                patch.object(integration, 'request', side_effect=[error, b'{"status":"ok"}']) as request,
+                patch.object(integration.time, 'monotonic', side_effect=[0, 0, 0.5]),
+                patch.object(integration.time, 'sleep'),
+            ):
+                integration.ready()
+                self.assertEqual(request.call_count, 2)
+
+    def test_deadline_exhaustion_reports_the_last_failure(self):
+        """A persistent failure terminates at the 20-second deadline with its cause."""
+        for error in self.transient_errors():
+            with self.subTest(error_type=type(error).__name__):
+                with (
+                    patch.object(integration, 'request', side_effect=error) as request,
+                    patch.object(integration.time, 'monotonic', side_effect=[10, 10, 29.5, 30]),
+                    patch.object(integration.time, 'sleep'),
+                    self.assertRaises(AssertionError) as caught,
+                ):
+                    integration.ready()
+                self.assertEqual(str(caught.exception), f'QA server did not become ready: {error}')
+                self.assertEqual(request.call_count, 2)
 
 
 if __name__ == '__main__':

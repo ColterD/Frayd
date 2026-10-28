@@ -115,7 +115,7 @@ def ready():
         try:
             request('/api/health', timeout=2)
             return
-        except (urllib.error.URLError, AssertionError) as error:
+        except (OSError, AssertionError) as error:
             last_error = error
             time.sleep(0.5)
     raise AssertionError(f'QA server did not become ready: {last_error}')
@@ -142,8 +142,8 @@ def main():
     """Exercise isolated container HTTP, persistence, DNS and read-only media paths."""
     global base
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--app-image', default='frayd-pr2-qa:local')
-    parser.add_argument('--proxy-image', default='frayd-pr2-proxy-qa:local')
+    parser.add_argument('--app-image', default='frayd-qa:local')
+    parser.add_argument('--proxy-image', default='frayd-proxy-qa:local')
     args = parser.parse_args()
     project = 'frayd-qa-' + secrets.token_hex(4)
     print(f'QA project: {project}')
