@@ -29,7 +29,7 @@ docker compose up -d --wait
 
 The app sees `/data/library`, not the host path. The image's `FRAYD_LIBRARY=/data/library` overrides the library path saved in Settings. Change the mount source to select a different host folder, then choose **Scan library** after adding or changing media.
 
-Alternatively, copy files into a new subdirectory of the default library volume, using additional disk space. Run this block in Bash, set the absolute source directory, and choose a new import name using only letters, digits, underscores or hyphens:
+Alternatively, copy regular files and directories into a new subdirectory of the default library volume, using additional disk space. Symlinks, including a symlinked source directory, and special files are rejected without following them. Keep the source unchanged throughout the preflight and copy: these steps are not atomic. Run this block in Bash with GNU `find`, set the absolute source directory, and choose a new import name using only letters, digits, underscores or hyphens:
 
 ```sh
 (
@@ -38,7 +38,13 @@ Alternatively, copy files into a new subdirectory of the default library volume,
   SOURCE_DIR=/absolute/path/to/your/media
   IMPORT_NAME=import-001
   case "$SOURCE_DIR" in /*) ;; *) echo 'Source must be absolute' >&2; exit 1 ;; esac
+  while [[ "$SOURCE_DIR" != / && "$SOURCE_DIR" == */ ]]; do
+    SOURCE_DIR=${SOURCE_DIR%/}
+  done
+  test ! -L "$SOURCE_DIR"
   test -d "$SOURCE_DIR"
+  UNSUPPORTED_ENTRY=$(find -P "$SOURCE_DIR" ! -type f ! -type d -printf x -quit)
+  test -z "$UNSUPPORTED_ENTRY" || { echo 'Source must contain only regular files and directories' >&2; exit 1; }
   case "$IMPORT_NAME" in ''|*[!A-Za-z0-9_-]*) echo 'Invalid import name' >&2; exit 1 ;; esac
   docker compose exec -T app sh -eu -c '
     umask 077

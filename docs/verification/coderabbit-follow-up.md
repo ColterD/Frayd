@@ -17,7 +17,7 @@ Navigation: [source boundaries](#source-and-delivery-boundaries),
 [comic cache follow-up](#optional-comic-page-cache-write-follow-up).
 
 Updated 2026-10-28 UTC for [fork draft PR #2](https://github.com/ColterD/Frayd/pull/2).
-This ledger accounts for **41 CodeRabbit issue/diagnostic entries**, including
+This ledger accounts for **42 CodeRabbit issue/diagnostic entries**, including
 original and subsequent findings, outside-diff comments, nitpicks and published
 tool diagnostics. Summary-only risks and GitHub CodeQL alerts are recorded
 separately and are not added to that count.
@@ -115,7 +115,8 @@ A resolved review thread and a passing check are separate evidence.
 | [DOC-MEDIA-BACKUP](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5685026287) | Minor, unverified wording suggestion | The separately mounted media instruction repeated “separately.” | It now identifies mounted media as a separate data source. The named-volume restore proof does not cover external media. |
 | [REAL-DOM-COVERAGE](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5685026287) | Trivial, unverified coverage suggestion | Mocked Range/TreeWalker and Plyr behavior cannot prove actual DOM selection offsets or source replacement. | Nine real-DOM cases pass using the production generated iframe and actual vendored Plyr: exact selection/save/paint/reload, rejection cases and active hooks/follower seek after two media replacements. The supplied browser version/hash and source hashes are recorded. Synthetic player events do not prove decoded playback or two-client synchronization; interactive latest-image acceptance remains held. |
 | [COPY-PRIVATE-MEDIA](https://github.com/ColterD/Frayd/pull/2#discussion_r4402829094) | Minor | The volume-copy example can retain ownership incompatible with UID 10001 while preserving private modes, leaving the copied media unreadable. | The Bash-guarded tar stream extracts as UID/GID 10001 into a new directory. Private 0700/0600 ownership/readability, scan and exact HTTP media bytes pass on the qualified image; repeat-target, invalid-name, missing-source and failed-producer controls fail safely. No chown capability is required; all owned resources are removed. |
-| [LEDGER-TABLE](https://github.com/ColterD/Frayd/pull/2#discussion_r4402829103) | Minor | Blank lines end the disposition table, leaving later findings outside it. | GitHub GFM rendered only 24 of 39 entries as table rows before correction. Removing the internal blank lines restores one table; final GitHub GFM rendering includes all 41 dispositions. |
+| [LEDGER-TABLE](https://github.com/ColterD/Frayd/pull/2#discussion_r4402829103) | Minor | Blank lines end the disposition table, leaving later findings outside it. | GitHub GFM rendered only 24 of 39 entries as table rows before correction. Removing the internal blank lines restores one table; GitHub GFM rendering includes all dispositions, with row counts tied to each recorded ledger source. |
+| [COPY-SYMLINK](https://github.com/ColterD/Frayd/pull/2#discussion_r4402974897) | Minor | Tar preserves symbolic links that the scanner skips, so a copied link can leave the expected media absent. | The old guide accepts a link and indexes zero media. The corrected preflight rejects links, FIFO, symlinked source roots (including trailing slashes) and traversal errors before creating the destination. The private regular-file scan/exact-byte path still passes. Source stability and non-atomicity remain explicit. |
 
 The `d835f40` full review selected 30 files and excluded one deleted SVG. The earlier
 `3b7a5f5` review selected five files and skipped `tests/test_integration.py` as
