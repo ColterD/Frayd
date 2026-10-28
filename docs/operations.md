@@ -135,10 +135,11 @@ set -C  # refuse to overwrite an existing archive
 docker run --rm -i --network none --user 0:0 --entrypoint tar -v "$SOURCE_VOLUME:/data:ro" "$IMAGE" -C /data -cpf - . > "$BACKUP_DIR/data.tar"
 test -s "$BACKUP_DIR/data.tar"
 test "$(stat -c '%a' "$BACKUP_DIR/data.tar")" = 600
-sha256sum "$BACKUP_DIR/data.tar"
+(cd "$BACKUP_DIR" && sha256sum data.tar > data.tar.sha256)
+test "$(stat -c '%a' "$BACKUP_DIR/data.tar.sha256")" = 600
 ```
 
-Require a successful archive command; a nonempty partial archive is not a backup. Retain the checksum privately and verify it before restore.
+Require a successful archive command; a nonempty partial archive is not a backup. Keep `data.tar.sha256` beside `data.tar`, with the same private access. Move both together if relocating the backup. The restore block verifies the checksum before extraction.
 
 4. Prepare a **distinct Compose project** with the same immutable app image and data paths. Create its containers without starting the app (`docker compose … create --pull never` for that project's exact configuration). This initializes a separate volume with image-owned directory scaffolding. Inspect the destination app's `/data` mount as above, set `DEST_VOLUME` to its exact name, and require a named volume different from `SOURCE_VOLUME`. Inspect the destination before extraction: it must contain directory scaffolding only, with no existing files. Stop if it has existing data. Never restore over a running or populated volume.
 
@@ -147,6 +148,10 @@ Require a successful archive command; a nonempty partial archive is not a backup
 ```sh
 test -n "$DEST_VOLUME"
 test "$DEST_VOLUME" != "$SOURCE_VOLUME"
+if ! (cd "$BACKUP_DIR" && sha256sum --check data.tar.sha256); then
+  echo 'Backup checksum verification failed; nothing was extracted' >&2
+  exit 1
+fi
 docker run --rm -i --network none --user 0:0 --entrypoint tar -v "$DEST_VOLUME:/data" "$IMAGE" -C /data -xpf - < "$BACKUP_DIR/data.tar"
 ```
 
@@ -160,6 +165,10 @@ copyable backup block under a permissive caller umask and verified directory mod
 selected media IDs/exact bytes and guest progress. The restored app saved new
 progress under UID/GID 10001 and retained it after restart. The lifecycle column
 appeared exactly once with its unknown default; no artifact rows were invented.
+The updated guide was then requalified in one fresh Docker round trip: the
+archive and relative-name checksum sidecar were both mode 600, an intact archive
+verified before extraction, and a corrupted copy exited before extraction with
+the actual destination still containing only empty image scaffolding.
 Accounts and sessions were zero in this fixture, so account/session recovery was
 not qualified. Browser/proxy and external bind-media recovery were not exercised.
 
