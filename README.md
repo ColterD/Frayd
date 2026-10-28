@@ -1,38 +1,111 @@
 # Frayd
 
-Your movies, music, books, and comics already live on your computer. Frayd gives them the streaming service treatment — right in your browser, right in your house.
+Frayd is a self-hosted media library with a Rust server (axum and SQLite) and a plain JavaScript browser client. It scans local videos, music, audiobooks, ebooks, comics and manga. Features include saved progress and watch parties.
 
-Think of it as your own private Netflix, except the library is the stuff you actually own, the subscription is zero dollars, and the algorithm never suggests anything because there is no algorithm. It runs on your machine, your family's phones and tablets connect to it, and that's the whole story.
+This is an early-stage project. Start on your own computer and use trusted media. The Docker setup below publishes only to loopback; it does not configure public hosting or household LAN access.
 
-## The good stuff
+## Run with Docker
 
-- **Movies & Shows** — click, watch, fall asleep. It remembers exactly where you dozed off.
-- **Music & Audiobooks** — the soundtrack keeps playing and picks up mid-sentence when you come back.
-- **Ebooks** — pages that actually turn, text that actually looks like a book, and highlights you can keep forever.
-- **Comics & Manga** — page-by-page reading with a bookmark memory better than yours.
-- **Watch Parties** — everyone hears the same thing at the same second, and anybody can stack the queue from their phone. Household democracy at last.
+Requirements: Git, Docker Engine and the Docker Compose plugin. Run these commands from a terminal:
 
-## Getting it (this is the easy part)
+```sh
+git clone https://github.com/kattiest/Frayd.git
+cd Frayd
+docker compose config --quiet
+docker compose up -d --build --wait
+```
 
-You need two things: Frayd, and a folder somewhere with your stuff in it.
+Open **http://127.0.0.1:3100**. The first account created becomes the owner/admin. You can also continue as a guest. Logging in with an unused email creates another account; this is not an invite-only account system. Guest access and library/media routes are not a private authentication boundary. Keep this deployment on a trusted machine and do not expose it directly to the internet.
 
-1. Open the installer page and click the button that matches your computer.
-2. Tell it where your media folder lives — `C:\Users\you\Media` or wherever.
-3. Copy the one command it gives you and paste it into a terminal. That single paste does everything: installs whatever your computer is missing, builds the program, and teaches it to start itself every time you boot up. Go make a sandwich; it takes a few minutes.
-4. When the page turns green, click the link, choose your username and password, and congratulations — the server is yours. You're the owner, which mostly means you're the only one who can change settings and break things.
+If port 3100 is occupied, prefix Compose commands with `FRAYD_PORT=3105`, then open http://127.0.0.1:3105. This variable changes the published proxy port; the app still listens on port 8484 inside Docker.
 
-From then on, everyone in the house just opens a browser, types in your address, and signs in with the account you made for them. Technically they could use it from the hammock out back too, if the wifi reaches.
+The first build downloads images and Rust dependencies, then runs locked Rust tests, Clippy and the release build. It can take several minutes. Runtime services run as UID/GID 10001 with read-only root filesystems, dropped capabilities, resource limits and temporary `/tmp` storage. Only the proxy publishes a port. The app is on an internal Docker network without external routing.
 
-## But is it safe?
+### Add your media
 
-- Your files never leave your hardware. No uploads, no cloud, no mysterious "partners."
-- Nobody can connect from outside your house unless you personally flip the switches to allow it.
-- Passwords are scrambled beyond recognition before they're stored, and anyone hammering at the login gets a time-out after ten guesses.
+By default, the named `data` volume holds the database, thumbnails and `/data/library`. To use an existing host media folder without copying it, create `compose.override.yaml` beside `compose.yaml`:
 
-## What about friends far away?
+```yaml
+services:
+  app:
+    volumes:
+      - type: bind
+        source: /absolute/path/to/your/media
+        target: /data/library
+        read_only: true
+        bind:
+          create_host_path: false
+```
 
-You can open it up to the internet when you're ready — the settings panel has the toggles (port forwarding, your own web address, security certificates), and the safety rails are already built in. It's a "when you feel like it" feature, not a homework assignment.
+Replace the source with a real directory, ensure UID 10001 can read its files and traverse its directories, then run:
 
-## For the curious
+```sh
+docker compose config --quiet
+docker compose up -d --wait
+```
 
-Rust server, plain JavaScript client, one small database file. No telemetry, nothing phones home, runs happily on a Raspberry Pi. Free and open source, in the real sense.
+The app sees your files at `/data/library`, not their host path. The image sets `FRAYD_LIBRARY=/data/library`; this takes precedence over the library path saved in Settings. Change the mount source to select a different host folder. Choose **Scan library** after adding or changing media. The read-only media mount prevents the app from changing those source files. The database and thumbnails remain in the `data` volume.
+
+Alternatively, copy files into the default library volume (this uses additional disk space):
+
+```sh
+docker compose cp /absolute/path/to/your/media/. app:/data/library/
+```
+
+### Persistence, stopping and removal
+
+`/data/frayd.sqlite` stores accounts, sessions, library metadata and reading/playback progress. `/data/thumbs` holds generated thumbnails. These survive container recreation in the Compose `data` volume. Back up that volume with the app stopped for a consistent database copy; media bind mounts need their own backup.
+
+```sh
+docker compose ps
+docker compose stop            # stop services, keep containers and data
+docker compose start           # resume services
+docker compose down            # remove containers and networks, keep data
+```
+
+To remove the deployment **and permanently delete its named volume**, including accounts, progress, thumbnails and any media copied into it:
+
+```sh
+docker compose down --volumes
+```
+
+A separately bind-mounted host media directory is not removed by that command. Keep the same Compose project name/directory when restarting if you want to reuse the same volume.
+
+## Supported tools and current limits
+
+- The Docker image includes `ffmpeg` and `ffprobe` for metadata, thumbnails and transcoding. Actual playback still depends on the media format and browser codec support.
+- ZIP-based CBZ/EPUB handling is built into the server. RAR-based CBR needs the optional `unrar` executable, which this image does not include.
+- Automatic router port mapping needs optional `upnpc`. It is not included, and the image defaults `FRAYD_UPNP=0`. The Compose example supplies neither TLS nor automatic network exposure.
+- Outside the isolated Docker network, audio thumbnail fallback can send filename-derived search terms to Apple's iTunes Search API and download artwork. Local metadata/embedded artwork extraction runs first. The supplied Compose app has no external routing, so online artwork lookup is unavailable and a missing thumbnail is expected.
+- Videos are currently classified as movies; season/episode organization is not implemented.
+- The browser installer pages and bootstrap scripts are experimental; the Docker commands above are the reproducible startup route documented here.
+- ZIP readers support stored and deflate archives. Container isolation does not establish that arbitrary media is safe.
+- No license file is currently present in the repository. Do not assume redistribution terms from the public repository alone.
+
+## Development and verification
+
+For a native server, install a current Rust toolchain, Clippy and a C compiler. Keep `client/` beside `server/`: the server embeds that source path at build time. Run from `server/`:
+
+```sh
+cargo test --locked
+cargo clippy --locked --all-targets
+cargo build --locked --release
+FRAYD_LIBRARY=/absolute/path/to/your/media cargo run --locked
+```
+
+The native default port is 8484. Environment overrides include `FRAYD_DB`, `FRAYD_LIBRARY`, `FRAYD_THUMBS`, `FRAYD_PORT`, `FRAYD_UPNP`, and the optional PEM paths `FRAYD_CERT`/`FRAYD_KEY` for TLS. Native runs do not have the Compose network isolation.
+
+From the repository root, with Node.js and Python 3.11+:
+
+```sh
+node --test tests/client.test.cjs
+docker compose config --quiet
+docker compose build
+python3 scripts/integration.py
+python3 -m unittest discover -s tests -p 'test_*.py'
+python3 scripts/audit-dependencies.py
+```
+
+The integration script uses already-built `frayd:local` and `frayd-proxy:local` images, a unique disposable project, a randomly assigned loopback port and a synthetic comic. It checks the page, first-owner setup, scan, comic and range bytes, saved progress, container recreation and logout. It removes its own project and volume in a `finally` block. It never targets the normal `frayd` project. It does not prove browser playback, every media format, watch-party behavior or public-hosting security.
+
+The dependency audit queries OSV for exact versions in `server/Cargo.lock`, prints its findings and exits nonzero on applicable advisories. It records one exact database disagreement: OSV flags `block-buffer 0.10.4` for `GHSA-qwgh-2vcv-g2f7`, while the publisher lists only `>=0.11.0,<0.12.1`. Each audit fetches the publisher advisory from the RustCrypto GitHub API and requires that exact identity, package and range before reporting this finding as `not_affected`. Changed, malformed or unavailable publisher evidence keeps the finding fatal. All other findings remain fatal. OSV network/API failures also fail the command. CI tests this narrow policy and runs the live query as a separate check. No application dependencies are added by these verification scripts.
