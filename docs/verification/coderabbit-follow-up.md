@@ -1,11 +1,11 @@
 # CodeRabbit follow-up verification
 
 Updated 2026-10-28 UTC for [fork draft PR #2](https://github.com/ColterD/Frayd/pull/2).
-This ledger accounts for **26 CodeRabbit issue/diagnostic entries**: the original
+This ledger accounts for **27 CodeRabbit issue/diagnostic entries**: the original
 12, two initial PR #2 documentation comments, two subsequent cleanup findings,
 one outside-diff cache finding, one unverified wording diagnostic and the final
 full-review index finding, the later count-consistency comment and three final
-documentation/harness comments, proxy-command alignment, the later legacy refresh finding and exact image provenance. Summary-only
+documentation/harness comments, proxy-command alignment, the later legacy refresh finding exact image provenance and EPUB spine invalidation. Summary-only
 risks and GitHub CodeQL alerts are recorded separately, not added to that count.
 PR #2 remains draft and unmerged. No deployment is qualified or authorized here.
 
@@ -22,6 +22,7 @@ PR #2 remains draft and unmerged. No deployment is qualified or authorized here.
 | Whole-PR review on `23ba22e` | [5678783997](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5678783997), batch 1/1, one Minor proxy-command alignment; zero outside-diff items, nitpicks or tool diagnostics. Coverage 100%, 56 functions across 12 files, ten unsupported skips. All four preceding review threads were marked addressed and resolved. |
 | Whole-PR review on `9a22ad2` | [5678944739](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5678944739), batch 1/1, one Minor legacy-reference scanner exclusion; zero outside-diff items, nitpicks or tool diagnostics. Coverage 100%, 56 functions across 12 files, ten unsupported skips. The prior proxy-command thread was addressed and resolved. |
 | Whole-PR review on `a634a5f` | [5679275186](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5679275186), batch 1/1, one Minor image-provenance documentation request; zero outside-diff items, nitpicks or tool diagnostics. Coverage 100%, 58 functions across 12 files, ten unsupported skips. Legacy-refresh runtime thread addressed and resolved. |
+| Whole-PR review on `6028ec0` | [5679402211](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5679402211), batch 1/1, one Minor EPUB spine invalidation issue; zero outside-diff items, nitpicks or tool diagnostics. Coverage 100%, 58 functions across 12 files, ten unsupported skips. Image-provenance thread addressed and resolved; all ten checks passed. |
 | Upstream synchronization | Upstream `kattiest/Frayd` commit `540b87acea05304c767a151d47456fceaaf7b29a` merged into fork main at `49de065f3fb0875425f5467b87ae161b43d7914e`, and into the PR branch at `fafad69434a5893cb1d1dbbcbdf56d87f0aab05b`. |
 | Security patch already on fork main | PR-branch patch `b840753a9cabb680b94733ae7a58b6b303619d17` was cherry-picked to fork main as `2789f37e55148e0ee69e7bba6bb5ee30b5f49225`. This fixes the original four EPUB-message sender-boundary findings in source; all four default-branch alerts now report fixed, not dismissed. It does not merge PR #2. |
 | Combined foundation | Implementation `6af4c15` and ancestry-only merge `a6af5f5` include upstream synchronization, hygiene, cache/publication corrections and explicit ingestion trust. Fork main received the narrow ingestion patch at `a7a6dabccce971992d1ed47b00ef66f74811e6e7`. The pre-index app image below passes 28 Rust tests and full runtime qualification; the latest index follow-up passes 29 Rust tests, Clippy and release build. Post-index image/review results are recorded in the PR body; browser evidence stays tied to the unchanged client hash. |
@@ -80,6 +81,8 @@ qualification. A resolved review thread and a passing check are separate evidenc
 | [LEGACY-REFRESH](https://github.com/ColterD/Frayd/pull/2#discussion_r4397774540) | Minor | A legacy conversion reference can suppress scanning a separately indexed genuine file at the referenced path. Keeping the database row is insufficient: replacement size, thumbnails and conversion eligibility must refresh. | Baseline actual scan retained stale size 8 instead of 41 bytes. A provenance-aware ownership predicate now permits indexed legacy targets to refresh; the focused regression preserves ID/progress/metadata, generated-artifact exclusions and unindexed legacy compatibility. All 33 Rust tests, Clippy and release pass; fixed-image real-media runtime refresh and restart persistence pass. |
 
 | [DOC-IMAGE-PROVENANCE](https://github.com/ColterD/Frayd/pull/2#discussion_r4398020230) | Minor, documentation | The legacy-refresh red/green section used short image IDs without source-commit bindings. | Full immutable image digests and verified source-commit bindings are recorded in that section; local receipts distinguish build-time working trees from their later commits. |
+
+| [EPUB-REFRESH](https://github.com/ColterD/Frayd/pull/2#discussion_r4398119571) | Minor | Changed ebook fingerprints retain cached `$.spine`, so a replaced EPUB can expose stale chapter navigation. | Actual scanner/chapter and Docker baselines retain the stale three-entry spine and return 404 for the new first chapter. Ebook-only invalidation and snapshot-guarded field-only lazy-cache publication fix the Rust regression; all 38 Rust tests and Clippy pass. Fixed-image full runtime qualification passes; hosted acceptance is recorded in the PR body. |
 
 The latest full review selected 24 files and excluded one deleted SVG. The earlier
 `3b7a5f5` review selected five files and skipped `tests/test_integration.py` as
@@ -493,3 +496,62 @@ the baseline backend manifest is
 Local receipts retain commands, build manifests, runtime logs, exact fixture
 observations and cleanup checks; the full digest/source/result bindings above
 make this public ledger independent of the local receipt paths.
+
+## EPUB replacement coherence follow-up
+
+Review `5679402211` identified a separate EPUB cache: replacing an ebook changed
+its file fingerprint without invalidating `meta_json.$.spine`. Both the actual
+Rust scanner/chapter regression and disposable Docker HTTP fixture reproduce
+the failure. The fixture warms three chapter paths, preserves them through an
+unchanged scan, then replaces the archive with two chapters using different paths.
+The baseline retains the old three-entry spine and returns HTTP 404 for the new
+first chapter. Unrelated title/progress/metadata and source bytes are checked
+separately from cache invalidation.
+
+The failing runtime artifact is
+`sha256:7d77ce2ccd7967fad3625bb8fa172d6378152607bcb4992e2649934cc0097a5a`,
+whose 31 image inputs match source commit
+`a634a5f4e8c29bca28b854d3ae128fd9039ce660`. The baseline command uses the
+unchanged qualified proxy
+`sha256:543d71e7db7b987f1e41dfb0a297efe5f020c141b2dbc39a859fd2473df7bbe2`.
+Its expected regression failure is retained; independent checks confirm zero
+owned containers, networks or volumes.
+
+The fixed source is committed before its image build as
+`c9bd0e11c1f6d8ae602546b95cab244c6ece58db`, including the exact integration
+harness used for both runs. All 38 Rust tests (32 unit and six archive tests) and
+locked Clippy pass with existing style warnings. Five focused EPUB cases cover
+replacement, unchanged cached order, missing archives, optional cache-write
+refusal, and source-version/path publication guards with preservation of concurrent
+metadata. Ebook fingerprint changes remove only `$.spine`; comic/manga `$.pages`
+invalidation stays intact. Lazy cache computation moves outside the application
+database mutex and publication merges only the spine field under the captured
+database source snapshot. A snapshot mismatch cannot publish the old cache.
+Optional database cache-write failures retain the previously successful chapter
+read behavior, while archive failures remain HTTP 404. The fresh-parsing spine-list
+endpoint is unchanged. These controls do not claim atomicity against arbitrary
+concurrent filesystem writers or detection of replacements preserving both size
+and seconds-granularity mtime.
+
+The fixed normal-build artifact is
+`sha256:c4ecab94711e3c8a2972e6cd096be9e17238f8e618398cd1eb30c7e9e42f63f9`,
+built from the already-committed source and harness
+`c9bd0e11c1f6d8ae602546b95cab244c6ece58db`. Its 31 image, nine verification
+and 20 backend inputs match that revision. Its binary SHA-256 is
+`960022fa84ff3b2148bd731f2656911e9c8fc1dea24a9307faa52081de1002a7`;
+the backend manifest is
+`1519753e3b2ba671b9a7ddb5698c54ab6bd1d2b52ec64878156d4afa11a67142`.
+The pinned Docker build passes all 38 Rust tests, Clippy and release compilation.
+Both baseline and fixed runtime commands use the harness committed at `c9bd0e1`
+and the full proxy digest above; only the application image argument differs.
+
+The fixed full Docker runner exits 0. Its EPUB fixture changes from 1,168 to
+1,654 bytes with mtime advanced five seconds: the warmed old three-entry spine
+is absent immediately after rescan, before any chapter request. Fresh listing
+contains the two renamed chapters, chunks 0 and 1 return exact new XHTML, and
+removed index 2 returns HTTP 404. Only the spine metadata changes; media ID 3,
+title, progress 1 with `updated_at=12346`, custom metadata, the unrelated pages
+field and source hashes remain intact. Restart preserves the new reading order
+and exact bytes. The prior conversion, source-replacement, legacy-reference and
+proxy/scan-phase scenarios also pass. Final-head CI and full review remain gates;
+the prior successful reviews are not relabeled as review of this source.
