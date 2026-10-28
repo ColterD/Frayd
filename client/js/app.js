@@ -81,6 +81,7 @@ $('#settings-btn')?.addEventListener('click', async () => {
       + `<div class="perm-row"><span class="k">Domain</span><input class="s-domain" value="${esc(settings.domain ?? '')}" placeholder="media.example.com" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px;flex:1"><span class="s">A record → your IP; use a real cert (e.g. Let's Encrypt) for this</span></div>`
       + `<div class="party-sec">Library</div>`
       + `<div class="perm-row"><span class="k">Media folder</span><input class="s-library" value="${esc(settings.library_path ?? '')}" placeholder="/home/you/Media" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px;flex:1"><button class="p-scan">Scan now</button></div>`
+      + `<div class="perm-row"><span class="k">Add from URL</span><input class="s-ingest" placeholder="video URL (yt-dlp supported)" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px;flex:1"><button class="p-ingest">Download</button><span class="s">needs yt-dlp installed</span></div>`
       + `<div class="perm-row" style="border:none"><span class="s">Suggested layout (any subset):</span></div>`
       + `<div class="perm-row" style="border:none"><pre class="s" style="color:#8A8F9E;font-size:12px;margin:0;line-height:1.5">Media/\n  Movies/    *.mp4 *.mkv\n  Shows/     S01E01 files\n  Music/     *.mp3 *.flac\n  Audiobooks/ *.m4b *.mp3\n  Ebooks/    *.epub\n  Comics/    *.cbz *.cbr\n  Manga/     folder of images under a *manga* dir</pre></div>`
       + `<button id="s-net-save" style="margin-top:10px;width:100%;background:#5B46F6;color:#fff;border:none;border-radius:8px;padding:10px;cursor:pointer">Save network settings</button>`
@@ -159,6 +160,19 @@ $('#settings-btn')?.addEventListener('click', async () => {
         scanBtn.textContent = r2.status === 409 ? 'busy' : '✗ ' + r2.status;
         setTimeout(() => { scanBtn.textContent = 'Scan now'; }, 2000);
       }
+    };
+    // ingest: yt-dlp download into library, then rescan picks it up
+    const ingestBtn = stage.querySelector('.p-ingest');
+    ingestBtn.onclick = async () => {
+      const url = stage.querySelector('.s-ingest').value.trim();
+      if (!/^https?:\/\//.test(url)) { ingestBtn.textContent = '✗ bad url'; return; }
+      ingestBtn.textContent = 'Starting…';
+      const r = await fetch('/api/ingest', { method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ url }) });
+      if (r.status === 202) {
+        ingestBtn.textContent = 'Downloading… (check library later)';
+        setTimeout(() => { ingestBtn.textContent = 'Download'; }, 5000);
+      } else if (r.status === 501) { ingestBtn.textContent = '✗ no yt-dlp'; setTimeout(() => { ingestBtn.textContent = 'Download'; }, 3000); }
+      else { ingestBtn.textContent = '✗ ' + r.status; setTimeout(() => { ingestBtn.textContent = 'Download'; }, 3000); }
     };
   } catch (e) {
     stage.innerHTML = `<div class="party-sec">Admin access required (${e}). Log out and back in to refresh your session.</div>`;
@@ -816,7 +830,7 @@ function closeEbook() {
 }
 
 function playAudio(it) {
-  $('#video-modal').classList.remove('on');
+  $('#video-modal').classList.remove('on', 'yt');
   $('#playerbar').classList.add('on');
   if (window.partySend) { partyLoadPending = true; partyLoadId = it.id; partyLoadTitle = it.title; }
   $('#pb-title').textContent = it.title;
@@ -850,6 +864,64 @@ function trackProgress(media, it) {
 // guest: follow host playback state (drives bottom audio bar)
 const vidEl = document.getElementById('plyr-video');
 const isVideoId = (id) => LIBRARY.some(x => x.id === id && (x.kind === 'movie' || x.kind === 'show'));
+
+// ---- YouTube party playback (guests + host-load mirror) ----
+// loads YT iframe API once; ytPlayer mirrors host state. Looser drift (YT seek latency ~2s).
+let ytPlayer = null, ytId = null, ytReady = false, ytPending = null;
+const YT_DRIFT = 3;
+window.partyFollowExternal = (vid, title, position, playing, updatedAt, isHostOwn) => {
+  const expected = () => position + (playing ? Math.max(0, Date.now() / 1000 - updatedAt) : 0);
+  $('#video-modal').classList.add('on');
+  $('#video-modal').classList.add('yt');
+  $('#pb-title').textContent = title || 'YouTube';
+  $('#pb-sub').textContent = 'party · youtube';
+  const ensure = (cb) => {
+    if (ytReady) return cb();
+    if (!window.YT) {
+      const t = document.createElement('script');
+      t.src = 'https://www.youtube.com/iframe_api';
+      document.head.appendChild(t);
+      window.onYouTubeIframeAPIReady = () => { ytReady = true; };
+    }
+    const iv = setInterval(() => { if (ytReady) { clearInterval(iv); cb(); } }, 200);
+  };
+  ensure(() => {
+    if (ytId !== vid) {
+      ytId = vid;
+      if (ytPlayer) ytPlayer.destroy();
+      ytPlayer = new YT.Player('yt-party', {
+        videoId: vid,
+        playerVars: { autoplay: 0, playsinline: 1 },
+        events: {
+          onReady: () => { ytPlayer.seekTo(expected(), true); if (playing) ytPlayer.playVideo(); },
+          // host: mirror player state into party broadcasts
+          onStateChange: (e) => {
+            if (!isHostOwn || !window.partySend) return;
+            if (e.data === 1) window.partySend({ type: 'play' });
+            else if (e.data === 2) window.partySend({ type: 'pause' });
+            else if (e.data === 0 && window.partySend) window.partySend({ type: 'pause' });
+          }
+        }
+      });
+      // host: periodic seek mirror (YT has no 'seeked' event)
+      if (isHostOwn) {
+        clearInterval(window._ytSeekTimer);
+        window._ytSeekTimer = setInterval(() => {
+          if (!ytPlayer || !ytPlayer.getCurrentTime || !window.partySend) return;
+          if (ytPlayer.getPlayerState() === 1) window.partySend({ type: 'seek', position: ytPlayer.getCurrentTime() });
+        }, 2000);
+      }
+      return;
+    }
+    if (!ytPlayer || !ytPlayer.seekTo) return;
+    const cur = ytPlayer.getCurrentTime ? ytPlayer.getCurrentTime() : 0;
+    const drift = Math.abs(cur - expected());
+    if (playing && drift > YT_DRIFT) ytPlayer.seekTo(expected(), true);
+    if (playing && ytPlayer.getPlayerState && ytPlayer.getPlayerState() !== 1) ytPlayer.playVideo();
+    if (!playing && ytPlayer.getPlayerState && ytPlayer.getPlayerState() === 1) ytPlayer.pauseVideo();
+  });
+  void isHostOwn;
+};
 
 window.partyFollow = (mediaId, title, position, playing, updatedAt) => {
   const expected = () => position + (playing ? Math.max(0, Date.now() / 1000 - updatedAt) : 0);
@@ -972,6 +1044,7 @@ function openVideo(it) {
   if (window.partySend) videoLoadPending = true;
   $('#vm-title').textContent = it.title;
   $('#video-modal').classList.add('on');
+  $('#video-modal').classList.remove('yt');
   resumeFor(it.id).then(p => {
     plyr.source = {
       type: 'video',

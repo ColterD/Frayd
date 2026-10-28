@@ -38,6 +38,8 @@ impl Party {
 #[derive(Default, Clone, serde::Serialize)]
 pub struct PlaybackState {
     pub media_id: Option<i64>,
+    /// External video (e.g. YouTube id) — takes precedence over media_id when set.
+    pub external_url: Option<String>,
     pub title: Option<String>,
     pub position: f64,
     pub playing: bool,
@@ -49,7 +51,8 @@ pub struct PlaybackState {
 
 #[derive(Clone, serde::Serialize)]
 pub struct QueueItem {
-    pub media_id: i64,
+    pub media_id: Option<i64>,
+    pub external_url: Option<String>,
     pub title: String,
     pub requested_by: String,
 }
@@ -115,16 +118,16 @@ impl Party {
             }
             Some("load") => {
                 st.media_id = msg["media_id"].as_i64();
+                st.external_url = msg["external_url"].as_str().map(String::from);
                 st.title = msg["title"].as_str().map(String::from);
                 st.position = msg["position"].as_f64().unwrap_or(0.0);
                 st.playing = true;
             }
             Some("approve") => {
-                if let (Some(id), Some(title)) =
-                    (msg["media_id"].as_i64(), msg["title"].as_str())
-                {
+                if let Some(title) = msg["title"].as_str() {
                     st.queue.push(QueueItem {
-                        media_id: id,
+                        media_id: msg["media_id"].as_i64(),
+                        external_url: msg["external_url"].as_str().map(String::from),
                         title: title.to_string(),
                         requested_by: msg["by"].as_str().unwrap_or("guest").to_string(),
                     });
@@ -134,10 +137,14 @@ impl Party {
                 // host advances: caller loads next via /api/library
                 if !st.queue.is_empty() {
                     let next = st.queue.remove(0);
-                    st.media_id = Some(next.media_id);
+                    st.media_id = next.media_id;
+                    st.external_url = next.external_url;
                     st.title = Some(next.title);
                     st.position = 0.0;
                     st.playing = true;
+                } else {
+                    st.media_id = None;
+                    st.external_url = None;
                 }
             }
             _ => return false,

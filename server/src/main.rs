@@ -88,6 +88,7 @@ async fn main() {
         .route("/api/admin/settings", get(get_settings).post(set_setting))
         .route("/api/thumb/:id", get(thumb))
         .route("/api/scan", post(move || trigger_scan(State(scan_state.clone()))))
+        .route("/api/ingest", post(ingest))
         .route("/api/scan/status", get(scan_status))
         .route("/api/party", post(party_create))
         .route("/api/party/:code/ws", get(party_ws))
@@ -578,6 +579,62 @@ async fn trigger_scan(State(app): State<std::sync::Arc<App>>) -> StatusCode {
         }
         Err(_) => StatusCode::CONFLICT,
     }
+}
+
+/// POST /api/ingest { url } → download via yt-dlp into <library>/Internet/, then rescan.
+/// Admin-only. yt-dlp is best-effort external binary (like upnpc/ffmpeg).
+#[derive(serde::Deserialize)]
+struct IngestReq {
+    url: String,
+}
+
+async fn ingest(
+    State(app): State<std::sync::Arc<App>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+    Json(body): Json<IngestReq>,
+) -> StatusCode {
+    // admin gate: downloading remote files into the library is an owner action
+    {
+        let db = app.db.lock().unwrap();
+        if require_admin(&db, &headers, q.get("identity").map(|s| s.as_str())).is_err() {
+            return StatusCode::FORBIDDEN;
+        }
+    }
+    // trust boundary: only http(s) URLs, no shell (args passed as array)
+    if !body.url.starts_with("http://") && !body.url.starts_with("https://") {
+        return StatusCode::BAD_REQUEST;
+    }
+    if std::process::Command::new("yt-dlp").arg("--version").output().is_err() {
+        return StatusCode::NOT_IMPLEMENTED; // yt-dlp not installed
+    }
+    let lib = app.library.clone().or_else(|| {
+        let db = app.db.lock().unwrap();
+        let raw: Option<String> = db
+            .query_row("SELECT value FROM settings WHERE key='library_path'", [], |r| r.get(0))
+            .ok();
+        raw.and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
+            .and_then(|v| v.as_str().map(String::from))
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    });
+    let Some(lib) = lib else { return StatusCode::NOT_IMPLEMENTED };
+    let dest = lib.join("Internet");
+    std::fs::create_dir_all(&dest).ok();
+    let url = body.url;
+    // spawn detached: download can take minutes; rescan after success
+    tokio::task::spawn_blocking(move || {
+        let out = dest.join("%(title)s.%(ext)s");
+        let ok = std::process::Command::new("yt-dlp")
+            .args(["-f", "mp4", "--no-playlist", "-o"])
+            .arg(out)
+            .arg(&url)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        tracing::info!("ingest yt-dlp {url}: {}", if ok { "ok" } else { "failed" });
+    });
+    StatusCode::ACCEPTED
 }
 
 #[derive(serde::Deserialize)]
