@@ -13,7 +13,7 @@ with proxy `sha256:70c8658365d70d40979de2f191387b2e5e08bea22b44f960c0e77f751f67f
 The app script is `d676ea713c0975ea5a3236ea98e1bb6e98f11b9c4ab7823d6c1165a5dee29646`.
 All 31 build, 19 verification and 20 backend inputs match the tested commit.
 
-The current harness passes 91 Node tests, 20 Python tests and 25 real-DOM cases,
+The current harness passes 92 Node tests, 20 Python tests and 25 real-DOM cases,
 including five native H.264 decoding controls and parser-gated reader restoration.
 The normal build reuses the qualified 51-test Rust/Clippy/release stage after
 confirming identical backend inputs and output binary; it is not fresh Rust
@@ -48,7 +48,15 @@ regression. A diagnostic-only harness change retains the original failure and in
 redacted owned-browser startup stderr in the failed receipt. Its failure control
 and current 25-case local browser run pass; the next hosted run must expose the
 missing startup evidence before a causal correction can be chosen. Actual-browser acceptance remains
-separate gates. No merge or deployment is authorized.
+a separate gate. On verification head `f16897334b55e5d6c3da201a00791c9bd4855662`,
+[one complete hosted build](https://github.com/ColterD/Frayd/actions/runs/40747689066/job/123025739721)
+passed through browser, lint, Rust/Clippy, image and HTTP/storage/DNS steps. The
+paired job `123025771918` failed before any case at the same five-second startup
+deadline; bounded redacted stderr did not establish a fatal cause. A further diagnostic observes only owned port-file existence and process liveness
+for up to ten seconds after the original five-second failure. It retains the
+failed verdict and never navigates or opens the late endpoint. The late-file and
+never-file controls pass. This is partial hosted success, not a resolved
+intermittent failure. No merge or deployment is authorized.
 
 ## Historical source and fixture boundaries
 

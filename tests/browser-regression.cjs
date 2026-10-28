@@ -57,12 +57,35 @@ async function bounded(promise, message, milliseconds = 3000) {
     })]);
   } finally { clearTimeout(timer); }
 }
-async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
-  const deadline = Date.now() + 5000;
+async function observeLatePortFile({ profile, browser, startedAt, observationMs = 10000 }) {
+  const deadline = Date.now() + observationMs;
+  const portFile = join(profile, 'DevToolsActivePort');
+  while (true) {
+    const elapsedMs = Date.now() - startedAt;
+    const appeared = existsSync(portFile);
+    const processAlive = browser.exitCode === null && browser.signalCode === null;
+    if (appeared || !processAlive || Date.now() >= deadline) {
+      return { additionalBudgetMs: observationMs, elapsedMs, appearedAfterMs: appeared ? elapsedMs : null,
+        processAlive, exitCode: browser.exitCode, signalCode: browser.signalCode };
+    }
+    await delay(Math.min(20, Math.max(0, deadline - Date.now())));
+  }
+}
+async function configureOwnedBrowserCache({ profile, fixtureUrl, browser,
+  lateStartupObservation = observeLatePortFile, onStartupFailure = () => {} }) {
+  const startedAt = Date.now();
+  const deadline = startedAt + 5000;
   const portFile = join(profile, 'DevToolsActivePort');
   while (!existsSync(portFile)) {
     if (browser.exitCode !== null || browser.signalCode !== null) throw new Error('Owned browser exited before cache setup');
-    if (Date.now() >= deadline) throw new Error('Owned browser did not expose its cache-control endpoint');
+    if (Date.now() >= deadline) {
+      const failure = new Error('Owned browser did not expose its cache-control endpoint');
+      onStartupFailure(failure);
+      try { failure.startupObservation = await lateStartupObservation({ profile, browser, startedAt }); }
+      catch (error) { failure.startupObservation = { observationError: redactDebuggerCapabilities(error.message) }; }
+      // Observation never turns the original failure into a navigation attempt.
+      throw failure;
+    }
     await delay(20);
   }
   const port = Number(readFileSync(portFile, 'utf8').split('\n')[0]);
@@ -124,7 +147,8 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
     throw error;
   }
 }
-async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, cacheSetup = configureOwnedBrowserCache } = {}) {
+async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir,
+  cacheSetup = configureOwnedBrowserCache, lateStartupObservation = observeLatePortFile } = {}) {
   let browser;
   let profile;
   let timer;
@@ -143,6 +167,7 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
   let runError;
   let cacheControl;
   let cacheSession;
+  let startupFailure;
   const cleanupErrors = [];
   let browserGroupStopped = false;
   let resolveResult;
@@ -304,11 +329,14 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
     });
     const exited = new Promise((_, reject) => {
       browser.once('error', reject);
-      browser.once('exit', (code, signal) => reject(new Error(`Browser exited before result: ${code}/${signal}; ${logs}`)));
+      browser.once('exit', (code, signal) => {
+        if (!startupFailure) reject(new Error(`Browser exited before result: ${code}/${signal}; ${logs}`));
+      });
     });
     const timedOut = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`Browser regression exceeded 60 seconds; ${logs}`)), 60000); });
     const observed = await Promise.race([(async () => {
-      cacheSession = await cacheSetup({ profile, fixtureUrl: url, browser });
+      cacheSession = await cacheSetup({ profile, fixtureUrl: url, browser, lateStartupObservation,
+        onStartupFailure: error => { startupFailure = error; } });
       cacheControl = cacheSession.receipt;
       return result;
     })(), exited, timedOut]);
@@ -345,6 +373,7 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
   if (runError) {
     output.runnerError = redactDebuggerCapabilities(runError.stack);
     if (!cacheControl) output.startupStderr = redactDebuggerCapabilities(logs).slice(-8192);
+    if (runError.startupObservation) output.startupObservation = runError.startupObservation;
   }
   output.cacheControl = cacheControl;
   output.mediaGate = { held: Boolean(heldMedia), pending: pendingMedia, events: mediaGateEvents };
@@ -356,5 +385,5 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
   writeFileSync(join(evidenceDirectory, 'result.json'), JSON.stringify(output, null, 2) + '\n');
   console.log(JSON.stringify(output, null, 2));
 }
-module.exports = { main, stopBrowserGroup };
+module.exports = { main, stopBrowserGroup, observeLatePortFile };
 if (require.main === module) main().catch(error => { console.error(error.stack); process.exitCode = 1; });
