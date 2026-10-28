@@ -17,7 +17,7 @@ PR #2 remains draft and unmerged. No deployment is qualified or authorized here.
 | Latest completed review | [5677830358](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5677830358), head `3b7a5f590bc914ff39f68894be6bdff0d3561617`, submitted 2026-10-28T04:34:52Z, publication batch 1/1 complete. One outside-diff Minor and one unverified Minor diagnostic. |
 | Upstream synchronization | Upstream `kattiest/Frayd` commit `540b87acea05304c767a151d47456fceaaf7b29a` merged into fork main at `49de065f3fb0875425f5467b87ae161b43d7914e`, and into the PR branch at `fafad69434a5893cb1d1dbbcbdf56d87f0aab05b`. |
 | Security patch already on fork main | PR-branch patch `b840753a9cabb680b94733ae7a58b6b303619d17` was cherry-picked to fork main as `2789f37e55148e0ee69e7bba6bb5ee30b5f49225`. This fixes the original four EPUB-message sender-boundary findings in source; all four default-branch alerts now report fixed, not dismissed. It does not merge PR #2. |
-| Current combined work | Current combined head `d9c91eb` includes fork main's security fix, upstream synchronization and hygiene `ad5dae3`. Backend cache/publication correction is frozen and passes 27 Rust tests, Clippy and release build. New immutable image/runtime/browser qualification is pending; historical results below do not qualify that new runtime. |
+| Current combined work | Implementation `6af4c15` and ancestry-only merge `a6af5f5` include upstream synchronization, hygiene, cache/publication corrections and explicit ingestion trust. Fork main received the narrow ingestion patch at `a7a6dabccce971992d1ed47b00ef66f74811e6e7`. The final app image below passes all 28 Rust tests and full runtime qualification; browser evidence is separately tied to the unchanged client hash. |
 
 Historical runtime images are immutable evidence boundaries:
 `sha256:cf030b02bc7703e5e0a5553971d28dac0238c6fc73b22cbd68d6cd99e88e8861`
@@ -29,11 +29,12 @@ These predate the upstream merge and latest backend corrections. Their successfu
 runs do not qualify the current combined application.
 
 The current backend 20-file manifest has SHA-256
-`5cff0ad4c08db1ab81c15aba00ad97023849d91bfb4992a00e19c12acf78cf49`.
+`84f4cec838e4740875a020b5ce1908b86e45762925758143a783595d893a014a`.
 Reconciliation rehashed all 20 source inputs with zero mismatches. The final
-post-merge Rust run passed 21 unit plus six archive-reader tests (exit 0), Clippy
+final Rust run passed 22 unit plus six archive-reader tests (exit 0), Clippy
 (exit 0, existing warnings) and release build (exit 0). Both client suites passed
-22 tests after the merge. This is source/build evidence; a new runtime is pending.
+22 tests after the merge. Final normal-image build and runtime qualification also pass;
+31 build, nine verification and 20 backend inputs match with zero drift.
 
 ## All 18 CodeRabbit dispositions
 
@@ -43,12 +44,12 @@ qualification. A resolved review thread and a passing check are separate evidenc
 
 | ID | Severity | Verified observation / disposition | Current limit |
 |---|---|---|---|
-| [CR-01](https://github.com/ColterD/Frayd/pull/1#discussion_r4396472345) | Major | Baseline omitted a song after twenty comics (two new VM cases failed). Filtering playable kinds before the cap passed all 11 original client tests. Real Chrome guest join showed only `Later Music` and its Request button; twenty comics were excluded. | Historical scripted/browser pass; combined browser rerun pending. Request relay and decoder behavior were not tested. |
+| [CR-01](https://github.com/ColterD/Frayd/pull/1#discussion_r4396472345) | Major | Baseline omitted a song after twenty comics (two new VM cases failed). Filtering playable kinds before the cap passed all 11 original client tests. Real Chrome guest join showed only `Later Music` and its Request button; twenty comics were excluded. | Historical real-browser and current 22-test scripted regressions pass; the picker function is unchanged. Combined picker browser interaction, request relay and decoder behavior were not separately retested. |
 | [CR-02](https://github.com/ColterD/Frayd/pull/1#discussion_r4396472349) | Major | Baseline scan test exited 101 while the app DB mutex was held. Separate WAL worker connection passes. Disposable runtime explicitly checked health, static root, library and progress through the proxy before, during and after blocked ffprobe; all twelve returned expected data in 0–5 ms in the later run, and release completed scanning. | Historical unit/runtime pass. Timing is fixture-specific; no proxy-startup requirement is inferred. |
 | [CR-03](https://github.com/ColterD/Frayd/pull/1#discussion_r4396472357) | Major | Baseline proxy returned HTTP 502 after app IP replacement and failed its 20s deadline. Later corrected run changed app IP `192.168.112.2` to `.4`; unchanged proxy ID/start time recovered in 8.51s with query/range bytes and WebSocket handshake preserved. | Historical pass; full watch-party protocol not qualified. |
-| [CR-04](https://github.com/ColterD/Frayd/pull/1#discussion_r4396472368) | Major | Actual ffmpeg converted synthetic H264/AC3 to H264/AAC under private `/data/transcodes/<media-id>/<job-uuid>/audio.mp4` with a read-only library. Source hash/names stayed unchanged; converted stream bytes survived app restart. Cache/registry failure and overlap controls fail closed. | Historical runtime/negative-test pass; combined conversion rerun pending. |
+| [CR-04](https://github.com/ColterD/Frayd/pull/1#discussion_r4396472368) | Major | Actual ffmpeg converted synthetic H264/AC3 to H264/AAC under private `/data/transcodes/<media-id>/<job-uuid>/audio.mp4` with a read-only library. Source hash/names stayed unchanged; converted stream bytes survived app restart. Cache/registry failure and overlap controls fail closed. | Final immutable-image conversion and restart stream proof pass; negative ownership/cache controls also pass. |
 | [CR-05](https://github.com/ColterD/Frayd/pull/1#discussion_r4396472379) | Minor | Three pagination regressions failed before correction. Any nonempty OSV continuation token now fails before classification; controlled incomplete CLI response exits 1 with zero report bytes and an explicit diagnostic. | Local controlled HTTP-boundary pass; no live paginated response claimed. |
-| [CR-06](https://github.com/ColterD/Frayd/pull/1#discussion_r4396472389) | Major | Alleged ZIP 9 UTF-8 decoding failure was not reproduced. Unflagged UTF-8 name lookup and saved physical-page index characterization pass. A separate persisted/fresh page-order mismatch failed (exit 101), then passed after listing/content shared persisted order. | Encoding allegation remains un-reproduced. Changed-archive invalidation is a separate valid issue, NEXT-01, corrected with local handler tests; new runtime qualification pending. |
+| [CR-06](https://github.com/ColterD/Frayd/pull/1#discussion_r4396472389) | Major | Alleged ZIP 9 UTF-8 decoding failure was not reproduced. Unflagged UTF-8 name lookup and saved physical-page index characterization pass. A separate persisted/fresh page-order mismatch failed (exit 101), then passed after listing/content shared persisted order. | Encoding allegation remains un-reproduced. Changed-archive invalidation is a separate valid issue, NEXT-01, corrected with local handler tests and real combined-image HTTP replacement proof. |
 | [CR-07](https://github.com/ColterD/Frayd/pull/1#discussion_r4396472409) | Major | Baseline removed one genuine browser-suffixed row (three instead of four); progress-bearing rows survived FK enforcement. Corrected tests retain four IDs, three progress positions and bytes. A legacy-pointer collision was also reproduced and fixed. | Only exact `provenance='generated'` entries grant row-deletion authority. Legacy playback references, suffixes and ambiguous historical names never do. |
 | [CR-08](https://github.com/ColterD/Frayd/pull/1#discussion_r4396472409) | Minor | Exact registered generated rows can be pruned even when the file is absent. Progress, annotations, tracks, playlists, competing ownership and legacy-only provenance retain rows. | Historical fixture pass; no broad orphan deletion or cascading user-data deletion. |
 | [CR-09](https://github.com/ColterD/Frayd/pull/1#pullrequestreview-5677254865) | Trivial | Baseline diagnostics failed. Tests now expose byte/text stderr and preserve the original error through cleanup errors; a real synthetic executable exits 23 with its diagnostic intact. Cleanup failure after success stays fatal. | Subprocess pass; no actual Docker outage induced. |
@@ -59,7 +60,7 @@ qualification. A resolved review thread and a passing check are separate evidenc
 | [PR2-DOC-02](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5677483709) | Trivial | Explicit oracle preserves cached page names, page-index archive lookup, IDs, metadata and progress after upgrade/rescan. Populated legacy startup refreshed two rows; explicit rescan returned HTTP 202 then idle. All 19 HTTP/eight DB assertions passed after each. | Historical pass for unchanged archives; NEXT-01 covers archive replacement. |
 | [FRESH-01](https://github.com/ColterD/Frayd/pull/2#discussion_r4396816530) | Minor | Old cleanup missed a real stopped labelled container. Corrected all-state listing rejects it; removal restores clean checks. Red regression followed by 14 passing Python tests and lint. | Hosted thread resolved/outdated, marked addressed in `3b7a5f5`; historical runtime cleanup passed. |
 | [FRESH-02](https://github.com/ColterD/Frayd/pull/2#discussion_r4396816549) | Minor | Two failed jobs originally left four registry rows. Corrected tests require zero per-job row/directory growth across repeat failure while retaining neighbors/legacy artifacts; historical 24 Rust tests and runtime passed. | Hosted thread resolved/outdated, marked addressed in `3b7a5f5`. Later publication-failure risk is separate below. |
-| [NEXT-01](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5677830358) | Minor, outside diff | Valid: persisted comic pages can outlive source mtime/size changes. Required oracle replaces an archive, rescans, verifies added page listing/index bytes and removed-page behavior while retaining ID/progress/other metadata. | Corrected and locally verified in the frozen 27-test suite; new image/HTTP qualification pending. Seconds-granularity mtime plus size does not detect replacements preserving both values. |
+| [NEXT-01](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5677830358) | Minor, outside diff | Valid: persisted comic pages can outlive source mtime/size changes. Required oracle replaces an archive, rescans, verifies added page listing/index bytes while retaining ID/progress/other metadata. | Corrected in the final 28-test suite and real combined-image HTTP replacement test. Seconds-granularity mtime plus size does not detect replacements preserving both values. |
 | [NEXT-D01](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5677830358) | Minor, unverified tool diagnostic | Report requested “Ubuntu-hosted” wording but explicitly could not confirm its finding. Ledger uses **“hosted run on Ubuntu”** and records the actual historical workflow outcome below. | Wording clarified; diagnostic validity is not claimed. |
 
 The latest review selected five files, and explicitly skipped
@@ -82,8 +83,8 @@ These are outside the 18-entry CodeRabbit count:
   records and unused outputs before correction (exit 101). Final test retires only
   exact unreferenced generated current-job files; repeated failure leaves zero
   records/job directories, unchanged source bytes and NULL playback pointer.
-  Legacy/referenced/neighbor files remain protected. All 27 Rust tests pass; real
-  final-image runtime is pending. Lock/permission/ownership conflicts remain held.
+  Legacy/referenced/neighbor files remain protected. All 28 Rust tests and the
+  final-image runtime suite pass. Lock/permission/ownership conflicts remain held.
 - **Cache namespace containment:** historical negative test exposed a media-ID
   symlink escaping the cache. Correction rejects symlink/non-directory parents and
   atomically creates a UUID directory before registration. Private cache ownership
@@ -112,8 +113,8 @@ These are outside the 18-entry CodeRabbit count:
   job passed; Rust/build jobs were still running in that snapshot. Alert instance
   commit `49de065` identifies the last unsafe instance, not the fixing scan head.
   PR head `d9c91eb` includes the main fix, so it is already in the PR base rather
-  than new PR-only security work. Real-browser sandbox qualification remains
-  pending. Trust of scripts already inside the
+  than new PR-only security work. Real-browser sandbox and legitimate navigation/
+  resume qualification passed on the unchanged current client. Trust of scripts already inside the
   active EPUB frame and same-frame navigation generations are unchanged limits.
 
 ## New archive-replacement qualification
@@ -131,8 +132,9 @@ In the final handler test, rescan after replacement returns
 `[page2,page5,page10]`; page index 1 returns exact `new fifth image` bytes. ID 1,
 position 7, title and synopsis remain unchanged. Malformed metadata is retained;
 unchanged scans report zero updates. These tests invoke actual Axum handlers with
-response bodies, not a network listener. Final-image HTTP replacement/removal
-checks remain pending. A source replacement preserving both second-level mtime
+response bodies, not a network listener. The combined-image network HTTP replacement test also
+passed as recorded below. The final-image removed-page check also passes,
+including exact runtime timestamp and database preservation. A source replacement preserving both second-level mtime
 and exact byte length is outside this fingerprint's detection boundary.
 
 ## Historical qualification and current hygiene
@@ -227,21 +229,19 @@ CI repeats syntax/client/Python/lint/Compose/build/context/integration/audit che
 
 Remaining acceptance gates:
 
-1. Bind the new images to combined head `d9c91eb` and the backend freeze above.
-   The changed-archive/publication oracles, full 27-test Rust suite, Clippy/release
-   build and 22 client tests pass locally. Finish combined Python/lint/current
-   dependency audit and record any changed input hashes; do not reuse old runtime
-   results as qualification for the merged source.
-2. Build new immutable QA images, rerun disposable runtime/legacy/rescan checks,
-   and qualify the actual browser EPUB sender boundary plus intended legitimate
-   reader behavior. Repeat any affected picker behavior on the combined client.
-   Record resource cleanup. No real operator data is required for these fixtures.
-3. Obtain new hosted checks, CodeQL and a completed CodeRabbit review tied to the
-   final PR SHA, including documentation coverage >=80%. Preserve the prior
-   100% result as historical rather than a guarantee for newly touched functions.
-   The four original default-branch alerts are already fixed; finish any remaining
-   main workflow jobs separately from final PR-head acceptance.
-4. Retain draft status until owner acceptance. Deployment, production restart,
+1. Obtain final-head hosted checks, CodeQL and a completed CodeRabbit review,
+   including documentation coverage >=80%. The automatic incremental run on
+   `9f3b700` was skipped before analysis; its findings/coverage are unavailable.
+   The displayed 100% result belongs to `3b7a5f5`, not the skipped or final head.
+   A documented full-review command is the next probe. Review conversations stay
+   open until their complete acceptance oracles and fresh-review gate pass.
+2. Record the remaining CodeQL alert 13 disposition explicitly. Alerts 1-4 and
+   11-12 report fixed through source changes; alert 13 still flags the intended
+   HTTP(S) URL argument after the explicit option terminator. Its source/parser/
+   recorder evidence is retained. The owner approved a false-positive disposition;
+   the full rationale and current remote state are recorded in the PR body. This
+   does not label it fixed by a source change or authorize query suppression.
+3. Retain draft status until owner acceptance. Deployment, production restart,
    real-data migration, arbitrary codecs and full watch-party behavior remain
    outside the qualification recorded here.
 
@@ -255,9 +255,15 @@ and HTTP(S), passed to a fixed executable as one argument without a shell. A
 bounded refinement now binds trusted application state explicitly and terminates
 command options before the URL. An isolated, network-free recorder verifies admin
 and scheme rejection, exact arguments, paths with spaces and literal metacharacters.
-All 28 Rust tests, Clippy and release compilation pass; delivery to fork main and
-hosted reanalysis are pending. These are separate from the four
-EPUB findings already fixed on fork main; no alert is suppressed or dismissed.
+All 28 Rust tests, Clippy and release compilation pass. The narrow patch is also
+on fork main at `a7a6dab`; its separate eight-test Rust suite, Clippy, release and
+all hosted workflow jobs pass. GitHub marks alerts 11-12 fixed. Alert 13 remains
+open despite the literal option terminator and effective argument controls; its
+false-positive disposition has an explicit owner approval, recorded separately
+from the source-fixed alerts. The PR body records the approved full rationale
+and current GitHub state. These are separate from the four
+EPUB findings already fixed on fork main. No query/code suppression was added;
+alert 13 receives the separately approved false-positive disposition.
 
 ## Real-browser and archive-replacement proof
 
@@ -277,4 +283,39 @@ adding a page. After HTTP 202 rescan, the refreshed list and page-1 response
 contained the exact added bytes; ID, title, progress, synopsis and custom metadata
 remained intact. Both owned containers and their network were removed afterward.
 This qualifies the stated image/client. The later ingest-only server refinement
-has separate build/runtime and hosted acceptance gates.
+passes separate final build/runtime qualification below; final-head hosted
+acceptance remains a separate gate.
+
+## Final immutable-image qualification
+
+The final application is
+`sha256:89306784bd39c45379c7cfbad8af9b3ec78adedcca4947eb028b55d3de92090e`;
+proxy `sha256:543d71e7db7b987f1e41dfb0a297efe5f020c141b2dbc39a859fd2473df7bbe2`
+is unchanged. Normal Docker build passed 28 Rust tests, Clippy and release build.
+Node 22/22, Python 14/14, configured CI Ruff, context exclusion and Compose checks
+passed. The exact image/client/binary identities and all 31/9/20 input hashes were
+rechecked after runtime with no drift.
+
+Full disposable integration exited 0. The app IP changed `.2` to `.4`; the proxy
+ID/start time stayed unchanged and HTTP recovered in 9.01 seconds. Query/range
+bytes and WebSocket upgrade passed. All twelve before/during/after scan reads
+returned expected data in 0–7 ms in this fixture. Actual H264/AC3 to H264/AAC
+conversion used a writable cache outside read-only media; source names/hashes and
+exact converted HTTP bytes after restart passed. Cleanup included stopped
+containers and confirmed zero owned containers, networks or volumes. This is local
+qualification, not a deployment or a completed hosted-review claim.
+
+The removed-page scenario used the final `89306784` image with a fresh direct host
+bind, avoiding earlier fixture-copy/snapshot failures. All 44 named checks passed:
+archive size changed 310 to 201 bytes while host and container both retained
+`mtime_ns=1793160000123456789`; `[0.jpg,1.jpg,2.jpg]` refreshed to `[0.jpg,2.jpg]`,
+index 1 returned exact `TWO` bytes and index 2 returned HTTP 404. Consistent SQLite
+backups preserved media ID 8, all unrelated media columns, identity 17, position 1
+and progress timestamp 12345. Four backups passed integrity checks. The earlier
+unsuccessful harness attempts remain failed evidence; this fresh scoped approach
+passed and both attempts' disposable resources were removed.
+
+Remote acceptance metadata is recorded in the PR body, including full-review
+publication, check results and the owner-authorized alert 13 disposition. This
+source ledger preserves immutable test boundaries and never treats a skipped
+review as acceptance.
