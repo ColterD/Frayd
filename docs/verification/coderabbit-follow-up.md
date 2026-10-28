@@ -1,5 +1,21 @@
 # CodeRabbit follow-up verification
 
+[Documentation index](../README.md) · [Operations](../operations.md) · [Development and canonical checks](../development.md)
+
+This is the historical verification ledger, not a setup guide or a current-head
+acceptance report. Use [Development](../development.md#canonical-checks) for the
+maintained command list. Every result below applies only to its recorded source,
+image and scenario. Earlier pending gates describe their historical checkpoint;
+they do not reopen later completed work. Current-head hosted acceptance belongs to
+the [draft PR description](https://github.com/ColterD/Frayd/pull/2). Draft status
+and no-deployment boundaries remain in force until owner acceptance.
+
+Navigation: [source boundaries](#source-and-delivery-boundaries),
+[dispositions](#coderabbit-dispositions),
+[historical commands and gates](#historical-commands-and-acceptance-gates),
+[EPUB follow-up](#epub-replacement-coherence-follow-up),
+[comic cache follow-up](#optional-comic-page-cache-write-follow-up).
+
 Updated 2026-10-28 UTC for [fork draft PR #2](https://github.com/ColterD/Frayd/pull/2).
 This ledger accounts for **29 CodeRabbit issue/diagnostic entries**, including
 original and subsequent findings, outside-diff comments, nitpicks and published
@@ -167,7 +183,7 @@ passed as recorded below. The final-image removed-page check also passes,
 including exact runtime timestamp and database preservation. A source replacement preserving both second-level mtime
 and exact byte length is outside this fingerprint's detection boundary.
 
-## Historical qualification and current hygiene
+## Historical qualification and hygiene
 
 The later pre-upstream image build passed **18 unit + 6 archive-reader tests**,
 Clippy and release build. Its integration exited 0: first-run setup, duplicate
@@ -210,7 +226,11 @@ No new application dependency was added. Hygiene receipt records 22 client tests
 14 Python tests, selected Ruff rules, syntax and whitespace checks passing after
 merge; these do not stand in for combined Rust/image/runtime qualification.
 
-## Repeatable commands and remaining gates
+## Historical commands and acceptance gates
+
+The commands and gates in this section preserve an earlier qualification checkpoint.
+Use [Development](../development.md#canonical-checks) for maintained commands;
+check the actual PR head for current acceptance.
 
 Run from an isolated checkout of the exact commit being qualified. Docker commands
 create QA images and disposable projects; keep tags separate from deployment.
@@ -225,7 +245,7 @@ docker compose config --quiet
 git diff --check
 ```
 
-The current client/Python counts are 22/16 passing respectively, exit 0; the
+At this historical checkpoint the client/Python counts were 22/16 passing respectively, exit 0; the
 extra Python cases cover readiness transport recovery and bounded exhaustion.
 VM tests execute full scripts with synthetic browser/network boundaries; they do
 not establish actual browser sandbox behavior. CI now runs both client suites.
@@ -258,7 +278,7 @@ audit queries current OSV; the historical 209-package clean result and exact
 block-buffer 0.10.4 publisher-range exception do not predict future advisories.
 CI repeats syntax/client/Python/lint/Compose/build/context/integration/audit checks.
 
-Acceptance checks and current remote record:
+Acceptance checks and remote record at that historical checkpoint:
 
 1. Final acceptance requires hosted checks, CodeQL and a completed CodeRabbit review,
    including documentation coverage >=80%. The automatic incremental run on
