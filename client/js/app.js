@@ -425,6 +425,7 @@ function renderHero(it) {
 
 // ---------- playback ----------
 const pbAudio = $('#pb-audio');
+let partyPlaybackKind = null;
 
 function openItem(it) {
   if (it.kind === 'movie' || it.kind === 'show') openVideo(it);
@@ -679,16 +680,14 @@ async function showChunk(n, opts = {}) {
           const range = sel.getRangeAt(0);
           const text = sel.toString().trim();
           if (!text) return;
-          // wrap immediately
-          const mark = document.createElement('mark');
-          mark.className = 'user-highlight';
-          try { range.surroundContents(mark); } catch { return; }
-          sel.removeAllRanges();
-          // serialize: count preceding chars in body text
+          // Paint only after the parent confirms that the highlight was saved.
+          // Serialize the original range before clearing the selection.
+          // Count preceding chars in body text.
           const pre = document.createRange();
           pre.selectNodeContents(document.body);
           pre.setEnd(range.startContainer, range.startOffset);
           const offset = pre.toString().length;
+          sel.removeAllRanges();
           parent.postMessage({type:'highlight', cfi: 'char:' + offset + ':' + text.length, text, page: Math.round(window.scrollX / PW)}, '*');
         });
       <\/script></head>`);
@@ -734,7 +733,7 @@ window.addEventListener('resize', () => {
   clearTimeout(ebookResizeT);
   ebookResizeT = setTimeout(() => showChunk(ebook.chunk), 300);
 });
-window.addEventListener('message', (e) => {
+window.addEventListener('message', async (e) => {
   if (!ebook) return;
   // srcdoc is sandboxed without allow-same-origin, so its origin is opaque.
   // Other opaque frames also report "null": bind messages to our reader window.
@@ -752,18 +751,39 @@ window.addEventListener('message', (e) => {
   } else if (e.data?.type === 'highlight') {
     if (typeof e.data.cfi !== 'string' || !/^char:\d+:\d+$/.test(e.data.cfi)
       || typeof e.data.text !== 'string' || !e.data.text.trim()) return;
-    // persist selection as highlight
-    fetch('/api/annotations', {
-      method: 'POST',
-      headers: authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({
-        media_id: ebook.it.id, kind: 'highlight',
-        spine_idx: ebook.chunk, cfi: e.data.cfi,
-        text: e.data.text, color: 'yellow'
-      })
-    });
-    $('#em-searchinfo').textContent = 'Highlighted';
-    setTimeout(() => { if (ebook) $('#em-searchinfo').textContent = ''; }, 1500);
+    const book = ebook;
+    const chapter = book.chunk;
+    const annotation = {
+      media_id: book.it.id, kind: 'highlight', spine_idx: chapter,
+      cfi: e.data.cfi, text: e.data.text, color: 'yellow'
+    };
+    const isCurrent = () => ebook === book && ebook.chunk === chapter
+      && $('#em-frame').contentWindow === frameWindow;
+    $('#em-searchinfo').textContent = 'Saving highlight…';
+    try {
+      const response = await fetch('/api/annotations', {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify(annotation)
+      });
+      if (response.status !== 201) {
+        if (isCurrent()) $('#em-searchinfo').textContent = response.status === 401
+          ? 'Sign in to save highlights' : 'Could not save highlight. Try again.';
+        return;
+      }
+      book.annots ??= [];
+      const exists = book.annots.some(a => a.kind === 'highlight'
+        && a.spine_idx === chapter && a.cfi === annotation.cfi);
+      if (!exists) book.annots.push(annotation);
+      if (!isCurrent()) return;
+      if (!exists) {
+        const [, off, len] = annotation.cfi.match(/^char:(\d+):(\d+)$/);
+        frameWindow.postMessage({ type: 'inject-hl', items: [{ off: +off, len: +len, color: annotation.color }] }, '*');
+      }
+      $('#em-searchinfo').textContent = 'Highlight saved';
+    } catch {
+      if (isCurrent()) $('#em-searchinfo').textContent = 'Could not save highlight. Try again.';
+    }
   } else if (e.data?.type === 'page') {
     if (!Number.isSafeInteger(e.data.page) || !Number.isSafeInteger(e.data.pages)
       || e.data.page < 1 || e.data.pages < e.data.page) return;
@@ -830,6 +850,7 @@ function closeEbook() {
 }
 
 function playAudio(it) {
+  partyPlaybackKind = 'audio';
   $('#video-modal').classList.remove('on', 'yt');
   $('#playerbar').classList.add('on');
   if (window.partySend) { partyLoadPending = true; partyLoadId = it.id; partyLoadTitle = it.title; }
@@ -862,7 +883,6 @@ function trackProgress(media, it) {
 
 // ---------- party sync ----------
 // guest: follow host playback state (drives bottom audio bar)
-const vidEl = document.getElementById('plyr-video');
 const isVideoId = (id) => LIBRARY.some(x => x.id === id && (x.kind === 'movie' || x.kind === 'show'));
 
 // ---- YouTube party playback (guests + host-load mirror) ----
@@ -870,6 +890,7 @@ const isVideoId = (id) => LIBRARY.some(x => x.id === id && (x.kind === 'movie' |
 let ytPlayer = null, ytId = null, ytReady = false, ytPending = null;
 const YT_DRIFT = 3;
 window.partyFollowExternal = (vid, title, position, playing, updatedAt, isHostOwn) => {
+  partyPlaybackKind = 'external';
   const expected = () => position + (playing ? Math.max(0, Date.now() / 1000 - updatedAt) : 0);
   $('#video-modal').classList.add('on');
   $('#video-modal').classList.add('yt');
@@ -896,10 +917,9 @@ window.partyFollowExternal = (vid, title, position, playing, updatedAt, isHostOw
           onReady: () => { ytPlayer.seekTo(expected(), true); if (playing) ytPlayer.playVideo(); },
           // host: mirror player state into party broadcasts
           onStateChange: (e) => {
-            if (!isHostOwn || !window.partySend) return;
-            if (e.data === 1) window.partySend({ type: 'play' });
-            else if (e.data === 2) window.partySend({ type: 'pause' });
-            else if (e.data === 0 && window.partySend) window.partySend({ type: 'pause' });
+            if (!isHostOwn || !window.partySend || partyPlaybackKind !== 'external') return;
+            if (e.data === 1) window.partySend({ type: 'play', position: ytPlayer.getCurrentTime() });
+            else if (e.data === 2 || e.data === 0) window.partySend({ type: 'pause', position: ytPlayer.getCurrentTime() });
           }
         }
       });
@@ -907,7 +927,7 @@ window.partyFollowExternal = (vid, title, position, playing, updatedAt, isHostOw
       if (isHostOwn) {
         clearInterval(window._ytSeekTimer);
         window._ytSeekTimer = setInterval(() => {
-          if (!ytPlayer || !ytPlayer.getCurrentTime || !window.partySend) return;
+          if (!ytPlayer || !ytPlayer.getCurrentTime || !window.partySend || partyPlaybackKind !== 'external') return;
           if (ytPlayer.getPlayerState() === 1) window.partySend({ type: 'seek', position: ytPlayer.getCurrentTime() });
         }, 2000);
       }
@@ -925,21 +945,23 @@ window.partyFollowExternal = (vid, title, position, playing, updatedAt, isHostOw
 
 window.partyFollow = (mediaId, title, position, playing, updatedAt) => {
   const expected = () => position + (playing ? Math.max(0, Date.now() / 1000 - updatedAt) : 0);
+  partyPlaybackKind = isVideoId(mediaId) ? 'video' : 'audio';
   // video: load into Plyr modal, mirror play/pause/seek on the <video> element
   if (isVideoId(mediaId)) {
+    const video = plyr.media;
     if (partyFollowId !== mediaId) {
       partyFollowId = mediaId;
       pbAudio.pause();
-      vidEl.src = `/api/stream/${mediaId}`;
-      const onMeta = () => { vidEl.currentTime = expected(); if (playing) vidEl.play().catch(() => {}); };
-      if (vidEl.readyState >= 1) onMeta();
-      else vidEl.addEventListener('loadedmetadata', onMeta, { once: true });
+      video.src = `/api/stream/${mediaId}`;
+      const onMeta = () => { video.currentTime = expected(); if (playing) video.play().catch(() => {}); };
+      if (video.readyState >= 1) onMeta();
+      else video.addEventListener('loadedmetadata', onMeta, { once: true });
       $('#video-modal').classList.add('on');
     } else {
-      const drift = Math.abs(vidEl.currentTime - expected());
-      if (drift > 2) vidEl.currentTime = expected();
-      if (playing && vidEl.paused) vidEl.play().catch(() => {});
-      if (!playing && !vidEl.paused) vidEl.pause();
+      const drift = Math.abs(video.currentTime - expected());
+      if (drift > 2) video.currentTime = expected();
+      if (playing && video.paused) video.play().catch(() => {});
+      if (!playing && !video.paused) video.pause();
     }
     return;
   }
@@ -963,26 +985,46 @@ window.partyFollow = (mediaId, title, position, playing, updatedAt) => {
 };
 let partyFollowId = null;
 
+// Panel actions use the active player; its native event is the single command.
+window.partyControlPlayback = async (type, state) => {
+  const playing = type === 'play';
+  if (state?.external_url) {
+    if (!ytPlayer?.getPlayerState || !ytPlayer?.getCurrentTime)
+      throw new Error('YouTube player is not ready');
+    if ((ytPlayer.getPlayerState() === 1) === playing) {
+      window.partySend?.({ type, position: ytPlayer.getCurrentTime() });
+    } else if (playing) ytPlayer.playVideo();
+    else ytPlayer.pauseVideo();
+    return;
+  }
+  if (state?.media_id == null) throw new Error('Choose a track first');
+  const media = isVideoId(state.media_id) ? plyr : pbAudio;
+  if (media.paused === !playing) {
+    window.partySend?.({ type, position: media.currentTime });
+  } else if (playing) await media.play();
+  else media.pause();
+};
+
 // host: local player events push party state
 window.partyHostHook = (send) => {
-  pbAudio.addEventListener('play', () => send({ type: 'play' }));
-  pbAudio.addEventListener('pause', () => send({ type: 'pause' }));
-  pbAudio.addEventListener('seeked', () => send({ type: 'seek', position: pbAudio.currentTime }));
+  pbAudio.addEventListener('play', () => { if (partyPlaybackKind === 'audio') send({ type: 'play', position: pbAudio.currentTime }); });
+  pbAudio.addEventListener('pause', () => { if (partyPlaybackKind === 'audio') send({ type: 'pause', position: pbAudio.currentTime }); });
+  pbAudio.addEventListener('seeked', () => { if (partyPlaybackKind === 'audio') send({ type: 'seek', position: pbAudio.currentTime }); });
   // host loads a track locally → broadcast it
   pbAudio.addEventListener('loadedmetadata', () => {
-    if (window.partySend && partyLoadPending) {
+    if (window.partySend && partyPlaybackKind === 'audio' && partyLoadPending) {
       partyLoadPending = false;
       send({ type: 'load', media_id: partyLoadId, title: partyLoadTitle, position: pbAudio.currentTime });
     }
   });
   // host video: mirror Plyr play/pause/seek + load
-  vidEl.addEventListener('play', () => send({ type: 'play' }));
-  vidEl.addEventListener('pause', () => send({ type: 'pause' }));
-  vidEl.addEventListener('seeked', () => send({ type: 'seek', position: vidEl.currentTime }));
-  vidEl.addEventListener('loadedmetadata', () => {
-    if (window.partySend && videoLoadPending && videoItem) {
+  plyr.on('play', () => { if (partyPlaybackKind === 'video') send({ type: 'play', position: plyr.currentTime }); });
+  plyr.on('pause', () => { if (partyPlaybackKind === 'video') send({ type: 'pause', position: plyr.currentTime }); });
+  plyr.on('seeked', () => { if (partyPlaybackKind === 'video') send({ type: 'seek', position: plyr.currentTime }); });
+  plyr.on('loadedmetadata', () => {
+    if (window.partySend && partyPlaybackKind === 'video' && videoLoadPending && videoItem) {
       videoLoadPending = false;
-      send({ type: 'load', media_id: videoItem.id, title: videoItem.title, position: vidEl.currentTime });
+      send({ type: 'load', media_id: videoItem.id, title: videoItem.title, position: plyr.currentTime });
     }
   });
 };
@@ -1038,6 +1080,7 @@ const plyr = new Plyr('#plyr-video', {
 let videoItem = null;
 
 function openVideo(it) {
+  partyPlaybackKind = 'video';
   $('#playerbar').classList.remove('on');
   pbAudio.pause();
   videoItem = it;
@@ -1050,7 +1093,7 @@ function openVideo(it) {
       type: 'video',
       sources: [{ src: `/api/stream/${it.id}`, type: 'video/mp4' }],
     };
-    if (p && p.position > 5) plyr.on('ready', () => { plyr.currentTime = p.position; }, { once: true });
+    if (p && p.position > 5) plyr.once('loadedmetadata', () => { plyr.currentTime = p.position; });
     plyr.play();
   });
   trackProgress(plyr, it);

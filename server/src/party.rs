@@ -104,15 +104,38 @@ impl Party {
 
     /// Host-only state mutation, then broadcast.
     pub fn host_update(&self, msg: &Value) -> bool {
+        self.host_update_at(msg, now())
+    }
+
+    fn host_update_at(&self, msg: &Value, timestamp: i64) -> bool {
         if !self.active.load(Ordering::SeqCst) {
             return false;
         }
+        let action = msg["type"].as_str();
+        if !matches!(action, Some("play" | "pause" | "seek" | "load" | "approve" | "skip")) {
+            return false;
+        }
+        let position = msg["position"].as_f64().filter(|p| p.is_finite() && *p >= 0.0);
         let mut st = self.state.lock().unwrap();
-        match msg["type"].as_str() {
-            Some("play") => st.playing = true,
-            Some("pause") => st.playing = false,
+        // Preserve elapsed playback before replacing the timeline's reference time.
+        if st.playing {
+            st.position += timestamp.saturating_sub(st.updated_at).max(0) as f64;
+        }
+        match action {
+            Some("play") => {
+                if let Some(p) = position {
+                    st.position = p;
+                }
+                st.playing = true;
+            }
+            Some("pause") => {
+                if let Some(p) = position {
+                    st.position = p;
+                }
+                st.playing = false;
+            }
             Some("seek") => {
-                if let Some(p) = msg["position"].as_f64() {
+                if let Some(p) = position {
                     st.position = p;
                 }
             }
@@ -120,7 +143,7 @@ impl Party {
                 st.media_id = msg["media_id"].as_i64();
                 st.external_url = msg["external_url"].as_str().map(String::from);
                 st.title = msg["title"].as_str().map(String::from);
-                st.position = msg["position"].as_f64().unwrap_or(0.0);
+                st.position = position.unwrap_or(0.0);
                 st.playing = true;
             }
             Some("approve") => {
@@ -149,7 +172,7 @@ impl Party {
             }
             _ => return false,
         }
-        st.updated_at = now();
+        st.updated_at = timestamp;
         true
     }
 
@@ -248,4 +271,73 @@ pub async fn member_socket(party: Arc<Party>, socket: WebSocket, key: String, is
         party.broadcast(&serde_json::json!({ "type": "members", "members": names }));
     }
     out_task.abort();
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn playing_party() -> Party {
+        let party = Party::new();
+        party.active.store(true, Ordering::SeqCst);
+        *party.state.lock().unwrap() = PlaybackState {
+            media_id: Some(1),
+            position: 10.0,
+            playing: true,
+            updated_at: 100,
+            ..Default::default()
+        };
+        party
+    }
+
+    #[test]
+    fn play_pause_use_supplied_position_and_legacy_commands_preserve_elapsed_time() {
+        let party = playing_party();
+        assert!(party.host_update_at(&json!({"type": "pause", "position": 47.5}), 120));
+        let paused = party.state.lock().unwrap().clone();
+        assert_eq!(paused.position, 47.5);
+        assert!(!paused.playing);
+        assert!(party.host_update_at(&json!({"type": "play"}), 130));
+        assert_eq!(party.state.lock().unwrap().position, 47.5);
+        assert!(party.host_update_at(&json!({"type": "pause"}), 140));
+        assert_eq!(party.state.lock().unwrap().position, 57.5);
+        assert!(party.host_update_at(&json!({"type": "play", "position": 72.0}), 150));
+        assert_eq!(party.state.lock().unwrap().position, 72.0);
+    }
+
+    #[test]
+    fn approve_and_empty_skip_materialize_the_running_timeline() {
+        let party = playing_party();
+        assert!(party.host_update_at(&json!({"type": "approve", "media_id": 2, "title": "Next"}), 120));
+        assert_eq!(party.state.lock().unwrap().position, 30.0);
+        assert_eq!(party.state.lock().unwrap().updated_at, 120);
+        assert!(party.host_update_at(&json!({"type": "skip"}), 125));
+        let next = party.state.lock().unwrap().clone();
+        assert_eq!(next.media_id, Some(2));
+        assert_eq!(next.position, 0.0);
+        assert!(party.host_update_at(&json!({"type": "skip"}), 135));
+        let empty = party.state.lock().unwrap().clone();
+        assert_eq!(empty.position, 10.0);
+        assert_eq!(empty.updated_at, 135);
+        assert_eq!(empty.media_id, None);
+    }
+
+    #[test]
+    fn invalid_positions_fall_back_without_rewinding_and_load_resets() {
+        for position in [json!(-1), json!("NaN"), Value::Null] {
+            let party = playing_party();
+            assert!(party.host_update_at(&json!({"type": "pause", "position": position}), 120));
+            assert_eq!(party.state.lock().unwrap().position, 30.0);
+        }
+        let party = playing_party();
+        let before = serde_json::to_value(&*party.state.lock().unwrap()).unwrap();
+        assert!(!party.host_update_at(&json!({"type": "unknown"}), 120));
+        assert_eq!(serde_json::to_value(&*party.state.lock().unwrap()).unwrap(), before);
+        assert!(party.host_update_at(&json!({"type": "pause"}), 125));
+        assert_eq!(party.state.lock().unwrap().position, 35.0);
+        assert!(party.host_update_at(&json!({"type": "load", "media_id": 3}), 130));
+        assert_eq!(party.state.lock().unwrap().position, 0.0);
+    }
 }

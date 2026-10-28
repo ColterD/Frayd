@@ -13,6 +13,7 @@ function browser() {
   function element() {
     const classes = new Set();
     const attributes = new Map();
+    const events = new Map();
     return {
       style: {}, dataset: {}, children: [], value: '', type: '', innerHTML: '', textContent: '',
       src: '', paused: true, readyState: 1, currentTime: 0, clientWidth: 760, clientHeight: 600,
@@ -22,11 +23,21 @@ function browser() {
       },
       setAttribute: (name, value) => attributes.set(name, value),
       getAttribute: name => attributes.get(name),
-      addEventListener() {},
+      addEventListener(name, callback, options) {
+        const handlers = events.get(name) || [];
+        handlers.push({ callback, once: options?.once });
+        events.set(name, handlers);
+      },
+      emit(name) {
+        const handlers = events.get(name) || [];
+        events.set(name, handlers.filter(handler => !handler.once));
+        for (const handler of handlers) handler.callback();
+        this['on' + name]?.();
+      },
       appendChild(child) { this.children.push(child); },
       append(...children) { this.children.push(...children); },
-      pause() { this.paused = true; },
-      play() { this.paused = false; return Promise.resolve(); },
+      pause() { if (!this.paused) { this.paused = true; queueMicrotask(() => this.emit('pause')); } },
+      play() { if (this.paused) { this.paused = false; queueMicrotask(() => this.emit('play')); } return Promise.resolve(); },
     };
   }
   const html = readFileSync(join(clientPath, 'index.html'), 'utf8');
@@ -38,7 +49,7 @@ function browser() {
     }
     nodes.set('#' + match[1], node);
   }
-  for (const selector of ['#search input', '.avatar', '#hero-play', '#hero-backdrop', '#pt-host', '#pt-join', '#party-code-input']) nodes.set(selector, element());
+  for (const selector of ['#search input', '.avatar', '#hero-play', '#hero-backdrop', '#pt-host', '#pt-join', '#party-code-input', '#pt-play', '#pt-pause', '#pt-skip']) nodes.set(selector, element());
   nodes.get('#em-frame').contentWindow = { postMessage() {} };
   nodes.get('#add-media').innerHTML = html.match(/<button id="add-media">([\s\S]*?)<\/button>/)[1];
   const requests = [];
@@ -58,8 +69,36 @@ function browser() {
     setTimeout() {}, clearTimeout() {},
     setInterval: fn => { const id = intervals.size + 1; intervals.set(id, fn); return id; },
     clearInterval: id => intervals.delete(id),
-    Plyr: class {}, Image: class {},
-    WebSocket: class { constructor() { sockets.push(this); } },
+    Plyr: class {
+      constructor() { this.events = element(); this.duration = 0; this.bindMedia(nodes.get('#plyr-video')); }
+      bindMedia(media) {
+        this.media = media;
+        for (const name of ['play', 'pause', 'seeked', 'loadedmetadata', 'ready'])
+          media.addEventListener(name, () => this.events.emit(name));
+      }
+      set source(value) {
+        this.sourceValue = value;
+        this.media.paused = true;
+        const media = element();
+        media.src = value.sources[0].src;
+        nodes.set('#plyr-video', media);
+        this.bindMedia(media);
+        this.duration = 0;
+      }
+      set currentTime(value) { if (this.duration) this.media.currentTime = Math.min(value, this.duration); }
+      get currentTime() { return this.media.currentTime; }
+      get paused() { return this.media.paused; }
+      on(name, callback) { this.events.addEventListener(name, callback); }
+      once(name, callback) { this.events.addEventListener(name, callback, { once: true }); }
+      emit(name) { this.media.emit(name); }
+      play() { return this.media.play(); }
+      pause() { this.media.pause(); }
+      stop() { this.pause(); this.currentTime = 0; }
+    }, Image: class {},
+    WebSocket: class {
+      constructor() { this.readyState = 1; this.sent = []; sockets.push(this); }
+      send(message) { this.sent.push(JSON.parse(message)); }
+    },
   });
   context.window = context;
   vm.runInContext(readFileSync(join(clientPath, 'js/app.js'), 'utf8'), context);
@@ -67,6 +106,7 @@ function browser() {
     context, nodes, requests, intervals, sockets,
     run: source => vm.runInContext(source, context),
     respond: fn => { response = fn; },
+    message: data => listeners.get('message')({ data, origin: 'null', source: nodes.get('#em-frame').contentWindow }),
     page: (page, pages) => listeners.get('message')({
       data: { type: 'page', page, pages }, origin: 'null', source: nodes.get('#em-frame').contentWindow,
     }),
@@ -240,4 +280,294 @@ test('party guest picker preserves playable order, escapes titles and limits pla
   b.run('partyFollow(8, "Audiobook", 4, false, 0)');
   assert.equal(b.nodes.get('#pb-audio').src, '/api/stream/8');
   assert.equal(b.nodes.get('#plyr-video').src, '');
+});
+
+// Plyr's ready event precedes metadata; its seek setter ignores unknown duration.
+test('movie reopen restores saved time after metadata, without undoing later seeks', async () => {
+  const b = browser();
+  let savedPosition = 203;
+  b.respond(async () => ({ ok: true, json: async () => ({ position: savedPosition }) }));
+  for (const [position, readyFirst] of [[203, true], [50, false]]) {
+    savedPosition = position;
+    b.run('openVideo({ id: 1, kind: "movie", title: "Movie" })');
+    await new Promise(resolve => setImmediate(resolve));
+    if (readyFirst) b.run('plyr.emit("ready")');
+    assert.equal(b.run('plyr.currentTime'), 0);
+    b.run('plyr.duration = 634; plyr.emit("loadedmetadata")');
+    assert.equal(b.run('plyr.currentTime'), position);
+    if (!readyFirst) b.run('plyr.emit("ready")');
+    b.run('plyr.currentTime = 300; plyr.emit("loadedmetadata")');
+    assert.equal(b.run('plyr.currentTime'), 300);
+    b.nodes.get('#vm-back').onclick();
+  }
+});
+
+test('movie without meaningful saved progress starts at zero', async () => {
+  for (const saved of [null, { position: 5 }]) {
+    const b = browser();
+    b.respond(async () => ({ ok: true, json: async () => saved }));
+    b.run('openVideo({ id: 1, kind: "movie", title: "Movie" })');
+    await new Promise(resolve => setImmediate(resolve));
+    b.run('plyr.emit("ready"); plyr.duration = 634; plyr.emit("loadedmetadata")');
+    assert.equal(b.run('plyr.currentTime'), 0);
+  }
+});
+
+test('audio resume preserves saved time with available or delayed metadata', async () => {
+  for (const readyState of [0, 1]) {
+    const b = browser();
+    const audio = b.nodes.get('#pb-audio');
+    audio.readyState = readyState;
+    b.respond(async () => ({ ok: true, json: async () => ({ position: 106 }) }));
+    b.run('playAudio({ id: 2, kind: "music", title: "Music" })');
+    await new Promise(resolve => setImmediate(resolve));
+    if (!readyState) {
+      assert.equal(audio.currentTime, 0);
+      assert.equal(audio.paused, true);
+      audio.readyState = 1;
+      audio.emit('loadedmetadata');
+    }
+    assert.equal(audio.currentTime, 106);
+    assert.equal(audio.paused, false);
+    audio.currentTime = 120;
+    audio.emit('loadedmetadata');
+    assert.equal(audio.currentTime, 120);
+  }
+});
+
+
+function highlightReader() {
+  const b = browser();
+  b.run('ebook = { it: { id: 7 }, chunk: 1, spine: ["a", "b"], annots: [] }');
+  const posted = [];
+  b.nodes.get('#em-frame').contentWindow.postMessage = data => posted.push(data);
+  return { b, posted };
+}
+
+const highlightMessage = { type: 'highlight', cfi: 'char:0:5', text: 'Hello' };
+const settle = () => new Promise(resolve => setImmediate(resolve));
+
+for (const [name, response, expected] of [
+  ['guest denial', async () => ({ status: 401 }), 'Sign in to save highlights'],
+  ['HTTP failure', async () => ({ status: 500 }), 'Could not save highlight. Try again.'],
+  ['network failure', async () => { throw new Error('offline'); }, 'Could not save highlight. Try again.'],
+]) {
+  test(`highlight ${name} reports failure without saving state or painting`, async () => {
+    const { b, posted } = highlightReader();
+    b.respond(response);
+    b.message(highlightMessage);
+    await settle();
+    assert.equal(b.nodes.get('#em-searchinfo').textContent, expected);
+    assert.equal(b.run('ebook.annots.length'), 0);
+    assert.deepEqual(posted, []);
+  });
+}
+
+test('highlight waits for creation and retains saved state for chapter revisit without duplicate paint', async () => {
+  const { b, posted } = highlightReader();
+  let finish;
+  b.respond(() => new Promise(resolve => { finish = resolve; }));
+  b.message(highlightMessage);
+  assert.equal(b.nodes.get('#em-searchinfo').textContent, 'Saving highlight…');
+  assert.equal(b.run('ebook.annots.length'), 0);
+  assert.deepEqual(posted, []);
+  finish({ status: 201 });
+  await settle();
+  assert.equal(b.nodes.get('#em-searchinfo').textContent, 'Highlight saved');
+  assert.equal(b.run('ebook.annots.length'), 1);
+  assert.equal(posted.length, 1);
+  assert.equal(posted[0].type, 'inject-hl');
+  b.respond(async () => ({ status: 201 }));
+  b.message(highlightMessage);
+  await settle();
+  assert.equal(b.run('ebook.annots.length'), 1);
+  assert.equal(posted.length, 1);
+  b.respond(async () => ({ text: async () => '<html><head></head><body>Hello world</body></html>' }));
+  const timers = [];
+  b.context.setTimeout = fn => timers.push(fn);
+  await b.run('showChunk(0)');
+  await b.run('showChunk(1)');
+  for (const timer of timers) timer();
+  assert.equal(posted.length, 2);
+  assert.equal(posted[1].items[0].off, 0);
+  assert.equal(posted[1].items[0].len, 5);
+});
+
+test('pending highlight completion keeps captured book and chapter without touching a new reader', async () => {
+  for (const status of [201, 401]) {
+    const { b, posted } = highlightReader();
+    let finish;
+    b.respond(() => new Promise(resolve => { finish = resolve; }));
+    b.message(highlightMessage);
+    b.run('previousBook = ebook; ebook = { it: { id: 8 }, chunk: 0, spine: ["c"], annots: [] }');
+    b.nodes.get('#em-searchinfo').textContent = 'New book';
+    finish({ status });
+    await settle();
+    assert.equal(b.run('ebook.annots.length'), 0);
+    assert.equal(b.nodes.get('#em-searchinfo').textContent, 'New book');
+    assert.deepEqual(posted, []);
+    assert.equal(b.run('previousBook.annots.length'), status === 201 ? 1 : 0);
+    assert.equal(JSON.parse(b.requests[0].options.body).spine_idx, 1);
+    assert.equal(JSON.parse(b.requests[0].options.body).media_id, 7);
+  }
+});
+
+
+test('generated reader selection paints only after a saved highlight is injected', async () => {
+  const { b } = highlightReader();
+  b.respond(async () => ({ text: async () => '<html><head></head><body>prefix Hello world</body></html>' }));
+  await b.run('showChunk(1)');
+  const script = b.nodes.get('#em-frame').srcdoc.match(/<script>([\s\S]*?)<\/script>/)[1];
+  const messages = [];
+  const frameListeners = [];
+  const documentListeners = new Map();
+  const textNode = { nodeValue: 'prefix Hello world' };
+  let painted = 0;
+  let selectionCleared = false;
+  const selection = {
+    isCollapsed: false, rangeCount: 1,
+    getRangeAt: () => ({ startContainer: textNode, startOffset: 7 }),
+    toString: () => 'Hello', removeAllRanges: () => { selectionCleared = true; },
+  };
+  const frame = {
+    addEventListener: (name, fn) => { if (name === 'message') frameListeners.push(fn); },
+    getSelection: () => selection, scrollX: 0,
+  };
+  const document = {
+    body: {}, head: { appendChild() {} },
+    addEventListener: (name, fn) => documentListeners.set(name, fn),
+    createElement: () => ({ style: { setProperty() {} } }),
+    createRange: () => ({
+      selectNodeContents() {}, setStart() {}, setEnd() {}, toString: () => 'prefix ',
+      surroundContents: () => { painted++; },
+    }),
+    createTreeWalker: () => {
+      let visited = false;
+      return { currentNode: textNode, nextNode: () => { if (visited) return false; visited = true; return true; } };
+    },
+  };
+  vm.runInNewContext(script, { window: frame, document, parent: { postMessage: data => messages.push(data) }, NodeFilter: { SHOW_TEXT: 4 } });
+  documentListeners.get('mouseup')();
+  assert.equal(painted, 0);
+  assert.equal(selectionCleared, true);
+  assert.equal(messages[0].cfi, 'char:7:5');
+  for (const listener of frameListeners) listener({ data: { type: 'inject-hl', items: [{ off: 7, len: 5, color: 'yellow' }] } });
+  assert.equal(painted, 1);
+});
+
+
+async function hostParty(kind = 'music') {
+  const b = browser();
+  b.run(`LIBRARY = [{ id: 9, kind: "${kind}", title: "Track" }]`);
+  vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), b.context);
+  b.nodes.get('#party-code-input').value = 'ABCD';
+  b.run('PartyUI.open()');
+  b.nodes.get('#pt-join').onclick();
+  const socket = b.sockets[0];
+  const state = { media_id: 9, title: 'Track', queue: [], position: 0, playing: true, updated_at: Date.now() / 1000 };
+  socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: true, state }) });
+  await settle();
+  socket.sent.length = 0;
+  return { b, socket, state, media: b.nodes.get(kind === 'movie' ? '#plyr-video' : '#pb-audio') };
+}
+
+for (const kind of ['music', 'movie']) {
+  test(`party panel controls actual ${kind} once, includes position, and ignores same-media echoes`, async () => {
+    const { b, socket, state, media } = await hostParty(kind);
+    media.currentTime = 47;
+    b.nodes.get('#pt-pause').onclick();
+    assert.equal(media.paused, true);
+    assert.deepEqual(socket.sent, []); // Native events arrive asynchronously.
+    await settle();
+    assert.deepEqual(socket.sent, [{ type: 'pause', position: 47 }]);
+    socket.onmessage({ data: JSON.stringify({ type: 'state', state: { ...state, playing: false, position: 47 } }) });
+    await settle();
+    assert.equal(media.currentTime, 47);
+    assert.equal(socket.sent.length, 1);
+    b.nodes.get('#pt-pause').onclick();
+    await settle();
+    assert.deepEqual(socket.sent[1], { type: 'pause', position: 47 });
+    b.nodes.get('#pt-play').onclick();
+    await settle();
+    assert.equal(media.paused, false);
+    assert.deepEqual(socket.sent[2], { type: 'play', position: 47 });
+    assert.equal(socket.sent.length, 3);
+    const inactive = b.nodes.get(kind === 'movie' ? '#pb-audio' : '#plyr-video');
+    assert.equal(inactive.paused, true);
+  });
+}
+
+test('native party controls include the active audio/video timeline position', async () => {
+  for (const kind of ['music', 'movie']) {
+    const { socket, media } = await hostParty(kind);
+    media.currentTime = 61.5;
+    media.pause();
+    await settle();
+    media.play();
+    await settle();
+    assert.deepEqual(socket.sent, [{ type: 'pause', position: 61.5 }, { type: 'play', position: 61.5 }]);
+  }
+});
+
+
+test('party video follow and host hooks use replacement Plyr media', async () => {
+  const { b, socket, media: oldMedia } = await hostParty('movie');
+  b.run('plyr.source = { type: "video", sources: [{ src: "/api/stream/9" }] }');
+  const media = b.nodes.get('#plyr-video');
+  assert.notEqual(media, oldMedia);
+  b.run('partyFollow(9, "Movie", 49, true, Date.now() / 1000)');
+  await settle();
+  assert.ok(media.currentTime >= 49 && media.currentTime < 50);
+  socket.sent.length = 0;
+  b.nodes.get('#pt-pause').onclick();
+  await settle();
+  assert.equal(media.paused, true);
+  assert.equal(socket.sent.length, 1);
+  assert.equal(socket.sent[0].type, 'pause');
+  assert.equal(socket.sent[0].position, media.currentTime);
+});
+
+test('unready external party controls explain the failure without native fallback', async () => {
+  const { b, socket, media } = await hostParty();
+  media.currentTime = 47;
+  await assert.rejects(b.run('partyControlPlayback("pause", { external_url: "abcdefghijk" })'), /YouTube player is not ready/);
+  assert.equal(media.paused, false);
+  assert.deepEqual(socket.sent, []);
+});
+
+test('party guest requests and host approval still use the queue protocol', async () => {
+  const guest = browser();
+  const request = { dataset: { media: '9', title: 'Requested track' } };
+  guest.context.document.querySelectorAll = selector => selector === '.pt-request' ? [request] : [];
+  vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), guest.context);
+  guest.nodes.get('#party-code-input').value = 'ABCD';
+  guest.run('PartyUI.open()');
+  guest.nodes.get('#pt-join').onclick();
+  const guestSocket = guest.sockets[0];
+  guestSocket.onmessage({ data: JSON.stringify({ type: 'state', is_host: false, state: { queue: [], playing: false } }) });
+  request.onclick();
+  assert.deepEqual(guestSocket.sent, [{ type: 'request', media_id: 9, title: 'Requested track' }]);
+  const { b, socket, state } = await hostParty();
+  const approval = { dataset: { req: '0' } };
+  b.context.document.querySelectorAll = selector => selector === '.pt-approve' ? [approval] : [];
+  socket.onmessage({ data: JSON.stringify({ type: 'request', media_id: 9, title: 'Requested track', by: 'guest' }) });
+  approval.onclick();
+  assert.deepEqual(socket.sent, [{ type: 'approve', media_id: 9, title: 'Requested track', by: 'guest' }]);
+  socket.onmessage({ data: JSON.stringify({ type: 'state', state: { ...state, queue: [{ title: 'Requested track', requested_by: 'guest' }] } }) });
+  assert.match(b.nodes.get('#party-stage').innerHTML, /Requested track/);
+});
+
+
+test('inactive audio events cannot overwrite video party playback during a switch', async () => {
+  const { b, socket, media: audio } = await hostParty();
+  audio.currentTime = 47;
+  b.run('LIBRARY.push({ id: 10, kind: "movie", title: "Movie" }); partyFollow(10, "Movie", 12, true, Date.now() / 1000)');
+  await settle();
+  assert.equal(audio.paused, true);
+  assert.deepEqual(socket.sent.map(command => command.type), ['play']);
+  assert.ok(socket.sent[0].position >= 12 && socket.sent[0].position < 13);
+  audio.emit('play');
+  audio.emit('pause');
+  audio.emit('seeked');
+  assert.equal(socket.sent.length, 1);
 });

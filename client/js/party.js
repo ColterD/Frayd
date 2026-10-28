@@ -188,8 +188,13 @@ const PartyUI = (() => {
       ${requestsHtml()}
       ${libraryPickerHtml()}`;
     const bind = (id, fn) => { const b = $(id); if (b) b.onclick = fn; };
-    bind('#pt-play', () => send({ type: 'play' }));
-    bind('#pt-pause', () => send({ type: 'pause' }));
+    const control = async type => {
+      if (typeof window.partyControlPlayback !== 'function') return renderError('Player is not ready');
+      try { await window.partyControlPlayback(type, state); }
+      catch (error) { renderError(error.message); }
+    };
+    bind('#pt-play', () => control('play'));
+    bind('#pt-pause', () => control('pause'));
     bind('#pt-skip', () => send({ type: 'skip' }));
     bind('#pt-host', host);
     bind('#pt-join', join);
