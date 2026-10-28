@@ -2,6 +2,8 @@
 'use strict';
 
 const PartyUI = (() => {
+  // youtube video id from watch?v=, youtu.be/, shorts/, embed/ URLs
+  const YT_RE = /(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/)|youtu\.be\/)([\w-]{11})/;
   let ws = null;
   let isHost = false;
   let state = null;
@@ -71,6 +73,11 @@ const PartyUI = (() => {
   const DRIFT = 1.5; // seconds — resync beyond this
 
   function followState() {
+    if (state && state.external_url) {
+      if (typeof window.partyFollowExternal === 'function')
+        window.partyFollowExternal(state.external_url, state.title, state.position, state.playing, state.updated_at, false);
+      return;
+    }
     if (typeof window.partyFollow !== 'function') return;
     if (state && state.media_id != null) {
       window.partyFollow(state.media_id, state.title, state.position, state.playing, state.updated_at);
@@ -80,12 +87,20 @@ const PartyUI = (() => {
   // host: only load tracks the party state changed to (skip/queue-advance) —
   // never follow play/pause/seek (those originate from host's own player events)
   function followMediaChangeOnly() {
+    // external (YouTube) load → mirror into YT player, host events handled separately
+    const ext = state?.external_url;
+    if (ext && ext !== hostLoadedExt && typeof window.partyFollowExternal === 'function') {
+      hostLoadedExt = ext;
+      window.partyFollowExternal(ext, state.title, 0, state.playing, state.updated_at, true);
+      return;
+    }
     const id = state?.media_id;
     if (id != null && id !== hostLoadedMedia && typeof window.partyFollow === 'function') {
       hostLoadedMedia = id;
       window.partyFollow(id, state.title, 0, state.playing, state.updated_at);
     }
   }
+  let hostLoadedExt = null;
 
   // ---- host hooks: local player actions become party state ----
   function hookHost() {
@@ -105,6 +120,11 @@ const PartyUI = (() => {
         <button id="pt-play">Play</button>
         <button id="pt-pause">Pause</button>
         <button id="pt-skip">Skip</button>
+      </div>
+      <div class="party-sec">Play a YouTube video</div>
+      <div class="party-join">
+        <input id="pt-yt" placeholder="YouTube URL" autocomplete="off">
+        <button id="pt-yt-go">Play</button>
       </div>`;
     }
     return html + '</div>';
@@ -181,6 +201,15 @@ const PartyUI = (() => {
     document.querySelectorAll('.pt-request').forEach(b => {
       b.onclick = () => send({ type: 'request', media_id: +b.dataset.media, title: b.dataset.title });
     });
+
+    bind('#pt-yt-go', () => {
+      const m = ($('#pt-yt')?.value || '').match(YT_RE);
+      if (!m) return renderError('Paste a YouTube URL (youtube.com/watch?v=… or youtu.be/…)');
+      const id = m[1];
+      send({ type: 'load', external_url: id, title: 'YouTube · ' + id, position: 0 });
+      window.partyFollowExternal(id, 'YouTube · ' + id, 0, true, Math.floor(Date.now() / 1000), true);
+    });
+    $('#pt-yt')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#pt-yt-go').click(); });
   }
 
   function renderConnecting(code) {
