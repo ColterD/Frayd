@@ -68,8 +68,9 @@ pub fn comic_pages(path: &Path) -> Option<Vec<(String, u64)>> {
             if entry.is_dir() {
                 continue;
             }
-            if image_entry(entry.name()) {
-                pages.push((entry.name().to_string(), entry.size()));
+            let name = entry.name().ok()?;
+            if image_entry(&name) {
+                pages.push((name.into_owned(), entry.size()));
             }
         }
         pages.sort_by(|a, b| natural_cmp(&a.0, &b.0));

@@ -9,6 +9,9 @@
 !server/*.sql
 !server/src/
 !server/src/**
+!server/tests/
+!server/tests/**
 !client/
 !client/**
 client/install/
+server/target/

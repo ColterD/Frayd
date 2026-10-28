@@ -79,7 +79,7 @@ A separately bind-mounted host media directory is not removed by that command. K
 - Outside the isolated Docker network, audio thumbnail fallback can send filename-derived search terms to Apple's iTunes Search API and download artwork. Local metadata/embedded artwork extraction runs first. The supplied Compose app has no external routing, so online artwork lookup is unavailable and a missing thumbnail is expected.
 - Videos are currently classified as movies; season/episode organization is not implemented.
 - The browser installer pages and bootstrap scripts are experimental; the Docker commands above are the reproducible startup route documented here.
-- Dependency audit is currently red for known advisories affecting locked `block-buffer` and `zip` versions. Run the audit below for current advisory IDs. Container isolation does not establish that arbitrary media is safe.
+- ZIP readers support stored and deflate archives. Container isolation does not establish that arbitrary media is safe.
 - No license file is currently present in the repository. Do not assume redistribution terms from the public repository alone.
 
 ## Development and verification
@@ -102,9 +102,10 @@ node --test tests/client.test.cjs
 docker compose config --quiet
 docker compose build
 python3 scripts/integration.py
+python3 -m unittest discover -s tests -p 'test_*.py'
 python3 scripts/audit-dependencies.py
 ```
 
 The integration script uses already-built `frayd:local` and `frayd-proxy:local` images, a unique disposable project, a randomly assigned loopback port and a synthetic comic. It checks the page, first-owner setup, scan, comic and range bytes, saved progress, container recreation and logout. It removes its own project and volume in a `finally` block. It never targets the normal `frayd` project. It does not prove browser playback, every media format, watch-party behavior or public-hosting security.
 
-The dependency audit queries OSV for exact versions in `server/Cargo.lock`, prints its findings and exits nonzero on advisories. Network/API failures also fail the command. CI runs this as a separate check, without suppressing known findings. No application dependencies are added by these verification scripts.
+The dependency audit queries OSV for exact versions in `server/Cargo.lock`, prints its findings and exits nonzero on applicable advisories. It records one exact database disagreement: OSV flags `block-buffer 0.10.4` for `GHSA-qwgh-2vcv-g2f7`, while the publisher lists only `>=0.11.0,<0.12.1`. Each audit fetches the publisher advisory from the RustCrypto GitHub API and requires that exact identity, package and range before reporting this finding as `not_affected`. Changed, malformed or unavailable publisher evidence keeps the finding fatal. All other findings remain fatal. OSV network/API failures also fail the command. CI tests this narrow policy and runs the live query as a separate check. No application dependencies are added by these verification scripts.
