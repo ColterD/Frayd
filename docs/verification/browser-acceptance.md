@@ -8,10 +8,10 @@ It does not authorize deployment or qualify arbitrary media, browsers or public 
 ## Source and fixture boundaries
 
 - Baseline application: `sha256:cd880c88f8c97dbebe771a3303455c714b3a03dde732cc8474634575b7f4cf58`, matching source `b852a7f87bc1ad9e3921d7b98202ccc2b719b70c`; prior accepted PR head `ccaa308e1395f0080e8c5b7de209f8ca043efb24` adds historical documentation.
-- Corrected runtime source: `407afbccb94697738025ae8c394d755814e79997`, committed before its image build. Application image: `sha256:958c9f9011cbeedec1d81433a8cae89efdc58bfbd990b2e33568f31b6b656b2d`. Its pinned build passes 45 Rust tests, Clippy and release compilation; post-fix browser observations are bounded by the results below.
+- First corrected runtime source: `407afbccb94697738025ae8c394d755814e79997`, committed before its image build. Application image: `sha256:958c9f9011cbeedec1d81433a8cae89efdc58bfbd990b2e33568f31b6b656b2d`. Its pinned build passes 45 Rust tests, Clippy and release compilation; observations below apply only to this first corrected image.
 - Proxy: `sha256:543d71e7db7b987f1e41dfb0a297efe5f020c141b2dbc39a859fd2473df7bbe2`.
 - Separate loopback fixture, fresh guest/device and disposable account, Chrome host and an independent in-app-browser guest for party checks. No production database or sessions were imported; only the identified free samples were copied.
-- Exact copies of the five free samples were hash-checked before and after baseline testing; original live samples were not modified. The download receipts below are from 2026-10-28. Source URLs may change; these hashes identify the tested media bytes, not the downloaded ZIP container.
+- Exact copies of the five free samples were hash-checked before and after baseline testing; original live samples were not modified. The download receipts below are from 2026-10-28. Source URLs may change; these hashes identify the tested media bytes. Extract the MP4 from the movie ZIP; the comic ZIP is retained as a CBZ-compatible archive. Other samples are direct media files.
 
 ## Media provenance
 
@@ -25,9 +25,24 @@ It does not authorize deployment or qualify arbitrary media, browsers or public 
 
 No sample media are added to the repository by this documentation. Embedded notices/credits remain in the test copies; public-domain statements in the retained receipts are scoped to the USA.
 
+## Latest reviewed follow-up
+
+Source `bf3cb589881542cb0f6c4d47d467a9909c7b697d` builds application
+`sha256:858879bf50c7050dfb55f93723e8fa74fbde77e4a2447e00eb574d9e45bca0b5`.
+The normal build passes 51 Rust tests, Clippy and release; 43 client and 16 Python
+tests also pass. This follow-up rejects selections spanning text nodes or element
+boundaries, keeps raw selection text/offsets aligned, and adds conservative
+interrupted-conversion recovery. The test-wrapper extraction correction is
+included without a scanner suppression.
+
+The earlier 958-image passes below remain historical observations of that exact
+artifact; they are not presented as browser qualification of this later image.
+Actual latest-image browser acceptance is held for Chrome input recovery and
+a fresh script-payload binding. The full latest-image HTTP/storage integration and same-version stopped-volume recovery pass; these automated/storage results do not close the browser gates.
+
 ## Acceptance matrix
 
-| Scenario and exact action | Baseline observation | Corrected image |
+| Scenario and exact action | Baseline observation | First corrected image (958) |
 |---|---|---|
 | Movie: open, observe decoded playback, seek, Back, read saved progress, reopen | Decode/seek pass. Saved 203.002927 seconds; reopen starts at zero. A second seek/reopen also restarts. | Blocked on browser input recovery. A pre-binding restart observation is inconclusive; two bound-payload iterations and the actual progress response are still required. |
 | Music: play, seek, close, reopen | Carefree advances; saved/resumed near 106 seconds. | Blocked on post-fix browser input recovery. |

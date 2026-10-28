@@ -60,6 +60,22 @@ Unchanged sources retain existing conversion references. A detectable source tim
 
 Older completed cache files and ownership records remain until manual cleanup, so cache usage can grow across replacements. Back up data and inspect current playback references before removing historical outputs. Older `.frayd-tmp` files in source libraries are not automatically migrated or removed; inspect and back up legacy files before deciding what to remove. No general cache-pruning procedure is qualified here.
 
+### Interrupted conversions
+
+New conversion reservations record pending, completed and retiring lifecycle
+state. On supported Linux locking, a worker and its ffmpeg child hold the job
+lease; startup, explicit rescans and the next conversion attempt can reclaim
+only proven inactive pending jobs. A cleanup blocked by the database retains
+bytes/provenance and retries on one of those later entry points.
+
+Publication marks completion atomically with the playback pointer. Completed
+old versions and historical unknown reservations remain retained. Active,
+referenced, conflicting, redirected or otherwise uncertain paths never gain
+deletion authority from their filename or age. Unsupported/unavailable locking
+retains an uncertain reservation instead of enabling automatic cleanup; the
+conversion fallback does not qualify recovery on that platform/filesystem.
+No general source-library or orphan-file pruning is introduced.
+
 ## Stop, resume and remove
 
 Run from the same Compose directory/project used for setup:
@@ -105,12 +121,20 @@ docker compose stop app
 test "$(docker inspect --format '{{.State.Running}}' "$SOURCE_CONTAINER")" = false
 ```
 
-3. Choose a new private backup directory outside the data volume, set `BACKUP_DIR` to its absolute path, and use `umask 077` before creating it. The archive contains accounts and sessions; protect it as private data. Do not overwrite an existing backup. Archive the entire stopped volume, including SQLite WAL/SHM files if present:
+3. Set `BACKUP_DIR` to a new absolute directory path outside the data volume, whose parent already exists. Do not create the target directory in advance: the block below creates and verifies it privately, and refuses existing paths or symlinks. These permission checks use Linux/GNU `stat`. The archive contains accounts and sessions; protect it as private data. Archive the entire stopped volume, including SQLite WAL/SHM files if present:
 
 ```sh
+umask 077
+case "$BACKUP_DIR" in /*) ;; *) echo 'BACKUP_DIR must be absolute' >&2; exit 1 ;; esac
+test ! -e "$BACKUP_DIR"
+test ! -L "$BACKUP_DIR"
+mkdir -m 700 -- "$BACKUP_DIR"
+test "$(stat -c '%a' "$BACKUP_DIR")" = 700
+test "$(stat -c '%u' "$BACKUP_DIR")" = "$(id -u)"
 set -C  # refuse to overwrite an existing archive
 docker run --rm -i --network none --user 0:0 --entrypoint tar -v "$SOURCE_VOLUME:/data:ro" "$IMAGE" -C /data -cpf - . > "$BACKUP_DIR/data.tar"
 test -s "$BACKUP_DIR/data.tar"
+test "$(stat -c '%a' "$BACKUP_DIR/data.tar")" = 600
 sha256sum "$BACKUP_DIR/data.tar"
 ```
 
@@ -128,7 +152,24 @@ docker run --rm -i --network none --user 0:0 --entrypoint tar -v "$DEST_VOLUME:/
 
 6. Start only the destination project with the same image and verify HTTP health, library/media bytes, accounts and saved progress, plus SQLite `PRAGMA integrity_check` and selected database IDs/progress. If verification fails, stop the destination and retain the original volume/image; do not delete the source or retry extraction over populated data. Back up separately mounted media separately.
 
-The synthetic round trip verified whole-volume archive/extraction, ownership, SQLite integrity, guest progress and exact media bytes. It completed through bounded QA continuations after a fixture comparison was narrowed to the required stable fields; it was not a one-shot recovery-script pass. Browser and proxy recovery were not exercised. It used immutable app image `sha256:cd880c88f8c97dbebe771a3303455c714b3a03dde732cc8474634575b7f4cf58`; it does not establish recovery for other images or operator data. The shell identity checks above are safeguards around the tested mechanics, not an automated recovery tool. Version-to-version upgrade and downgrade procedures remain **unqualified**.
+The latest synthetic round trip passed in one uninterrupted invocation on image
+`sha256:858879bf50c7050dfb55f93723e8fa74fbde77e4a2447e00eb574d9e45bca0b5`,
+built from source `bf3cb589881542cb0f6c4d47d467a9909c7b697d`. It executed the
+copyable backup block under a permissive caller umask and verified directory mode
+700, archive mode 600, whole-volume copy, numeric ownership, SQLite integrity,
+selected media IDs/exact bytes and guest progress. The restored app saved new
+progress under UID/GID 10001 and retained it after restart. The lifecycle column
+appeared exactly once with its unknown default; no artifact rows were invented.
+Accounts and sessions were zero in this fixture, so account/session recovery was
+not qualified. Browser/proxy and external bind-media recovery were not exercised.
+
+The earlier `cd880c88` round trip used bounded QA continuations; its historical
+receipts remain separate from this later one-shot result. The shell checks above
+are safeguards around the tested mechanics, not an automated operator recovery
+tool or a guarantee for valued data. Permission checks also refused existing,
+symlink and relative targets without modifying them. Version-to-version upgrade,
+downgrade, legacy-schema restore and original-volume rollback remain **unqualified**.
+
 
 ## Troubleshooting
 
