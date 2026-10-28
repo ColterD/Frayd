@@ -399,7 +399,7 @@ fn bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Resolve identity for a request: Bearer token first, fall back to ?identity= query.
+/// Resolve a valid Bearer session first; unauthenticated keys may identify only devices.
 fn resolve_identity(
     db: &Connection,
     headers: &axum::http::HeaderMap,
@@ -412,18 +412,21 @@ fn resolve_identity(
     }
     if let Some(key) = query_identity {
         // LAN fallback: hostname-keyed device identity, auto-created on first use
-        let existing: Option<i64> = db
-            .query_row("SELECT id FROM identities WHERE key = ?1", [key], |r| r.get(0))
-            .ok();
+        let existing: rusqlite::Result<(i64, String)> = db.query_row(
+            "SELECT id, kind FROM identities WHERE key = ?1", [key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        );
         return match existing {
-            Some(id) => Ok(id),
-            None => db
+            Ok((id, kind)) if kind == "device" => Ok(id),
+            Ok(_) => Err(StatusCode::UNAUTHORIZED),
+            Err(rusqlite::Error::QueryReturnedNoRows) => db
                 .execute(
                     "INSERT INTO identities (kind, key) VALUES ('device', ?1)",
                     [key],
                 )
                 .map(|_| db.last_insert_rowid())
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR),
+            Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
         };
     }
     Err(StatusCode::UNAUTHORIZED)
@@ -1340,6 +1343,78 @@ mod backend_regressions {
             scanning: std::sync::atomic::AtomicBool::new(false), auth_rl: auth::RateLimiter::new(300,10),
             party: Arc::new(party::Party::new()) })
     }
+    /// Isolate an account owner, device owner, and private rows for identity-boundary tests.
+    fn identity_boundary_app() -> Arc<App> {
+        let app = app_for("synthetic.cbz");
+        {
+            let db = app.db.lock().unwrap();
+            db.execute("INSERT INTO identities(id,kind,key) VALUES(2,'account','owner@example.invalid')", []).unwrap();
+            db.execute("INSERT INTO user_perms(identity_id,is_admin) VALUES(2,1)", []).unwrap();
+            db.execute("INSERT INTO annotations(id,identity_id,media_id,kind,spine_idx,cfi,text) VALUES(1,2,1,'highlight',0,'char:0:5','owner')", []).unwrap();
+            db.execute("INSERT INTO progress(identity_id,media_id,position,updated_at) VALUES(2,1,42,unixepoch())", []).unwrap();
+        }
+        app
+    }
+
+    /// A public account key must never authorize private reads, writes, deletion, or administration.
+    #[tokio::test]
+    async fn account_key_fallback_cannot_cross_identity_boundary() {
+        let app = identity_boundary_app();
+        let query = std::collections::HashMap::from([("identity".into(), "owner@example.invalid".into()), ("ann_id".into(), "1".into())]);
+        let headers = axum::http::HeaderMap::new();
+        let statuses = [
+            list_annotations(State(app.clone()), Path(1), headers.clone(), Query(query.clone())).await.into_response().status(),
+            get_progress(State(app.clone()), Path(1), headers.clone(), Query(query.clone())).await.into_response().status(),
+            set_progress(State(app.clone()), headers.clone(), Json(ProgressIn { identity: Some("owner@example.invalid".into()), media_id: 1, position: 99.0 })).await,
+            delete_annotation(State(app.clone()), headers.clone(), Query(query.clone())).await,
+            list_perms(State(app.clone()), headers.clone(), Query(query.clone())).await.into_response().status(),
+        ];
+        assert_eq!(statuses, [StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN]);
+        let mut invalid = headers;
+        invalid.insert(header::AUTHORIZATION, "Bearer synthetic-invalid-session".parse().unwrap());
+        let db = app.db.lock().unwrap();
+        assert_eq!(resolve_identity(&db, &invalid, Some("owner@example.invalid")), Err(StatusCode::UNAUTHORIZED));
+        assert_eq!(require_admin(&db, &invalid, Some("owner@example.invalid")), Err(StatusCode::UNAUTHORIZED));
+        assert_eq!(db.query_row("SELECT position FROM progress WHERE identity_id=2", [], |r| r.get::<_,f64>(0)).unwrap(), 42.0);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM annotations WHERE id=1 AND identity_id=2", [], |r| r.get::<_,i64>(0)).unwrap(), 1);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM identities", [], |r| r.get::<_,i64>(0)).unwrap(), 2);
+    }
+
+    /// Valid sessions retain precedence; ordinary device fallback and account-only annotation creation remain intact.
+    #[tokio::test]
+    async fn device_fallback_and_authenticated_account_remain_compatible() {
+        let app = identity_boundary_app();
+        let mut headers = axum::http::HeaderMap::new();
+        {
+            let db = app.db.lock().unwrap();
+            let token = auth::create_session(&db, 2).unwrap();
+            headers.insert(header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+            assert_eq!(resolve_identity(&db, &headers, Some("fixture")), Ok(2));
+            assert_eq!(require_admin(&db, &headers, Some("fixture")), Ok(2));
+            assert_eq!(resolve_identity(&db, &axum::http::HeaderMap::new(), Some("fixture")), Ok(1));
+            let mut invalid = axum::http::HeaderMap::new();
+            invalid.insert(header::AUTHORIZATION, "Bearer synthetic-invalid-session".parse().unwrap());
+            assert_eq!(resolve_identity(&db, &invalid, Some("fixture")), Ok(1));
+            let created = resolve_identity(&db, &axum::http::HeaderMap::new(), Some("new-device")).unwrap();
+            assert_eq!(resolve_identity(&db, &axum::http::HeaderMap::new(), Some("new-device")), Ok(created));
+            assert_eq!(db.query_row("SELECT kind FROM identities WHERE id=?1", [created], |r| r.get::<_,String>(0)).unwrap(), "device");
+            assert_eq!(resolve_identity(&db, &axum::http::HeaderMap::new(), None), Err(StatusCode::UNAUTHORIZED));
+        }
+        let query = std::collections::HashMap::from([("identity".into(), "fixture".into())]);
+        assert_eq!(list_annotations(State(app.clone()), Path(1), headers.clone(), Query(query.clone())).await.into_response().status(), StatusCode::OK);
+        assert_eq!(set_progress(State(app.clone()), axum::http::HeaderMap::new(), Json(ProgressIn { identity: Some("fixture".into()), media_id: 1, position: 8.0 })).await, StatusCode::NO_CONTENT);
+        assert_eq!(get_progress(State(app.clone()), Path(1), axum::http::HeaderMap::new(), Query(query)).await.into_response().status(), StatusCode::OK);
+        let annotation = || AnnotationIn { media_id: 1, kind: "highlight".into(), spine_idx: 0, cfi: "char:8:3".into(), text: Some("new".into()), color: None, note: None };
+        assert_eq!(create_annotation(State(app.clone()), axum::http::HeaderMap::new(), Json(annotation())).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(create_annotation(State(app.clone()), headers.clone(), Json(annotation())).await, StatusCode::CREATED);
+        let query = std::collections::HashMap::from([("identity".into(), "fixture".into()), ("ann_id".into(), "1".into())]);
+        assert_eq!(delete_annotation(State(app.clone()), axum::http::HeaderMap::new(), Query(query.clone())).await, StatusCode::NOT_FOUND);
+        assert_eq!(delete_annotation(State(app.clone()), headers, Query(query)).await, StatusCode::NO_CONTENT);
+        let db = app.db.lock().unwrap();
+        assert_eq!(db.query_row("SELECT position FROM progress WHERE identity_id=1", [], |r| r.get::<_,f64>(0)).unwrap(), 8.0);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM annotations WHERE identity_id=2 AND cfi='char:8:3'", [], |r| r.get::<_,i64>(0)).unwrap(), 1);
+    }
+
     /// Build an actual minimal EPUB with explicit OPF reading order and literal chapter payloads.
     fn write_epub_fixture(path: &StdPath, chapters: &[(&str,&[u8])]) {
         use std::io::Write;
