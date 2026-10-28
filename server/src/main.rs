@@ -73,6 +73,7 @@ async fn main() {
 
     // The scan trigger consumes server-owned state and no HTTP-provided arguments.
     let scan_state = state.clone();
+    let ingest_state = state.clone();
     let app = Router::new()
         .route("/api/health", get(|| async { Json(serde_json::json!({"status": "ok"})) }))
         .route("/api/library", get(library_handler))
@@ -88,7 +89,10 @@ async fn main() {
         .route("/api/admin/settings", get(get_settings).post(set_setting))
         .route("/api/thumb/:id", get(thumb))
         .route("/api/scan", post(move || trigger_scan(State(scan_state.clone()))))
-        .route("/api/ingest", post(ingest))
+        .route("/api/ingest", post(move |headers: axum::http::HeaderMap,
+            query: Query<std::collections::HashMap<String,String>>, body: Json<IngestReq>| {
+            ingest(State(ingest_state.clone()),headers,query,body)
+        }))
         .route("/api/scan/status", get(scan_status))
         .route("/api/party", post(party_create))
         .route("/api/party/:code/ws", get(party_ws))
@@ -591,6 +595,7 @@ struct IngestReq {
     url: String,
 }
 
+/// Authorize ingestion and pass one HTTP(S) URL after the downloader option terminator.
 async fn ingest(
     State(app): State<std::sync::Arc<App>>,
     headers: axum::http::HeaderMap,
@@ -631,6 +636,7 @@ async fn ingest(
         let ok = std::process::Command::new("yt-dlp")
             .args(["-f", "mp4", "--no-playlist", "-o"])
             .arg(out)
+            .arg("--")
             .arg(&url)
             .status()
             .map(|s| s.success())
@@ -1486,5 +1492,79 @@ mod backend_regressions {
         assert_eq!(comic_page(State(app.clone()),Path((1,0))).await.into_response().status(),StatusCode::NOT_FOUND);
         let after: String = app.db.lock().unwrap().query_row("SELECT meta_json FROM media",[],|r|r.get(0)).unwrap();
         assert_eq!(before,after);
+    }
+}
+
+#[cfg(test)]
+mod ingest_tests {
+    use super::*;
+
+    /// Isolate the same server state on both fork-main and PR branches with synthetic admin identities.
+    fn fixture_app(root: &StdPath) -> Arc<App> {
+        let db=store::open(":memory:");
+        db.execute_batch("INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture-admin'),(2,'device','fixture-reader');
+            INSERT INTO user_perms(identity_id,is_admin) VALUES(1,1),(2,0);").unwrap();
+        let library=root.join("library with spaces"); std::fs::create_dir_all(&library).unwrap();
+        Arc::new(App { db:Mutex::new(db),db_path:String::new(),library:Some(library),
+            scanning:std::sync::atomic::AtomicBool::new(false),auth_rl:auth::RateLimiter::new(300,10),
+            party:Arc::new(party::Party::new()) })
+    }
+
+    /// Exercise the real handler's authorization and argument construction without a network downloader.
+    async fn submit(app: &Arc<App>, identity: &str, url: &str) -> StatusCode {
+        ingest(State(app.clone()),axum::http::HeaderMap::new(),
+            Query(std::collections::HashMap::from([("identity".to_string(),identity.to_string())])),
+            Json(IngestReq { url:url.to_string() })).await
+    }
+
+    /// Keep HTTP authorization, destination selection and explicit URL framing correct at the process boundary.
+    #[tokio::test]
+    async fn ingest_preserves_admin_guards_and_literal_downloader_arguments() {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(root)=std::env::var_os("FRAYD_TEST_INGEST_ROOT") {
+            let root=PathBuf::from(root); let app=fixture_app(&root);
+            let calls=root.join("calls"); let argv=root.join("argv");
+            assert_eq!(submit(&app,"fixture-reader","https://example.invalid/video").await,StatusCode::FORBIDDEN);
+            for url in ["--exec=touch-marker","file:///tmp/source","ftp://example.invalid/video"] {
+                assert_eq!(submit(&app,"fixture-admin",url).await,StatusCode::BAD_REQUEST);
+            }
+            assert!(!calls.exists(),"rejected request launched downloader");
+            assert!(!root.join("library with spaces/Internet").exists());
+            let marker=root.join("must-not-exist");
+            let metacharacters=format!("https://example.invalid/video?q=$(touch {});--exec=ignored&n=1",marker.display());
+            for url in ["http://example.invalid/video",metacharacters.as_str()] {
+                let _=std::fs::remove_file(&argv);
+                assert_eq!(submit(&app,"fixture-admin",url).await,StatusCode::ACCEPTED);
+                let mut actual=Vec::new();
+                for _ in 0..200 {
+                    if let Ok(bytes)=std::fs::read(&argv) {
+                        if bytes.ends_with(&[0]) {
+                            actual=bytes[..bytes.len()-1].split(|byte|*byte==0)
+                                .map(|part|String::from_utf8(part.to_vec()).unwrap()).collect::<Vec<_>>();
+                            if actual.last().is_some_and(|last|last==url) { break; }
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                let expected_output=format!("{}/library with spaces/Internet/%(title)s.%(ext)s",root.display());
+                assert_eq!(actual,vec!["-f","mp4","--no-playlist","-o",expected_output.as_str(),"--",url]);
+                assert!(!marker.exists(),"URL metacharacters executed as a shell command");
+            }
+            assert_eq!(std::fs::read(calls).unwrap(),b"....");
+            return;
+        }
+        let root=std::env::temp_dir().join(format!("frayd-ingest-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        let executable=root.join("bin/yt-dlp");
+        std::fs::write(&executable,b"#!/bin/sh\nprintf '.' >> \"$FRAYD_TEST_INGEST_CALLS\"\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nprintf '%s\\0' \"$@\" > \"$FRAYD_TEST_INGEST_ARGV\"\nexit 1\n").unwrap();
+        std::fs::set_permissions(&executable,std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths=vec![root.join("bin")]; paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+        let output=Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","ingest_tests::ingest_preserves_admin_guards_and_literal_downloader_arguments","--nocapture"])
+            .env("FRAYD_TEST_INGEST_ROOT",&root).env("FRAYD_TEST_INGEST_CALLS",root.join("calls"))
+            .env("FRAYD_TEST_INGEST_ARGV",root.join("argv")).env("PATH",std::env::join_paths(paths).unwrap())
+            .output().unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(output.status.success(),"isolated ingestion worker: {}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
     }
 }

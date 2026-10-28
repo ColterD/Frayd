@@ -252,6 +252,29 @@ experimental ingestion handler: destination creation, output argument and URL
 argument. Their reported source is the route callback. The destination comes
 from server configuration; the URL is real request data, restricted to an admin
 and HTTP(S), passed to a fixed executable as one argument without a shell. A
-bounded refinement is in progress to bind trusted application state explicitly
-and terminate command options before the URL. These are separate from the four
+bounded refinement now binds trusted application state explicitly and terminates
+command options before the URL. An isolated, network-free recorder verifies admin
+and scheme rejection, exact arguments, paths with spaces and literal metacharacters.
+All 28 Rust tests, Clippy and release compilation pass; delivery to fork main and
+hosted reanalysis are pending. These are separate from the four
 EPUB findings already fixed on fork main; no alert is suppressed or dismissed.
+
+## Real-browser and archive-replacement proof
+
+On immutable combined-source image
+`sha256:bd333d3458e8ecd8c6cee4f70021a3367ff773cf39c2b91ed845c74d9bec5d19`,
+the production client hash was
+`f2e00dedb4aec824e323699b1bceb63d46a08a54b3219d575f7ba845be62599f`.
+Real Chrome accepted active-reader messages with opaque origin `null`: chapter
+navigation worked, progress saved at 1.25, and reopening resumed chapter two,
+page two of five. Six forged highlight/page/chapter reports from unrelated opaque
+and same-origin frames caused zero annotation/progress/chapter requests, and
+reader UI/database state stayed unchanged. Positive highlight persistence and
+media decoding were not tested.
+
+A real HTTP replacement test kept comic 8's exact modification timestamp while
+adding a page. After HTTP 202 rescan, the refreshed list and page-1 response
+contained the exact added bytes; ID, title, progress, synopsis and custom metadata
+remained intact. Both owned containers and their network were removed afterward.
+This qualifies the stated image/client. The later ingest-only server refinement
+has separate build/runtime and hosted acceptance gates.
