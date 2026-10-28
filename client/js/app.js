@@ -1,5 +1,6 @@
 // Frayd web client — auth, dashboard, playback
 'use strict';
+console.log('frayd app.js v4');
 
 const $ = (s) => document.querySelector(s);
 const el = (tag, cls, html) => {
@@ -458,17 +459,22 @@ async function openEbook(it) {
   $('#ebook-modal').classList.add('on');
   // TOC (best-effort)
   ebook.toc = await fetch(`/api/epub/${it.id}/toc`).then(r => r.ok ? r.json() : []).catch(() => []);
-  resumeFor(it.id).then(p => { if (p) showChunk(Math.min(Math.floor(p.position), spine.length - 1)); else showChunk(0); });
+  resumeFor(it.id).then(p => {
+    const ch = p ? Math.min(Math.floor(p.position), spine.length - 1) : 0;
+    const frac = p ? p.position - Math.floor(p.position) : 0;
+    showChunk(ch, { frac });
+  });
 }
 
-async function showChunk(n) {
+async function showChunk(n, opts = {}) {
   if (!ebook) return;
   ebook.chunk = Math.max(0, Math.min(n, ebook.spine.length - 1));
+  ebook.pendingCol = opts.atEnd ? Infinity : opts.frac != null ? opts.frac : 0;
   const chunkUrl = ebook.spine[ebook.chunk]; // zip-relative path
   const base = chunkUrl.includes('/') ? chunkUrl.slice(0, chunkUrl.lastIndexOf('/') + 1) : '';
   try {
     let html = await (await fetch(`/api/epub/${ebook.it.id}/chunk/${ebook.chunk}`)).text();
-    const PW = ebookPageW(), GAP = 40, PAD = 28;
+    const PW = ebookPageW(), PAD = 28; // page margin; column gap must be 2*PAD (see stride below)
     const FRAME_H = Math.round((document.getElementById('em-frame')?.clientHeight || window.innerHeight * 0.78) / window.innerHeight * 100);
     // rewrite relative src/href to asset endpoint (skip absolute, data:, #anchors, mailto)
     html = html.replace(/(src|href)="([^"]*)"/g, (m, attr, url) => {
@@ -479,8 +485,10 @@ async function showChunk(n) {
     // paginate: CSS multi-column; flip via injected script postMessage (sandbox-safe)
     html = html.replace(/<\/head>/i,
       `<style>
+        /* multicol on body (html overflows). padding both sides: every in-flow page
+           gets symmetric 28px margins, stride stays exact */
         html{overflow:hidden}
-        body{column-width:${PW - 2 * PAD}px;column-gap:${GAP}px;column-fill:auto;
+        body{column-width:${PW - 2 * PAD}px;column-gap:${2 * PAD}px;column-fill:auto;
           height:${FRAME_H}vh;width:${PW}px;padding:${PAD}px;
           margin:0;box-sizing:border-box;font-family:Georgia,serif;
           text-align:justify;overflow-wrap:break-word}
@@ -488,29 +496,90 @@ async function showChunk(n) {
       </style>
       <script>
         const PW = ${PW}, PAD = ${PAD}; // inner page padding (visual margin, kills edge-butt)
-        const STEP = ${PW} - 2 * PAD + ${GAP}; // stride = column box (PW - 2*padding) + gap
+        const STEP = ${PW}; // column (PW-2*PAD) + gap (2*PAD) = exactly PW: viewport = one page, no bleed
         let col = 0;
-        function pageCount() {
-          const pages = Math.round((document.body.scrollWidth - ${PW} - 2 * PAD) / STEP) + 1;
-          return Math.max(1, pages);
-        }
         function report() { parent.postMessage({type:'page', page: col + 1, pages: pageCount()}, '*'); }
+        function pageCount() {
+          const pages = Math.round((document.documentElement.scrollWidth - ${PW}) / STEP) + 1;
+          return Math.max(1, pages - 1); // minus the blank filler column
+        }
+        // scroll clamp/reflow guard: re-apply until scrollLeft actually matches col*STEP
+        let snapT = null;
+        function snap() {
+          const x = Math.round(col * STEP);
+          if (Math.abs(window.scrollX - x) <= 1) return;
+          window.scrollTo({ left: x, behavior: 'instant' });
+          setTimeout(snap, 60); // layout (fonts/images) can clamp mid-scroll; re-apply
+        }
         window.addEventListener('message', (e) => {
           if (e.data === 'next' || e.data === 'prev') {
             const last = pageCount() - 1;
             if (e.data === 'next') {
               if (col >= last) parent.postMessage({type:'chapter', dir:1}, '*');
-              else { col++; window.scrollTo({ left: Math.round(col * STEP), behavior: 'instant' }); report(); }
+              else { col++; snap(); report(); }
             } else {
               if (col <= 0) parent.postMessage({type:'chapter', dir:-1}, '*');
-              else { col--; window.scrollTo({ left: Math.round(col * STEP), behavior: 'instant' }); report(); }
+              else { col--; snap(); report(); }
             }
           } else if (typeof e.data === 'object' && e.data?.type === 'goto') {
             col = Math.max(0, Math.min(e.data.col, pageCount() - 1));
-            window.scrollTo({ left: Math.round(col * STEP), behavior: 'instant' }); report();
+            snap(); report();
           }
         });
-        window.addEventListener('load', () => { col = 0; report(); });
+        window.addEventListener('load', () => {
+          // tail page: scroller excludes body's right padding from max scroll.
+          // spacer forces ONE EXTRA overflow column (column-break + 100% height so
+          // it can't fit inside the last text column) -> extends scrollWidth by a
+          // full stride, making the last page's margin reachable
+          const sp = document.createElement('div');
+          sp.style.cssText = 'width:1px;height:100%;break-before:column';
+          document.body.appendChild(sp);
+          // resume position: parent messages {type:'goto', col} after load
+          col = 0; report();
+        });
+        // parent-driven resume: apply once, after first page report (layout settled)
+        window.addEventListener('message', (e) => {
+          if (typeof e.data === 'object' && e.data?.type === 'resume') {
+            const lastReal = pageCount(); // filler excluded from count
+            const c = e.data.col === 'end' ? lastReal - 1
+              : Math.round(e.data.col * (lastReal - 1)); // fraction → column
+            col = Math.max(0, Math.min(c, lastReal - 1));
+            snap(); report();
+          } else if (e.data?.type === 'inject-hl') {
+            // highlight restore runs HERE (sandbox: parent can't touch our DOM)
+            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+            const nodes = [];
+            while (walker.nextNode()) nodes.push(walker.currentNode);
+            let pos = 0;
+            const offs = nodes.map(n => { const st = pos; pos += n.nodeValue.length; return { n, st }; });
+            for (const h of [...e.data.items].sort((a, b) => b.off - a.off)) {
+              for (const { n, st } of offs) {
+                const en = st + n.nodeValue.length;
+                if (h.off >= st && h.off + h.len <= en) {
+                  const r = document.createRange();
+                  r.setStart(n, h.off - st);
+                  r.setEnd(n, h.off - st + h.len);
+                  const m = document.createElement('mark');
+                  m.className = 'user-highlight';
+                  m.style.setProperty('--hl', h.color);
+                  try { r.surroundContents(m); } catch {}
+                  break;
+                }
+              }
+            }
+          }
+        });
+        // geometry readback: parent asks with {type:'geom'} → returns real numbers
+        window.addEventListener('message', (e) => {
+          if (typeof e.data === 'object' && e.data?.type === 'geom') {
+            const b = document.documentElement;
+            const lastText = [...document.body.children].filter(n => n.nodeType === 1).pop();
+            parent.postMessage({ type: 'geom', innerWidth: window.innerWidth,
+              scrollWidth: b.scrollWidth, clientWidth: b.clientWidth,
+              scrollLeft: window.scrollX, col, STEP,
+              bodyPad: getComputedStyle(b).paddingLeft + '/' + getComputedStyle(b).paddingRight }, '*');
+          }
+        });
         // in-chapter search: wrap matches in <mark>, report count + positions
         window.addEventListener('message', (e) => {
           if (typeof e.data === 'object' && e.data?.type === 'search') {
@@ -544,7 +613,7 @@ async function showChunk(n) {
               }
               if (hits.length) {
                 const first = document.querySelector('mark.search-hit');
-                const pw = PW + GAP;
+                const pw = PW;
                 window.scrollTo({ left: Math.round(first.getBoundingClientRect().left + window.scrollX - PW / 2), behavior: 'instant' });
               }
             }
@@ -559,7 +628,7 @@ async function showChunk(n) {
             marks.forEach(m => m.classList.remove('current'));
             const nx = marks[(cur + 1) % marks.length];
             nx.classList.add('current');
-            const pw = PW + GAP;
+            const pw = PW;
             window.scrollTo({ left: Math.round(nx.getBoundingClientRect().left + window.scrollX - PW / 2), behavior: 'instant' });
             parent.postMessage({type:'search-hit', idx: (cur + 1) % marks.length + 1, total: marks.length}, '*');
           }
@@ -588,7 +657,7 @@ async function showChunk(n) {
           pre.selectNodeContents(document.body);
           pre.setEnd(range.startContainer, range.startOffset);
           const offset = pre.toString().length;
-          parent.postMessage({type:'highlight', cfi: 'char:' + offset + ':' + text.length, text, page: Math.round(window.scrollX / (PW + GAP))}, '*');
+          parent.postMessage({type:'highlight', cfi: 'char:' + offset + ':' + text.length, text, page: Math.round(window.scrollX / PW)}, '*');
         });
       <\/script></head>`);
     // re-apply saved highlights for this chapter (char-offset based)
@@ -601,39 +670,23 @@ async function showChunk(n) {
       html = html.replace(/<body[^>]*>/i, (m) => m + '<span id="__hlroot"></span>');
     }
     $('#em-frame').srcdoc = html;
+    // resume position after iframe layout settles (want 'end' = last real page)
+    const want = ebook.pendingCol;
+    ebook.pendingCol = 0;
+    $('#em-frame').addEventListener('load', () => {
+      setTimeout(() => {
+        $('#em-frame').contentWindow?.postMessage({ type: 'resume', col: want === Infinity ? 'end' : want }, '*'); // want: 'end' | fraction-of-chapter 0..1
+      }, 80);
+    }, { once: true });
+    // highlights injected via postMessage (sandbox-safe; same job as before)
     if (inject.length) {
-      $('#em-frame').addEventListener('load', () => {
-        const w = $('#em-frame').contentWindow;
-        if (!w) return;
-        try {
-          const full = w.document.body.textContent;
-          const walker = w.document.createTreeWalker(w.document.body, w.NodeFilter.SHOW_TEXT);
-          const nodes = [];
-          while (walker.nextNode()) nodes.push(walker.currentNode);
-          let pos = 0;
-          const nodeOffsets = nodes.map(n => { const st = pos; pos += n.nodeValue.length; return { n, st }; });
-          for (const h of inject) {
-            for (const { n, st } of nodeOffsets) {
-              const en = st + n.nodeValue.length;
-              if (h.off >= st && h.off + h.len <= en) {
-                const r = w.document.createRange();
-                r.setStart(n, h.off - st);
-                r.setEnd(n, h.off - st + h.len);
-                const mark = w.document.createElement('mark');
-                mark.className = 'user-highlight';
-                mark.style.setProperty('--hl', h.color);
-                try { r.surroundContents(mark); } catch {}
-                break;
-              }
-            }
-          }
-        } catch (err) { console.warn('highlight restore failed', err); }
-      }, { once: true });
+      const items = inject.map(h => ({ off: h.off, len: h.len, color: h.color }));
+      const send = () => $('#em-frame').contentWindow?.postMessage({ type: 'inject-hl', items }, '*');
+      setTimeout(send, 100); // after resume/first layout
     }
   } catch {
     $('#em-frame').srcdoc = '<p style="font-family:sans-serif;color:#333">Failed to load chapter.</p>';
   }
-  updateEbookInfo();
 }
 
 // page-flip: injected iframe script reports page state via postMessage
@@ -653,7 +706,11 @@ window.addEventListener('message', (e) => {
   if (!ebook) return;
   if (e.data?.type === 'chapter') {
     const n = ebook.chunk + e.data.dir;
-    if (n >= 0 && n < ebook.spine.length) showChunk(n);
+    if (n < 0 || n >= ebook.spine.length) return;
+    // entering prev chapter from its top → land on its last real page
+    showChunk(n, e.data.dir < 0 ? { atEnd: true } : {});
+  } else if (e.data?.type === 'geom') {
+    console.log('[ebook geom]', e.data);
   } else if (e.data?.type === 'highlight') {
     // persist selection as highlight
     fetch('/api/annotations', {
@@ -669,6 +726,10 @@ window.addEventListener('message', (e) => {
     setTimeout(() => { if (ebook) $('#em-searchinfo').textContent = ''; }, 1500);
   } else if (e.data?.type === 'page') {
     $('#em-pageinfo').textContent = `${ebook.chunk + 1} · p${e.data.page}/${e.data.pages}`;
+    // progress = chunk + fractional page (fraction-of-chapter, resolution-independent)
+    const frac = e.data.pages > 1 ? (e.data.page - 1) / (e.data.pages - 1) : 0;
+    ebook.lastFrac = Math.min(frac, 0.999);
+    syncProgress(ebook.it.id, ebook.chunk + ebook.lastFrac);
   } else if (e.data?.type === 'search-results') {
     ebook.searchHits = e.data.count;
     $('#em-searchinfo').textContent = e.data.count
@@ -703,6 +764,8 @@ $('#em-next').onclick = () => ebookFlip(1);
 $('#em-close').onclick = closeEbook;
 // TOC drawer
 $('#em-toc-btn').onclick = () => { renderToc(); $('#em-toc').classList.toggle('on'); };
+$('#em-prev').ondblclick = $('#em-next').ondblclick = () =>
+  $('#em-frame').contentWindow?.postMessage({ type: 'geom' }, '*');
 function renderToc() {
   const el = $('#em-toc');
   if (!ebook?.toc?.length) { el.innerHTML = '<h3>No table of contents</h3>'; return; }
