@@ -39,6 +39,7 @@ function browser() {
     nodes.set('#' + match[1], node);
   }
   for (const selector of ['#search input', '.avatar', '#hero-play', '#hero-backdrop', '#pt-host', '#pt-join', '#party-code-input']) nodes.set(selector, element());
+  nodes.get('#em-frame').contentWindow = { postMessage() {} };
   nodes.get('#add-media').innerHTML = html.match(/<button id="add-media">([\s\S]*?)<\/button>/)[1];
   const requests = [];
   const intervals = new Map();
@@ -66,7 +67,9 @@ function browser() {
     context, nodes, requests, intervals, sockets,
     run: source => vm.runInContext(source, context),
     respond: fn => { response = fn; },
-    page: (page, pages) => listeners.get('message')({ data: { type: 'page', page, pages } }),
+    page: (page, pages) => listeners.get('message')({
+      data: { type: 'page', page, pages }, origin: 'null', source: nodes.get('#em-frame').contentWindow,
+    }),
   };
 }
 

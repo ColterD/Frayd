@@ -16,7 +16,7 @@ jobs:
         run: |
           node --check client/js/app.js
           node --check client/js/party.js
-          node --test tests/client.test.cjs
+          node --test tests/*.test.cjs
       - name: Compose validation
         run: docker compose config --quiet
       - name: Locked Rust tests, Clippy, release build and runtime images

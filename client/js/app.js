@@ -736,7 +736,13 @@ window.addEventListener('resize', () => {
 });
 window.addEventListener('message', (e) => {
   if (!ebook) return;
+  // srcdoc is sandboxed without allow-same-origin, so its origin is opaque.
+  // Other opaque frames also report "null": bind messages to our reader window.
+  const frameWindow = $('#em-frame').contentWindow;
+  if (e.origin !== 'null' || !frameWindow || e.source !== frameWindow) return;
+  if (!e.data || typeof e.data !== 'object' || Array.isArray(e.data)) return;
   if (e.data?.type === 'chapter') {
+    if (e.data.dir !== -1 && e.data.dir !== 1) return;
     const n = ebook.chunk + e.data.dir;
     if (n < 0 || n >= ebook.spine.length) return;
     // entering prev chapter from its top → land on its last real page
@@ -744,6 +750,8 @@ window.addEventListener('message', (e) => {
   } else if (e.data?.type === 'geom') {
     console.log('[ebook geom]', e.data);
   } else if (e.data?.type === 'highlight') {
+    if (typeof e.data.cfi !== 'string' || !/^char:\d+:\d+$/.test(e.data.cfi)
+      || typeof e.data.text !== 'string' || !e.data.text.trim()) return;
     // persist selection as highlight
     fetch('/api/annotations', {
       method: 'POST',
@@ -757,16 +765,21 @@ window.addEventListener('message', (e) => {
     $('#em-searchinfo').textContent = 'Highlighted';
     setTimeout(() => { if (ebook) $('#em-searchinfo').textContent = ''; }, 1500);
   } else if (e.data?.type === 'page') {
+    if (!Number.isSafeInteger(e.data.page) || !Number.isSafeInteger(e.data.pages)
+      || e.data.page < 1 || e.data.pages < e.data.page) return;
     $('#em-pageinfo').textContent = `${ebook.chunk + 1} · p${e.data.page}/${e.data.pages}`;
     // progress = chunk + fractional page (fraction-of-chapter, resolution-independent)
     const frac = e.data.pages > 1 ? (e.data.page - 1) / (e.data.pages - 1) : 0;
     ebook.lastFrac = Math.min(frac, 0.999);
     syncProgress(ebook.it.id, ebook.chunk + ebook.lastFrac);
   } else if (e.data?.type === 'search-results') {
+    if (!Number.isSafeInteger(e.data.count) || e.data.count < 0) return;
     ebook.searchHits = e.data.count;
     $('#em-searchinfo').textContent = e.data.count
       ? `${e.data.count} hits — Enter for next` : 'No hits';
   } else if (e.data?.type === 'search-hit') {
+    if (!Number.isSafeInteger(e.data.idx) || !Number.isSafeInteger(e.data.total)
+      || e.data.idx < 1 || e.data.total < e.data.idx) return;
     $('#em-searchinfo').textContent = `${e.data.idx}/${e.data.total} in ch.`;
   }
 });
