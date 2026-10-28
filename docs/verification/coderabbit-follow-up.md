@@ -1,100 +1,203 @@
 # CodeRabbit follow-up verification
 
-This ledger covers all eight actionable findings, two nitpicks and two diagnostics
-from [review 5677254865](https://github.com/ColterD/Frayd/pull/1#pullrequestreview-5677254865)
-on `f2a46190c83a9d256281204a1db99edd3623983d`. The follow-up is
-[fork draft PR #2](https://github.com/ColterD/Frayd/pull/2); deployment remains held.
-Results below were collected on 2026-10-27 America/Chicago (2026-10-28 UTC).
+Updated 2026-10-28 UTC for [fork draft PR #2](https://github.com/ColterD/Frayd/pull/2).
+This ledger accounts for **18 CodeRabbit issue/diagnostic entries**: the original
+12, two initial PR #2 documentation comments, two subsequent cleanup findings,
+one outside-diff cache finding and one unverified wording diagnostic. Summary-only
+risks and GitHub CodeQL alerts are recorded separately, not added to that count.
+PR #2 remains draft and unmerged. No deployment is qualified or authorized here.
 
-## Source and verification boundary
+## Source and delivery boundaries
 
-The baseline is synchronized fork main
-`08242a83e26a0807af5db8bd89987519b73d9494`, including upstream merge
-`3b0d003bfb604fe49bc627d47aaf7bcefc67c11a`. Its server/client source matches the
-reviewed head. Baseline failures below used that source with disposable fixtures;
-there was no access to an operator database or library.
+| Source | Identity and meaning |
+|---|---|
+| Original review | [5677254865](https://github.com/ColterD/Frayd/pull/1#pullrequestreview-5677254865), head `f2a46190c83a9d256281204a1db99edd3623983d`. Baseline `08242a83e26a0807af5db8bd89987519b73d9494` has matching server/client source and includes upstream merge `3b0d003bfb604fe49bc627d47aaf7bcefc67c11a`. |
+| Initial PR #2 review | [5677483709](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5677483709), documentation-only head `64b546ee712a88292c625028a5867c56755177c0`. |
+| First implementation review | [5677717042](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5677717042), head `247ff29fa3771b19e7996b005616475523a2400b`. Two new Minor findings; hosted documentation coverage 100%, 39 functions across 12 files, nine unsupported skips. |
+| Latest completed review | [5677830358](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5677830358), head `3b7a5f590bc914ff39f68894be6bdff0d3561617`, submitted 2026-10-28T04:34:52Z, publication batch 1/1 complete. One outside-diff Minor and one unverified Minor diagnostic. |
+| Upstream synchronization | Upstream `kattiest/Frayd` commit `540b87acea05304c767a151d47456fceaaf7b29a` merged into fork main at `49de065f3fb0875425f5467b87ae161b43d7914e`, and into the PR branch at `fafad69434a5893cb1d1dbbcbdf56d87f0aab05b`. |
+| Security patch already on fork main | PR-branch patch `b840753a9cabb680b94733ae7a58b6b303619d17` was cherry-picked to fork main as `2789f37e55148e0ee69e7bba6bb5ee30b5f49225`. This fixes the original four EPUB-message sender-boundary findings in source; all four default-branch alerts now report fixed, not dismissed. It does not merge PR #2. |
+| Current combined work | Current combined head `d9c91eb` includes fork main's security fix, upstream synchronization and hygiene `ad5dae3`. Backend cache/publication correction is frozen and passes 27 Rust tests, Clippy and release build. New immutable image/runtime/browser qualification is pending; historical results below do not qualify that new runtime. |
 
-The tested application image is
-`sha256:0f7b830c6e19a52cebb5816f9e14f9ae472d9092743157b8ababd35f09c8d03b`;
-the proxy is
+Historical runtime images are immutable evidence boundaries:
+`sha256:cf030b02bc7703e5e0a5553971d28dac0238c6fc73b22cbd68d6cd99e88e8861`
+was used for initial legacy/browser checks;
+`sha256:0f7b830c6e19a52cebb5816f9e14f9ae472d9092743157b8ababd35f09c8d03b`
+was the later cleanup/namespace build. The proxy was
 `sha256:543d71e7db7b987f1e41dfb0a297efe5f020c141b2dbc39a859fd2473df7bbe2`.
-The rebuilt app includes the follow-up cleanup and namespace corrections. Final
-runtime qualification exited 0 against these exact immutable image IDs. Earlier
-`247ff29` observations are retained as historical controls where identified. All 20 backend and 32 image-build input hashes were rechecked
-against the final local source with zero mismatches. Publication and hosted checks
-must bind their results to the eventual PR commit. Private local receipts are
-summarized here with the actual observations; the committed tests and commands
-below allow repetition without those receipts.
+These predate the upstream merge and latest backend corrections. Their successful
+runs do not qualify the current combined application.
 
-## Finding dispositions
+The current backend 20-file manifest has SHA-256
+`5cff0ad4c08db1ab81c15aba00ad97023849d91bfb4992a00e19c12acf78cf49`.
+Reconciliation rehashed all 20 source inputs with zero mismatches. The final
+post-merge Rust run passed 21 unit plus six archive-reader tests (exit 0), Clippy
+(exit 0, existing warnings) and release build (exit 0). Both client suites passed
+22 tests after the merge. This is source/build evidence; a new runtime is pending.
 
-“Local pass” means the bounded scenario passed, not hosted acceptance or deployment.
+## All 18 CodeRabbit dispositions
 
-| ID | Original review severity | Baseline and final observation | Disposition / limit |
+Severity is the original published severity. “Historical pass” describes the
+bounded source/image scenario recorded below; the new combined runtime still needs
+qualification. A resolved review thread and a passing check are separate evidence.
+
+| ID | Severity | Verified observation / disposition | Current limit |
 |---|---|---|---|
-| CR-01 | Major | With twenty comics before a song, the baseline picker omitted the song; two new VM scenarios failed (9/11 passing). Filtering playable kinds before the cap passes all 11 tests, preserving order, escaping titles and limiting to 20 playable choices. | Local scripted and real Chrome guest-picker pass; no decoder or request-relay claim. |
-| CR-02 | Major | Baseline scan test exited 101 while the app DB mutex was held. A separate WAL worker connection passes. With a deliberately blocked real `ffprobe`, successful proxy-facing health, root, library and progress HTTP reads completed in 0.000–0.001s in the recorded run; releasing it completed the scan. | Local unit and disposable HTTP pass; timings describe this fixture only. Full before/during/after oracle is specified below with its remaining limit. |
-| CR-03 | Major | Baseline proxy returned HTTP 502 after a forced app IP change and failed the 20s readiness deadline (exit 1). Final proxy recovered in 9.01s after the IP changed; its container ID and start time were unchanged. Query/range bytes and WebSocket upgrade survived. | Local Docker pass; no full watch-party protocol qualification. |
-| CR-04 | Major | Real packaged ffmpeg converted synthetic H264/AC3 to H264/AAC under `/data/transcodes/<media-id>/<job-uuid>/audio.mp4` with an OS-enforced read-only media mount. Original hash/names were unchanged; exact converted HTTP bytes survived app restart. Cache/registry failure and library overlap tests fail closed. | Local runtime and negative-test pass; no all-format or browser decoder claim. |
-| CR-05 | Minor | Three pagination regressions failed before the correction. Now any nonempty continuation token is rejected before classifying results, with or without first-page findings. The actual CLI entry point under a controlled incomplete response exits 1 with zero report bytes and an explicit incomplete-audit diagnostic. | Local controlled HTTP-boundary pass; no live paginated OSV response claimed. |
-| CR-06 | Major | The alleged ZIP 9 UTF-8 decoding regression was not reproduced: unflagged UTF-8 name lookup and saved physical-page index characterization pass. A separate cached/fresh ordering mismatch was reproduced (exit 101) and corrected: listing and content now honor the same persisted order. Missing-cache population preserves other metadata; unreadable archives do not erase it. | Allegation not reproduced; separate coherency defect fixed and locally verified. See compatibility proof below. |
-| CR-07 | Major | Baseline scanner removed one genuine browser-suffixed row (3 rather than 4); its progress-bearing rows survived FK enforcement. Final tests retain all four IDs, three progress positions and source bytes. A separate legacy-reference collision initially removed a genuine row; the corrected guard retains its ID/bytes and existing playback pointer. | Local pass. Only `provenance='generated'` permits automatic artifact-row deletion; a legacy playback reference never grants deletion authority. |
-| CR-08 | Minor | Tests prune exact registered generated artifact rows whether their files exist or are missing. Rows with progress, annotations, tracks, playlists, competing ownership or legacy-only provenance remain retained. | Local fixture pass; ambiguous unregistered historical names are deliberately preserved. |
-| CR-09 | Trivial | Baseline diagnostic tests failed. Final tests expose captured byte/text stderr, preserve the original error through cleanup failures, and exercise a real synthetic Docker executable exiting 23 with its diagnostic intact. Cleanup failure after success remains fatal. | Local subprocess pass; no actual Docker outage induced. |
-| CR-10 | Trivial | Original ignore rules failed the sentinel context oracle. Final real scratch-image/export check excludes synthetic `.env` variants and installer sentinels while retaining normal JS. The disposable runtime also checks image/HTTP exclusion. | Local Docker pass; sentinels contain no real secrets. |
-| D-01 | Lint | Original B905 reproduced. Explicit `zip(..., strict=True)` passes selected Ruff rules; result-count mismatch remains fatal. | Local pass, including the exact CI lint block. |
-| D-02 | Documentation | Meaningful docs added to changed production callables and new helpers. Local AST count is 3/3 audit script and 13/13 named audit-test callables/classes documented. | **Hosted pass on `247ff29`: 100.00% >=80%, 39 functions across 12 files; nine unsupported skips.** Must recheck later source changes; threshold unchanged. |
+| [CR-01](https://github.com/ColterD/Frayd/pull/1#discussion_r4396472345) | Major | Baseline omitted a song after twenty comics (two new VM cases failed). Filtering playable kinds before the cap passed all 11 original client tests. Real Chrome guest join showed only `Later Music` and its Request button; twenty comics were excluded. | Historical scripted/browser pass; combined browser rerun pending. Request relay and decoder behavior were not tested. |
+| [CR-02](https://github.com/ColterD/Frayd/pull/1#discussion_r4396472349) | Major | Baseline scan test exited 101 while the app DB mutex was held. Separate WAL worker connection passes. Disposable runtime explicitly checked health, static root, library and progress through the proxy before, during and after blocked ffprobe; all twelve returned expected data in 0–5 ms in the later run, and release completed scanning. | Historical unit/runtime pass. Timing is fixture-specific; no proxy-startup requirement is inferred. |
+| [CR-03](https://github.com/ColterD/Frayd/pull/1#discussion_r4396472357) | Major | Baseline proxy returned HTTP 502 after app IP replacement and failed its 20s deadline. Later corrected run changed app IP `192.168.112.2` to `.4`; unchanged proxy ID/start time recovered in 8.51s with query/range bytes and WebSocket handshake preserved. | Historical pass; full watch-party protocol not qualified. |
+| [CR-04](https://github.com/ColterD/Frayd/pull/1#discussion_r4396472368) | Major | Actual ffmpeg converted synthetic H264/AC3 to H264/AAC under private `/data/transcodes/<media-id>/<job-uuid>/audio.mp4` with a read-only library. Source hash/names stayed unchanged; converted stream bytes survived app restart. Cache/registry failure and overlap controls fail closed. | Historical runtime/negative-test pass; combined conversion rerun pending. |
+| [CR-05](https://github.com/ColterD/Frayd/pull/1#discussion_r4396472379) | Minor | Three pagination regressions failed before correction. Any nonempty OSV continuation token now fails before classification; controlled incomplete CLI response exits 1 with zero report bytes and an explicit diagnostic. | Local controlled HTTP-boundary pass; no live paginated response claimed. |
+| [CR-06](https://github.com/ColterD/Frayd/pull/1#discussion_r4396472389) | Major | Alleged ZIP 9 UTF-8 decoding failure was not reproduced. Unflagged UTF-8 name lookup and saved physical-page index characterization pass. A separate persisted/fresh page-order mismatch failed (exit 101), then passed after listing/content shared persisted order. | Encoding allegation remains un-reproduced. Changed-archive invalidation is a separate valid issue, NEXT-01, corrected with local handler tests; new runtime qualification pending. |
+| [CR-07](https://github.com/ColterD/Frayd/pull/1#discussion_r4396472409) | Major | Baseline removed one genuine browser-suffixed row (three instead of four); progress-bearing rows survived FK enforcement. Corrected tests retain four IDs, three progress positions and bytes. A legacy-pointer collision was also reproduced and fixed. | Only exact `provenance='generated'` entries grant row-deletion authority. Legacy playback references, suffixes and ambiguous historical names never do. |
+| [CR-08](https://github.com/ColterD/Frayd/pull/1#discussion_r4396472409) | Minor | Exact registered generated rows can be pruned even when the file is absent. Progress, annotations, tracks, playlists, competing ownership and legacy-only provenance retain rows. | Historical fixture pass; no broad orphan deletion or cascading user-data deletion. |
+| [CR-09](https://github.com/ColterD/Frayd/pull/1#pullrequestreview-5677254865) | Trivial | Baseline diagnostics failed. Tests now expose byte/text stderr and preserve the original error through cleanup errors; a real synthetic executable exits 23 with its diagnostic intact. Cleanup failure after success stays fatal. | Subprocess pass; no actual Docker outage induced. |
+| [CR-10](https://github.com/ColterD/Frayd/pull/1#pullrequestreview-5677254865) | Trivial | Original ignore rules failed. Real context export excludes synthetic `.env` variants and installer sentinels while retaining normal JS; runtime checks image/HTTP exclusion. | Historical Docker pass; repeat context/runtime checks on new build. |
+| D-01 | Warning | Original B905 reproduced. Explicit `zip(..., strict=True)` passes selected Ruff rules; mismatched package/result counts remain fatal. | Local and historical hosted lint pass. |
+| D-02 | Warning | Latest completed hosted review reports **100.00% >=80.00%**, 44 functions across 12 files, one unsupported skip, on `3b7a5f5`. Threshold unchanged. | Passed for that SHA; next combined-head coverage pending. Exact 12 analyzed filenames are undisclosed; selected files are not the coverage-file list. |
+| [PR2-DOC-01](https://github.com/ColterD/Frayd/pull/2#discussion_r4396630072) | Minor | Explicit oracle now requires successful proxy-facing liveness/library/progress before, during and after the blocked probe, followed by scan completion. Historical harness rerun exercised all phases. | Documentation and historical verification gap closed; separate from CR-02's Major code severity. |
+| [PR2-DOC-02](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5677483709) | Trivial | Explicit oracle preserves cached page names, page-index archive lookup, IDs, metadata and progress after upgrade/rescan. Populated legacy startup refreshed two rows; explicit rescan returned HTTP 202 then idle. All 19 HTTP/eight DB assertions passed after each. | Historical pass for unchanged archives; NEXT-01 covers archive replacement. |
+| [FRESH-01](https://github.com/ColterD/Frayd/pull/2#discussion_r4396816530) | Minor | Old cleanup missed a real stopped labelled container. Corrected all-state listing rejects it; removal restores clean checks. Red regression followed by 14 passing Python tests and lint. | Hosted thread resolved/outdated, marked addressed in `3b7a5f5`; historical runtime cleanup passed. |
+| [FRESH-02](https://github.com/ColterD/Frayd/pull/2#discussion_r4396816549) | Minor | Two failed jobs originally left four registry rows. Corrected tests require zero per-job row/directory growth across repeat failure while retaining neighbors/legacy artifacts; historical 24 Rust tests and runtime passed. | Hosted thread resolved/outdated, marked addressed in `3b7a5f5`. Later publication-failure risk is separate below. |
+| [NEXT-01](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5677830358) | Minor, outside diff | Valid: persisted comic pages can outlive source mtime/size changes. Required oracle replaces an archive, rescans, verifies added page listing/index bytes and removed-page behavior while retaining ID/progress/other metadata. | Corrected and locally verified in the frozen 27-test suite; new image/HTTP qualification pending. Seconds-granularity mtime plus size does not detect replacements preserving both values. |
+| [NEXT-D01](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5677830358) | Minor, unverified tool diagnostic | Report requested “Ubuntu-hosted” wording but explicitly could not confirm its finding. Ledger uses **“hosted run on Ubuntu”** and records the actual historical workflow outcome below. | Wording clarified; diagnostic validity is not claimed. |
 
-## Initial PR #2 documentation review
+The latest review selected five files, and explicitly skipped
+`tests/test_integration.py` as similar to previous changes. Selection does not prove
+full analysis. No path-filter ignored section was published. The original review
+contained eight actionable items across seven inline records, two nested nitpicks
+and two diagnostics; CR-07/08 share a comment but are separate requirements.
 
-[Review 5677483709](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5677483709)
-covered only the initial ledger commit
-`64b546ee712a88292c625028a5867c56755177c0`, not the implementation now described.
-Its two documentation findings are distinct from the original code severities:
+## Summary-only risks and separate security work
 
-- **Minor, [4396630072](https://github.com/ColterD/Frayd/pull/2#discussion_r4396630072):**
-  CR-02's explicit acceptance oracle is successful **proxy-facing liveness, library
-  and progress reads before, during and after** a deliberately blocked metadata
-  probe, followed by scan completion. No proxy startup requirement is inferred.
-  The updated runtime harness explicitly checks all three surfaces plus the static
-  root through the proxy before, during and after the blocked scan. All twelve
-  reads returned expected data in 0–8 ms in the disposable rerun, including saved
-  progress after release; scanning completed. This closes the documentation and
-  phase-verification gap, separate from CR-02's historical Major label.
-- **Nitpick, `53807223294e2a90f1e418b8`:** CR-06's acceptance oracle explicitly
-  preserves cached page names and archive lookup by page index **after upgrade and
-  rescan**, together with media IDs, metadata and progress. The compatibility proof
-  below records final-image startup/restart results and persisted/fresh ordering;
-  committed tests cover scanner identity preservation and archive lookup. A
-  separate populated legacy-library check ran startup scan (two existing rows
-  refreshed) and an explicit HTTP 202 rescan. All 19 HTTP and eight database
-  assertions passed after each; the unchanged explicit rescan required zero
-  upserts. This closes the wording and verification gap without converting the
-  un-reproduced ZIP allegation into a proven bug.
+These are outside the 18-entry CodeRabbit count:
 
-## Repeatable checks
+- **Prolonged DB lock:** cleanup must retain provenance if ownership cannot be
+  validated. Historical follow-up tests held a lock beyond the normal busy timeout
+  and retried after release. Persistent lock can leave a reported held job; there
+  is no automatic global orphan reaper.
+- **Failed publication:** latest review summary identified a real unused-output
+  leak, separate from FRESH-02's conversion failure. A SQLite trigger refused
+  publication after process doubles produced a completed file; two jobs left four
+  records and unused outputs before correction (exit 101). Final test retires only
+  exact unreferenced generated current-job files; repeated failure leaves zero
+  records/job directories, unchanged source bytes and NULL playback pointer.
+  Legacy/referenced/neighbor files remain protected. All 27 Rust tests pass; real
+  final-image runtime is pending. Lock/permission/ownership conflicts remain held.
+- **Cache namespace containment:** historical negative test exposed a media-ID
+  symlink escaping the cache. Correction rejects symlink/non-directory parents and
+  atomically creates a UUID directory before registration. Private cache ownership
+  remains required; a hostile same-UID parent-replacement race is not qualified.
+- **Six PR CodeQL path/command diagnostics:** these were separate from CodeRabbit.
+  Source triage traced the route to server-created application state, fixed
+  executables and numeric ID/UUID/fixed-name output components. A zero-argument
+  callback made the boundary explicit; no suppression/dismissal was added. The
+  [CodeQL aggregate on `3b7a5f5`](https://github.com/ColterD/Frayd/runs/122632053805)
+  completed successfully with “No new alerts in code changed by this pull request”
+  and zero annotations. This clears the PR-check gate; individual global alert
+  states for those six were not established by this aggregate. The result predates
+  the new combined source.
+- **Four actual default-branch EPUB-message findings:** reproduced hostile sender
+  cases triggered annotation/progress/chapter requests before the fix. The guard
+  now requires an active reader, exact `null` origin, exact active-frame
+  `event.source`, and valid payload shape before dispatch. Five hostile classes
+  went from failing to producing no effects. Combined client suite passed 22/22,
+  including legitimate highlights, progress, search/geometry and chapter changes.
+  Fork main received the security patch separately as recorded above. Alerts
+  [1](https://github.com/ColterD/Frayd/security/code-scanning/1),
+  [2](https://github.com/ColterD/Frayd/security/code-scanning/2),
+  [3](https://github.com/ColterD/Frayd/security/code-scanning/3) and
+  [4](https://github.com/ColterD/Frayd/security/code-scanning/4) each report
+  `fixed` at 2026-10-28T04:40:11Z on main, not dismissed. Main's JavaScript CodeQL
+  job passed; Rust/build jobs were still running in that snapshot. Alert instance
+  commit `49de065` identifies the last unsafe instance, not the fixing scan head.
+  PR head `d9c91eb` includes the main fix, so it is already in the PR base rather
+  than new PR-only security work. Real-browser sandbox qualification remains
+  pending. Trust of scripts already inside the
+  active EPUB frame and same-frame navigation generations are unchanged limits.
 
-Run from the repository root on an isolated checkout. Docker commands create QA
-images and disposable projects, and require a functioning local Docker daemon.
-The Rust build uses the pinned builder in `Dockerfile`; no host Rust installation
-is required. Keep the QA tags separate from any deployed images.
+## New archive-replacement qualification
+
+The valid NEXT-01 baseline was reproduced after the upstream merge: unchanged
+rescan retained persisted reverse order `[page10,page2]`, then replacement with an
+added `page5` and deliberately restored mtime still returned the stale two-page
+cache (exit 101). The corrected scanner compares both size and mtime with
+NULL-safe semantics, clearing only changed comic/manga page names. Backdated and
+missing legacy fingerprints are covered; unchanged sources retain persisted order.
+Lazy publication also compares the original DB fingerprint against any intervening
+rescan before writing names.
+
+In the final handler test, rescan after replacement returns
+`[page2,page5,page10]`; page index 1 returns exact `new fifth image` bytes. ID 1,
+position 7, title and synopsis remain unchanged. Malformed metadata is retained;
+unchanged scans report zero updates. These tests invoke actual Axum handlers with
+response bodies, not a network listener. Final-image HTTP replacement/removal
+checks remain pending. A source replacement preserving both second-level mtime
+and exact byte length is outside this fingerprint's detection boundary.
+
+## Historical qualification and current hygiene
+
+The later pre-upstream image build passed **18 unit + 6 archive-reader tests**,
+Clippy and release build. Its integration exited 0: first-run setup, duplicate
+rejection, authenticated session/login/logout, full/range bytes, saved progress,
+recreation, forced IP change, WebSocket upgrade, twelve blocked-scan phase reads,
+real read-only-source conversion, restart persistence and all-state cleanup.
+Clippy retained existing warnings; this is not a warning-free claim.
+
+The original hosted integration failed because Docker on Ubuntu rejected a fixed
+reservation IP on a daemon-allocated subnet. The correction uses dynamic allocation
+while preserving changed-IP and unchanged-proxy assertions. The later **hosted run
+on Ubuntu** and all hosted checks on `3b7a5f5` passed: all ten check runs completed successfully, including
+[build/integration](https://github.com/ColterD/Frayd/actions/runs/40632502363/job/122631898658),
+[dependency audit](https://github.com/ColterD/Frayd/actions/runs/40632502363/job/122631898423),
+four language/workflow analyses, aggregate CodeQL and CodeRabbit (push/PR checks
+include duplicate workflow jobs). Earlier failure logs remain historical controls;
+they are not current gates.
+
+Legacy fixture proof used baseline schema plus annotations and no initial artifact
+registry. Nineteen curl requests each exited 0 with expected statuses/bodies; eight
+DB invariants passed after startup/restart and populated-library rescan. Cached
+`["Á.jpg","À.jpg","Â.jpg"]` mapped index 0 to acute bytes and index 1 to grave;
+uncached natural order had matching bytes. All seven media IDs, two progress rows,
+annotation 19, synopsis/custom/chapter metadata survived. One backfilled
+`legacy_reference` preserved a genuine shared final path; genuine final/temp suffix
+rows streamed exact markers. These were byte-transport fixtures, not decoded media.
+
+The historical Chrome guest picker showed `(guest)` and only `Later Music` plus
+Request after twenty comics. Request relay/approval and playback were not exercised.
+Owned preview containers/networks were removed; former ports are not demo endpoints.
+
+Hygiene at the synchronized source adds root ignore rules for native
+`server/transcodes/` and `/.ruff_cache/`, removes unused `users-three.svg` after
+no-reference checks on both fork/upstream source, and documents browser YouTube
+iframe access separately from server URL ingestion. Stock Docker lacks yt-dlp and
+its app network is internal; native ingestion needs networking and writable media.
+These are source/config observations, not live ingestion acceptance. Vendor Plyr,
+all seven referenced archive fixtures and excluded experimental installers remain.
+No new application dependency was added. Hygiene receipt records 22 client tests,
+14 Python tests, selected Ruff rules, syntax and whitespace checks passing after
+merge; these do not stand in for combined Rust/image/runtime qualification.
+
+## Repeatable commands and remaining gates
+
+Run from an isolated checkout of the exact commit being qualified. Docker commands
+create QA images and disposable projects; keep tags separate from deployment.
+The pinned Docker builder runs locked Rust tests, Clippy and release build.
 
 ```sh
 node --check client/js/app.js
 node --check client/js/party.js
-node --test tests/client.test.cjs
+node --test tests/*.test.cjs
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 docker compose config --quiet
 git diff --check
 ```
 
-Initial recorded result: every command exited 0; 11 client tests and 13 Python tests passed.
-The follow-up adds the stopped-container regression: 14 Python tests now pass.
-The client and Python suites were rerun while reconciling this ledger, with the
-same counts and exit 0. Client DOM/network boundaries are synthetic VM fixtures.
-Python tests cover audit pagination/count/publisher policy and subprocess errors.
+The latest recorded client/Python counts are 22/14 passing respectively, exit 0.
+VM tests execute full scripts with synthetic browser/network boundaries; they do
+not establish actual browser sandbox behavior. CI now runs both client suites.
 
-Repeat the exact Linux x86_64 CI lint block in a disposable environment:
+For the Linux x86_64 hash-locked lint environment:
 
 ```sh
 RUNNER_TEMP=$(mktemp -d)
@@ -103,10 +206,9 @@ python3 -m venv "$RUNNER_TEMP/frayd-python-lint"
 "$RUNNER_TEMP/frayd-python-lint/bin/ruff" check --no-cache --select E4,E7,E9,F,B905 scripts tests
 ```
 
-Recorded exit 0, including the hash-locked Ruff 0.17.3 install. This CI-only MIT
-wheel was checked against PyPI metadata and OSV (no indexed advisory returned);
-source-to-wheel reproducibility and hosted runner execution were not established.
-Remove only the temporary directory created by the command after inspection.
+Historical exit 0. CI-only Ruff 0.17.3 is hash-locked, MIT-licensed; PyPI metadata
+and OSV were checked with no indexed advisory returned. Source-to-wheel
+reproducibility was not established. Remove only the created temporary directory.
 
 ```sh
 docker build --progress plain -t frayd-pr2-qa:local .
@@ -117,148 +219,39 @@ python3 -u scripts/integration.py
 python3 scripts/audit-dependencies.py
 ```
 
-Recorded exit 0 for each command. The original application build ran `cargo test --locked`
-(14 unit + 6 archive-reader tests); the rebuilt follow-up passes 18 unit + 6 archive-reader
-tests, 24 total. Both builds run `cargo clippy --locked --all-targets` and
-`cargo build --locked --release`. Clippy retained seven existing binary warnings
-and five duplicate integration warnings; there is no claim of warning-free Rust.
-The live OSV run checked 209 locked packages with no applicable finding and retained
-the existing exact publisher-range exception for block-buffer 0.10.4. That result
-is time-bound; the command queries current OSV and may fail on new advisories.
+These commands passed historically, but must run again after the new source freeze.
+The context check exports an actual image with synthetic `.env` sentinels. The
+audit queries current OSV; the historical 209-package clean result and exact
+block-buffer 0.10.4 publisher-range exception do not predict future advisories.
+CI repeats syntax/client/Python/lint/Compose/build/context/integration/audit checks.
 
-The integration command exercises first-run setup, duplicate rejection, login,
-logout/session revocation, comic bytes, full/range streaming, progress persistence,
-app recreation, forced DNS/IP replacement, WebSocket handshake, blocked scan and
-real conversion against read-only media. It removes its owned containers, networks
-and volume in cleanup; the final recorded run confirmed their absence. The context
-check exports an actual temporary image rather than simulating ignore matching.
-Existing `.github/workflows/checks.yml` repeats these client/Python, lint, build,
-context, runtime and audit checks on pushes and PRs. Local results do not establish
-that the hosted workflow has run on the final PR head.
+Remaining acceptance gates:
 
-For the focused backend oracles, run the following inside the same Rust builder
-with the `server/` tree as working directory, or with a matching local Rust setup:
+1. Bind the new images to combined head `d9c91eb` and the backend freeze above.
+   The changed-archive/publication oracles, full 27-test Rust suite, Clippy/release
+   build and 22 client tests pass locally. Finish combined Python/lint/current
+   dependency audit and record any changed input hashes; do not reuse old runtime
+   results as qualification for the merged source.
+2. Build new immutable QA images, rerun disposable runtime/legacy/rescan checks,
+   and qualify the actual browser EPUB sender boundary plus intended legitimate
+   reader behavior. Repeat any affected picker behavior on the combined client.
+   Record resource cleanup. No real operator data is required for these fixtures.
+3. Obtain new hosted checks, CodeQL and a completed CodeRabbit review tied to the
+   final PR SHA, including documentation coverage >=80%. Preserve the prior
+   100% result as historical rather than a guarantee for newly touched functions.
+   The four original default-branch alerts are already fixed; finish any remaining
+   main workflow jobs separately from final PR-head acceptance.
+4. Retain draft status until owner acceptance. Deployment, production restart,
+   real-data migration, arbitrary codecs and full watch-party behavior remain
+   outside the qualification recorded here.
 
-```sh
-cargo test --locked scan_uses_worker_connection_while_application_database_is_locked
-cargo test --locked listing_honors_persisted_page_order_used_by_content
-cargo test --locked legacy_playback_collision_preserves_genuine_media_identity_and_bytes
-cargo test --locked scan_preserves_genuine_browser_suffix_sources_and_progress
-cargo test --locked registered_present_and_missing_rows_prune_but_all_user_references_and_conflicts_survive
-cargo test --locked --test archive_readers
-```
+## Inherited ingestion diagnostics
 
-All named scenarios passed in the recorded final suite. The first four supplied
-useful failing controls against baseline or the intermediate collision guard;
-the ZIP characterization cases passed and do not establish an encoding regression.
-
-## Legacy compatibility HTTP proof
-
-A second disposable app started from the baseline SQLite schema plus annotations,
-with no artifact registry, persisted UTF-8 comic page order, progress, metadata,
-and genuine browser-suffixed media. This earlier compatibility/browser run used
-`sha256:cf030b02bc7703e5e0a5553971d28dac0238c6fc73b22cbd68d6cd99e88e8861`
-on implementation `247ff29`; it is historical proof for the unchanged archive and
-client paths, separate from the final rebuilt runtime. Those compatibility unit
-controls also pass in the follow-up 24-test Rust suite.
-After startup and again after restart, 19 exact HTTP requests (each curl exit 0)
-and eight DB invariants passed:
-
-- Cached listing returned `["Á.jpg","À.jpg","Â.jpg"]`; page 0 returned the acute
-  marker and page 1 the grave marker. The uncached archive populated natural order
-  `["À.jpg","Á.jpg","Â.jpg"]` with matching page bytes.
-- Negative/out-of-range pages, absent archive and absent media returned expected
-  HTTP 404s. Existing progress remained position 1, updated_at 12345.
-- All seven original media IDs, both progress records, annotation 19, synopsis,
-  custom metadata and chapters remained intact. Missing-cache population changed
-  only pages; an absent archive left existing metadata intact.
-- A legacy final pointer and the genuine row sharing that path both streamed
-  `LEGACY-FINAL-PLAYBACK` with HTTP 200. Genuine final/temp suffix rows also streamed
-  exact marker bytes. The single backfilled registry entry was `legacy_reference`;
-  repeated startup preserved it and every media ID.
-
-These are synthetic marker-byte transport and SQLite migration observations,
-not decodable image/video playback. The committed archive, scanner, cache and
-collision tests above repeat the core invariants without private QA harness files.
-A populated-library follow-up refreshed two legacy comic rows during startup,
-then accepted an explicit rescan (HTTP 202, followed by scanning=false). All 19
-HTTP and eight DB assertions passed after both scans; persisted page order and
-bytes, IDs, progress, annotations and custom metadata survived. The explicit
-unchanged rescan required zero upserts. These synthetic fixtures do not replace
-testing an owner's actual legacy database. All task-owned
-legacy QA containers/networks were removed; no live deployment was modified.
-
-## Browser picker proof
-
-**Browser picker passed:** real Chrome on the manually opened disposable page:
-   Continue as guest, Party, join a distinct synthetic host, observe `(guest)` and
-   `REQUEST A TRACK` containing only `Later Music` with its Request button. Twenty
-   comics were excluded and song 99 was selectable. The rendered screenshot and
-   action receipt were reconciled; all labelled preview containers/networks were
-   removed. Track request relay, host approval and browser media decoding remain
-   untested. This fixture has been removed; its former port is not a demo endpoint.
-
-## Outstanding acceptance gates
-
-1. **Hosted review after follow-up corrections:** review 5677717042 on `247ff29`
-   measured 100.00% function documentation coverage (39 functions, 12 files; nine
-   unsupported skips), passing the unchanged 80% requirement. Two new Minor items
-   concern stopped-container cleanup verification and failed-job registry/directory
-   growth. Local corrections pass; a later-head hosted review remains pending. Its summary-only
-   prolonged-database-lock cleanup risk is also under assessment. The published
-   selected-file list has 23 entries; it does not identify the exact 12 coverage
-   files. Do not treat a successful check status as a finding disposition.
-2. **Hosted final-head checks and owner acceptance:** confirm both workflow jobs on
-   the published PR commit and retain draft status until acceptance. No deployment,
-   production restart, real-data migration, browser decoder qualification, arbitrary
-   codec support or complete watch-party protocol result is claimed here.
-
-## Hosted follow-up observations
-
-The hosted Docker builds and Rust checks passed on `247ff29`, but integration
-failed on both push and PR runs: Ubuntu Docker rejects a fixed reservation IP on
-a daemon-allocated subnet. The one-line harness correction uses dynamic allocation
-and keeps the actual changed-IP and unchanged-proxy assertions. The final-image local rerun
-passed in 8.51 seconds with full Range/WebSocket, scan-phase, conversion and
-cleanup checks. Its app IP changed from 192.168.112.2 to 192.168.112.4 while proxy
-ID/start time remained unchanged; all twelve scan-phase reads returned expected
-data in 0–5 ms in this fixture. Actual conversion and restart stream bytes passed.
-Cleanup checked stopped containers too and confirmed no owned resources. The
-corrected Ubuntu hosted run remains pending.
-
-GitHub Advanced Security separately reported six path/command diagnostics in
-transcode output handling. Static triage maps every reported source to the
-`trigger_scan` route callback, which accepts server-built state and no HTTP body,
-query or path values. Output components are operator configuration plus numeric
-IDs, UUIDs and fixed filenames; the executable is fixed and no shell parses its
-arguments. No alerts were suppressed or dismissed. A separate pre-existing
-media-ID directory symlink gap was identified and is being corrected with a
-negative containment test; all 24 Rust tests, Clippy, release build and the final
-immutable-image runtime suite pass locally. Hosted reanalysis remains pending.
-
-## Review 5677717042 correction oracles
-
-- **FRESH-01, Minor:** the old final cleanup check missed a real stopped labelled
-  container. The corrected shared assertion includes all container states and
-  rejects that same fixture; after removal, all resource checks pass. The unit
-  regression failed first, then the 14-test Python suite and lint passed. Network
-  and volume listings retain their supported flags.
-- **FRESH-02, Minor:** two actual failed conversion jobs left four registry rows
-  before correction. The negative oracle requires no per-job row/directory growth
-  on repeat failure, retaining neighboring and legacy artifacts. Both failing
-  controls now pass, together with all 24 Rust tests, Clippy and the final Docker
-  runtime suite. Hosted reanalysis remains pending.
-- **Summary-only database-lock risk:** cleanup must retain provenance if a lock
-  prevents exact ownership validation. The follow-up tests a lock beyond the
-  normal busy timeout and an explicit retry after release. A persistent lock can
-  leave a reported held job; no automatic global orphan reaper is claimed.
-- **Independent namespace guard:** a pre-existing media-ID symlink previously
-  permitted a job outside the canonical cache. The correction rejects symlink or
-  non-directory parents and atomically creates a fresh UUID job directory before
-  registering outputs. Private cache ownership remains required; check-then-use
-  paths do not establish resistance to a hostile same-UID writer replacing parents.
-
-These corrections do not dismiss the six CodeQL alerts. The route now explicitly
-binds startup-created application state in a zero-argument callback; HTTP input
-is not accepted as a cache/output path. Hosted reanalysis and the subsequent
-CodeRabbit review remain pending; this is not a claim that their checks passed.
+After synchronization, GitHub separately reported alerts 11–13 in upstream's
+experimental ingestion handler: destination creation, output argument and URL
+argument. Their reported source is the route callback. The destination comes
+from server configuration; the URL is real request data, restricted to an admin
+and HTTP(S), passed to a fixed executable as one argument without a shell. A
+bounded refinement is in progress to bind trusted application state explicitly
+and terminate command options before the URL. These are separate from the four
+EPUB findings already fixed on fork main; no alert is suppressed or dismissed.
