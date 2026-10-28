@@ -29,13 +29,30 @@ docker compose up -d --wait
 
 The app sees `/data/library`, not the host path. The image's `FRAYD_LIBRARY=/data/library` overrides the library path saved in Settings. Change the mount source to select a different host folder, then choose **Scan library** after adding or changing media.
 
-Alternatively, copy files into the default library volume, using additional disk space:
+Alternatively, copy files into a new subdirectory of the default library volume, using additional disk space. Run this block in Bash, set the absolute source directory, and choose a new import name using only letters, digits, underscores or hyphens:
 
 ```sh
-docker compose cp /absolute/path/to/your/media/. app:/data/library/
+(
+  set -eu
+  set -o pipefail
+  SOURCE_DIR=/absolute/path/to/your/media
+  IMPORT_NAME=import-001
+  case "$SOURCE_DIR" in /*) ;; *) echo 'Source must be absolute' >&2; exit 1 ;; esac
+  test -d "$SOURCE_DIR"
+  case "$IMPORT_NAME" in ''|*[!A-Za-z0-9_-]*) echo 'Invalid import name' >&2; exit 1 ;; esac
+  docker compose exec -T app sh -eu -c '
+    umask 077
+    mkdir -- "/data/library/$1"
+  ' sh "$IMPORT_NAME"
+  tar -C "$SOURCE_DIR" -cf - . |
+    docker compose exec -T app sh -eu -c '
+      umask 077
+      exec tar --no-same-owner -xf - -C "/data/library/$1"
+    ' sh "$IMPORT_NAME"
+)
 ```
 
-Use this alternative without the read-only library override. Media copied into the named volume shares that volume's deletion and backup lifecycle.
+Use this alternative with the app running and without the read-only library override. Extraction runs as the app's UID/GID 10001, avoiding unreadable host-owned private files; its private umask does not grant access to other users. The new destination must not already exist. A failure can leave a partial import: inspect that directory before scanning or retrying. After a successful copy, choose **Scan library**. Media copied into the named volume shares that volume's deletion and backup lifecycle.
 
 ## Configuration and storage
 
