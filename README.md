@@ -77,6 +77,8 @@ A separately bind-mounted host media directory is not removed by that command. K
 - ZIP-based CBZ/EPUB handling is built into the server. RAR-based CBR needs the optional `unrar` executable, which this image does not include.
 - Automatic router port mapping needs optional `upnpc`. It is not included, and the image defaults `FRAYD_UPNP=0`. The Compose example supplies neither TLS nor automatic network exposure.
 - Outside the isolated Docker network, audio thumbnail fallback can send filename-derived search terms to Apple's iTunes Search API and download artwork. Local metadata/embedded artwork extraction runs first. The supplied Compose app has no external routing, so online artwork lookup is unavailable and a missing thumbnail is expected.
+- YouTube watch parties load the YouTube iframe API in each participant's browser. Each browser needs access to YouTube; the app's isolated Docker network does not block browser-side requests. This feature has not been verified by the disposable integration checks below.
+- **Add from URL** uses an optional server-side `yt-dlp` executable to download into the library. The supplied image does not include it, and the Compose app has no external routing, so URL ingestion is unavailable in this setup. Native use additionally requires network access and a writable library; the read-only media mount above cannot receive downloads.
 - Videos are currently classified as movies; season/episode organization is not implemented.
 - The browser installer pages and bootstrap scripts are experimental; the Docker commands above are the reproducible startup route documented here.
 - ZIP readers support stored and deflate archives. Container isolation does not establish that arbitrary media is safe.
@@ -98,7 +100,7 @@ The native default port is 8484. Environment overrides include `FRAYD_DB`, `FRAY
 From the repository root, with Node.js and Python 3.11+:
 
 ```sh
-node --test tests/client.test.cjs
+node --test tests/*.test.cjs
 docker compose config --quiet
 docker build -t frayd-pr2-qa:local .
 docker build -f Dockerfile.proxy -t frayd-pr2-proxy-qa:local .

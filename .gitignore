@@ -8,6 +8,8 @@ __pycache__/
 *.sqlite
 *.sqlite-*
 server/thumbs/
+server/transcodes/
+/.ruff_cache/
 DONOTUPLOAD/
 .codex/
 .env
