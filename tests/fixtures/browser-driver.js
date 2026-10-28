@@ -182,7 +182,7 @@
     send(data) { this.sent.push(JSON.parse(data)); }
     close() { this.readyState = 3; }
   };
-  async function firstPartyState({ id, isHost, metadataFirst, nextId = id, priorFollowId = null }) {
+  async function firstPartyState({ id, isHost, metadataFirst, nextId = id, priorFollowId = null, localPaused = false }) {
     PartyUI.close();
     delete window.partySend;
     partyFollowId = priorFollowId;
@@ -198,6 +198,7 @@
       media.dispatchEvent(new Event('loadedmetadata'));
       equal(plyr.currentTime, 203, 'Saved resume applied before first party echo');
     }
+    if (localPaused) media.pause();
     PartyUI.open();
     document.getElementById('party-code-input').value = 'ABCD';
     document.getElementById('pt-join').click();
@@ -214,7 +215,7 @@
     if (isHost && nextId === id) {
       equal({ src: media.getAttribute('src'), child: media.querySelector('source')?.getAttribute('src') }, sourceBefore,
         'Host echo preserves effective stream and source structure');
-      equal(media.paused, false, 'Host echo preserves local playback despite paused echo');
+      equal(media.paused, localPaused, 'Host echo preserves local playback despite party state');
     } else {
       equal(media.paused, true, 'Guest or changed-media load follows paused party state');
     }
@@ -242,6 +243,43 @@
   }
   await run('host changed-media first state still loads the party stream',
     () => firstPartyState({ id: 11, nextId: 10, isHost: true, metadataFirst: true }));
+  await run('host reactivates a closed retained video after queued audio', async () => {
+    LIBRARY = [{ id: 10, kind: 'movie' }, { id: 11, kind: 'music' }];
+    PartyUI.close();
+    delete window.partySend;
+    const previous = plyr.media;
+    openVideo({ id: 10, kind: 'movie', title: 'Previous movie' });
+    await until(() => plyr.media !== previous, 'reactivation fixture installs video');
+    const media = plyr.media;
+    Object.defineProperty(media, 'duration', { configurable: true, value: 634 });
+    Object.defineProperty(media, 'readyState', { configurable: true, value: 1 });
+    media.dispatchEvent(new Event('loadedmetadata'));
+    equal(plyr.currentTime, 203, 'Prior movie resumes normally');
+    document.getElementById('vm-back').click();
+    PartyUI.open();
+    document.getElementById('party-code-input').value = 'ABCD';
+    document.getElementById('pt-join').click();
+    const state = { title: 'Queued fixture', queue: [], position: 0, playing: true, updated_at: Date.now() / 1000 };
+    socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: true, state: { ...state, media_id: 11 } }) });
+    const audio = document.getElementById('pb-audio');
+    // Empty fixture bytes require explicit metadata for the real audio element.
+    audio.dispatchEvent(new Event('loadedmetadata'));
+    equal(audio.paused, false, 'Queued audio is playing before video request');
+    equal(partyPlaybackKind, 'audio', 'Audio owns playback before video request');
+    check(!document.getElementById('video-modal').classList.contains('on'), 'Prior video is closed');
+    socket.onmessage({ data: JSON.stringify({ type: 'state', state: { ...state, media_id: 10, updated_at: Date.now() / 1000 } }) });
+    equal(audio.paused, true, 'Reactivated video pauses queued audio');
+    check(document.getElementById('video-modal').classList.contains('on'), 'Reactivated video modal is visible');
+    equal(media.paused, false, 'Reactivated video follows playing state');
+    check(plyr.currentTime < 2, 'Reactivated video follows party load position');
+    PartyUI.close();
+    return { beforeKind: 'audio', afterKind: partyPlaybackKind, audioPaused: audio.paused,
+      videoPaused: media.paused, videoPosition: plyr.currentTime, productionHostHandler: true };
+  });
+  await run('host preserves an active paused video in real Plyr', () => {
+    LIBRARY = [{ id: 10, kind: 'movie' }, { id: 11, kind: 'movie' }];
+    return firstPartyState({ id: 11, isHost: true, metadataFirst: true, localPaused: true });
+  });
   window.fetch = originalFetch;
   window.WebSocket = originalWebSocket;
   mediaPrototype.play = originalPlay;

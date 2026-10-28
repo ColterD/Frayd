@@ -599,7 +599,8 @@ for (const [name, src, child, currentSrc, preserve] of [
 ]) {
   test(`host preservation checks the effective stream: ${name}`, () => {
     const b = browser();
-    b.run('LIBRARY = [{ id: 9, kind: "movie" }]');
+    b.run('LIBRARY = [{ id: 9, kind: "movie" }]; partyPlaybackKind = "video"');
+    b.nodes.get('#video-modal').classList.add('on');
     const media = b.nodes.get('#plyr-video');
     media.src = src;
     media.currentSrc = currentSrc;
@@ -610,6 +611,57 @@ for (const [name, src, child, currentSrc, preserve] of [
     assert.equal(media.src, preserve ? src : '/api/stream/9');
   });
 }
+
+for (const useHostHandler of [false, true]) {
+  for (const inactiveState of ['audio', 'closed video', 'audio with video modal open']) {
+    test(`${useHostHandler ? 'host state handler' : 'direct follow'} reactivates a retained video from ${inactiveState}`, async () => {
+      const b = browser();
+      b.respond(async () => ({ ok: true, json: async () => ({ position: 203 }) }));
+      b.run('LIBRARY = [{ id: 9, kind: "movie" }, { id: 10, kind: "music" }]; openVideo(LIBRARY[0])');
+      await settle();
+      b.run('plyr.duration = 634; plyr.emit("loadedmetadata")');
+      assert.equal(b.run('plyr.currentTime'), 203);
+      b.nodes.get('#vm-back').onclick();
+      await settle();
+      let socket;
+      if (useHostHandler) {
+        vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), b.context);
+        b.nodes.get('#party-code-input').value = 'ABCD';
+        b.run('PartyUI.open()');
+        b.nodes.get('#pt-join').onclick();
+        socket = b.sockets[0];
+      }
+      const follow = id => useHostHandler
+        ? socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: true,
+          state: { media_id: id, title: 'Fixture', queue: [], position: 0, playing: true, updated_at: Date.now() / 1000 } }) })
+        : b.run(`partyFollow(${id}, "Fixture", 0, true, Date.now()/1000, { preserveActiveVideo: true })`);
+      follow(10);
+      await settle();
+      if (inactiveState === 'closed video') b.run('partyPlaybackKind = "video"');
+      if (inactiveState === 'audio with video modal open') b.nodes.get('#video-modal').classList.add('on');
+      assert.equal(b.nodes.get('#pb-audio').paused, false);
+      follow(9);
+      await settle();
+      assert.equal(b.nodes.get('#pb-audio').paused, true);
+      assert.equal(b.nodes.get('#video-modal').classList.contains('on'), true);
+      assert.equal(b.run('plyr.paused'), false);
+      assert.ok(b.run('plyr.currentTime') < 2);
+      assert.equal(b.run('partyPlaybackKind'), 'video');
+    });
+  }
+}
+
+test('host preserves an active paused video and its position', async () => {
+  const b = browser();
+  b.respond(async () => ({ ok: true, json: async () => ({ position: 203 }) }));
+  b.run('LIBRARY = [{ id: 9, kind: "movie" }]; openVideo(LIBRARY[0])');
+  await settle();
+  b.run('plyr.duration = 634; plyr.emit("loadedmetadata"); plyr.pause()');
+  b.run('partyFollow(9, "Movie", 0, true, Date.now()/1000, { preserveActiveVideo: true })');
+  assert.equal(b.run('plyr.currentTime'), 203);
+  assert.equal(b.run('plyr.paused'), true);
+  assert.equal(b.nodes.get('#video-modal').classList.contains('on'), true);
+});
 
 test('host first party state still loads a different video', async () => {
   const b = browser();

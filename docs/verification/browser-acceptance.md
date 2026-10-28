@@ -190,8 +190,8 @@ both ID and drift branches, including stale same-media IDs. Guest initial and
 subsequent synchronization retains the host's position and play/pause state.
 
 Red Node and actual-DOM controls reproduce a host resume of 203 seconds resetting
-to zero before and after metadata. The corrected source passes 60 Node tests and
-16 actual-DOM cases, including fresh/stale host IDs, guest synchronization,
+to zero before and after metadata. The corrected source passes 67 Node tests and
+18 actual-DOM cases, including fresh/stale host IDs, guest synchronization,
 changed media and URL/precedence controls. Media events/transport remain synthetic
 in that harness; decoded playback and distinct-client timing still need the
 current-image media checks.
@@ -203,3 +203,22 @@ success. Real fake-Docker hangs/errors reproduce the old masking behavior and
 pass the corrected controls; all 20 Python tests pass. Three accompanying AST
 command-injection diagnostics have separate static dispositions in the ledger;
 cleanup timeouts are not presented as a security mitigation.
+
+### Active-video eligibility and actual UI baseline
+
+Candidate source `2bbedcb20fa15ee50379406706d581758c91b350`, app
+`sha256:0559037b661010cb38cdddabc24de9966bed397bef529b58ca2a3706196e3f14`,
+passes its full HTTP/DNS suites, but actual Vivaldi QA exposes an additional guard
+case. With loaded `5e8364` app and `69fb7e` party payloads bound, a queued movie
+decodes at 1920 pixels wide. After closing it, playing music, and queuing that same
+movie again, the old source match leaves music playing and the movie hidden and
+paused. Party state incorrectly reports the movie as playing.
+
+The current correction captures the prior playback kind and requires an already
+open video modal before preserving a matching host stream. An active paused video
+remains eligible; an inactive cached video follows the reactivation path. Node
+and real-DOM baseline failures precede the patch; 67 Node and 18 real-DOM cases
+pass afterward. A replacement image and actual-media recheck remain required.
+Earlier movie-reopen observations with stale `903` browser code are excluded from
+the `055` verdict. Resource-content hashes after an explicit documented cache-bypassed
+reload establish the browser payload used for the actual UI regression above.

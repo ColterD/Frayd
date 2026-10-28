@@ -958,12 +958,14 @@ window.partyFollowExternal = (vid, title, position, playing, updatedAt, isHostOw
 
 window.partyFollow = (mediaId, title, position, playing, updatedAt, options = {}) => {
   const expected = () => position + (playing ? Math.max(0, Date.now() / 1000 - updatedAt) : 0);
+  const priorPlaybackKind = partyPlaybackKind;
   partyPlaybackKind = isVideoId(mediaId) ? 'video' : 'audio';
   // video: load into Plyr modal, mirror play/pause/seek on the <video> element
   if (isVideoId(mediaId)) {
     const video = plyr.media;
     // A host's first state echoes their local load; Plyr may use a source child.
-    if (options.preserveActiveVideo) {
+    if (options.preserveActiveVideo && priorPlaybackKind === 'video'
+      && $('#video-modal').classList.contains('on')) {
       const source = video.src || video.querySelector('source')?.src || video.currentSrc || '';
       const stream = new URL(`/api/stream/${mediaId}`, window.location.origin).href;
       if (new URL(source, window.location.origin).href === stream) {

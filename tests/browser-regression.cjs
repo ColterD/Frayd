@@ -158,7 +158,7 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir } 
     });
     const timedOut = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`Browser regression exceeded 60 seconds; ${logs}`)), 60000); });
     const observed = await Promise.race([result, exited, timedOut]);
-    const expectedCases = 16;
+    const expectedCases = 18;
     const complete = observed.cases.length === expectedCases
       && new Set(observed.cases.map(item => item.name)).size === expectedCases
       && observed.cases.every(item => item.status === 'PASS')
