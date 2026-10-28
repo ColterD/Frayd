@@ -25,7 +25,7 @@ It does not authorize deployment or qualify arbitrary media, browsers or public 
 
 No sample media are added to the repository by this documentation. Embedded notices/credits remain in the test copies; public-domain statements in the retained receipts are scoped to the USA.
 
-## Latest reviewed follow-up
+## Earlier reviewed follow-up (858)
 
 Source `bf3cb589881542cb0f6c4d47d467a9909c7b697d` builds application
 `sha256:858879bf50c7050dfb55f93723e8fa74fbde77e4a2447e00eb574d9e45bca0b5`.
@@ -39,6 +39,25 @@ The earlier 958-image passes below remain historical observations of that exact
 artifact; they are not presented as browser qualification of this later image.
 Actual latest-image browser acceptance is held for Chrome input recovery and
 a fresh script-payload binding. The full latest-image HTTP/storage integration and same-version stopped-volume recovery pass; these automated/storage results do not close the browser gates.
+
+## Current automated qualification
+
+Runtime source `c4cde98a36b781ea0a0f5f512b0d5001a3fbd2fc` builds app
+`sha256:9fe2f139cece83cd1151a416cb45fe8fd6e80b85bce1268cc26e002b9a276a44`
+and proxy `sha256:70c8658365d70d40979de2f191387b2e5e08bea22b44f960c0e77f751f67fb83`.
+Verification source `bb26bdc04d3476270ac96721af843618e8997e00` adds the browser
+harness and CI wiring without changing runtime inputs. Both immutable images pass
+the full HTTP/storage and controlled DNS-failure suites; their disposable projects
+have zero remaining resources. All 47 client and 17 Python tests pass. The normal
+build reused the qualified 51-test Rust/Clippy/release stage with identical server
+inputs and output binary; no fresh Rust execution is claimed for that cache hit.
+Nine real-DOM cases pass separately, as described below.
+
+The retained interactive fixture still runs the earlier 858 image. Latest-image
+manual media acceptance remains held until browser input recovers and the new
+image, loaded payload and actual media actions can be bound together. Earlier
+958 observations, 858 backup recovery and these new automated results each retain
+their own source/image limits.
 
 ## Acceptance matrix
 
