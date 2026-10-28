@@ -1,0 +1,14 @@
+# Only application sources and proxy configuration belong in the build context.
+*
+!Dockerfile
+!Dockerfile.proxy
+!nginx.conf
+!server/
+!server/Cargo.toml
+!server/Cargo.lock
+!server/*.sql
+!server/src/
+!server/src/**
+!client/
+!client/**
+client/install/

@@ -138,9 +138,10 @@ const PartyUI = (() => {
   }
 
   function libraryPickerHtml() {
-    if (isHost || !window.LIBRARY) return '';
+    if (isHost) return '';
+    const library = window.getLibrary?.() || [];
     return '<div class="party-sec">Request a track</div><ul class="party-queue">' +
-      window.LIBRARY.slice(0, 20).map(it =>
+      library.slice(0, 20).map(it =>
         `<li>${esc(it.title)} <button data-media="${it.id}" data-title="${esc(it.title)}" class="pt-request">Request</button></li>`
       ).join('') + '</ul>';
   }

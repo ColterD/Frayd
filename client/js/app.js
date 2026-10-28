@@ -196,6 +196,7 @@ $('#login-form').addEventListener('submit', doLogin);
 $('#pw-toggle').onclick = () => {
   const p = $('#password');
   p.type = p.type === 'password' ? 'text' : 'password';
+  $('#pw-toggle').setAttribute('aria-label', p.type === 'password' ? 'Show password' : 'Hide password');
 };
 $('#logout')?.addEventListener('click', () => {
   fetch('/api/auth/logout', { method: 'POST', headers: authHeaders() }).catch(() => {});
@@ -270,6 +271,7 @@ function currentKind() {
 
 // ---------- library ----------
 let LIBRARY = [];
+window.getLibrary = () => LIBRARY;
 
 async function loadLibrary() {
   LIBRARY = await (await fetch('/api/library')).json();
@@ -347,7 +349,7 @@ function renderRows(items) {
       main.appendChild(section(kind[0].toUpperCase() + kind.slice(1) + 's', kindItems, false));
     }
   }
-  if (!items.length) main.appendChild(el('p', '', '<br>No media found. Set FRAYD_LIBRARY and restart the server.'));
+  if (!items.length) main.appendChild(el('p', '', '<br>No media found. Place files in the server’s media folder, then choose Scan library. Ask the server administrator if no media folder is configured.'));
 }
 
 // author → series → books: one section per author, sub-rows per series
@@ -485,6 +487,7 @@ async function showChunk(n, opts = {}) {
   if (!ebook) return;
   ebook.chunk = Math.max(0, Math.min(n, ebook.spine.length - 1));
   ebook.pendingCol = opts.atEnd ? Infinity : opts.frac != null ? opts.frac : 0;
+  ebook.lastFrac = opts.atEnd ? 0.999 : (opts.frac ?? 0);
   const chunkUrl = ebook.spine[ebook.chunk]; // zip-relative path
   const base = chunkUrl.includes('/') ? chunkUrl.slice(0, chunkUrl.lastIndexOf('/') + 1) : '';
   try {
@@ -793,7 +796,7 @@ function renderToc() {
 }
 function closeEbook() {
   $('#ebook-modal').classList.remove('on');
-  if (ebook) { syncProgress(ebook.it.id, ebook.chunk); ebook = null; }
+  if (ebook) { syncProgress(ebook.it.id, ebook.chunk + (ebook.lastFrac ?? 0)); ebook = null; }
   $('#em-frame').src = 'about:blank';
   $('#em-search').value = '';
   $('#em-searchinfo').textContent = '';
@@ -833,7 +836,7 @@ function trackProgress(media, it) {
 // ---------- party sync ----------
 // guest: follow host playback state (drives bottom audio bar)
 const vidEl = document.getElementById('plyr-video');
-const isVideoId = (id) => (window.LIBRARY || []).some(x => x.id === id && (x.kind === 'movie' || x.kind === 'show'));
+const isVideoId = (id) => LIBRARY.some(x => x.id === id && (x.kind === 'movie' || x.kind === 'show'));
 
 window.partyFollow = (mediaId, title, position, playing, updatedAt) => {
   const expected = () => position + (playing ? Math.max(0, Date.now() / 1000 - updatedAt) : 0);
