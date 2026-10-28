@@ -68,14 +68,17 @@ def request(path, data=None, token=None, headers=None, expected=200, timeout=15)
     return response.read()
 
 def websocket_upgrade(token):
-    """Verify a real party WebSocket handshake through the recovered proxy."""
-    code = json.loads(request('/api/party', {'identity': 'qa-host'}, token))['code']
+    """Verify creator identity and private host proof survive the recovered proxy handshake."""
+    party = json.loads(request('/api/party', {'identity': 'qa-host'}, token))
+    code = party['code']
+    host_capability = party['host_capability']
     address = urlsplit(base)
     key = base64.b64encode(secrets.token_bytes(16)).decode()
     handshake = (f'GET /api/party/{code}/ws?identity=qa-host HTTP/1.1\r\n'
-                 f'Host: {address.netloc}\r\nAuthorization: Bearer {token}\r\n'
+                 f'Host: {address.netloc}\r\n'
                  'Upgrade: websocket\r\nConnection: Upgrade\r\n'
-                 f'Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n')
+                 f'Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n'
+                 f'Sec-WebSocket-Protocol: frayd-party, frayd-host.{host_capability}\r\n\r\n')
     with socket.create_connection((address.hostname, address.port), timeout=2) as connection:
         connection.sendall(handshake.encode())
         response = b''
@@ -88,6 +91,7 @@ def websocket_upgrade(token):
         (key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode(), usedforsecurity=False).digest())
     headers = dict(line.split(b': ', 1) for line in response.split(b'\r\n\r\n', 1)[0].split(b'\r\n')[1:])
     assert next(value for name, value in headers.items() if name.lower() == b'sec-websocket-accept') == accept
+    assert next(value for name, value in headers.items() if name.lower() == b'sec-websocket-protocol') == b'frayd-party'
 
 
 def check_scan_read_paths(phase, media_id, token):

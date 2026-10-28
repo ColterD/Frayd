@@ -4,6 +4,9 @@ const { join } = require('node:path');
 const { test } = require('node:test');
 const vm = require('node:vm');
 
+const { randomUUID } = require('node:crypto');
+const hostResponse = code => ({ code, host_capability: randomUUID() });
+
 function panel(fetch) {
   const nodes = new Map();
   const requests = [];
@@ -42,7 +45,7 @@ function panel(fetch) {
     localStorage: { frayd_identity: 'panel-test' },
     esc: value => String(value),
     WebSocket: class {
-      constructor(url) { this.url = url; this.readyState = 1; this.closed = 0; this.sent = []; sockets.push(this); }
+      constructor(url, protocols) { this.url = url; this.protocols = Array.from(protocols || []); this.readyState = 1; this.closed = 0; this.sent = []; sockets.push(this); }
       close() { this.closed++; this.readyState = 3; }
       send(value) { this.sent.push(JSON.parse(value)); }
     },
@@ -192,12 +195,12 @@ for (const phase of ['HTTP', 'JSON']) {
     }
     p.run('PartyUI.hide(); PartyUI.open()');
     const second = p.nodes.get('#pt-host').onclick();
-    if (phase === 'HTTP') responses[0].resolve({ ok: true, json: async () => ({ code: 'ABCD' }) });
-    else body.resolve({ code: 'ABCD' });
+    if (phase === 'HTTP') responses[0].resolve({ ok: true, json: async () => hostResponse('ABCD') });
+    else body.resolve(hostResponse('ABCD'));
     await first;
     const socket = p.sockets[0];
     socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: true, state: { title: 'Song', position: 0 } }) });
-    for (const response of responses.slice(1)) response.resolve({ ok: true, json: async () => ({ code: 'ABCD' }) });
+    for (const response of responses.slice(1)) response.resolve({ ok: true, json: async () => hostResponse('ABCD') });
     await second;
     assert.equal(socket.closed, 0, 'second Start must not close the first host socket and end its party');
     assert.equal(p.sockets.length, 1);
@@ -205,7 +208,7 @@ for (const phase of ['HTTP', 'JSON']) {
     assert.match(p.nodes.get('#party-stage').innerHTML, /you are host/);
     p.run('PartyUI.close(); PartyUI.open()');
     const next = p.nodes.get('#pt-host').onclick();
-    responses.at(-1).resolve({ ok: true, json: async () => ({ code: 'EFGH' }) });
+    responses.at(-1).resolve({ ok: true, json: async () => hostResponse('EFGH') });
     await next;
     assert.equal(p.sockets.length, 2);
     assert.match(p.sockets[1].url, /EFGH/);
@@ -217,7 +220,7 @@ for (const failure of ['HTTP', 'network', 'JSON']) {
     let calls = 0;
     const p = panel(async () => {
       calls++;
-      if (calls > 1) return { ok: true, json: async () => ({ code: 'ABCD' }) };
+      if (calls > 1) return { ok: true, json: async () => hostResponse('ABCD') };
       if (failure === 'network') throw new Error('offline');
       return { ok: failure !== 'HTTP', status: 503, json: async () => { throw new Error('invalid JSON'); } };
     });
@@ -246,12 +249,13 @@ for (const phase of ['HTTP', 'JSON']) {
       let guest;
       if (action === 'Leave') p.nodes.get('#pt-close').onclick();
       else guest = p.joinParty('EFGH');
-      if (phase === 'HTTP') response.resolve({ ok: true, json: async () => ({ code: 'ABCD' }) });
-      else body.resolve({ code: 'ABCD' });
+      if (phase === 'HTTP') response.resolve({ ok: true, json: async () => hostResponse('ABCD') });
+      else body.resolve(hostResponse('ABCD'));
       await start;
       assert.equal(p.sockets.length, action === 'Join' ? 1 : 0);
       if (guest) {
         assert.equal(guest.closed, 0);
+        assert.deepEqual(guest.protocols, ['frayd-party'], 'cancelled Start must never transfer its proof to Join');
         assert.match(p.nodes.get('#party-stage').innerHTML, /Code: <b>EFGH/);
       }
     });
@@ -278,8 +282,54 @@ test('a cancelled Start failure cannot clear a newer pending Start or paint its 
   await p.nodes.get('#pt-host').onclick();
   assert.equal(responses.length, 2, 'old completion must not unlock the current Start');
   assert.doesNotMatch(p.nodes.get('#party-stage').innerHTML, /Could not start party/);
-  responses[1].resolve({ ok: true, json: async () => ({ code: 'EFGH' }) });
+  responses[1].resolve({ ok: true, json: async () => hostResponse('EFGH') });
   await current;
   assert.equal(p.sockets.length, 1);
   assert.match(p.sockets[0].url, /EFGH/);
 });
+
+
+test('Start transfers creator proof only in the protocol offer, with the exact creation identity', async () => {
+  const created = hostResponse('ABCD');
+  let creator;
+  const p = panel(async (_url, options) => {
+    creator = JSON.parse(options.body).identity;
+    return { ok: true, json: async () => created };
+  });
+  delete p.context.localStorage.frayd_identity;
+  p.run('PartyUI.open()');
+  await p.nodes.get('#pt-host').onclick();
+  const socket = p.sockets[0];
+  assert.equal(socket.protocols.length, 2);
+  assert.equal(socket.protocols[0], 'frayd-party');
+  assert.equal(socket.protocols[1] === 'frayd-host.' + created.host_capability, true);
+  assert.equal(new URL(socket.url, 'http://fixture.invalid').searchParams.get('identity') === creator, true);
+  assert.equal(socket.url.includes(created.host_capability), false);
+  assert.equal(JSON.stringify(p.context.localStorage).includes(created.host_capability), false);
+  assert.equal(p.nodes.get('#party-stage').innerHTML.includes(created.host_capability), false);
+  assert.deepEqual(socket.sent, []);
+});
+
+test('Join after a host session never reuses its proof', async () => {
+  const created = hostResponse('ABCD');
+  const p = panel(async () => ({ ok: true, json: async () => created }));
+  p.run('PartyUI.open()');
+  await p.nodes.get('#pt-host').onclick();
+  const host = p.sockets[0];
+  p.run('PartyUI.close()');
+  const guest = p.joinParty('EFGH');
+  assert.equal(host.closed, 1);
+  assert.deepEqual(guest.protocols, ['frayd-party']);
+  assert.equal(guest.url.includes(created.host_capability), false);
+  assert.equal(JSON.stringify(p.context.localStorage).includes(created.host_capability), false);
+});
+
+for (const malformed of [undefined, '', 'invalid']) {
+  test('Start with missing or malformed proof does not attempt an insecure host connection: ' + typeof malformed, async () => {
+    const p = panel(async () => ({ ok: true, json: async () => ({ code: 'ABCD', host_capability: malformed }) }));
+    p.run('PartyUI.open()');
+    await p.nodes.get('#pt-host').onclick();
+    assert.equal(p.sockets.length, 0);
+    assert.match(p.nodes.get('#party-stage').innerHTML, /Could not start party/);
+  });
+}

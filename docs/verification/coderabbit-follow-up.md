@@ -141,11 +141,16 @@ A resolved review thread and a passing check are separate evidence.
 | [PARTY-START-OWNER](https://github.com/ColterD/Frayd/pull/2#discussion_r4406015132) | Minor | Overlapping Start responses can replace the first host socket and end the party they just created. | One pending request owns Start through HTTP and JSON completion. Leave and Join invalidate stale responses; failures permit retry without releasing a newer request. Staggered-response baselines fail; all 18 focused party tests and the shared 133 Node / 30 DOM run pass. |
 | [YOUTUBE-HOST-SENDER](https://github.com/ColterD/Frayd/pull/2#discussion_r4406015143) | Major | A reused player retains the guest session's host flag, preventing Play/Pause publication after hosting the same video. | The inline anchor is party.js, but the captured callback is in app.js. Callbacks and one rebound seek poller use the current host sender, retaining identity/readiness/ownership guards. Guest-to-host reuse publishes play, pause and seek with one player; guest/departed sessions send nothing. The shared 133 Node / 30 DOM run passes; the external adapter is mocked. |
 | [NODE-PROVISIONING](https://github.com/ColterD/Frayd/pull/2#discussion_r4406484592) | Major | CI requires an exact preinstalled Node cache path that a runner image may not contain. | A valid exact-version cache remains the fast path; a missing/invalid entry uses the official archive with pinned SHA-256 before extraction and an exact runtime guard. Twelve controlled checks pass, including actual Node download/WebSocket, no-network cache reuse and corrupt-archive rejection. Prior hosted passes do not reproduce missing-cache failure; no new action dependency was added. |
-| [EFFECTIVE-STREAM-IDENTITY](https://github.com/ColterD/Frayd/pull/2#discussion_r4406484598) | Major | A local media selection can replace the element source while the cached last-party ID remains unchanged; refollow can misattribute another movie's position. | Both Node and real DOM baselines reproduce media 9 receiving media 10's position and audio retaining stream 10. Source change and ownership guards now share the effective stream comparison. All 93 client tests, 135 combined Node tests and 32 DOM cases pass. Actually matching child sources retain zero source reassignment; audio progress ownership is a separate pre-existing limit. |
+| [EFFECTIVE-STREAM-IDENTITY](https://github.com/ColterD/Frayd/pull/2#discussion_r4406484598) | Major | A local media selection can replace the element source while the cached last-party ID remains unchanged; refollow can misattribute another movie's position. | Both Node and real DOM baselines reproduce media 9 receiving media 10's position and audio retaining stream 10. Source change and ownership guards now share the effective stream comparison. All 93 client tests, 135 combined Node tests and 32 DOM cases pass. Actually matching child sources retain zero source reassignment; the separate progress-ownership correction below prevents stale local trackers from writing another stream’s position. |
 | [REPLACED-SOURCE-RETIREMENT](https://github.com/ColterD/Frayd/pull/2#discussion_r4406484606) | Major | Clearing a known replaced source's playback pointer leaves the completed generated pair outside recovery. | The pointer-clear transaction retires only the exact registered, inactive, unreferenced prior pair after containment and lease checks. Three real recovery cycles remove six stale rows and three directories while preserving the historical neighbor. Five scanner tests cover 17 modes; the normal combined Rust suite passes 57 tests. Unknown, referenced, active and unrelated history retain protection. |
 | [LINUX-RETIREMENT-ORACLE](https://github.com/ColterD/Frayd/pull/2#discussion_r4406654190) | Minor | A Linux-only lease/recovery test is compiled and asserted on other targets, including a Unix-only symlink call on Windows. | The test now compiles only on Linux, matching the production lease/recovery contract. Its focused Linux execution passes; production scanner bytes before the test module are unchanged. No non-Linux build is claimed. |
 | [PROGRESS-SAVE-WAIT](https://github.com/ColterD/Frayd/pull/2#discussion_r4406654195) | Minor | The effective-stream regression uses a fixed delay although pause-driven progress saving is asynchronous. | The test waits for the requested effective stream before pausing, then waits for the video progress request near 24 seconds. Audio has no progress-save wait. The updated oracle passes 135 Node and 32 DOM cases, including six decoded controls; the old source still fails both stream waits and the Node wrong-progress/source assertions. |
 | [DECODED-FIXTURE-SCOPE](https://github.com/ColterD/Frayd/pull/2#discussion_r4406719666) | Minor | The development guide still describes every player event as synthetic after actual native decoding controls were added. | The guide separates synthetic IDs 9/10/11 from owned H.264 IDs 20/21/22, names readiness/width/positive-frame oracles and retains physical-audio, other-codec and distinct-client timing limits for that fixture. Separate actual YouTube API/peer observations stay in their own checkpoint. |
+| [HOST-REGISTRATION-PROOF](https://github.com/ColterD/Frayd/pull/2#discussion_r4406874506) | Major, security | A disclosed device key can claim the first host slot or replace the connected host, then control playback or end the room. | Creation now issues a private UUID capability bound to creator identity and session generation. One predicate checks it before upgrade and again before membership changes; malformed, ambiguous, wrong, stale and wrong-identity proof is rejected. Only the public WebSocket protocol is negotiated. Causal real-socket attacks become 18 passing rejection/legitimate scenarios; focused Rust 11 and panel 23 tests pass. Full package/image gates remain separate. |
+| [IMPORT-OWNER-ACCESS](https://github.com/ColterD/Frayd/pull/2#discussion_r4406874499) | Minor | Applying a private umask to group-readable source modes can produce unreadable imported files and untraversable directories. | Source tar archive headers normalize owner access and remove group/other permissions before app-UID extraction. Other-UID mode-0040 files and nested group-only directories reproduce the old failure; corrected imports are private, readable and exact, without changing source ownership/modes/bytes. Existing private-file and five refusal controls pass under UID 10001 with dropped capabilities. |
+| [LINUX-TRANSCODE-ORACLES](https://github.com/ColterD/Frayd/pull/2#discussion_r4406874512) | Minor | The transcode test module uses Unix APIs and Linux-only cleanup behavior but compiles on unsupported targets. | The whole test module now uses cfg(all(test, target_os = "linux")), matching its production recovery contract. All 18 focused Linux tests pass. Only the Linux target is installed; no non-Linux compilation is claimed. |
+
+Full review [5690680279](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5690680279) covers `a7a6dab` through `fc14655`, with 41 selected files and two filtered assets. It adds HOST-REGISTRATION-PROOF, IMPORT-OWNER-ACCESS and LINUX-TRANSCODE-ORACLES. No additional nitpick, outside-diff, duplicate or tool section is published. Its full-review metric is absent; the preceding incremental result is 82.43% against 80% across 148 functions and 24 files, with three unsupported skips. The full output retains the verbose-detail omission warning.
 
 Full review [5690486617](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5690486617) covers `a7a6dab` through `5d63ac2`, with 41 selected files and two filtered assets. It adds DECODED-FIXTURE-SCOPE; no further nitpick, outside-diff, duplicate or tool section is published. The preceding incremental review [5690407263](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5690407263) adds LINUX-RETIREMENT-ORACLE and PROGRESS-SAVE-WAIT. Its published coverage is 82.43% against 80%, across 148 functions and 24 files, with four unsupported skips. The full review publishes no new metric and warns that verbose details/warnings were omitted to fit its comment limit; no claim covers undisclosed internal warnings.
 
@@ -698,8 +703,8 @@ registrations, frames and cleanup cannot mutate a replacement or a newer socket
 with the same identity. The current host's Leave still ends the current party.
 
 The real WebSocket baseline fails and the corrected five-scenario harness
-passes. Eight focused party tests include the five existing timeline controls;
-the normal combined Rust suite passes 57 tests. The server proactively closes
+passes. At the `5d63ac2` checkpoint, eight focused party tests include the five
+existing timeline controls and the normal combined Rust suite passes 57 tests. The server proactively closes
 retired sockets, so old wire commands are not asserted as delivered; production
 receive-path unit controls prove stale-frame rejection. The rebuilt `5d63ac2` /
 `767fe…` runtime passes the actual two-client YouTube callback oracle: A retains
@@ -708,3 +713,46 @@ and actual A API pause/play produces outbound commands, authoritative peer
 state 2/1 and an advancing peer clock. Both players are muted; no physical-audio
 or decoded-frame claim is made. Owned contexts, browser/profile and rooms are
 cleaned up.
+
+## Progress ownership after party audio
+
+The effective-stream regression also exposed an adjacent wrong-item write: after
+local audio item 10 installed its tracker and party playback selected item 9,
+pausing the party stream wrote `{media_id:10, position:24}`. This is a separate
+runtime finding, not another CodeRabbit disposition-table entry.
+
+`trackProgress` now checks its tracker generation, metadata readiness and the
+canonical current native stream before periodic, pause or ended saves. Delayed
+retired callbacks cannot clear a successor's interval, including same-ID
+reopens. Following party audio retains its existing no-new-tracker policy; it
+simply cannot corrupt the prior local item's bookmark.
+
+The focused baseline has one positive control pass and four ownership failures;
+the actual DOM baseline has 31 passes and the one wrong-item failure. Corrected
+focused checks pass 5/5 and all client tests 97/97. The combined gate including
+the host-proof tests passes 144 Node tests and the DOM suite 32/32, including all six decoded-video controls. The audio handoff
+plays the requested stream at the requested position without the old-ID save.
+Current-item periodic/pause/ended saves remain positive controls. Container
+qualification and real external-player observations remain separately bound to
+their exact runtime artifacts.
+
+## Host control and public creation
+
+Device/member labels are public identity, not host authorization. The create
+response alone returns `host_capability`. The host keeps it only for its socket
+upgrade offer; it is not written to a URL, localStorage, party state, queue or
+membership messages. Only `frayd-party` is negotiated back to the client.
+
+The capability must match the creator identity and the captured live generation
+before registration can remove or add any member. The check is repeated after
+identity resolution/upgrade. Valid creator-proof reconnects and duplicate guest
+sockets retain their socket-isolation behavior; current-host Leave still ends
+the room. Missing proof never falls back to identity-only hosting. Updated host
+clients are required; legacy no-protocol guest joins remain supported.
+
+Any guest can still create or replace the single household party under the
+existing trusted-deployment policy. This correction protects control of an
+existing room; it does not introduce exclusive authorization for global party
+creation or qualify public hosting. Security reproductions and sanitized
+validation are retained through the managed security artifact collection, not
+inside repository reports or operator credential files.

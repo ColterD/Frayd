@@ -19,15 +19,19 @@ YouTube API. That suite does not qualify actual external playback by itself;
 the real-player checkpoint below is separate.
 
 Party updates clamp captured timestamps under the state lock, preventing stale
-updates from counting elapsed playback twice. The Rust target contains 57 tests. CI requires locked tests, Clippy and release
+updates from counting elapsed playback twice. The Rust target contains 60 tests. CI requires locked tests, Clippy and release
 compilation; warnings in unchanged code remain.
-The frozen client/harness passes 135 Node tests and 32 actual-DOM cases, including
+The frozen client/harness passes 144 Node tests and 32 actual-DOM cases, including
 real native decoding, parser-gated reader restoration and real protocol setup
 after an injected initial transport failure. Owned HTTP nonresponse and early
 exit controls verify bounded failure and cleanup. The effective-stream regression waits
 for the requested stream and the video progress request; it uses no fixed pause
 delay and imposes no audio progress-save requirement. The Linux-only replacement
-retirement oracle is compiled only on Linux, matching its production contract.
+retirement oracle is compiled only on Linux, matching its production contract. Native progress
+saves also require the latest tracker, metadata readiness and the matching stream.
+The audio regression reproduces a prior local item receiving the party position;
+the corrected stream keeps that old item untouched. Following party audio still
+does not create a new bookmark tracker.
 
 The harness waits for a complete port field and retries transient target-list
 readiness failures within one startup deadline. Unexpected targets stay fatal.
@@ -41,7 +45,9 @@ consult the current host sender rather than a role captured by an earlier sessio
 Native source changes compare the actual configured stream, preventing a local
 selection from confusing the last party-follow ID and another item's progress.
 Server generation and socket tokens isolate replacement parties and duplicate
-connections; old frames and disconnects cannot alter the current session. A decoded-video case proves queued stale pause suppression while preserving
+connections; old frames and disconnects cannot alter the current session. Host registration
+also requires the creator's private proof, bound to identity and generation; a
+disclosed member label alone cannot grant authority or evict its owner. A decoded-video case proves queued stale pause suppression while preserving
 a legitimate pause. Synthetic metadata fixtures explicitly model and restore
 metadata readiness rather than treating an event dispatch as a state change. Complex player, party and harness contracts were
 documented without changing the hosted 80% coverage threshold; its next measured

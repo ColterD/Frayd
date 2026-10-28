@@ -20,6 +20,7 @@ struct Session {
     generation: Arc<()>,
     code: Option<String>,
     host: Option<String>,
+    host_capability: Option<uuid::Uuid>,
     state: PlaybackState,
     members: Vec<Member>,
 }
@@ -33,6 +34,7 @@ struct Member {
 /// Authorization captured before upgrade and checked again when the socket registers.
 pub struct Admission {
     generation: Arc<()>,
+    host_proof: Option<uuid::Uuid>,
 }
 
 struct Connection {
@@ -73,8 +75,9 @@ impl Party {
         Self::default()
     }
 
-    /// Replaces the old party atomically, retiring its sockets and playback state.
-    pub fn create(&self, host: &str) -> String {
+    /// Replaces the old party atomically and returns its public code and private creator proof.
+    /// The proof belongs only in the create response and is discarded with this generation.
+    pub fn create(&self, host: &str) -> (String, uuid::Uuid) {
         let mut session = self.session.lock().unwrap();
         let code = loop {
             let code = rand::thread_rng()
@@ -88,38 +91,45 @@ impl Party {
                 break code;
             }
         };
+        let host_capability = uuid::Uuid::new_v4();
         session.broadcast(&serde_json::json!({"type": "ended"}));
         *session = Session {
             code: Some(code.clone()),
             host: Some(host.to_string()),
+            host_capability: Some(host_capability),
             state: PlaybackState { updated_at: now(), ..Default::default() },
             ..Default::default()
         };
-        code
+        (code, host_capability)
     }
 
     /// Captures the matching generation before identity resolution and HTTP upgrade.
     /// Keeping this token alive prevents allocation reuse from reviving stale admissions.
-    pub fn authorize(&self, code: &str) -> Option<Admission> {
+    pub fn authorize(&self, code: &str, host_proof: Option<uuid::Uuid>) -> Option<Admission> {
         let session = self.session.lock().unwrap();
         if !session.code.as_ref()?.eq_ignore_ascii_case(code) {
             return None;
         }
         Some(Admission {
             generation: session.generation.clone(),
+            host_proof,
         })
+    }
+
+    /// Rejects host-key collisions before upgrade without changing membership.
+    /// Registration repeats this check under the transition lock after upgrade.
+    pub fn can_register(&self, admission: &Admission, key: &str) -> bool {
+        self.session.lock().unwrap().role(admission, key).is_some()
     }
 
     /// Rejects upgrades whose generation retired while identity resolution was in flight.
     /// Identity roles are derived under the same lock; latest registration owns its key.
     fn register(&self, admission: Admission, key: String, tx: Tx) -> Option<Connection> {
         let mut session = self.session.lock().unwrap();
-        if session.code.is_none() || !Arc::ptr_eq(&session.generation, &admission.generation) {
-            return None;
-        }
+        let is_host = session.role(&admission, &key)?;
         let connection = Connection {
             admission,
-            is_host: session.host.as_deref() == Some(&key),
+            is_host,
             key,
             socket: Arc::new(()),
         };
@@ -170,6 +180,23 @@ impl Party {
 }
 
 impl Session {
+    /// A public identity key alone never grants host authority, even before its first socket.
+    /// Proof is accepted only for the creator key in this exact live generation.
+    fn role(&self, admission: &Admission, key: &str) -> Option<bool> {
+        if self.code.is_none() || !Arc::ptr_eq(&self.generation, &admission.generation) {
+            return None;
+        }
+        let is_host = self.host.as_deref() == Some(key);
+        if is_host {
+            if admission.host_proof.is_none() || admission.host_proof != self.host_capability {
+                return None;
+            }
+        } else if admission.host_proof.is_some() {
+            return None;
+        }
+        Some(is_host)
+    }
+
     /// A reused join code or identity key never gives an old socket authority.
     fn contains(&self, connection: &Connection) -> bool {
         Arc::ptr_eq(&self.generation, &connection.admission.generation)
@@ -271,6 +298,38 @@ fn now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+/// Invalid or ambiguous capability offers carry no sensitive error payload.
+#[derive(Debug)]
+pub struct InvalidHostProof;
+
+/// Parses a single canonical capability offer without accepting aliases or silent fallback.
+/// Only the public protocol is negotiated; capability offers never enter URLs or envelopes.
+pub fn host_proof(headers: &axum::http::HeaderMap) -> Result<Option<uuid::Uuid>, InvalidHostProof> {
+    let mut proof = None;
+    let mut public_protocol = false;
+    for header in headers.get_all("sec-websocket-protocol") {
+        let value = header.to_str().map_err(|_| InvalidHostProof)?;
+        for protocol in value.split(',').map(str::trim) {
+            if protocol == "frayd-party" && !public_protocol {
+                public_protocol = true;
+            } else if let Some(value) = protocol.strip_prefix("frayd-host.") {
+                let parsed = uuid::Uuid::parse_str(value).map_err(|_| InvalidHostProof)?;
+                if proof.is_some() || parsed.get_version_num() != 4
+                    || parsed.get_variant() != uuid::Variant::RFC4122 || parsed.to_string() != value {
+                    return Err(InvalidHostProof);
+                }
+                proof = Some(parsed);
+            } else {
+                return Err(InvalidHostProof);
+            }
+        }
+    }
+    if proof.is_some() && !public_protocol {
+        return Err(InvalidHostProof);
+    }
+    Ok(proof)
 }
 
 /// Every frame and disconnect is scoped to the registered generation and socket.
@@ -414,7 +473,11 @@ mod tests {
 
     /// Registers a socket channel so tests exercise the production ownership checks.
     fn connect(party: &Party, code: &str, key: &str) -> (Connection, mpsc::UnboundedReceiver<Message>) {
-        let admission = party.authorize(code).unwrap();
+        let proof = {
+            let session = party.session.lock().unwrap();
+            if session.host.as_deref() == Some(key) { session.host_capability } else { None }
+        };
+        let admission = party.authorize(code, proof).unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
         (party.register(admission, key.to_string(), tx).unwrap(), rx)
     }
@@ -431,14 +494,15 @@ mod tests {
     #[test]
     fn replacement_rejects_stale_registration_even_when_code_and_host_are_reused() {
         let party = Party::new();
-        let code = party.create("host");
-        let delayed = party.authorize(&code.to_lowercase()).unwrap();
+        let (code, _) = party.create("host");
+        let proof = party.session.lock().unwrap().host_capability;
+        let delayed = party.authorize(&code.to_lowercase(), proof).unwrap();
         party.create("host");
         // Force a short-code collision: only the generation conveys authority.
         party.session.lock().unwrap().code = Some(code.clone());
         let (tx, _rx) = mpsc::unbounded_channel();
         assert!(party.register(delayed, "host".into(), tx).is_none());
-        assert!(party.authorize("missing").is_none());
+        assert!(party.authorize("missing", None).is_none());
         let (host, _) = connect(&party, &code, "host");
         party.receive(&host, &json!({"type":"load", "title":"current"}));
         assert_eq!(party.session.lock().unwrap().state.title.as_deref(), Some("current"));
@@ -447,12 +511,12 @@ mod tests {
     #[test]
     fn stale_host_frames_and_guest_cleanup_cannot_touch_replacement() {
         let party = Party::new();
-        let old_code = party.create("host");
+        let (old_code, _) = party.create("host");
         let (old_host, mut old_host_rx) = connect(&party, &old_code, "host");
         let (old_guest, mut old_guest_rx) = connect(&party, &old_code, "guest");
         party.receive(&old_host, &json!({"type":"load", "external_url":"old", "position":27}));
         party.receive(&old_host, &json!({"type":"approve", "title":"old queue"}));
-        let code = party.create("host");
+        let (code, _) = party.create("host");
         assert!(drain(&mut old_host_rx).iter().any(|v| v["type"] == "ended"));
         assert!(drain(&mut old_guest_rx).iter().any(|v| v["type"] == "ended"));
         let (host, mut host_rx) = connect(&party, &code, "host");
@@ -487,7 +551,7 @@ mod tests {
     #[test]
     fn duplicate_sockets_lose_frame_and_cleanup_authority_without_removing_current_members() {
         let party = Party::new();
-        let code = party.create("host");
+        let (code, _) = party.create("host");
         let (old_host, _) = connect(&party, &code, "host");
         let (host, mut host_rx) = connect(&party, &code, "host");
         let (old_guest, _) = connect(&party, &code, "guest");
@@ -504,7 +568,86 @@ mod tests {
         assert!(drain(&mut guest_rx).iter().any(|v| v["state"]["title"] == "current"));
         party.disconnect(&host);
         assert!(drain(&mut guest_rx).iter().any(|v| v["type"] == "ended"));
-        assert!(party.authorize(&code).is_none());
+        assert!(party.authorize(&code, None).is_none());
         assert!(party.session.lock().unwrap().members.is_empty());
+    }
+
+    #[test]
+    fn host_proof_is_required_before_any_host_registration_or_eviction() {
+        let party = Party::new();
+        let (code, proof) = party.create("host");
+        for supplied in [None, Some(uuid::Uuid::new_v4())] {
+            let admission = party.authorize(&code, supplied).unwrap();
+            assert!(!party.can_register(&admission, "host"));
+            let (tx, _rx) = mpsc::unbounded_channel();
+            assert!(party.register(admission, "host".into(), tx).is_none());
+        }
+        assert!(party.session.lock().unwrap().members.is_empty());
+        let (host, mut host_rx) = connect(&party, &code, "host");
+        let (_guest, mut guest_rx) = connect(&party, &code, "guest");
+        drain(&mut host_rx);
+        drain(&mut guest_rx);
+        for (key, supplied) in [("host", None), ("host", Some(uuid::Uuid::new_v4())), ("guest", Some(proof))] {
+            let admission = party.authorize(&code, supplied).unwrap();
+            assert!(!party.can_register(&admission, key));
+            let (tx, _rx) = mpsc::unbounded_channel();
+            assert!(party.register(admission, key.into(), tx).is_none());
+        }
+        assert_eq!(party.session.lock().unwrap().members.len(), 2);
+        assert!(drain(&mut host_rx).is_empty());
+        assert!(drain(&mut guest_rx).is_empty());
+        party.receive(&host, &json!({"type":"load", "title":"legitimate"}));
+        let messages = drain(&mut guest_rx);
+        assert!(messages.iter().any(|v| v["state"]["title"] == "legitimate"));
+        assert!(!serde_json::to_string(&messages).unwrap().contains(&proof.to_string()));
+        party.disconnect(&host);
+        assert!(drain(&mut guest_rx).iter().any(|v| v["type"] == "ended"));
+    }
+
+    #[test]
+    fn capability_rechecks_generation_and_identity_after_preflight_before_registration() {
+        let party = Party::new();
+        let (old_code, old_proof) = party.create("host");
+        let admission = party.authorize(&old_code, Some(old_proof)).unwrap();
+        assert!(party.can_register(&admission, "host"));
+        let (code, _) = party.create("host");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        assert!(party.register(admission, "host".into(), tx).is_none());
+        let stale = party.authorize(&code, Some(old_proof)).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        assert!(party.register(stale, "host".into(), tx).is_none());
+        let (host, _) = connect(&party, &code, "host");
+        let proof = party.session.lock().unwrap().host_capability;
+        let mismatched = party.authorize(&code, proof).unwrap();
+        assert!(party.can_register(&mismatched, "host"));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        assert!(party.register(mismatched, "guest".into(), tx).is_none());
+        assert!(party.session.lock().unwrap().contains(&host));
+    }
+
+    #[test]
+    fn protocol_parser_rejects_aliases_empty_and_duplicate_proofs_without_fallback() {
+        use axum::http::{HeaderMap, HeaderValue};
+        let proof = uuid::Uuid::new_v4().to_string();
+        let mut headers = HeaderMap::new();
+        assert!(host_proof(&headers).unwrap().is_none());
+        headers.insert("sec-websocket-protocol", HeaderValue::from_static("frayd-party"));
+        assert!(host_proof(&headers).unwrap().is_none());
+        headers.append("sec-websocket-protocol", HeaderValue::from_str(&format!("frayd-host.{proof}")).unwrap());
+        assert!(host_proof(&headers).unwrap().is_some());
+        headers.append("sec-websocket-protocol", HeaderValue::from_str(&format!("frayd-host.{proof}")).unwrap());
+        assert!(host_proof(&headers).is_err());
+        for value in [
+            "".to_string(), "frayd-party, ".to_string(), "frayd-party, frayd-party".to_string(),
+            "frayd-party, frayd-host.".to_string(), "frayd-party, frayd-host.invalid".to_string(),
+            format!("frayd-host.{proof}"), format!("frayd-party, frayd-host.{}", proof.to_uppercase()),
+            format!("frayd-party, frayd-host.{}", proof.replace('-', "")),
+            format!("frayd-party, frayd-host%2E{proof}"),
+            format!("frayd-party, frayd-host.{proof}, frayd-host.{}", uuid::Uuid::new_v4()),
+        ] {
+            headers.clear();
+            headers.insert("sec-websocket-protocol", HeaderValue::from_str(&value).unwrap());
+            assert!(host_proof(&headers).is_err());
+        }
     }
 }

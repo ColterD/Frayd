@@ -390,7 +390,11 @@
         partyFollow(9, 'Party nine', 24, true, Date.now() / 1000);
         await until(() => (media.src || media.querySelector('source')?.src || media.currentSrc).endsWith('/api/stream/9'),
           'effective party nine stream replaces local ten');
+        const paused = new Promise(resolve => media.addEventListener('pause', resolve, { once: true }));
         media.pause();
+        await paused;
+        if (kind === 'audio') check(!saves.some(save => save.media_id === 10),
+          `Retired local audio tracker must not save party position as ten: ${JSON.stringify(saves)}`);
         if (kind === 'video') {
           await until(() => saves.some(save => save.media_id === 9 && save.position >= 24 && save.position < 26),
             'asynchronous pause saves party nine progress');

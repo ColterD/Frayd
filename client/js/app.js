@@ -954,18 +954,38 @@ function playAudio(it) {
 }
 
 let progressTimer = null;
+let progressGeneration = 0;
+/**
+ * Save only while this tracker still owns a metadata-ready matching native stream.
+ * Party audio may replace src without installing a tracker; its retired local ID
+ * must not receive party positions. A new tracker also retires old same-ID handlers
+ * so a delayed ended event cannot clear the successor's interval. Plyr resolves its
+ * current native element after source replacement before checking the stream URL.
+ * @param {HTMLMediaElement|Plyr} media Native player or replacing Plyr wrapper.
+ * @param {{id: number}} it Library item whose progress this tracker may save.
+ */
 function trackProgress(media, it) {
   clearInterval(progressTimer);
+  const generation = ++progressGeneration;
+  const ownsProgress = () => {
+    const native = media === plyr ? plyr.media : media;
+    return generation === progressGeneration && native.readyState >= 1
+      && hasNativeStream(native, it.id);
+  };
   let last = 0;
   progressTimer = setInterval(() => {
-    if (media.paused) return;
+    if (!ownsProgress() || media.paused) return;
     if (media.currentTime - last >= 10) {
       last = media.currentTime;
       syncProgress(it.id, media.currentTime);
     }
   }, 1000);
-  media.onpause = () => syncProgress(it.id, media.currentTime);
-  media.onended = () => { clearInterval(progressTimer); syncProgress(it.id, media.duration); };
+  media.onpause = () => { if (ownsProgress()) syncProgress(it.id, media.currentTime); };
+  media.onended = () => {
+    if (!ownsProgress()) return;
+    clearInterval(progressTimer);
+    syncProgress(it.id, media.duration);
+  };
 }
 
 // ---------- party sync ----------

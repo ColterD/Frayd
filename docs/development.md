@@ -95,6 +95,8 @@ owned H.264 fixture; six controls require readyState 4, video width 160 and a
 positive decoded-frame count. That fixture does not qualify physical audio,
 other codecs or distinct-client timing. Separate real-player observations are
 recorded in the [browser acceptance checkpoints](verification/browser-acceptance.md).
+Native progress-save controls also require the current tracker, metadata and
+matching stream, including a negative check for stale local audio bookmarks.
 The fixture redirects Plyr's icon URL to the existing local sprite.
 
 The output records the actual browser version, executable hash and tested source
@@ -104,3 +106,18 @@ Keep the browser supplied by your operating system or CI image updated. No new
 npm dependency is introduced, and the Cargo audit does not scan that external
 browser. These DOM checks complement the manual media matrix; they do not close
 its held interactive acceptance cases.
+
+### Party protocol
+
+`POST /api/party` returns a public code and private `host_capability`. Host socket
+registration requires that proof plus the creator identity in the current
+session generation. The client offers `frayd-party` and `frayd-host.<proof>` as
+WebSocket protocols; the server selects only `frayd-party`. Do not put the proof
+in URLs, storage, public messages or logs. Ordinary guest joins carry no proof.
+
+Preflight and post-upgrade registration share the same role predicate before
+membership changes. Tests cover first-slot and connected-host impersonation,
+malformed/duplicate/stale offers, wrong identity and legitimate reconnects.
+Guest creation/replacement remains public for the trusted household; the proof
+authorizes existing-room host controls, not exclusive global creation rights.
+After a client/server upgrade, refresh open tabs before hosting a new party.

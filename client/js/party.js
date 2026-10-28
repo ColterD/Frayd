@@ -31,21 +31,28 @@ const PartyUI = (() => {
     return localStorage.frayd_identity || 'guest-' + Math.random().toString(36).slice(2, 8);
   }
 
+  /** Start with a private proof tied to the exact creation identity; cancel both awaits on reset.
+   * Keep the proof scoped to this call and reject older create APIs without an insecure fallback.
+   */
   async function host() {
     if (pendingStart) return;
     // This token spans both awaits; session reset cancels its authority to connect.
     const start = {};
+    const hostIdentity = identity();
     pendingStart = start;
     try {
       const r = await fetch('/api/party', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ identity: identity() })
+        body: JSON.stringify({ identity: hostIdentity })
       });
       if (pendingStart !== start) return;
       if (!r.ok) return renderError('Could not start party (' + r.status + ')');
-      const { code } = await r.json();
-      if (pendingStart === start) connect(code);
+      const { code, host_capability: capability } = await r.json();
+      if (pendingStart !== start) return;
+      if (typeof capability !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(capability))
+        return renderError('Could not start party');
+      connect(code, capability, hostIdentity);
     } catch {
       if (pendingStart === start) renderError('Could not start party');
     } finally {
@@ -63,15 +70,20 @@ const PartyUI = (() => {
    * Replace the current party session and give its socket exclusive ownership of
    * incoming updates. Identity checks on every callback prevent a superseded
    * socket's messages, errors, or close event from changing the new session.
+   * The creator's capability lives only in this connection call and the upgrade
+   * protocol offer; it never enters a URL, storage, or a party message.
    * @param {string} code Party code used by the WebSocket endpoint and panel.
+   * @param {string|null} capability Private creator proof; absent for guest joins.
+   * @param {string} key Identity captured at creation, or the current guest identity.
    */
-  function connect(code) {
+  function connect(code, capability = null, key = identity()) {
     const previous = ws;
     resetSession();
     if (previous) previous.close();
     partyCode = code;
-    const url = `/api/party/${code}/ws?identity=${encodeURIComponent(identity())}`;
-    const socket = new WebSocket(url);
+    const url = `/api/party/${code}/ws?identity=${encodeURIComponent(key)}`;
+    const protocols = capability ? ['frayd-party', 'frayd-host.' + capability] : ['frayd-party'];
+    const socket = new WebSocket(url, protocols);
     ws = socket;
     socket.onerror = () => { if (ws === socket) renderError('Party not found or rejected'); };
     socket.onclose = () => { if (ws === socket) renderEnded(); };

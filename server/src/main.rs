@@ -658,13 +658,13 @@ struct PartyCreateReq {
     identity: String,
 }
 
-/// POST /api/party → { code } — host starts a party.
+/// POST /api/party → { code, host_capability }; the proof is returned only to this creator.
 async fn party_create(
     State(app): State<std::sync::Arc<App>>,
     Json(req): Json<PartyCreateReq>,
 ) -> impl IntoResponse {
-    let code = app.party.create(&req.identity);
-    (StatusCode::OK, Json(serde_json::json!({ "code": code })))
+    let (code, host_capability) = app.party.create(&req.identity);
+    (StatusCode::OK, Json(serde_json::json!({ "code": code, "host_capability": host_capability.to_string() })))
 }
 
 /// GET /api/party/:code/ws — join party socket. Identity via ?identity= or Bearer.
@@ -675,7 +675,10 @@ async fn party_ws(
     Query(q): Query<std::collections::HashMap<String, String>>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    let Some(admission) = app.party.authorize(&code) else {
+    let Ok(host_proof) = party::host_proof(&headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Some(admission) = app.party.authorize(&code, host_proof) else {
         return StatusCode::NOT_FOUND.into_response();
     };
 
@@ -689,7 +692,11 @@ async fn party_ws(
             Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
         }
     };
-    ws.on_upgrade(move |socket| party::member_socket(app.party.clone(), socket, admission, key))
+    if !app.party.can_register(&admission, &key) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    ws.protocols(["frayd-party"])
+        .on_upgrade(move |socket| party::member_socket(app.party.clone(), socket, admission, key))
         .into_response()
 }
 

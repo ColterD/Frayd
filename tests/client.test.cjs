@@ -1276,7 +1276,76 @@ for (const kind of ['video', 'audio']) {
       assert.ok(!saves.some(save => save.media_id === 9 && save.position === 203), JSON.stringify(saves));
       assert.ok(saves.some(save => save.media_id === 9 && save.position >= 24 && save.position < 26));
     }
+    if (kind === 'audio') assert.ok(!saves.some(save => save.media_id === 10), JSON.stringify(saves));
     assert.equal(media.src, '/api/stream/9');
     assert.ok(media.currentTime >= 24 && media.currentTime < 26);
   });
 }
+
+
+test('current local audio saves periodic pause and ended progress', async () => {
+  const b = browser();
+  b.run("playAudio({ id: 10, kind: 'audiobook', title: 'Current local' })");
+  await settle();
+  const media = b.nodes.get('#pb-audio');
+  b.requests.length = 0;
+  media.currentTime = 12;
+  b.intervals.get(b.run('progressTimer'))();
+  media.currentTime = 18;
+  media.pause();
+  await settle();
+  media.duration = 90;
+  media.emit('ended');
+  assert.deepEqual(progress(b), [12, 18, 90]);
+  assert.equal(b.intervals.has(b.run('progressTimer')), false);
+});
+
+test('audio progress rejects periodic pause and ended callbacks after its stream changes', async () => {
+  const b = browser();
+  b.run("playAudio({ id: 10, kind: 'audiobook', title: 'Previous local' })");
+  await settle();
+  const media = b.nodes.get('#pb-audio');
+  const tick = b.intervals.get(b.run('progressTimer'));
+  media.src = '/api/stream/9';
+  media.currentTime = 24;
+  media.duration = 90;
+  b.requests.length = 0;
+  tick();
+  media.pause();
+  await settle();
+  media.emit('ended');
+  assert.deepEqual(progress(b), []);
+});
+
+test('retired same-ID progress callbacks cannot write or clear the current tracker', async () => {
+  const b = browser();
+  b.run("playAudio({ id: 10, kind: 'audiobook', title: 'Local' })");
+  await settle();
+  const media = b.nodes.get('#pb-audio');
+  const retired = [media.onpause, media.onended, b.intervals.get(b.run('progressTimer'))];
+  b.run("trackProgress(pbAudio, { id: 10 })");
+  const timer = b.run('progressTimer');
+  media.currentTime = 24;
+  media.duration = 90;
+  b.requests.length = 0;
+  for (const callback of retired) callback();
+  assert.deepEqual(progress(b), []);
+  assert.equal(b.intervals.has(timer), true);
+  b.intervals.get(timer)();
+  assert.deepEqual(progress(b), [24]);
+});
+
+test('local audio progress waits for metadata from the current stream', async () => {
+  const b = browser();
+  b.run("playAudio({ id: 10, kind: 'audiobook', title: 'Current local' })");
+  await settle();
+  const media = b.nodes.get('#pb-audio');
+  media.readyState = 0;
+  media.currentTime = 24;
+  media.duration = NaN;
+  b.requests.length = 0;
+  b.intervals.get(b.run('progressTimer'))();
+  media.emit('pause');
+  media.emit('ended');
+  assert.deepEqual(progress(b), []);
+});

@@ -388,7 +388,7 @@ fn run_job(db_path: &str, media_id: i64, src: &Path, library: &Path) {
     discard_failed_job(&mut db,media_id,src,&tmp,&out,Some(&completed));
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use rusqlite::OptionalExtension;

@@ -29,7 +29,7 @@ docker compose up -d --wait
 
 The app sees `/data/library`, not the host path. The image's `FRAYD_LIBRARY=/data/library` overrides the library path saved in Settings. Change the mount source to select a different host folder, then choose **Scan library** after adding or changing media.
 
-Alternatively, copy regular files and directories into a new subdirectory of the default library volume, using additional disk space. Symlinks, including a symlinked source directory, and special files are rejected without following them. Keep the source unchanged throughout the preflight and copy: these steps are not atomic. Run this block in Bash with GNU `find`, set the absolute source directory, and choose a new import name using only letters, digits, underscores or hyphens:
+Alternatively, copy regular files and directories into a new subdirectory of the default library volume, using additional disk space. Symlinks, including a symlinked source directory, and special files are rejected without following them. Keep the source unchanged throughout the preflight and copy: these steps are not atomic. Run this block in Bash with GNU `find` and GNU `tar`, set the absolute source directory, and choose a new import name using only letters, digits, underscores or hyphens:
 
 ```sh
 (
@@ -50,7 +50,7 @@ Alternatively, copy regular files and directories into a new subdirectory of the
     umask 077
     mkdir -- "/data/library/$1"
   ' sh "$IMPORT_NAME"
-  tar -C "$SOURCE_DIR" -cf - . |
+  tar --mode='u=rwX,go=' -C "$SOURCE_DIR" -cf - . |
     docker compose exec -T app sh -eu -c '
       umask 077
       exec tar --no-same-owner -xf - -C "/data/library/$1"
@@ -58,7 +58,7 @@ Alternatively, copy regular files and directories into a new subdirectory of the
 )
 ```
 
-Use this alternative with the app running and without the read-only library override. Extraction runs as the app's UID/GID 10001, avoiding unreadable host-owned private files; its private umask does not grant access to other users. The new destination must not already exist. A failure can leave a partial import: inspect that directory before scanning or retrying. After a successful copy, choose **Scan library**. Media copied into the named volume shares that volume's deletion and backup lifecycle.
+Use this alternative with the app running and without the read-only library override. GNU tar sets private archive-header modes with owner read/write access and directory traversal; it does not change the source permissions. This also handles sources readable only through group access. Extraction runs as the app's UID/GID 10001 with a private umask, so copied files remain readable and directories traversable by the app without granting group or other access. The new destination must not already exist. A failure can leave a partial import: inspect that directory before scanning or retrying. After a successful copy, choose **Scan library**. Media copied into the named volume shares that volume's deletion and backup lifecycle.
 
 ## Configuration and storage
 
