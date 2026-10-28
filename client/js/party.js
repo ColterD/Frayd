@@ -7,13 +7,22 @@ const PartyUI = (() => {
   let ws = null;
   let isHost = false;
   let state = null;
+  let partyCode = null;
 
   const $ = (s) => document.querySelector(s);
 
   function open() { $('#party-modal').classList.add('on'); render(); }
+  function hide() { $('#party-modal').classList.remove('on'); }
+  function resetSession() {
+    ws = null; partyCode = null; isHost = false; state = null; pending = []; members = [];
+    hostLoadedMedia = null; hostLoadedExt = null;
+    window.partySend = null;
+  }
   function close() {
-    $('#party-modal').classList.remove('on');
-    if (ws) { ws.close(); ws = null; }
+    const socket = ws;
+    resetSession();
+    hide();
+    if (socket) socket.close();
   }
 
   function identity() {
@@ -38,27 +47,31 @@ const PartyUI = (() => {
   }
 
   function connect(code) {
-    if (ws) ws.close();
+    const previous = ws;
+    resetSession();
+    if (previous) previous.close();
+    partyCode = code;
     const url = `/api/party/${code}/ws?identity=${encodeURIComponent(identity())}`;
-    ws = new WebSocket(url);
-    ws.onerror = () => renderError('Party not found or rejected');
-    ws.onclose = () => { if ($('#party-modal').classList.contains('on')) renderEnded(); };
-    ws.onmessage = (e) => handle(JSON.parse(e.data), code);
+    const socket = new WebSocket(url);
+    ws = socket;
+    socket.onerror = () => { if (ws === socket) renderError('Party not found or rejected'); };
+    socket.onclose = () => { if (ws === socket) renderEnded(); };
+    socket.onmessage = (e) => { if (ws === socket) handle(JSON.parse(e.data)); };
     renderConnecting(code);
   }
 
-  function handle(msg, code) {
+  function handle(msg) {
     if (msg.type === 'state') {
       if (typeof msg.is_host === 'boolean') isHost = msg.is_host;
       state = msg.state;
       if (isHost) { hookHost(); followMediaChangeOnly(); } else followState();
-      render(code);
+      render();
     } else if (msg.type === 'request') {
       pending.push(msg);
-      render(code);
+      render();
     } else if (msg.type === 'members') {
       members = msg.members || [];
-      render(code);
+      render();
     } else if (msg.type === 'ended') {
       renderEnded();
     }
@@ -103,11 +116,13 @@ const PartyUI = (() => {
   let hostLoadedExt = null;
 
   // ---- host hooks: local player actions become party state ----
+  function sendHost(obj) { if (isHost) send(obj); }
+
   function hookHost() {
+    window.partySend = sendHost;
     if (hookHost.done) return;
     hookHost.done = true;
-    if (typeof window.partyHostHook === 'function') window.partyHostHook(send);
-    window.partySend = send;
+    if (typeof window.partyHostHook === 'function') window.partyHostHook(sendHost);
   }
 
   function nowPlaying() {
@@ -167,7 +182,7 @@ const PartyUI = (() => {
       ).join('') + '</ul>';
   }
 
-  function render(code) {
+  function render() {
     const stage = $('#party-stage');
     if (!ws) {
       stage.innerHTML = `
@@ -180,8 +195,9 @@ const PartyUI = (() => {
       $('#pt-join').onclick = join;
       return;
     }
+    if (!state) return renderConnecting(partyCode);
     stage.innerHTML = `
-      <div class="party-code">Code: <b>${esc(code)}</b> <span class="s">${isHost ? '(you are host)' : '(guest)'}</span></div>
+      <div class="party-code">Code: <b>${esc(partyCode)}</b> <span class="s">${isHost ? '(you are host)' : '(guest)'}</span></div>
       ${nowPlaying()}
       ${membersHtml()}
       ${queueHtml()}
@@ -225,17 +241,21 @@ const PartyUI = (() => {
     $('#party-stage').insertAdjacentHTML('afterbegin', `<div class="party-error">${esc(msg)}</div>`);
   }
   function renderEnded() {
-    ws = null; isHost = false; state = null; pending = []; members = [];
+    const socket = ws;
+    resetSession();
+    if (socket && socket.readyState < 2) socket.close();
     render();
     renderError('Party ended');
   }
 
-  return { open, close };
+  return { open, hide, close };
 })();
 
 document.addEventListener('DOMContentLoaded', () => {
   const btn = $('#party-btn');
   if (btn) btn.onclick = PartyUI.open;
+  const hide = $('#pt-hide');
+  if (hide) hide.onclick = PartyUI.hide;
   const x = $('#pt-close');
   if (x) x.onclick = PartyUI.close;
 });

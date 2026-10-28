@@ -993,11 +993,13 @@ window.partyFollow = (mediaId, title, position, playing, updatedAt, options = {}
     }
     return;
   }
+  $('#video-modal').classList.remove('on', 'yt');
+  plyr.pause();
+  $('#playerbar').classList.add('on');
   // already playing this media locally (host loaded it themselves) — nothing to do
   if (pbAudio.src.endsWith(`/api/stream/${mediaId}`)) { partyFollowId = mediaId; }
   if (partyFollowId !== mediaId) {
     partyFollowId = mediaId;
-    $('#playerbar').classList.add('on');
     $('#pb-title').textContent = title || '—';
     $('#pb-sub').textContent = 'party';
     pbAudio.src = `/api/stream/${mediaId}`;
@@ -1106,8 +1108,10 @@ const plyr = new Plyr('#plyr-video', {
   seekTime: 10,
 });
 let videoItem = null;
+let videoOpenGeneration = 0;
 
 function openVideo(it) {
+  const generation = ++videoOpenGeneration;
   partyPlaybackKind = 'video';
   $('#playerbar').classList.remove('on');
   pbAudio.pause();
@@ -1117,11 +1121,20 @@ function openVideo(it) {
   $('#video-modal').classList.add('on');
   $('#video-modal').classList.remove('yt');
   resumeFor(it.id).then(p => {
+    if (videoItem !== it || generation !== videoOpenGeneration) return;
+    const streamPath = `/api/stream/${it.id}`;
+    const streamUrl = new URL(streamPath, window.location.origin).href;
     plyr.source = {
       type: 'video',
-      sources: [{ src: `/api/stream/${it.id}`, type: 'video/mp4' }],
+      sources: [{ src: streamPath, type: 'video/mp4' }],
     };
-    if (p && p.position > 5) plyr.once('loadedmetadata', () => { plyr.currentTime = p.position; });
+    const media = plyr.media;
+    // Plyr forwards metadata from retired media; only this source may resume.
+    if (p && p.position > 5) media.addEventListener('loadedmetadata', () => {
+      const source = media.src || media.querySelector('source')?.src || media.currentSrc || '';
+      if (plyr.media === media && videoItem === it && generation === videoOpenGeneration
+        && new URL(source, window.location.origin).href === streamUrl) plyr.currentTime = p.position;
+    }, { once: true });
     plyr.play();
   });
   trackProgress(plyr, it);
@@ -1156,9 +1169,8 @@ document.addEventListener('keydown', (e) => {
 });
 $('#vm-party').onclick = () => {
   // party panel opens over the player
-  const pm = $('#party-modal');
-  pm.classList.add('on');
-  pm.style.zIndex = 200;
+  $('#party-modal').style.zIndex = 200;
+  PartyUI.open();
 };
 
 // ---------- boot ----------

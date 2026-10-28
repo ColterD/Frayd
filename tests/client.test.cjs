@@ -18,7 +18,8 @@ function browser() {
       style: {}, dataset: {}, children: [], value: '', type: '', innerHTML: '', textContent: '',
       src: '', paused: true, readyState: 1, currentTime: 0, clientWidth: 760, clientHeight: 600,
       classList: {
-        add: name => classes.add(name), remove: name => classes.delete(name),
+        add: (...names) => names.forEach(name => classes.add(name)),
+        remove: (...names) => names.forEach(name => classes.delete(name)),
         contains: name => classes.has(name),
       },
       querySelector: () => null,
@@ -301,6 +302,85 @@ test('movie reopen restores saved time after metadata, without undoing later see
     assert.equal(b.run('plyr.currentTime'), 300);
     b.nodes.get('#vm-back').onclick();
   }
+});
+
+test('retired video metadata cannot consume the current movie resume', async () => {
+  const b = browser();
+  const retired = b.nodes.get('#plyr-video');
+  b.respond(async () => ({ ok: true, json: async () => ({ position: 64 }) }));
+  b.run('openVideo({ id: 1, kind: "movie", title: "Movie" })');
+  await new Promise(resolve => setImmediate(resolve));
+  retired.emit('loadedmetadata'); // Vendored Plyr forwards even a retired media event.
+  assert.equal(b.run('plyr.currentTime'), 0);
+  b.run('plyr.duration = 120; plyr.emit("loadedmetadata")');
+  assert.equal(b.run('plyr.currentTime'), 64);
+});
+
+test('late movie metadata cannot seek a replacement or a closed video', async () => {
+  const b = browser();
+  b.respond(async () => ({ ok: true, json: async () => ({ position: 64 }) }));
+  b.run('openVideo({ id: 1, kind: "movie", title: "First" })');
+  await new Promise(resolve => setImmediate(resolve));
+  const first = b.nodes.get('#plyr-video');
+  b.respond(async () => ({ ok: true, json: async () => null }));
+  b.run('openVideo({ id: 2, kind: "movie", title: "Second" })');
+  await new Promise(resolve => setImmediate(resolve));
+  b.run('plyr.duration = 120');
+  first.emit('loadedmetadata');
+  assert.equal(b.run('plyr.currentTime'), 0);
+  b.respond(async () => ({ ok: true, json: async () => ({ position: 64 }) }));
+  b.run('openVideo({ id: 3, kind: "movie", title: "Closed" })');
+  await new Promise(resolve => setImmediate(resolve));
+  b.nodes.get('#vm-back').onclick();
+  b.run('plyr.duration = 120; plyr.emit("loadedmetadata")');
+  assert.equal(b.run('plyr.currentTime'), 0);
+});
+
+for (const next of ['close', 'replacement']) {
+  test(`a movie progress response after ${next} cannot load the old source`, async () => {
+    const b = browser();
+    let finish;
+    b.respond(() => new Promise(resolve => { finish = resolve; }));
+    b.run('openVideo({ id: 1, kind: "movie", title: "First" })');
+    if (next === 'close') b.nodes.get('#vm-back').onclick();
+    else {
+      b.respond(async () => ({ ok: true, json: async () => null }));
+      b.run('openVideo({ id: 2, kind: "movie", title: "Second" })');
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    const media = b.nodes.get('#plyr-video');
+    finish({ ok: true, json: async () => ({ position: 64 }) });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(b.nodes.get('#plyr-video'), media);
+    assert.equal(media.src, next === 'close' ? '' : '/api/stream/2');
+  });
+}
+
+test('an old progress response cannot restart a quick same-item reopen', async () => {
+  const b = browser();
+  const pending = [];
+  b.respond(() => new Promise(resolve => pending.push(resolve)));
+  b.run('sameMovie = { id: 1, kind: "movie", title: "Movie" }; openVideo(sameMovie)');
+  b.nodes.get('#vm-back').onclick();
+  b.run('openVideo(sameMovie)');
+  pending[1]({ ok: true, json: async () => null });
+  await new Promise(resolve => setImmediate(resolve));
+  const media = b.nodes.get('#plyr-video');
+  pending[0]({ ok: true, json: async () => ({ position: 64 }) });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(b.nodes.get('#plyr-video'), media);
+  b.run('plyr.duration = 120; plyr.emit("loadedmetadata")');
+  assert.equal(b.run('plyr.currentTime'), 0);
+});
+
+test('metadata from a reused video with a different stream cannot apply old resume', async () => {
+  const b = browser();
+  b.respond(async () => ({ ok: true, json: async () => ({ position: 64 }) }));
+  b.run('openVideo({ id: 1, kind: "movie", title: "First" })');
+  await new Promise(resolve => setImmediate(resolve));
+  b.nodes.get('#plyr-video').src = '/api/stream/2';
+  b.run('plyr.duration = 120; plyr.emit("loadedmetadata")');
+  assert.equal(b.run('plyr.currentTime'), 0);
 });
 
 test('movie without meaningful saved progress starts at zero', async () => {
@@ -677,6 +757,60 @@ test('host first party state still loads a different video', async () => {
     state: { media_id: 10, title: 'Next', queue: [], position: 90, playing: true, updated_at: Date.now() / 1000 } }) });
   assert.equal(b.nodes.get('#plyr-video').src, '/api/stream/10');
   assert.ok(b.run('plyr.currentTime') < 2);
+});
+
+for (const audioWasLoaded of [false, true]) {
+  test(`guest video to ${audioWasLoaded ? 'retained' : 'new'} audio activates only the audio player`, async () => {
+    const b = browser();
+    b.run('LIBRARY = [{ id: 9, kind: "movie" }, { id: 10, kind: "music" }]');
+    vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), b.context);
+    b.nodes.get('#party-code-input').value = 'ABCD';
+    b.run('PartyUI.open()');
+    b.nodes.get('#pt-join').onclick();
+    const socket = b.sockets[0];
+    const follow = id => socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: false,
+      state: { media_id: id, title: 'Fixture', queue: [], position: 0, playing: true, updated_at: Date.now() / 1000 } }) });
+    if (audioWasLoaded) follow(10);
+    follow(9);
+    await settle();
+    assert.equal(b.run('plyr.paused'), false);
+    b.nodes.get('#video-modal').classList.add('yt');
+    b.nodes.get('#playerbar').classList.remove('on');
+    follow(10);
+    await settle();
+    assert.equal(b.run('plyr.paused'), true);
+    assert.equal(b.nodes.get('#pb-audio').paused, false);
+    assert.equal(b.nodes.get('#video-modal').classList.contains('on'), false);
+    assert.equal(b.nodes.get('#video-modal').classList.contains('yt'), false);
+    assert.equal(b.nodes.get('#playerbar').classList.contains('on'), true);
+  });
+}
+
+test('host video to audio cleanup cannot publish an obsolete video pause', async () => {
+  const { b, socket, state } = await hostParty('movie');
+  b.run('LIBRARY.push({ id: 10, kind: "music" })');
+  socket.onmessage({ data: JSON.stringify({ type: 'state', state: { ...state, media_id: 10 } }) });
+  await settle();
+  assert.equal(b.run('plyr.paused'), true);
+  assert.equal(b.nodes.get('#pb-audio').paused, false);
+  assert.deepEqual(socket.sent.map(message => message.type), ['play']);
+});
+
+test('video party button renders and reopens the connected panel through PartyUI', () => {
+  const b = browser();
+  vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), b.context);
+  b.nodes.get('#vm-party').onclick();
+  assert.equal(typeof b.nodes.get('#pt-join').onclick, 'function');
+  assert.equal(b.nodes.get('#party-modal').style.zIndex, 200);
+  b.nodes.get('#party-code-input').value = 'ABCD';
+  b.nodes.get('#pt-join').onclick();
+  b.sockets[0].onmessage({ data: JSON.stringify({ type: 'state', is_host: false,
+    state: { media_id: null, title: '', queue: [], position: 0, playing: false } }) });
+  b.run('PartyUI.hide()');
+  b.nodes.get('#vm-party').onclick();
+  assert.equal(b.sockets.length, 1);
+  assert.match(b.nodes.get('#party-stage').innerHTML, /ABCD/);
+  assert.equal(b.nodes.get('#party-modal').classList.contains('on'), true);
 });
 
 async function hostParty(kind = 'music') {

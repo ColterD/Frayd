@@ -222,3 +222,36 @@ pass afterward. A replacement image and actual-media recheck remain required.
 Earlier movie-reopen observations with stale `903` browser code are excluded from
 the `055` verdict. Resource-content hashes after an explicit documented cache-bypassed
 reload establish the browser payload used for the actual UI regression above.
+
+## Native metadata resume and connected controls
+
+Actual Vivaldi QA on `aff7ed25` received HTTP 200 with saved movie position
+64.624054, yet decoded playback started near zero. This is a source-bound product
+failure, separate from earlier stale-browser observations. The native regression
+uses a [generated 120-second H.264 fixture](../../tests/fixtures/native-resume.mp4)
+and its [generation command](../../tests/fixtures/generate-native-resume.sh).
+The 24,997-byte fixture contains black 160×90 video frames, uses no downloaded
+media, and was generated with the existing app image's ffmpeg 5.1.9.
+
+The controlled native baseline observes trusted metadata from a retired media
+element's cancellation clip before the replacement video has a duration. Plyr
+forwards that event through its container, consuming the one-shot resume callback;
+new playback settles at 0.3049 seconds despite saved progress 64. The correction
+listens on the captured replacement video and checks its item, open generation and
+configured stream. Closed, superseded or different-source requests cannot apply an
+old resume response. Five native decoding controls now restore near 64.30–64.31
+seconds, while new zero-progress playback starts near 0.315 seconds; each decodes
+6–10 frames. These are controlled short-run observations, not a performance or
+full-duration quality claim.
+
+Party controls now distinguish **Hide** (remain connected) from **Leave**
+(disconnect). Reopening retains the active code/state, hidden closure clears
+session state, and stale socket callbacks cannot change a new connection.
+Audio following retires the old video surface and pauses its player before both
+fresh and retained-audio paths. The video party button uses the same reopen API.
+These corrections address the actual overlay hit-test gap and the reproduced
+state where video and audio remained active together.
+
+The combined local source passes 85 Node tests, 20 Python tests and 24 browser
+cases, including the five native decoding cases. Its new image, current Vivaldi
+media checks and hosted acceptance remain separate required gates.

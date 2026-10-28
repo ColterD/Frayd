@@ -14,7 +14,7 @@ const root = resolve(__dirname, '..');
 const evidenceDir = join(root, '.codex/evidence/pr2-real-dom');
 const productionFiles = ['client/index.html', 'client/js/app.js', 'client/js/party.js',
   'client/vendor/plyr/plyr.min.js', 'client/vendor/plyr/plyr.min.css', 'client/vendor/plyr/plyr.svg', 'client/css/frayd.css'];
-const harnessFiles = ['tests/browser-regression.cjs', 'tests/fixtures/browser-driver.js', 'tests/fixtures/reader-probe.js'];
+const harnessFiles = ['tests/browser-regression.cjs', 'tests/fixtures/browser-driver.js', 'tests/fixtures/reader-probe.js', 'tests/fixtures/native-resume.mp4', 'tests/fixtures/generate-native-resume.sh'];
 function hash(path) { return createHash('sha256').update(readFileSync(path)).digest('hex'); }
 function browserPath() {
   if (process.env.BROWSER_BIN) return realpathSync(process.env.BROWSER_BIN);
@@ -63,6 +63,7 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir } 
   let resolveResult;
   const result = new Promise(resolve => { resolveResult = resolve; });
   const unexpectedRequests = [];
+  const nativeRequests = [];
   const probe = readFileSync(join(root, 'tests/fixtures/reader-probe.js'), 'utf8');
   const contentTypes = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml' };
   const server = createServer(async (request, response) => {
@@ -110,9 +111,27 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir } 
         return response.end(`<!doctype html><html><head><meta charset="utf-8"><script>${probe}</script></head><body>${body}</body></html>`);
       }
       if (path === '/api/annotations/7') return json(annotations);
+      if (path === '/api/progress/20' || path === '/api/progress/22') { nativeRequests.push({ path, status: 200, position: 64 }); return json({ position: 64 }); }
+      if (path === '/api/progress/21') { nativeRequests.push({ path, status: 200, position: 0 }); return json({ position: 0 }); }
       if (path.startsWith('/api/progress/')) return json(null);
       if (path === '/api/progress') return json({});
       if (path === '/api/library') return json([]);
+      if (/^\/api\/stream\/(20|21|22)$/.test(path)) {
+        // A cached cancellation blank can finish before the requested movie.
+        if (path === '/api/stream/20' || path === '/api/stream/22') await delay(150);
+        const media = readFileSync(join(root, 'tests/fixtures/native-resume.mp4'));
+        const range = request.headers.range?.match(/^bytes=(\d+)-(\d*)$/);
+        const start = range ? Number(range[1]) : 0;
+        const end = range?.[2] ? Math.min(Number(range[2]), media.length - 1) : media.length - 1;
+        if (start > end || start >= media.length) {
+          response.writeHead(416, { 'Content-Range': `bytes */${media.length}` });
+          return response.end();
+        }
+        nativeRequests.push({ path, status: range ? 206 : 200, start, end });
+        response.writeHead(range ? 206 : 200, { 'Content-Type': 'video/mp4', 'Accept-Ranges': 'bytes', 'Cache-Control': 'no-store',
+          'Content-Length': end - start + 1, ...(range ? { 'Content-Range': `bytes ${start}-${end}/${media.length}` } : {}) });
+        return response.end(media.subarray(start, end + 1));
+      }
       if (/^\/api\/stream\/(10|11)$/.test(path)) { response.writeHead(204); return response.end(); }
       if (path === '/favicon.ico') { response.writeHead(204); return response.end(); }
       const staticFile = path === '/' ? 'client/index.html'
@@ -158,13 +177,13 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir } 
     });
     const timedOut = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`Browser regression exceeded 60 seconds; ${logs}`)), 60000); });
     const observed = await Promise.race([result, exited, timedOut]);
-    const expectedCases = 18;
+    const expectedCases = 24;
     const complete = observed.cases.length === expectedCases
       && new Set(observed.cases.map(item => item.name)).size === expectedCases
       && observed.cases.every(item => item.status === 'PASS')
       && observed.passed === expectedCases && observed.failed === 0;
-    output = { provenance, ...observed, expectedCases, complete, unexpectedRequests,
-      fixtureConfiguration: { iconUrl: '/vendor/plyr/plyr.svg', mediaResponses: 'HTTP 204, no codec bytes',
+    output = { provenance, ...observed, expectedCases, complete, unexpectedRequests, nativeRequests,
+      fixtureConfiguration: { iconUrl: '/vendor/plyr/plyr.svg', mediaResponses: 'IDs10/11 HTTP204; IDs20/21/22 owned120s H264 MP4 with Range support',
         browserSandbox: 'Disabled only for this disposable headless process; EPUB iframe keeps sandbox=allow-scripts.' } };
     if (!complete || observed.failed || observed.errors.length || unexpectedRequests.length) process.exitCode = 1;
   } catch (error) {

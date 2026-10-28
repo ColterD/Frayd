@@ -4,6 +4,7 @@
   const cases = [];
   const errors = [];
   const mediaDiagnostics = [];
+  const nativeMedia = [];
   window.addEventListener('error', event => {
     if (event instanceof ErrorEvent) errors.push({ message: event.message, stack: event.error?.stack, filename: event.filename, line: event.lineno });
     else mediaDiagnostics.push({ type: event.type, target: event.target?.tagName, detail: 'Empty fixture streams exercise DOM events without decoded playback.' });
@@ -56,7 +57,7 @@
   }
   async function run(name, fn) {
     try { cases.push({ name, status: 'PASS', observed: await fn() }); }
-    catch (error) { cases.push({ name, status: 'FAIL', error: error.stack }); }
+    catch (error) { cases.push({ name, status: error.code === 'NATIVE_CODEC_UNAVAILABLE' ? 'BLOCKED' : 'FAIL', error: error.stack }); }
   }
   async function highlight({ body, start, end, text, offset, search, saved = [] }) {
     await api('configure', { body, annotations: saved });
@@ -86,6 +87,76 @@
     equal((await api('state')).posts.length, 1, 'Duplicate selection sends no second POST');
     return { cfi: state.posts[0].cfi, savedText: text, restoredMarks: restored, posts: 1, paintHeldUntil201: true };
   }
+  async function nativeResume(name, decodableBlank, id = 20, expectedPosition = 64) {
+    if (!document.createElement('video').canPlayType('video/mp4; codecs="avc1.42E01E"')) {
+      const error = new Error('Native H264 codec is unavailable; resume scenario was not executed');
+      error.code = 'NATIVE_CODEC_UNAVAILABLE';
+      throw error;
+    }
+    const trace = [];
+    const snapshot = event => {
+      const media = plyr.media;
+      trace.push({ event, time: media.currentTime, duration: media.duration,
+        plyrDuration: plyr.duration, readyState: media.readyState, width: media.videoWidth,
+        paused: media.paused, currentSrc: media.currentSrc,
+        decodedFrames: media.getVideoPlaybackQuality().totalVideoFrames });
+    };
+    const nativeMetadata = event => {
+      if (event.target instanceof HTMLVideoElement) snapshot(`native:${event.type}:trusted=${event.isTrusted}`);
+    };
+    const wrappedMetadata = () => snapshot('plyr:loadedmetadata');
+    document.addEventListener('loadedmetadata', nativeMetadata, true);
+    plyr.on('loadedmetadata', wrappedMetadata);
+    plyr.muted = true;
+    const originalBlank = plyr.config.blankVideo;
+    if (decodableBlank) plyr.config.blankVideo = '/api/stream/21';
+    const previous = plyr.media;
+    previous.addEventListener('loadedmetadata', event => {
+      trace.push({ event: 'retired-native-metadata', trusted: event.isTrusted,
+        retired: previous !== plyr.media, src: previous.currentSrc,
+        currentDuration: plyr.media.duration, currentTime: plyr.currentTime });
+    }, { once: true });
+    try {
+      openVideo({ id, kind: 'movie', title: 'Native resume' });
+      await until(() => {
+        if (plyr.media.error?.code === 3 || plyr.media.error?.code === 4) {
+          const error = new Error(`Native H264 decode unavailable: ${plyr.media.error.message}`);
+          error.code = 'NATIVE_CODEC_UNAVAILABLE';
+          throw error;
+        }
+        return plyr.media !== previous && plyr.media.readyState === 4
+          && plyr.media.videoWidth === 160 && !plyr.media.paused && plyr.currentTime > 0;
+      }, 'native H264 decode and playback');
+      await delay(300);
+      snapshot('settled');
+      check(plyr.media.getVideoPlaybackQuality().totalVideoFrames > 0, 'Requested media must decode video frames');
+      const activeMetadata = trace.findIndex(event => event.event === 'native:loadedmetadata:trusted=true');
+      check(activeMetadata >= 0, 'Requested media must emit native trusted metadata');
+      if (decodableBlank) {
+        const retiredMetadata = trace.findIndex(event => event.event === 'retired-native-metadata' && event.trusted && event.retired);
+        check(retiredMetadata >= 0 && retiredMetadata < activeMetadata,
+          `Cancellation blank must finish before requested metadata: ${JSON.stringify(trace)}`);
+      }
+      nativeMedia.push({ name, trace: trace.slice(), expectedPosition,
+        decodableBlank, canPlayH264: plyr.media.canPlayType('video/mp4; codecs="avc1.42E01E"') });
+      check(plyr.currentTime >= expectedPosition && plyr.currentTime < expectedPosition + 6,
+        `Native saved${expectedPosition} resume: ${JSON.stringify(trace)}`);
+      return { trace: trace.slice(), decodedWidth: plyr.media.videoWidth, nativeEvents: true };
+    } finally {
+      document.removeEventListener('loadedmetadata', nativeMetadata, true);
+      plyr.off('loadedmetadata', wrappedMetadata);
+      document.getElementById('vm-back').click();
+      plyr.config.blankVideo = originalBlank;
+    }
+  }
+  await run('native decoded plain movie resume before any party hooks',
+    () => nativeResume('plain native resume', false));
+  await run('native decoded resume with a decodable cancellation blank before party hooks',
+    () => nativeResume('decodable blank before party', true, 22));
+  await run('native movie close and reopen retains the saved position',
+    () => nativeResume('close and reopen', true));
+  await run('native different movie without saved progress starts at zero',
+    () => nativeResume('new movie without saved progress', false, 21, 0));
   await run('plain text save, 201 paint, reload and duplicate', () => highlight({
     body: '<p id="target">prefix target suffix</p>', start: 7, end: 13, text: 'target', offset: 7,
   }));
@@ -280,14 +351,69 @@
     LIBRARY = [{ id: 10, kind: 'movie' }, { id: 11, kind: 'movie' }];
     return firstPartyState({ id: 11, isHost: true, metadataFirst: true, localPaused: true });
   });
+  await run('guest video to fresh and retained audio pauses video and retains explicit panel control', async () => {
+    const observations = [];
+    for (const audioWasLoaded of [false, true]) {
+      PartyUI.close();
+      delete window.partySend;
+      LIBRARY = [{ id: 10, kind: 'movie' }, { id: 11, kind: 'music' }];
+      partyFollowId = null;
+      const audio = document.getElementById('pb-audio');
+      audio.pause();
+      audio.removeAttribute('src');
+      audio.load();
+      const video = plyr.media;
+      Object.defineProperty(video, 'duration', { configurable: true, value: 634 });
+      Object.defineProperty(video, 'readyState', { configurable: true, value: 1 });
+      document.getElementById('vm-party').click();
+      document.getElementById('party-code-input').value = 'ABCD';
+      document.getElementById('pt-join').click();
+      const state = id => ({ type: 'state', is_host: false, state: { media_id: id, title: 'Fixture',
+        queue: [], position: 0, playing: true, updated_at: Date.now() / 1000 } });
+      if (audioWasLoaded) {
+        socket.onmessage({ data: JSON.stringify(state(11)) });
+        audio.dispatchEvent(new Event('loadedmetadata'));
+      }
+      socket.onmessage({ data: JSON.stringify(state(10)) });
+      equal(video.paused, false, 'Guest video starts before audio follow');
+      const modal = document.getElementById('video-modal');
+      modal.classList.add('yt');
+      document.getElementById('playerbar').classList.remove('on');
+      socket.onmessage({ data: JSON.stringify(state(11)) });
+      audio.dispatchEvent(new Event('loadedmetadata'));
+      equal(video.paused, true, 'Audio follow pauses the actual current Plyr media');
+      equal(audio.paused, false, 'Audio follow starts audio');
+      check(!modal.classList.contains('on') && !modal.classList.contains('yt'), 'Audio follow closes video presentation');
+      check(document.getElementById('playerbar').classList.contains('on'), 'Audio player bar is visible');
+      check(document.getElementById('party-modal').classList.contains('on'), 'Media changes do not hide party controls');
+      const connection = socket;
+      PartyUI.hide();
+      document.getElementById('vm-party').click();
+      check(socket === connection && document.getElementById('party-stage').textContent.includes('ABCD'),
+        'Video party button reopens connected code without reconnecting');
+      observations.push({ audioWasLoaded, videoPaused: video.paused, audioPaused: audio.paused,
+        videoModalOpen: modal.classList.contains('on'), connectionRetained: socket === connection });
+      PartyUI.close();
+    }
+    return observations;
+  });
+  // End a party through its production state handler before the native control.
+  PartyUI.open();
+  document.getElementById('party-code-input').value = 'ABCD';
+  document.getElementById('pt-join').click();
+  socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: true,
+    state: { media_id: null, title: '', queue: [], position: 0, playing: false } }) });
+  socket.onmessage({ data: JSON.stringify({ type: 'ended' }) });
   window.fetch = originalFetch;
   window.WebSocket = originalWebSocket;
   mediaPrototype.play = originalPlay;
   mediaPrototype.pause = originalPause;
   Object.defineProperty(mediaPrototype, 'paused', originalPaused);
-  await api('result', { cases, errors, mediaDiagnostics, passed: cases.filter(item => item.status === 'PASS').length,
+  await run('native decoded movie resume after production party end',
+    () => nativeResume('after prior party lifecycle', true));
+  await api('result', { cases, errors, mediaDiagnostics, nativeMedia, passed: cases.filter(item => item.status === 'PASS').length,
     failed: cases.filter(item => item.status === 'FAIL').length,
-    limits: ['Synthetic media events do not prove decoded playback, codec support, or two-client synchronization.',
+    limits: ['IDs10/11 use synthetic media events; native20/21/22 decode the owned H264 fixture. Other codecs, physical output and two-client synchronization remain untested.',
       'Vendored Plyr retains synthetic event forwarding from detached media; no naturally occurring late event user path is established.',
       'Disposable loopback API; no deployed service, user profile, account, or existing browser session accessed.'] });
 })().catch(error => fetch('/__fixture/result', { method: 'POST', headers: { 'Content-Type': 'application/json' },
