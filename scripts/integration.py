@@ -176,6 +176,19 @@ def epub_fixture_snapshot(database):
         return {'media': media, 'metadata': metadata, 'progress': progress}
 
 
+def comic_cache_failure_snapshot(database):
+    """Read the faulted synthetic comic row, progress and trigger without writing."""
+    with closing(sqlite3.connect(database.resolve().as_uri() + '?mode=ro', uri=True)) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute('BEGIN')
+        media = dict(connection.execute(
+            'SELECT id,kind,path,title,size_bytes,mtime_secs,meta_json FROM media WHERE id=4').fetchone())
+        progress = dict(connection.execute(
+            'SELECT identity_id,media_id,position,completed,updated_at FROM progress WHERE identity_id=1 AND media_id=4').fetchone())
+        trigger = connection.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='qa_reject_comic_cache'").fetchone()[0]
+        return {'media': media, 'progress': progress, 'trigger': trigger}
+
+
 def assert_project_removed(project):
     """Reject any remaining task-owned containers, networks or volumes."""
     for resource in ('container', 'network', 'volume'):
@@ -484,11 +497,14 @@ def main():
             assert old_epub != new_epub and len(old_epub) != len(new_epub)
             ebook_source = library / 'qa-book.epub'
             ebook_source.write_bytes(old_epub)
+            comic_source = library / 'qa-cache-failure.cbz'
+            comic_source.write_bytes(fixture)
+            comic_metadata = {'synopsis': 'Keep comic synopsis', 'custom': {'edition': 4}}
             ebook_metadata = {'synopsis': 'Keep EPUB synopsis', 'custom': {'edition': 7},
                              'pages': ['unrelated-preserved-field']}
             assert len(converted) != len(replacement_converted)
             timestamp = int(time.time()) - 10
-            for path in [legacy_source, genuine_source, ebook_source]:
+            for path in [legacy_source, genuine_source, ebook_source, comic_source]:
                 os.utime(path, (timestamp, timestamp))
             database = data / 'frayd.sqlite'
             with closing(sqlite3.connect(database)) as connection:
@@ -503,7 +519,21 @@ def main():
                 connection.execute("INSERT INTO media(id,kind,path,title,size_bytes,mtime_secs,meta_json) VALUES(3,'ebook',?,'Preserved EPUB title',?,?,?)",
                     ('/data/library/qa-book.epub', len(old_epub), timestamp, json.dumps(ebook_metadata)))
                 connection.execute('INSERT INTO progress(identity_id,media_id,position,updated_at) VALUES(1,3,1,12346)')
+                connection.execute("INSERT INTO media(id,kind,path,title,size_bytes,mtime_secs,meta_json) VALUES(4,'comic',?,'Preserved uncached comic',?,?,?)",
+                    ('/data/library/qa-cache-failure.cbz', len(fixture), timestamp, json.dumps(comic_metadata)))
+                connection.execute('INSERT INTO progress(identity_id,media_id,position,updated_at) VALUES(1,4,0,12347)')
+                connection.execute("""CREATE TRIGGER qa_reject_comic_cache BEFORE UPDATE OF meta_json ON media
+                    WHEN OLD.id=4 AND json_extract(NEW.meta_json,'$.pages') IS NOT NULL
+                    BEGIN SELECT RAISE(ABORT,'qa comic cache publication refused'); END""")
                 connection.commit()
+                try:
+                    connection.execute("UPDATE media SET meta_json=json_set(meta_json,'$.pages',json('[\"001.png\"]')) WHERE id=4")
+                except sqlite3.IntegrityError as error:
+                    assert 'qa comic cache publication refused' in str(error)
+                else:
+                    raise AssertionError('comic cache write-failure trigger did not reject its probe')
+                finally:
+                    connection.rollback()
             database.chmod(0o666)
             before_legacy = legacy_fixture_snapshot(database)
             legacy_hash = hashlib.sha256(video).hexdigest()
@@ -535,7 +565,7 @@ def main():
                 assert after_legacy['progress'] == before_legacy['progress']
                 assert hashlib.sha256(legacy_source.read_bytes()).hexdigest() == legacy_hash
                 assert hashlib.sha256(genuine_source.read_bytes()).hexdigest() == genuine_hash
-                assert {path.name for path in library.iterdir()} == {'Film.mkv', 'Film.browser.mp4', 'qa-book.epub'}
+                assert {path.name for path in library.iterdir()} == {'Film.mkv', 'Film.browser.mp4', 'qa-book.epub', 'qa-cache-failure.cbz'}
                 assert request('/api/stream/2') == replacement_converted
                 assert json.loads(request('/api/progress/2?identity=qa-legacy-device'))['position'] == 42
                 genuine_row = after_legacy['media'][1]
@@ -594,7 +624,7 @@ def main():
                 assert hashlib.sha256(ebook_source.read_bytes()).hexdigest() == ebook_hash
                 assert hashlib.sha256(legacy_source.read_bytes()).hexdigest() == legacy_hash
                 assert hashlib.sha256(genuine_source.read_bytes()).hexdigest() == genuine_hash
-                assert {path.name for path in library.iterdir()} == {'Film.mkv', 'Film.browser.mp4', 'qa-book.epub'}
+                assert {path.name for path in library.iterdir()} == {'Film.mkv', 'Film.browser.mp4', 'qa-book.epub', 'qa-cache-failure.cbz'}
                 print('PASS: EPUB media3 old3->new2 renamed chapters; SQL spine invalidated then refreshed, exact new XHTML0/1 and removed chapter2 HTTP404; ID/title/progress/custom/pages/source hashes preserved')
                 compose('restart', 'app')
                 ready()
@@ -605,6 +635,29 @@ def main():
                 assert json.loads(request('/api/progress/3?identity=qa-legacy-device'))['position'] == 1
                 assert hashlib.sha256(ebook_source.read_bytes()).hexdigest() == ebook_hash
                 print('PASS: replaced EPUB metadata/cache, current chapters and device progress persist after restart')
+                comic_before = comic_cache_failure_snapshot(database)
+                assert json.loads(comic_before['media']['meta_json']) == comic_metadata
+                assert comic_before['progress']['position'] == 0
+                comic_hash = hashlib.sha256(fixture).hexdigest()
+                assert hashlib.sha256(comic_source.read_bytes()).hexdigest() == comic_hash
+                docker('exec', name, 'sh', '-c', 'test -r /data/library/qa-cache-failure.cbz && test ! -w /data/library/qa-cache-failure.cbz')
+                print('PROBE: comic media4 has readable realCBZ, uncached metadata, progress0 and validated SQLiteABORT trigger scoped only to pages publication')
+                assert json.loads(request('/api/comic/4/pages')) == ['001.png']
+                assert request('/api/comic/4/page/0') == image
+                request('/api/comic/4/page/1', expected=404)
+                assert comic_cache_failure_snapshot(database) == comic_before
+                assert json.loads(request('/api/progress/4?identity=qa-legacy-device')) == {'position': 0.0, 'updated_at': 12347}
+                assert hashlib.sha256(comic_source.read_bytes()).hexdigest() == comic_hash
+                assert {path.name for path in library.iterdir()} == {'Film.mkv', 'Film.browser.mp4', 'qa-book.epub', 'qa-cache-failure.cbz'}
+                print('PASS: comic optional-cache SQLiteerror still returns pagesHTTP200 and exactPNGpage0HTTP200; outofrange404; cache/ID/title/meta/progress0/source unchanged')
+                compose('restart', 'app')
+                ready()
+                wait_for_scan_idle()
+                assert json.loads(request('/api/comic/4/pages')) == ['001.png']
+                assert request('/api/comic/4/page/0') == image
+                assert comic_cache_failure_snapshot(database) == comic_before
+                assert hashlib.sha256(comic_source.read_bytes()).hexdigest() == comic_hash
+                print('PASS: comic remains readable after restart while cache-publication trigger still rejects writes and metadata/progress stay unchanged')
 
     assert_project_removed(project)
     print(f'PASS: task-owned {project} containers, networks and volume removed')

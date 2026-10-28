@@ -510,6 +510,7 @@ async fn comic_page(
 
 /// Share the existing page order between listing and content endpoints.
 /// Populate missing caches outside the DB lock, publishing only if the source fingerprint is unchanged.
+/// Optional SQLite cache failures retain computed names; rejected snapshots return no result.
 async fn comic_page_names(app: &Arc<App>, id: i64, path: &str) -> Option<Vec<String>> {
     let (mtime,size) = {
         let db = app.db.lock().unwrap();
@@ -526,11 +527,13 @@ async fn comic_page_names(app: &Arc<App>, id: i64, path: &str) -> Option<Vec<Str
     let names: Vec<String> = pages.into_iter().map(|(name,_)| name).collect();
     let db = app.db.lock().unwrap();
     // Patch only the cache field; a concurrent rescan must not receive a stale archive listing.
-    let changed = db.execute("UPDATE media SET meta_json=json_set(COALESCE(meta_json,'{}'),
+    match db.execute("UPDATE media SET meta_json=json_set(COALESCE(meta_json,'{}'),
         '$.pages',json(?1)) WHERE id=?2 AND path=?3 AND mtime_secs IS ?4 AND size_bytes IS ?5",
-        rusqlite::params![serde_json::to_string(&names).ok()?,id,path,mtime,size]).ok()?;
-    if changed != 1 { return None; }
-    Some(names)
+        rusqlite::params![serde_json::to_string(&names).ok()?,id,path,mtime,size]) {
+        Ok(1)=>Some(names),
+        Ok(_)=>None,
+        Err(error)=>{tracing::warn!(%error,id,"comic page cache write held");Some(names)}
+    }
 }
 
 /// Clear the scan admission flag on success, errors, and unwinding.
@@ -1564,6 +1567,32 @@ mod backend_regressions {
         assert_eq!(names,vec!["Á.png","À.png","Â.png"]);
         let response=comic_page(State(app.clone()),Path((1,1))).await.into_response();
         assert_eq!(axum::body::to_bytes(response.into_body(),8192).await.unwrap(),&b"first physical page"[..]);
+    }
+    /// Optional SQLite cache refusal must not hide page bytes already readable from a valid comic.
+    #[tokio::test]
+    async fn comic_cache_write_failure_keeps_successful_page_response() {
+        let path=concat!(env!("CARGO_MANIFEST_DIR"),"/tests/fixtures/stored.cbz");let app=app_for(path);
+        app.db.lock().unwrap().execute(r#"UPDATE media SET meta_json=json_set(json_remove(meta_json,'$.pages'),'$.custom',json('{"nested":"keep"}')) WHERE id=1"#,[]).unwrap();
+        let before:String=app.db.lock().unwrap().query_row("SELECT meta_json FROM media WHERE id=1",[],|r|r.get(0)).unwrap();
+        app.db.lock().unwrap().execute_batch("CREATE TRIGGER reject_comic_pages BEFORE UPDATE OF meta_json ON media BEGIN SELECT RAISE(FAIL,'fixture comic cache write refused'); END;").unwrap();
+        let response=comic_page(State(app.clone()),Path((1,0))).await.into_response();assert_eq!(response.status(),StatusCode::OK);
+        assert_eq!(axum::body::to_bytes(response.into_body(),8192).await.unwrap(),&b"second image"[..]);
+        let response=comic_pages(State(app.clone()),Path(1)).await.into_response();assert_eq!(response.status(),StatusCode::OK);
+        assert_eq!(serde_json::from_slice::<Vec<String>>(&axum::body::to_bytes(response.into_body(),8192).await.unwrap()).unwrap(),vec!["page2.png","page10.png"]);
+        let db=app.db.lock().unwrap();assert_eq!(db.query_row("SELECT meta_json FROM media WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),before);
+        assert_eq!(db.query_row("SELECT position FROM progress WHERE media_id=1",[],|r|r.get::<_,f64>(0)).unwrap(),7.0);
+    }
+    /// A zero-row cache update remains a rejected snapshot, never a readable computed fallback.
+    #[tokio::test]
+    async fn comic_zero_row_cache_update_does_not_return_computed_names() {
+        let path=concat!(env!("CARGO_MANIFEST_DIR"),"/tests/fixtures/stored.cbz");let app=app_for(path);
+        app.db.lock().unwrap().execute("UPDATE media SET meta_json=json_remove(meta_json,'$.pages') WHERE id=1",[]).unwrap();
+        let before:String=app.db.lock().unwrap().query_row("SELECT meta_json FROM media WHERE id=1",[],|r|r.get(0)).unwrap();
+        app.db.lock().unwrap().execute_batch("CREATE TRIGGER ignore_comic_pages BEFORE UPDATE OF meta_json ON media BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+        assert_eq!(comic_page_names(&app,1,path).await,None);
+        assert_eq!(comic_page(State(app.clone()),Path((1,0))).await.into_response().status(),StatusCode::NOT_FOUND);
+        let db=app.db.lock().unwrap();assert_eq!(db.changes(),0);
+        assert_eq!(db.query_row("SELECT meta_json FROM media WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),before);
     }
     /// Ensure lazy listing publication cannot replace unrelated metadata or user progress.
     #[tokio::test]
