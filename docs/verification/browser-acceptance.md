@@ -19,7 +19,7 @@ YouTube API. That suite does not qualify actual external playback by itself;
 the real-player checkpoint below is separate.
 
 Party updates clamp captured timestamps under the state lock, preventing stale
-updates from counting elapsed playback twice. The Rust target contains 60 tests. CI requires locked tests, Clippy and release
+updates from counting elapsed playback twice. The Rust target contains 63 tests. CI requires locked tests, Clippy and release
 compilation; warnings in unchanged code remain.
 The frozen client/harness passes 144 Node tests and 32 actual-DOM cases, including
 real native decoding, parser-gated reader restoration and real protocol setup
@@ -47,7 +47,10 @@ selection from confusing the last party-follow ID and another item's progress.
 Server generation and socket tokens isolate replacement parties and duplicate
 connections; old frames and disconnects cannot alter the current session. Host registration
 also requires the creator's private proof, bound to identity and generation; a
-disclosed member label alone cannot grant authority or evict its owner. A decoded-video case proves queued stale pause suppression while preserving
+disclosed member label alone cannot grant authority or evict its owner. A guest key
+also cannot replace a registration whose outbound receiver is still open. Rejoin
+works after that receiver retires; this is active-slot continuity, not first-slot
+or inactive device-identity authentication. A decoded-video case proves queued stale pause suppression while preserving
 a legitimate pause. Synthetic metadata fixtures explicitly model and restore
 metadata readiness rather than treating an event dispatch as a state change. Complex player, party and harness contracts were
 documented without changing the hosted 80% coverage threshold; its next measured

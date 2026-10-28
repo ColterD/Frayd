@@ -121,3 +121,11 @@ malformed/duplicate/stale offers, wrong identity and legitimate reconnects.
 Guest creation/replacement remains public for the trusted household; the proof
 authorizes existing-room host controls, not exclusive global creation rights.
 After a client/server upgrade, refresh open tabs before hosting a new party.
+
+A live guest key cannot be registered again until its prior outbound receiver
+closes or cleanup removes it. Both preflight and registration use this occupancy
+check; stale cleanup cannot remove a permitted successor. An immediate same-key
+rejoin can be rejected until server retirement completes. This protects active
+membership, not first-registration or inactive device-identity authentication;
+public device labels remain trusted-local identifiers. Valid creator-proof host
+replacement stays supported.

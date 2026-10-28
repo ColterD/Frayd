@@ -81,18 +81,20 @@ Keep generated data writable and outside read-only source media. When `FRAYD_TRA
 
 Unchanged sources retain existing conversion references. A detectable source timestamp or byte-length change on rescan invalidates the current reference, and conversion jobs check actual file and database versions before publication. Legacy references with initially unknown fingerprints remain compatible, but their original source version is unverified. Rescan fingerprints use seconds plus byte length: replacements preserving both values are undetected.
 
-Older completed cache files and ownership records remain until manual cleanup, so cache usage can grow across replacements. Back up data and inspect current playback references before removing historical outputs. Older `.frayd-tmp` files in source libraries are not automatically migrated or removed; inspect and back up legacy files before deciding what to remove. No general cache-pruning procedure is qualified here.
+A known source replacement can retire its exact inactive, unreferenced prior generated pair in the same transaction that clears playback. A later eligible Linux recovery pass can delete those files and ownership records. Do not rely on generated cache files for recovery; back up original media and persistent application data. Unrelated historical completed outputs and unqualified records remain operator-managed, so cache usage can still grow. Inspect current references before removing historical outputs. Older `.frayd-tmp` files in source libraries are not automatically migrated or removed; inspect and back up legacy files before deciding what to remove. No general cache-pruning procedure is qualified here.
 
 ### Interrupted conversions
 
 New conversion reservations record pending, completed and retiring lifecycle
 state. On supported Linux locking, a worker and its ffmpeg child hold the job
 lease; startup, explicit rescans and the next conversion attempt can reclaim
-only proven inactive pending jobs. A cleanup blocked by the database retains
+only proven inactive, eligible pending or retiring jobs. A cleanup blocked by the database retains
 bytes/provenance and retries on one of those later entry points.
 
-Publication marks completion atomically with the playback pointer. Completed
-old versions and historical unknown reservations remain retained. Active,
+Publication marks completion atomically with the playback pointer. Known source
+replacement can move the eligible prior completed pair to retiring for later
+recovery; other historical completed outputs and unknown reservations remain
+retained. Active,
 referenced, conflicting, redirected or otherwise uncertain paths never gain
 deletion authority from their filename or age. Unsupported/unavailable locking
 retains an uncertain reservation instead of enabling automatic cleanup; the

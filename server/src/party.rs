@@ -116,14 +116,14 @@ impl Party {
         })
     }
 
-    /// Rejects host-key collisions before upgrade without changing membership.
+    /// Rejects unproven host keys and occupied guest keys before changing membership.
     /// Registration repeats this check under the transition lock after upgrade.
     pub fn can_register(&self, admission: &Admission, key: &str) -> bool {
         self.session.lock().unwrap().role(admission, key).is_some()
     }
 
     /// Rejects upgrades whose generation retired while identity resolution was in flight.
-    /// Identity roles are derived under the same lock; latest registration owns its key.
+    /// Role and guest occupancy are checked under the same lock before any replacement.
     fn register(&self, admission: Admission, key: String, tx: Tx) -> Option<Connection> {
         let mut session = self.session.lock().unwrap();
         let is_host = session.role(&admission, &key)?;
@@ -133,7 +133,7 @@ impl Party {
             key,
             socket: Arc::new(()),
         };
-        // Latest socket for an identity owns its membership; older callbacks lose authority.
+        // Only proven hosts or retired guests can be replaced; older callbacks lose authority.
         session.members.retain(|m| m.key != connection.key);
         session.members.push(Member {
             key: connection.key.clone(), socket: connection.socket.clone(), tx: tx.clone(),
@@ -182,6 +182,8 @@ impl Party {
 impl Session {
     /// A public identity key alone never grants host authority, even before its first socket.
     /// Proof is accepted only for the creator key in this exact live generation.
+    /// Guest labels cannot evict a live outbound receiver. Rejoin may fail until that
+    /// receiver retires; this occupancy guard does not authenticate first-slot guests.
     fn role(&self, admission: &Admission, key: &str) -> Option<bool> {
         if self.code.is_none() || !Arc::ptr_eq(&self.generation, &admission.generation) {
             return None;
@@ -191,7 +193,9 @@ impl Session {
             if admission.host_proof.is_none() || admission.host_proof != self.host_capability {
                 return None;
             }
-        } else if admission.host_proof.is_some() {
+        } else if admission.host_proof.is_some()
+            || self.members.iter().any(|member| member.key == key && !member.tx.is_closed())
+        {
             return None;
         }
         Some(is_host)
@@ -549,11 +553,12 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_sockets_lose_frame_and_cleanup_authority_without_removing_current_members() {
+    fn replaced_host_and_closed_guest_sockets_lose_frame_and_cleanup_authority() {
         let party = Party::new();
         let (code, _) = party.create("host");
         let (old_host, _) = connect(&party, &code, "host");
         let (host, mut host_rx) = connect(&party, &code, "host");
+        // The old receiver is dropped here, so this is a retired guest replacement.
         let (old_guest, _) = connect(&party, &code, "guest");
         let (_guest, mut guest_rx) = connect(&party, &code, "guest");
         drain(&mut host_rx);
@@ -649,5 +654,93 @@ mod tests {
             headers.insert("sec-websocket-protocol", HeaderValue::from_str(&value).unwrap());
             assert!(host_proof(&headers).is_err());
         }
+    }
+
+    #[test]
+    fn active_guest_rejects_duplicate_registration_without_losing_requests_or_updates() {
+        let party = Party::new();
+        let (code, _) = party.create("host");
+        let (host, mut host_rx) = connect(&party, &code, "host");
+        let (victim, mut victim_rx) = connect(&party, &code, "victim");
+        let (_observer, mut observer_rx) = connect(&party, &code, "observer");
+        drain(&mut host_rx);
+        drain(&mut victim_rx);
+        drain(&mut observer_rx);
+        let duplicate = party.authorize(&code, None).unwrap();
+        assert!(!party.can_register(&duplicate, "victim"));
+        let (tx, mut rejected_rx) = mpsc::unbounded_channel();
+        assert!(party.register(duplicate, "victim".into(), tx).is_none());
+        assert!(drain(&mut rejected_rx).is_empty());
+        assert!(drain(&mut host_rx).is_empty());
+        assert!(drain(&mut victim_rx).is_empty());
+        assert!(drain(&mut observer_rx).is_empty());
+        assert_eq!(party.session.lock().unwrap().members.len(), 3);
+        assert!(party.session.lock().unwrap().contains(&victim));
+        party.receive(&host, &json!({"type":"load", "title":"current host"}));
+        assert!(drain(&mut victim_rx).iter().any(|v| v["state"]["title"] == "current host"));
+        party.receive(&victim, &json!({"type":"request", "title":"original victim"}));
+        for rx in [&mut host_rx, &mut observer_rx] {
+            assert!(drain(rx).iter().any(|v| v["type"] == "request" && v["by"] == "victim" && v["title"] == "original victim"));
+        }
+    }
+
+    #[test]
+    fn guest_replacement_requires_closed_receiver_or_completed_cleanup_and_retires_old_tokens() {
+        let party = Party::new();
+        let (code, _) = party.create("host");
+        let (host, mut host_rx) = connect(&party, &code, "host");
+        let (old_guest, old_rx) = connect(&party, &code, "guest");
+        let replacement = party.authorize(&code, None).unwrap();
+        assert!(!party.can_register(&replacement, "guest"));
+        drop(old_rx);
+        assert!(party.can_register(&replacement, "guest"));
+        let (tx, mut current_rx) = mpsc::unbounded_channel();
+        let current = party.register(replacement, "guest".into(), tx).unwrap();
+        drain(&mut host_rx);
+        drain(&mut current_rx);
+        party.receive(&old_guest, &json!({"type":"request", "title":"stale guest"}));
+        party.disconnect(&old_guest);
+        assert!(drain(&mut host_rx).is_empty());
+        assert!(party.session.lock().unwrap().contains(&current));
+        party.receive(&host, &json!({"type":"load", "title":"new guest state"}));
+        assert!(drain(&mut current_rx).iter().any(|v| v["state"]["title"] == "new guest state"));
+        party.receive(&current, &json!({"type":"request", "title":"current guest"}));
+        assert!(drain(&mut host_rx).iter().any(|v| v["type"] == "request" && v["title"] == "current guest"));
+        party.disconnect(&current);
+        let after_cleanup = party.authorize(&code, None).unwrap();
+        assert!(party.can_register(&after_cleanup, "guest"));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        assert!(party.register(after_cleanup, "guest".into(), tx).is_some());
+    }
+
+    #[test]
+    fn racing_guest_registrations_recheck_ownership_after_both_preflights_pass() {
+        let party = Party::new();
+        let (code, _) = party.create("host");
+        let first = party.authorize(&code, None).unwrap();
+        let second = party.authorize(&code, None).unwrap();
+        assert!(party.can_register(&first, "guest"));
+        assert!(party.can_register(&second, "guest"));
+        let (first_tx, mut first_rx) = mpsc::unbounded_channel();
+        let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+        let barrier = std::sync::Barrier::new(2);
+        let (one, two) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                barrier.wait();
+                party.register(first, "guest".into(), first_tx)
+            });
+            let second = scope.spawn(|| {
+                barrier.wait();
+                party.register(second, "guest".into(), second_tx)
+            });
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert_eq!(usize::from(one.is_some()) + usize::from(two.is_some()), 1);
+        let winner = one.or(two).unwrap();
+        assert!(party.session.lock().unwrap().contains(&winner));
+        assert_eq!(party.session.lock().unwrap().members.len(), 1);
+        let initial_states = [&mut first_rx, &mut second_rx].into_iter()
+            .flat_map(drain).filter(|v| v["type"] == "state").count();
+        assert_eq!(initial_states, 1);
     }
 }

@@ -149,6 +149,11 @@ A resolved review thread and a passing check are separate evidence.
 | [HOST-REGISTRATION-PROOF](https://github.com/ColterD/Frayd/pull/2#discussion_r4406874506) | Major, security | A disclosed device key can claim the first host slot or replace the connected host, then control playback or end the room. | Creation now issues a private UUID capability bound to creator identity and session generation. One predicate checks it before upgrade and again before membership changes; malformed, ambiguous, wrong, stale and wrong-identity proof is rejected. Only the public WebSocket protocol is negotiated. Causal real-socket attacks become 18 passing rejection/legitimate scenarios; focused Rust 11 and panel 23 tests pass. Full package/image gates remain separate. |
 | [IMPORT-OWNER-ACCESS](https://github.com/ColterD/Frayd/pull/2#discussion_r4406874499) | Minor | Applying a private umask to group-readable source modes can produce unreadable imported files and untraversable directories. | Source tar archive headers normalize owner access and remove group/other permissions before app-UID extraction. Other-UID mode-0040 files and nested group-only directories reproduce the old failure; corrected imports are private, readable and exact, without changing source ownership/modes/bytes. Existing private-file and five refusal controls pass under UID 10001 with dropped capabilities. |
 | [LINUX-TRANSCODE-ORACLES](https://github.com/ColterD/Frayd/pull/2#discussion_r4406874512) | Minor | The transcode test module uses Unix APIs and Linux-only cleanup behavior but compiles on unsupported targets. | The whole test module now uses cfg(all(test, target_os = "linux")), matching its production recovery contract. All 18 focused Linux tests pass. Only the Linux target is installed; no non-Linux compilation is claimed. |
+| [BOUNDED-PAUSE-ORACLE](https://github.com/ColterD/Frayd/pull/2#discussion_r4407150991) | Minor | A fixture waits indefinitely for pause even when playback has not started and pause emits no event. | It now waits for playback, uses a one-time listener and bounds pause observation with the existing deadline, removing the listener in finally. Missing-playback and missing-event controls terminate around four seconds with no retained listeners. Actual DOM 32/32 and all six decoded controls pass; audio wrong-ID and video progress oracles remain intact. |
+| [ACTIVE-GUEST-CONTINUITY](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5691012247) | Major, originally unverified; runtime validated | A member reuses an advertised active guest key, evicts the victim and submits requests under its label. | A causal real-socket baseline confirms eviction and impersonation. The shared role predicate rejects guest keys with open outbound receivers before upgrade and atomic registration. Fourteen focused Rust tests and ten real-socket scenarios pass, covering retained victim/observer traffic, preflight races, closed-receiver rejoin, stale cleanup and valid-proof host replacement. This protects active slots; first-slot/inactive identity authentication and global creation are outside the claim. |
+| [COMPLETED-CACHE-DOCS](https://github.com/ColterD/Frayd/pull/2#discussion_r4407203979) | Minor | Operator guidance says completed cache files always remain until manual cleanup despite known-replacement retirement. | Both retention statements now explain that a qualified prior completed pair can retire and later be deleted by recovery. Pending/retiring recovery is distinguished from retained unrelated or uncertain history. Operators are told to preserve original media and app data rather than rely on generated cache for recovery. |
+
+Full review [5691074067](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5691074067) covers `a7a6dab` through `34cbefb`, with 41 selected files and two filtered assets. It adds COMPLETED-CACHE-DOCS, without new nitpick, outside-diff, duplicate or tool sections. Incremental review [5691012247](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5691012247) adds BOUNDED-PAUSE-ORACLE and an explicitly unverified active-guest claim; the later controlled reproduction validates that claim. These are two requirements, not duplicate full-review records. Full output omits verbose details and publishes no new docstring metric.
 
 Full review [5690680279](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5690680279) covers `a7a6dab` through `fc14655`, with 41 selected files and two filtered assets. It adds HOST-REGISTRATION-PROOF, IMPORT-OWNER-ACCESS and LINUX-TRANSCODE-ORACLES. No additional nitpick, outside-diff, duplicate or tool section is published. Its full-review metric is absent; the preceding incremental result is 82.43% against 80% across 148 functions and 24 files, with three unsupported skips. The full output retains the verbose-detail omission warning.
 
@@ -745,8 +750,9 @@ membership messages. Only `frayd-party` is negotiated back to the client.
 
 The capability must match the creator identity and the captured live generation
 before registration can remove or add any member. The check is repeated after
-identity resolution/upgrade. Valid creator-proof reconnects and duplicate guest
-sockets retain their socket-isolation behavior; current-host Leave still ends
+identity resolution/upgrade. Valid creator-proof reconnects retain their socket-isolation behavior. Guest
+replacement requires the previous receiver to close or cleanup to finish;
+stale callbacks cannot remove its successor. Current-host Leave still ends
 the room. Missing proof never falls back to identity-only hosting. Updated host
 clients are required; legacy no-protocol guest joins remain supported.
 
@@ -756,3 +762,25 @@ existing room; it does not introduce exclusive authorization for global party
 creation or qualify public hosting. Security reproductions and sanitized
 validation are retained through the managed security artifact collection, not
 inside repository reports or operator credential files.
+
+## Active guest continuity
+
+Guest device labels remain public trusted-local identifiers. A copied label
+must not displace an existing guest whose outbound receiver is open. One shared
+role predicate checks this before upgrade and again under the registration
+lock, including two admissions that both passed preflight before either joined.
+
+The original real-socket reproduction receives the victim's advertised label,
+registers a duplicate, observes the victim close and relays a request as that
+victim. The corrected ten-scenario harness preserves victim and observer
+traffic, rejects encoded-key/invalid-Bearer collision attempts and proof on
+guest keys, and preserves valid creator-proof host replacement. Unit tests
+retain live receivers explicitly; a separate closed-receiver control proves
+rejoin and stale-frame/cleanup isolation.
+
+This guard deliberately fails closed until the server observes receiver
+retirement. Immediate same-key rejoin can temporarily reject. Once a slot is
+empty, this scheme does not authenticate ownership of its public device label;
+first-slot/inactive identity authentication and exclusive household creation
+remain outside scope. Security reproductions and sanitized receipts use the
+managed security artifact collection.
