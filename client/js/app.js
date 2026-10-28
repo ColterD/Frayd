@@ -426,6 +426,7 @@ function renderHero(it) {
 // ---------- playback ----------
 const pbAudio = $('#pb-audio');
 let partyPlaybackKind = null;
+let nativeLoadGeneration = 0;
 
 function openItem(it) {
   if (it.kind === 'movie' || it.kind === 'show') openVideo(it);
@@ -886,17 +887,55 @@ function closeEbook() {
   $('#em-searchinfo').textContent = '';
 }
 
+/**
+ * Give native playback ownership before pausing a ready external player, so its
+ * pause callback cannot publish a stale party command. Return the prior owner so
+ * party follow can preserve only a video that was already active locally.
+ * @param {'audio'|'video'} kind Native player taking ownership.
+ * @returns {string|null} Playback owner before this transition.
+ */
+function beginNativePlayback(kind) {
+  const priorKind = partyPlaybackKind;
+  partyPlaybackKind = kind;
+  if (priorKind === 'external' && ytPlayerReady) ytPlayer?.pauseVideo();
+  return priorKind;
+}
+
+/**
+ * Accept a delayed native load only while its generation, player and exact stream
+ * still own playback. External handoff and newer native commands retire callbacks
+ * even when a later command reuses the same media ID or native element.
+ * @param {HTMLMediaElement} media Native element captured when scheduling the load.
+ * @param {'audio'|'video'} kind Expected playback owner.
+ * @param {number} id Library stream ID for this load.
+ * @param {number} generation Authority generation captured by this load.
+ * @returns {boolean} Whether this callback may still seek or start its element.
+ */
+function ownsNativeLoad(media, kind, id, generation) {
+  if (nativeLoadGeneration !== generation || partyPlaybackKind !== kind
+    || media !== (kind === 'video' ? plyr.media : pbAudio)) return false;
+  const source = media.src || media.querySelector('source')?.src || media.currentSrc || '';
+  return new URL(source, window.location.origin).href
+    === new URL(`/api/stream/${id}`, window.location.origin).href;
+}
+
 function playAudio(it) {
-  partyPlaybackKind = 'audio';
+  beginNativePlayback('audio');
+  const generation = ++nativeLoadGeneration;
   $('#video-modal').classList.remove('on', 'yt');
   $('#playerbar').classList.add('on');
   if (window.partySend) { partyLoadPending = true; partyLoadId = it.id; partyLoadTitle = it.title; }
   $('#pb-title').textContent = it.title;
   $('#pb-sub').textContent = it.author || it.kind;
   resumeFor(it.id).then(p => {
+    if (nativeLoadGeneration !== generation || partyPlaybackKind !== 'audio') return;
     pbAudio.src = `/api/stream/${it.id}`;
     const seek = (p && p.position > 5) ? p.position : 0;
-    const onMeta = () => { if (seek) pbAudio.currentTime = seek; pbAudio.play(); };
+    const onMeta = () => {
+      if (!ownsNativeLoad(pbAudio, 'audio', it.id, generation)) return;
+      if (seek) pbAudio.currentTime = seek;
+      pbAudio.play();
+    };
     if (pbAudio.readyState >= 1) onMeta();
     else pbAudio.addEventListener('loadedmetadata', onMeta, { once: true });
   });
@@ -942,6 +981,7 @@ const YT_DRIFT = 3;
  */
 window.partyFollowExternal = (vid, title, position, playing, updatedAt, isHostOwn) => {
   partyPlaybackKind = 'external';
+  ++nativeLoadGeneration;
   pbAudio.pause();
   plyr.pause();
   ytDesired = { vid, position, playing, updatedAt };
@@ -1023,10 +1063,7 @@ window.partyFollowExternal = (vid, title, position, playing, updatedAt, isHostOw
  */
 window.partyFollow = (mediaId, title, position, playing, updatedAt, options = {}) => {
   const expected = () => position + (playing ? Math.max(0, Date.now() / 1000 - updatedAt) : 0);
-  const priorPlaybackKind = partyPlaybackKind;
-  partyPlaybackKind = isVideoId(mediaId) ? 'video' : 'audio';
-  // Transfer ownership before pausing so YouTube callbacks cannot echo a stale pause.
-  if (priorPlaybackKind === 'external' && ytPlayerReady) ytPlayer?.pauseVideo();
+  const priorPlaybackKind = beginNativePlayback(isVideoId(mediaId) ? 'video' : 'audio');
   $('#video-modal').classList.remove('yt');
   // video: load into Plyr modal, mirror play/pause/seek on the <video> element
   if (isVideoId(mediaId)) {
@@ -1041,45 +1078,45 @@ window.partyFollow = (mediaId, title, position, playing, updatedAt, options = {}
         return;
       }
     }
-    if (partyFollowId !== mediaId) {
-      partyFollowId = mediaId;
+    const generation = ++nativeLoadGeneration;
+    const changed = partyFollowId !== mediaId;
+    partyFollowId = mediaId;
+    if (changed) {
       pbAudio.pause();
       video.src = `/api/stream/${mediaId}`;
-      const onMeta = () => {
-        video.currentTime = expected();
-        if (playing) video.play().catch(() => {});
-        else video.pause();
-      };
-      if (video.readyState >= 1) onMeta();
-      else video.addEventListener('loadedmetadata', onMeta, { once: true });
       $('#video-modal').classList.add('on');
-    } else {
-      const drift = Math.abs(video.currentTime - expected());
-      if (drift > 2) video.currentTime = expected();
+    }
+    const onMeta = () => {
+      if (!ownsNativeLoad(video, 'video', mediaId, generation)) return;
+      if (changed || Math.abs(video.currentTime - expected()) > 2) video.currentTime = expected();
       if (playing && video.paused) video.play().catch(() => {});
       if (!playing && !video.paused) video.pause();
-    }
+    };
+    if (video.readyState >= 1) onMeta();
+    else video.addEventListener('loadedmetadata', onMeta, { once: true });
     return;
   }
+  const generation = ++nativeLoadGeneration;
   $('#video-modal').classList.remove('on', 'yt');
   plyr.pause();
   $('#playerbar').classList.add('on');
-  // already playing this media locally (host loaded it themselves) — nothing to do
-  if (pbAudio.src.endsWith(`/api/stream/${mediaId}`)) { partyFollowId = mediaId; }
-  if (partyFollowId !== mediaId) {
-    partyFollowId = mediaId;
+  // A locally loaded host stream already has its source installed.
+  if (pbAudio.src.endsWith(`/api/stream/${mediaId}`)) partyFollowId = mediaId;
+  const changed = partyFollowId !== mediaId;
+  partyFollowId = mediaId;
+  if (changed) {
     $('#pb-title').textContent = title || '—';
     $('#pb-sub').textContent = 'party';
     pbAudio.src = `/api/stream/${mediaId}`;
-    const onMeta = () => { pbAudio.currentTime = expected(); if (playing) pbAudio.play().catch(() => {}); };
-    if (pbAudio.readyState >= 1) onMeta();
-    else pbAudio.addEventListener('loadedmetadata', onMeta, { once: true });
-    return;
   }
-  const drift = Math.abs(pbAudio.currentTime - expected());
-  if (drift > 1.5) pbAudio.currentTime = expected(); // resync
-  if (playing && pbAudio.paused) pbAudio.play().catch(() => {});
-  if (!playing && !pbAudio.paused) pbAudio.pause();
+  const onMeta = () => {
+    if (!ownsNativeLoad(pbAudio, 'audio', mediaId, generation)) return;
+    if (changed || Math.abs(pbAudio.currentTime - expected()) > 1.5) pbAudio.currentTime = expected();
+    if (playing && pbAudio.paused) pbAudio.play().catch(() => {});
+    if (!playing && !pbAudio.paused) pbAudio.pause();
+  };
+  if (pbAudio.readyState >= 1) onMeta();
+  else pbAudio.addEventListener('loadedmetadata', onMeta, { once: true });
 };
 let partyFollowId = null;
 
@@ -1105,8 +1142,8 @@ window.partyControlPlayback = async (type, state) => {
 
 // host: local player events push party state
 window.partyHostHook = (send) => {
-  pbAudio.addEventListener('play', () => { if (partyPlaybackKind === 'audio') send({ type: 'play', position: pbAudio.currentTime }); });
-  pbAudio.addEventListener('pause', () => { if (partyPlaybackKind === 'audio') send({ type: 'pause', position: pbAudio.currentTime }); });
+  pbAudio.addEventListener('play', () => { if (partyPlaybackKind === 'audio' && !pbAudio.paused) send({ type: 'play', position: pbAudio.currentTime }); });
+  pbAudio.addEventListener('pause', () => { if (partyPlaybackKind === 'audio' && pbAudio.paused) send({ type: 'pause', position: pbAudio.currentTime }); });
   pbAudio.addEventListener('seeked', () => { if (partyPlaybackKind === 'audio') send({ type: 'seek', position: pbAudio.currentTime }); });
   // host loads a track locally → broadcast it
   pbAudio.addEventListener('loadedmetadata', () => {
@@ -1116,9 +1153,19 @@ window.partyHostHook = (send) => {
     }
   });
   // host video: mirror Plyr play/pause/seek + load
-  plyr.on('play', () => { if (partyPlaybackKind === 'video') send({ type: 'play', position: plyr.currentTime }); });
-  plyr.on('pause', () => { if (partyPlaybackKind === 'video') send({ type: 'pause', position: plyr.currentTime }); });
-  plyr.on('seeked', () => { if (partyPlaybackKind === 'video') send({ type: 'seek', position: plyr.currentTime }); });
+  // Capture native events: Plyr's proxy loses the original element identity.
+  document.addEventListener('play', event => {
+    if (event.target === plyr.media && partyPlaybackKind === 'video' && !plyr.paused)
+      send({ type: 'play', position: plyr.currentTime });
+  }, true);
+  document.addEventListener('pause', event => {
+    if (event.target === plyr.media && partyPlaybackKind === 'video' && plyr.paused)
+      send({ type: 'pause', position: plyr.currentTime });
+  }, true);
+  document.addEventListener('seeked', event => {
+    if (event.target === plyr.media && partyPlaybackKind === 'video')
+      send({ type: 'seek', position: plyr.currentTime });
+  }, true);
   plyr.on('loadedmetadata', () => {
     if (window.partySend && partyPlaybackKind === 'video' && videoLoadPending && videoItem) {
       videoLoadPending = false;
@@ -1187,7 +1234,8 @@ let videoOpenGeneration = 0;
  */
 function openVideo(it) {
   const generation = ++videoOpenGeneration;
-  partyPlaybackKind = 'video';
+  const nativeGeneration = ++nativeLoadGeneration;
+  beginNativePlayback('video');
   $('#playerbar').classList.remove('on');
   pbAudio.pause();
   videoItem = it;
@@ -1196,9 +1244,9 @@ function openVideo(it) {
   $('#video-modal').classList.add('on');
   $('#video-modal').classList.remove('yt');
   resumeFor(it.id).then(p => {
-    if (videoItem !== it || generation !== videoOpenGeneration) return;
+    if (videoItem !== it || generation !== videoOpenGeneration
+      || nativeGeneration !== nativeLoadGeneration || partyPlaybackKind !== 'video') return;
     const streamPath = `/api/stream/${it.id}`;
-    const streamUrl = new URL(streamPath, window.location.origin).href;
     plyr.source = {
       type: 'video',
       sources: [{ src: streamPath, type: 'video/mp4' }],
@@ -1206,9 +1254,8 @@ function openVideo(it) {
     const media = plyr.media;
     // Plyr forwards metadata from retired media; only this source may resume.
     if (p && p.position > 5) media.addEventListener('loadedmetadata', () => {
-      const source = media.src || media.querySelector('source')?.src || media.currentSrc || '';
-      if (plyr.media === media && videoItem === it && generation === videoOpenGeneration
-        && new URL(source, window.location.origin).href === streamUrl) plyr.currentTime = p.position;
+      if (ownsNativeLoad(media, 'video', it.id, nativeGeneration)
+        && videoItem === it && generation === videoOpenGeneration) plyr.currentTime = p.position;
     }, { once: true });
     plyr.play();
   });

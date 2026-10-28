@@ -10,6 +10,7 @@ const clientPath = join(__dirname, '..', 'client');
 function browser() {
   const nodes = new Map();
   const listeners = new Map();
+  const documentCaptures = new Map();
   function element() {
     const classes = new Set();
     const attributes = new Map();
@@ -31,6 +32,7 @@ function browser() {
         events.set(name, handlers);
       },
       emit(name) {
+        for (const handler of documentCaptures.get(name) || []) handler({ target: this, type: name });
         const handlers = events.get(name) || [];
         events.set(name, handlers.filter(handler => !handler.once));
         for (const handler of handlers) handler.callback();
@@ -60,7 +62,10 @@ function browser() {
   const document = {
     body: element(), querySelector: selector => nodes.get(selector) || null,
     getElementById: id => nodes.get('#' + id), querySelectorAll: () => [],
-    createElement: element, addEventListener() {},
+    createElement: element,
+    addEventListener(name, callback, capture) {
+      if (capture === true) documentCaptures.set(name, [...(documentCaptures.get(name) || []), callback]);
+    },
   };
   const sockets = [];
   const context = vm.createContext({
@@ -946,6 +951,7 @@ for (const kind of ['music', 'movie']) {
           if (partyPlaybackKind === 'external') partySend({ type: 'pause' });
         } };`);
       b.nodes.get('#video-modal').classList.add('on', 'yt');
+      if (retained) b.nodes.get(kind === 'movie' ? '#plyr-video' : '#pb-audio').src = '/api/stream/9';
       b.run('partyFollow(9, "Native", 24, true, Date.now()/1000, { preserveActiveVideo: true })');
       await settle();
       assert.equal(b.context.external.paused, true);
@@ -1059,5 +1065,87 @@ for (const nativeKind of ['audio', 'video']) {
     assert.deepEqual(sends, []);
     assert.deepEqual(players[0].calls, [['seek', 20]]);
     assert.equal(b.run('partyPlaybackKind'), 'external');
+  });
+}
+
+for (const entry of ['playAudio', 'openVideo']) {
+  test(`local ${entry} after ready external playback pauses YouTube before native activation`, async () => {
+    const b = browser();
+    const players = youtubePlayerFixture(b);
+    b.run('partyFollowExternal("external", "External", 5, true, Date.now()/1000, true)');
+    players[0].emitReady();
+    players[0].calls.length = 0;
+    b.run(`${entry}({ id: 9, title: 'Local native', kind: '${entry === 'playAudio' ? 'music' : 'movie'}' })`);
+    await settle();
+    assert.deepEqual(players[0].calls, [['pause']]);
+    assert.equal(b.run('partyPlaybackKind'), entry === 'playAudio' ? 'audio' : 'video');
+    assert.equal(b.run(entry === 'playAudio' ? 'pbAudio.paused' : 'plyr.paused'), false);
+    assert.equal(b.nodes.get('#video-modal').classList.contains('yt'), false);
+  });
+}
+
+for (const kind of ['audio', 'video']) {
+  test(`queued ${kind} pause after rapid external round trip cannot pause the resumed party`, async () => {
+    const b = browser();
+    youtubePlayerFixture(b);
+    const sends = [];
+    b.context.partySend = command => sends.push(command);
+    b.run(`LIBRARY = [{ id: 9, kind: '${kind === 'audio' ? 'music' : 'movie'}' }];
+      partyFollow(9, 'Native', 24, true, Date.now()/1000); partyHostHook(partySend)`);
+    await settle();
+    sends.length = 0;
+    b.run(`partyFollowExternal('external', 'External', 0, false, Date.now()/1000, true);
+      partyFollow(9, 'Native', 24, true, Date.now()/1000)`);
+    await settle();
+    assert.equal(b.run(`${kind === 'audio' ? 'pbAudio' : 'plyr'}.paused`), false);
+    assert.deepEqual(sends.filter(command => command.type === 'pause'), []);
+    sends.length = 0;
+    b.run(`${kind === 'audio' ? 'pbAudio' : 'plyr'}.pause()`);
+    await settle();
+    assert.equal(sends.filter(command => command.type === 'pause').length, 1);
+  });
+}
+
+for (const kind of ['audio', 'video']) for (const returnToNative of [false, true]) {
+  test(`pending ${kind} party metadata cannot restart after external handoff${returnToNative ? ' and paused native return' : ''}`, async () => {
+    const b = browser();
+    youtubePlayerFixture(b);
+    b.run(`LIBRARY = [{ id: 9, kind: '${kind === 'audio' ? 'music' : 'movie'}' }]`);
+    const media = b.nodes.get(kind === 'audio' ? '#pb-audio' : '#plyr-video');
+    media.readyState = 0;
+    b.run(`partyFollow(9, 'Pending native', 24, true, Date.now()/1000);
+      partyFollowExternal('external', 'External', 0, false, Date.now()/1000, false)`);
+    if (returnToNative) b.run("partyFollow(9, 'Paused return', 42, false, Date.now()/1000)");
+    media.readyState = 1;
+    media.emit('loadedmetadata');
+    await settle();
+    assert.equal(media.paused, true);
+    assert.equal(media.currentTime, returnToNative ? 42 : 0);
+  });
+}
+
+for (const entry of ['playAudio', 'openVideo']) for (const phase of ['progress', 'metadata']) {
+  test(`local ${entry} pending ${phase} cannot apply after external handoff`, async () => {
+    const b = browser();
+    youtubePlayerFixture(b);
+    let release;
+    b.respond(() => new Promise(resolve => { release = resolve; }));
+    b.nodes.get('#pb-audio').readyState = 0;
+    b.run(`${entry}({ id: 9, title: 'Pending local', kind: '${entry === 'playAudio' ? 'music' : 'movie'}' })`);
+    if (phase === 'metadata') {
+      release({ ok: true, json: async () => ({ position: 106 }) });
+      await settle();
+    }
+    const media = b.nodes.get(entry === 'playAudio' ? '#pb-audio' : '#plyr-video');
+    b.run("partyFollowExternal('external', 'External', 0, false, Date.now()/1000, false)");
+    if (phase === 'progress') release({ ok: true, json: async () => ({ position: 106 }) });
+    await settle();
+    media.readyState = 1;
+    b.run('plyr.duration = 634');
+    media.emit('loadedmetadata');
+    await settle();
+    assert.equal(b.nodes.get(entry === 'playAudio' ? '#pb-audio' : '#plyr-video'), media);
+    assert.equal(media.paused, true);
+    assert.equal(media.currentTime, 0);
   });
 }

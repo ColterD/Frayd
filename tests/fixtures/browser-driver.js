@@ -175,6 +175,47 @@
     () => nativeResume('close and reopen', true));
   await run('native different movie without saved progress starts at zero',
     () => nativeResume('new movie without saved progress', false, 21, 0));
+  await run('decoded native video suppresses queued pause after rapid external round trip and keeps user pause', async () => {
+    const saved = { player: ytPlayer, id: ytId, apiReady: ytReady, playerReady: ytPlayerReady };
+    const forwarded = [];
+    const pauses = [];
+    let media;
+    const observe = event => pauses.push({ trusted: event.isTrusted, pausedWhenDelivered: media.paused });
+    try {
+      LIBRARY = [{ id: 20, kind: 'movie' }];
+      openVideo({ id: 20, kind: 'movie', title: 'Decoded queued pause fixture' });
+      await until(() => plyr.media.readyState === 4 && !plyr.media.paused
+        && plyr.media.videoWidth === 160
+        && plyr.media.getVideoPlaybackQuality().totalVideoFrames > 0, 'decoded native playback before queued pause');
+      media = plyr.media;
+      check(media.getVideoPlaybackQuality().totalVideoFrames > 0, 'Queue scenario decodes owned video frames');
+      media.addEventListener('pause', observe);
+      partyHostHook(command => forwarded.push(command));
+      partyFollowId = 20;
+      ytReady = true;
+      ytPlayerReady = true;
+      ytId = 'native-queued-roundtrip';
+      ytPlayer = { seekTo() {}, pauseVideo() {}, getCurrentTime: () => 0, getPlayerState: () => 2 };
+      forwarded.length = 0;
+      partyFollowExternal('native-queued-roundtrip', 'Mock external', 0, false, Date.now() / 1000, false);
+      partyFollow(20, 'Native return', 12, true, Date.now() / 1000);
+      await until(() => pauses.length > 0 && !media.paused, 'actual queued pause arrives after native resume');
+      await delay(80);
+      check(pauses[0].trusted && !pauses[0].pausedWhenDelivered, 'Trusted stale pause is delivered while native video is playing');
+      equal(forwarded.filter(command => command.type === 'pause'), [], 'Queued stale native pause cannot overwrite resumed party');
+      forwarded.length = 0;
+      media.pause();
+      await until(() => forwarded.some(command => command.type === 'pause'), 'legitimate native pause is broadcast');
+      equal(forwarded.filter(command => command.type === 'pause').length, 1, 'Legitimate native pause broadcasts once');
+      check(pauses.at(-1).trusted && pauses.at(-1).pausedWhenDelivered, 'Legitimate native pause is trusted and currently paused');
+      return { pauses, decodedFrames: media.getVideoPlaybackQuality().totalVideoFrames,
+        actualNativeEvents: true, externalAdapterMocked: true, legitimatePauseBroadcasts: 1 };
+    } finally {
+      if (media) media.removeEventListener('pause', observe);
+      document.getElementById('vm-back').click();
+      ytPlayer = saved.player; ytId = saved.id; ytReady = saved.apiReady; ytPlayerReady = saved.playerReady;
+    }
+  });
   await run('saved marks survive parser-gated reader startup', async () => {
     const saved = [{ kind: 'highlight', spine_idx: 0, cfi: 'char:7:6', text: 'target', color: 'yellow' }];
     await api('configure', { body: '<p id="target">prefix target suffix</p>', annotations: saved, parserGate: true });
@@ -266,19 +307,30 @@
       detachedSyntheticEvents.push({ retiredMedia: retired.length, forwarded: forwarded.slice() });
       check(forwarded.every(message => message.position === plyr.currentTime), 'Any retained vendor listeners must read current player position');
       forwarded.length = 0;
-      for (const name of ['play', 'pause', 'seeked']) active.dispatchEvent(new Event(name));
-      equal(forwarded.map(message => message.type), ['play', 'pause', 'seek'], 'Active host event forwarding');
+      active.dispatchEvent(new Event('play'));
+      check(!forwarded.some(message => message.type === 'play'), 'A play event while the native element is paused is stale');
+      active.dispatchEvent(new Event('pause'));
+      active.dispatchEvent(new Event('seeked'));
+      equal(forwarded.map(message => message.type), ['pause', 'seek'], 'Active host event forwarding respects actual paused state');
       partyFollowId = null;
       window.partyFollow(id, 'Fixture movie', 12, false, Date.now() / 1000);
       check(active.getAttribute('src') === `/api/stream/${id}`, 'Follower uses current Plyr media');
-      active.dispatchEvent(new Event('loadedmetadata'));
-      equal(active.currentTime, 12, 'Follower metadata callback seeks current media');
-      window.partyFollow(id, 'Fixture movie', 24, false, Date.now() / 1000);
-      equal(active.currentTime, 24, 'Follower drift seeks current media');
+      // HTTP204 supplies no metadata: model readiness explicitly for this synthetic event.
+      const readyDescriptor = Object.getOwnPropertyDescriptor(active, 'readyState');
+      try {
+        Object.defineProperty(active, 'readyState', { configurable: true, value: 1 });
+        active.dispatchEvent(new Event('loadedmetadata'));
+        equal(active.currentTime, 12, 'Follower metadata callback seeks current media');
+        window.partyFollow(id, 'Fixture movie', 24, false, Date.now() / 1000);
+        equal(active.currentTime, 24, 'Follower drift seeks current media');
+      } finally {
+        if (readyDescriptor) Object.defineProperty(active, 'readyState', readyDescriptor);
+        else delete active.readyState;
+      }
       retired.push(active);
     }
     return { replacements: 2, activeEvents: ['play', 'pause', 'seek'], detachedSyntheticEvents,
-      followerPositions: [12, 24], syntheticEventsOnly: true };
+      followerPositions: [12, 24], syntheticEventsOnly: true, metadataReadinessModeledAndRestored: true };
   });
   // Keep real Plyr/source/DOM behavior; empty streams need controlled media timing.
   const originalFetch = window.fetch;
@@ -294,8 +346,9 @@
     return Promise.resolve();
   };
   mediaPrototype.pause = function () {
+    if (this.paused) return;
     playback.set(this, true);
-    this.dispatchEvent(new Event('pause'));
+    setTimeout(() => this.dispatchEvent(new Event('pause')), 0);
   };
   Object.defineProperty(mediaPrototype, 'paused', { configurable: true,
     get() { return playback.has(this) ? playback.get(this) : originalPaused.get.call(this); } });
@@ -495,6 +548,7 @@
           equal(plyr.paused, true, 'External handoff pauses native video');
           check(!socket.sent.some(command => command.type === 'pause'), 'Native pause cannot broadcast a stale host pause');
           if (readyBeforeTransition) mock.emitReady();
+          await delay(0);
           equal(mock.state, readyBeforeTransition ? 1 : 2, 'External mock has the expected readiness and playback');
           const modal = document.getElementById('video-modal');
           check(modal.classList.contains('yt'), 'External presentation is active');
@@ -519,6 +573,30 @@
           observations.push({ retained, readyBeforeTransition, nativePausedForExternal: true, externalPauses: mock.pauses, nativePlaying: !native.paused,
             position: native.currentTime, modalOpen: modal.classList.contains('on'), youtubeClass: false });
         }
+        const queuedAudio = document.getElementById('pb-audio');
+        const queueCommands = [];
+        partyHostHook(command => queueCommands.push(command));
+        LIBRARY = [{ id: 10, kind: 'movie' }, { id: 11, kind: 'music' }];
+        Object.defineProperty(queuedAudio, 'readyState', { configurable: true, value: 1 });
+        partyFollow(11, 'Queue audio', 24, true, Date.now() / 1000);
+        await delay(0);
+        queueCommands.length = 0;
+        partyFollowExternal(`queued-audio-${kind}-${isHost}`, 'Mock external', 0, false, Date.now() / 1000, false);
+        partyFollow(11, 'Queue audio return', 24, true, Date.now() / 1000);
+        await delay(10);
+        equal(queueCommands.filter(command => command.type === 'pause'), [], 'Queued audio pause cannot overwrite resumed party');
+        queuedAudio.pause();
+        await delay(10);
+        equal(queueCommands.filter(command => command.type === 'pause').length, 1, 'Legitimate queued audio pause broadcasts once');
+        const pendingMedia = plyr.media;
+        Object.defineProperty(pendingMedia, 'readyState', { configurable: true, value: 0 });
+        partyFollowId = null;
+        partyFollow(10, 'Pending native video', 24, true, Date.now() / 1000);
+        partyFollowExternal(`pending-video-${kind}-${isHost}`, 'Mock external', 0, false, Date.now() / 1000, false);
+        Object.defineProperty(pendingMedia, 'readyState', { configurable: true, value: 1 });
+        pendingMedia.dispatchEvent(new Event('loadedmetadata'));
+        await delay(10);
+        equal(pendingMedia.paused, true, 'Retired native metadata cannot restart video under external ownership');
         const pendingId = `latest-state-${kind}-${isHost}`;
         partyFollowExternal(pendingId, 'First pending state', 5, true, Date.now() / 1000, isHost);
         partyFollowExternal(pendingId, 'Latest pending state', 20, false, Date.now() / 1000, isHost);
@@ -526,7 +604,34 @@
         equal(mock.commands, ['seek'], 'Ready callback applies the latest paused request without playing');
         equal(mock.position, 20, 'Ready callback seeks to the latest same-video position');
         equal(mock.state, 2, 'Latest pending paused request remains paused');
-        return { observations, latestPendingStateViaAppFollow: { position: mock.position, playing: false },
+        const localActivations = [];
+        for (const localKind of ['audio', 'video']) {
+          partyFollowExternal(`local-${kind}-${isHost}-${localKind}`, 'External before local action',
+            5, true, Date.now() / 1000, isHost);
+          mock.emitReady();
+          equal(mock.state, 1, 'External player is running before local native activation');
+          const previousMedia = plyr.media;
+          socket.sent.length = 0;
+          if (localKind === 'audio') playAudio({ id: 11, kind: 'music', title: 'Local audio' });
+          else openVideo({ id: 10, kind: 'movie', title: 'Local movie' });
+          equal(mock.state, 2, 'Local native entry pauses external playback synchronously');
+          equal(mock.pauses, 1, 'Local native entry pauses external player once');
+          check(!socket.sent.some(command => command.type === 'pause'), 'Local handoff suppresses external pause broadcast');
+          if (localKind === 'video') {
+            await until(() => plyr.media !== previousMedia, 'local movie installs current Plyr source');
+            Object.defineProperty(plyr.media, 'duration', { configurable: true, value: 634 });
+            Object.defineProperty(plyr.media, 'readyState', { configurable: true, value: 1 });
+            plyr.media.dispatchEvent(new Event('loadedmetadata'));
+          }
+          const localMedia = localKind === 'audio' ? document.getElementById('pb-audio') : plyr.media;
+          await until(() => !localMedia.paused, 'local native playback starts');
+          equal(partyPlaybackKind, localKind, 'Local player owns playback');
+          check(!document.getElementById('video-modal').classList.contains('yt'), 'Local entry restores native presentation');
+          localActivations.push({ kind: localKind, externalPauses: mock.pauses,
+            externalStopped: mock.state === 2, nativePlaying: !localMedia.paused });
+        }
+        return { queuedAudioControl: { stalePauseBroadcasts: 0, legitimatePauseBroadcasts: 1 },
+          retiredVideoMetadataIgnored: true, observations, latestPendingStateViaAppFollow: { position: 20, playing: false }, localActivations,
           productionPartyStateHandler: true, mockedYouTubeAPI: true, actualYouTubePlayback: false };
       } finally {
         PartyUI.close();
