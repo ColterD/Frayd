@@ -940,6 +940,7 @@ for (const kind of ['music', 'movie']) {
       b.run(`LIBRARY = [{ id: 9, kind: ${JSON.stringify(kind)} }];
         partyFollowId = ${retained ? 9 : 'null'};
         partyPlaybackKind = 'external';
+        ytPlayerReady = true;
         ytPlayer = { pauseVideo() {
           external.paused = true; external.pauses++;
           if (partyPlaybackKind === 'external') partySend({ type: 'pause' });
@@ -959,3 +960,82 @@ for (const kind of ['music', 'movie']) {
     });
   }
 }
+
+function youtubePlayerFixture(b) {
+  const players = [];
+  b.context.YT = { Player: class {
+    constructor(id, config) { this.config = config; this.calls = []; this.ready = false; players.push(this); }
+    requireReady() { if (!this.ready) throw new Error('YouTube player is not ready'); }
+    seekTo(position) { this.requireReady(); this.calls.push(['seek', position]); }
+    playVideo() { this.requireReady(); this.calls.push(['play']); }
+    pauseVideo() { this.requireReady(); this.calls.push(['pause']); }
+    getCurrentTime() { this.requireReady(); return 0; }
+    getPlayerState() { this.requireReady(); return 2; }
+    destroy() {}
+    emitReady() { this.ready = true; this.config.events.onReady({ target: this }); }
+  } };
+  b.run('ytReady = true');
+  return players;
+}
+
+for (const kind of ['music', 'movie']) {
+  test(`unready YouTube to native ${kind} completes and late readiness cannot restart external playback`, async () => {
+    const b = browser();
+    const players = youtubePlayerFixture(b);
+    b.run(`LIBRARY = [{ id: 9, kind: ${JSON.stringify(kind)} }];
+      partyFollowExternal('pending', 'External', 0, true, Date.now()/1000, false)`);
+    let transitionError = null;
+    try { b.run('partyFollow(9, "Native", 24, true, Date.now()/1000)'); }
+    catch (error) { transitionError = error.message; }
+    players[0].emitReady();
+    await settle();
+    assert.deepEqual({ transitionError, externalCalls: players[0].calls }, { transitionError: null, externalCalls: [] });
+    const native = b.nodes.get(kind === 'movie' ? '#plyr-video' : '#pb-audio');
+    assert.equal(native.paused, false);
+    assert.ok(native.currentTime >= 24 && native.currentTime < 26);
+    assert.equal(b.nodes.get('#video-modal').classList.contains('yt'), false);
+  });
+}
+
+test('replacement YouTube readiness belongs to the current player only', () => {
+  const b = browser();
+  const players = youtubePlayerFixture(b);
+  b.run('LIBRARY = [{ id: 9, kind: "movie" }]; partyFollowExternal("old", "Old", 0, true, Date.now()/1000, false)');
+  players[0].emitReady();
+  players[0].calls.length = 0;
+  b.run('partyFollowExternal("new", "New", 0, true, Date.now()/1000, false)');
+  assert.doesNotThrow(() => players[0].emitReady());
+  assert.deepEqual(players[0].calls, []);
+  assert.deepEqual(players[1].calls, []);
+  assert.doesNotThrow(() => b.run('partyFollowExternal("new", "New", 0, true, Date.now()/1000, false)'));
+  assert.doesNotThrow(() => b.run('partyFollow(9, "Native", 24, true, Date.now()/1000)'));
+  players[1].emitReady();
+  assert.deepEqual(players[1].calls, []);
+});
+
+test('unready external playback applies the latest same-video paused position on readiness', () => {
+  const b = browser();
+  const players = youtubePlayerFixture(b);
+  b.run('partyFollowExternal("same", "First", 5, true, Date.now()/1000, false)');
+  b.run('partyFollowExternal("same", "Latest", 20, false, Date.now()/1000, false)');
+  players[0].emitReady();
+  assert.deepEqual(players[0].calls, [['seek', 20]]);
+});
+
+test('late API readiness creates only the latest requested video and ignores native handoff', () => {
+  for (const nativeHandoff of [false, true]) {
+    const b = browser();
+    const players = youtubePlayerFixture(b);
+    b.run('ytReady = false; LIBRARY = [{ id: 9, kind: "music" }]');
+    b.run('partyFollowExternal("obsolete", "Old", 5, true, Date.now()/1000, false)');
+    b.run('partyFollowExternal("latest", "New", 20, false, Date.now()/1000, false)');
+    if (nativeHandoff) b.run('partyFollow(9, "Native", 24, false, Date.now()/1000)');
+    b.run('ytReady = true');
+    for (const callback of [...b.intervals.values()]) callback();
+    assert.deepEqual(players.map(player => player.config.videoId), nativeHandoff ? [] : ['latest']);
+    if (!nativeHandoff) {
+      players[0].emitReady();
+      assert.deepEqual(players[0].calls, [['seek', 20]]);
+    }
+  }
+});

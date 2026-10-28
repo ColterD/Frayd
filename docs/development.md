@@ -85,8 +85,9 @@ node tests/browser-regression.cjs
 
 Set `BROWSER_BIN` to an existing executable when it is not discoverable on PATH.
 The runner performs no browser download and adds no npm package. It serves a
-loopback-only fixture, creates a new temporary browser profile and removes that
-profile after the run, after stopping its owned process group with bounded waits.
+loopback-only fixture and creates a new temporary browser profile. It removes that
+profile only after confirming its owned process group has stopped with bounded waits.
+If shutdown fails, the runner retains the profile and reports the cleanup error.
 Runner and cleanup failures remain separate in the result. It executes the production client, generated sandboxed
 EPUB frame and vendored Plyr. Fixture APIs control annotation responses; player
 events are synthetic and do not establish decoded playback or physical audio.

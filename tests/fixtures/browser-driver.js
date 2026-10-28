@@ -459,20 +459,21 @@
       const observations = [];
       let mock;
       window.YT = { Player: function (id, config) {
-        mock = { state: 2, position: 0, pauses: 0,
-          seekTo(position) { this.position = position; },
-          getCurrentTime() { return this.position; },
-          getPlayerState() { return this.state; },
-          playVideo() { this.state = 1; config.events.onStateChange({ data: 1 }); },
-          pauseVideo() { this.pauses++; this.state = 2; config.events.onStateChange({ data: 2 }); },
+        mock = { state: 2, position: 0, pauses: 0, ready: false, commands: [],
+          requireReady() { if (!this.ready) throw new Error('Mock YouTube player is not ready'); },
+          emitReady() { this.ready = true; config.events.onReady({ target: this }); },
+          seekTo(position) { this.requireReady(); this.commands.push('seek'); this.position = position; },
+          getCurrentTime() { this.requireReady(); return this.position; },
+          getPlayerState() { this.requireReady(); return this.state; },
+          playVideo() { this.requireReady(); this.commands.push('play'); this.state = 1; config.events.onStateChange({ target: this, data: 1 }); },
+          pauseVideo() { this.requireReady(); this.pauses++; this.state = 2; config.events.onStateChange({ target: this, data: 2 }); },
           destroy() {},
         };
-        queueMicrotask(() => config.events.onReady());
         return mock;
       } };
       ytReady = true;
       try {
-        for (const retained of [false, true]) {
+        for (const retained of [false, true]) for (const readyBeforeTransition of [true, false]) {
           PartyUI.close();
           delete window.partySend;
           LIBRARY = [{ id: 10, kind: 'movie' }, { id: 11, kind: 'music' }];
@@ -486,18 +487,23 @@
           document.getElementById('party-code-input').value = 'ABCD';
           document.getElementById('pt-join').click();
           socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: isHost,
-            state: { external_url: `mock-${kind}-${isHost}-${retained}`, title: 'Mock YouTube',
+            state: { external_url: `mock-${kind}-${isHost}-${retained}-${readyBeforeTransition}`, title: 'Mock YouTube',
               media_id: null, queue: [], position: 0, playing: true, updated_at: Date.now() / 1000 } }) });
-          await delay(0);
-          equal(mock.state, 1, 'Mock YouTube is playing before native transition');
+          if (readyBeforeTransition) mock.emitReady();
+          equal(mock.state, readyBeforeTransition ? 1 : 2, 'External mock has the expected readiness and playback');
           const modal = document.getElementById('video-modal');
           check(modal.classList.contains('yt'), 'External presentation is active');
           socket.sent.length = 0;
           socket.onmessage({ data: JSON.stringify({ type: 'state',
             state: { external_url: null, media_id: id, title: 'Native fixture', queue: [],
               position: 24, playing: true, updated_at: Date.now() / 1000 } }) });
-          equal(mock.state, 2, 'Native transition pauses mock YouTube');
-          equal(mock.pauses, 1, 'External player paused once');
+          equal(mock.state, 2, 'External playback is stopped after native transition');
+          equal(mock.pauses, readyBeforeTransition ? 1 : 0, 'Only a ready external player is paused');
+          if (!readyBeforeTransition) {
+            mock.emitReady();
+            equal(mock.commands, [], 'Late readiness cannot seek or start YouTube after native transition');
+            equal(mock.state, 2, 'Late readiness leaves external playback stopped');
+          }
           check(!socket.sent.some(command => command.type === 'pause'), 'External pause cannot broadcast a stale host pause');
           check(!modal.classList.contains('yt'), 'Native player presentation is restored');
           equal(modal.classList.contains('on'), kind === 'movie', 'Native modal visibility');
@@ -505,14 +511,23 @@
           const expectedPosition = isHost ? 0 : 24;
           check(native.currentTime >= expectedPosition && native.currentTime < expectedPosition + 2,
             'Native position follows role authority');
-          observations.push({ retained, externalPauses: mock.pauses, nativePlaying: !native.paused,
+          observations.push({ retained, readyBeforeTransition, externalPauses: mock.pauses, nativePlaying: !native.paused,
             position: native.currentTime, modalOpen: modal.classList.contains('on'), youtubeClass: false });
         }
-        return { observations, productionPartyStateHandler: true, mockedYouTubeAPI: true, actualYouTubePlayback: false };
+        const pendingId = `latest-state-${kind}-${isHost}`;
+        partyFollowExternal(pendingId, 'First pending state', 5, true, Date.now() / 1000, isHost);
+        partyFollowExternal(pendingId, 'Latest pending state', 20, false, Date.now() / 1000, isHost);
+        mock.emitReady();
+        equal(mock.commands, ['seek'], 'Ready callback applies the latest paused request without playing');
+        equal(mock.position, 20, 'Ready callback seeks to the latest same-video position');
+        equal(mock.state, 2, 'Latest pending paused request remains paused');
+        return { observations, latestPendingStateViaAppFollow: { position: mock.position, playing: false },
+          productionPartyStateHandler: true, mockedYouTubeAPI: true, actualYouTubePlayback: false };
       } finally {
         PartyUI.close();
         clearInterval(window._ytSeekTimer);
         ytPlayer = null;
+        ytPlayerReady = false;
         ytId = null;
         ytReady = originalReady;
         window.YT = originalYT;

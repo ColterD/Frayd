@@ -46,6 +46,12 @@ const PartyUI = (() => {
     connect(code);
   }
 
+  /**
+   * Replace the current party session and give its socket exclusive ownership of
+   * incoming updates. Identity checks on every callback prevent a superseded
+   * socket's messages, errors, or close event from changing the new session.
+   * @param {string} code Party code used by the WebSocket endpoint and panel.
+   */
   function connect(code) {
     const previous = ws;
     resetSession();
@@ -60,6 +66,14 @@ const PartyUI = (() => {
     renderConnecting(code);
   }
 
+  /**
+   * Apply a message admitted by the active socket's callback. State snapshots
+   * replace shared playback state; only an explicit host flag changes our role.
+   * Guests follow authoritative playback, while hosts load changed media without
+   * replaying their own player events. Requests and membership update the panel;
+   * an ended message retires the entire session.
+   * @param {Object} msg Parsed server message with a type-specific payload.
+   */
   function handle(msg) {
     if (msg.type === 'state') {
       if (typeof msg.is_host === 'boolean') isHost = msg.is_host;
@@ -99,6 +113,13 @@ const PartyUI = (() => {
 
   // host: only load tracks the party state changed to (skip/queue-advance) —
   // never follow play/pause/seek (those originate from host's own player events)
+  /**
+   * Load each changed external or library media identifier once for the host.
+   * Local host events own play, pause, seek, and resume position, so these loads
+   * start at zero instead of following the echoed server position. The library
+   * callback may preserve an already active video and its local resume position.
+   * Guests use followState for authoritative position and playback updates.
+   */
   function followMediaChangeOnly() {
     // external (YouTube) load → mirror into YT player, host events handled separately
     const ext = state?.external_url;
@@ -118,6 +139,12 @@ const PartyUI = (() => {
   // ---- host hooks: local player actions become party state ----
   function sendHost(obj) { if (isHost) send(obj); }
 
+  /**
+   * Restore the current session's public sender on every host snapshot, while
+   * installing player listeners only once for this page. Their shared sendHost
+   * callback reads the current role and socket, allowing rehosting without
+   * duplicate listeners or broadcasts from a later guest session.
+   */
   function hookHost() {
     window.partySend = sendHost;
     if (hookHost.done) return;
@@ -182,6 +209,13 @@ const PartyUI = (() => {
       ).join('') + '</ul>';
   }
 
+  /**
+   * Rebuild controls from the current session and bind actions to its live state.
+   * Socket ownership selects entry, connecting, or active-party content; modal
+   * visibility is independent, so Hide and reopen retain the connection and its
+   * updates. Leave clears the session separately before entry controls return.
+   * Host playback controls act through the local player, which publishes events.
+   */
   function render() {
     const stage = $('#party-stage');
     if (!ws) {
@@ -240,6 +274,12 @@ const PartyUI = (() => {
   function renderError(msg) {
     $('#party-stage').insertAdjacentHTML('afterbegin', `<div class="party-error">${esc(msg)}</div>`);
   }
+  /**
+   * Retire an ended session before closing its socket so late callbacks cannot
+   * restore stale state. Clear role, sender, members, requests, and loaded-media
+   * markers, then show entry controls with an ended notice. Preserve visibility
+   * so a remotely ended hidden panel stays hidden until the user reopens it.
+   */
   function renderEnded() {
     const socket = ws;
     resetSession();

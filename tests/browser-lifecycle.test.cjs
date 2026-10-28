@@ -5,7 +5,7 @@ const { createServer } = require('node:http');
 const { mkdtempSync, readFileSync, existsSync, rmSync, writeFileSync, mkdirSync } = require('node:fs');
 const { join, resolve, dirname } = require('node:path');
 const { tmpdir } = require('node:os');
-const { once } = require('node:events');
+const { once, EventEmitter } = require('node:events');
 const { setTimeout: delay } = require('node:timers/promises');
 const { test } = require('node:test');
 const vm = require('node:vm');
@@ -238,10 +238,10 @@ test('cache discovery waits for a complete valid port and stops on exit or deadl
   for (const scenario of ['complete', 'exit', 'deadline']) {
     let now = 0;
     let reads = 0;
-    const browser = { exitCode: null, signalCode: null };
+    const browser = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
     const fetched = [];
     const context = {
-      Date: { now: () => now }, join, AbortSignal,
+      Date: { now: () => now }, join, AbortSignal, AbortController,
       existsSync: () => true,
       readFileSync: () => ['', '12', '12partial\n/unused', '70000\n/unused', '32123\n/unused'][Math.min(reads++, 4)],
       async delay() {
@@ -268,5 +268,106 @@ test('browser runner rejects unsupported Node and missing global WebSocket befor
       createServer() { throw new Error('Unsupported runtime started fixture resources'); },
     });
     await assert.rejects(main(), /require Node.js 22\+ with the global WebSocket API/);
+  }
+});
+
+test('browser setup shares its remaining startup budget across port and HTTP discovery', async () => {
+  const source = readFileSync(join(__dirname, 'browser-regression.cjs'), 'utf8');
+  const start = source.indexOf('async function bounded(');
+  const end = source.indexOf('async function main(', start);
+  for (const expireAfterHttp of [false, true]) {
+    let now = 0;
+    let portReady = false;
+    let httpBudget;
+    const context = {
+      Date: { now: () => now }, join, URL, AbortController,
+      existsSync: () => portReady,
+      readFileSync: () => '32123\n/unused',
+      async delay() { now += 4000; portReady = true; },
+      AbortSignal: { timeout(milliseconds) { httpBudget = milliseconds; return {}; }, any() { return {}; } },
+      async fetch() {
+        if (!expireAfterHttp) throw new Error('HTTP boundary reached');
+        now = 15001;
+        return { ok: true, json: async () => [{ type: 'page', url: 'about:blank', webSocketDebuggerUrl: 'ws://127.0.0.1:32123/devtools/page/owned-test' }] };
+      },
+      WebSocket: class { constructor() { throw new Error('Expired startup opened a protocol connection'); } },
+    };
+    const configure = vm.runInNewContext(source.slice(start, end) + '\nconfigureOwnedBrowserCache;', context);
+    await assert.rejects(configure({ profile: '/owned/profile', fixtureUrl: 'unused', browser: Object.assign(new EventEmitter(), { exitCode: null, signalCode: null }) }),
+      expireAfterHttp ? /startup deadline exceeded/ : /HTTP boundary reached/);
+    assert.equal(httpBudget, 11000, 'HTTP discovery uses only the budget left after port discovery');
+  }
+});
+
+
+test('page discovery retries temporary HTTP failures and empty lists but rejects unsafe targets', async () => {
+  const source = readFileSync(join(__dirname, 'browser-regression.cjs'), 'utf8');
+  const setupSource = source.slice(source.indexOf('async function bounded('), source.indexOf('async function main('));
+  for (const scenario of ['transient', 'multiple', 'nonblank', 'foreign']) {
+    let calls = 0;
+    const page = { type: 'page', url: 'about:blank', webSocketDebuggerUrl: 'ws://127.0.0.1:32123/devtools/page/owned-test' };
+    const browser = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
+    const configure = vm.runInNewContext(setupSource + '\nconfigureOwnedBrowserCache;', {
+      Date, join, URL, AbortSignal, AbortController, setTimeout, clearTimeout, delay,
+      existsSync: () => true, readFileSync: () => '32123\n/unused',
+      async fetch() {
+        calls++;
+        if (scenario === 'transient' && calls === 1) throw new TypeError('fetch failed');
+        if (scenario === 'transient' && calls === 2) return { ok: false, status: 503 };
+        const pages = scenario === 'transient' && calls === 3 ? []
+          : scenario === 'multiple' ? [page, page]
+          : [{ ...page, ...(scenario === 'nonblank' ? { url: 'https://example.invalid' }
+            : scenario === 'foreign' ? { webSocketDebuggerUrl: 'ws://example.invalid/devtools/page/owned-test' } : {}) }];
+        return { ok: true, json: async () => pages };
+      },
+      WebSocket: class { constructor() { throw new Error('Validated owned protocol boundary reached'); } },
+    });
+    await assert.rejects(configure({ profile: '/owned/profile', fixtureUrl: 'unused', browser }),
+      scenario === 'transient' ? /Validated owned protocol boundary reached/ : scenario === 'foreign' ? /Unexpected owned browser page endpoint/ : /exactly one blank page/);
+    assert.equal(calls, scenario === 'transient' ? 4 : 1);
+    assert.equal(browser.listenerCount('exit'), 0, 'Discovery releases its exit listener');
+  }
+});
+
+test('unresponsive owned discovery stops at the shared deadline or browser exit and cleans up', { timeout: 20000 }, async () => {
+  const source = readFileSync(join(__dirname, 'browser-regression.cjs'), 'utf8');
+  const setupSource = source.slice(source.indexOf('async function bounded('), source.indexOf('async function main('));
+  for (const scenario of ['deadline', 'exit']) {
+    const profile = mkdtempSync(join(tmpdir(), 'frayd-discovery-never-'));
+    const browser = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
+    let requested = false;
+    let exitTimer;
+    const server = createServer((request, response) => {
+      assert.equal(request.url, '/json/list');
+      requested = true; // Keep the actual HTTP response open until discovery aborts.
+      if (scenario === 'exit') exitTimer = setTimeout(() => {
+        browser.exitCode = 7;
+        browser.emit('exit', 7, null);
+      }, 20);
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    writeFileSync(join(profile, 'DevToolsActivePort'), `${server.address().port}\n/unused`);
+    const configure = vm.runInNewContext(setupSource + '\nconfigureOwnedBrowserCache;', {
+      Date, join, URL, AbortSignal, AbortController, setTimeout, clearTimeout, delay,
+      existsSync, readFileSync, fetch,
+      WebSocket: class { constructor() { throw new Error('Unresponsive discovery opened a protocol connection'); } },
+    });
+    const startedAt = Date.now();
+    try {
+      await assert.rejects(configure({ profile, fixtureUrl: 'unused', browser }),
+        scenario === 'deadline' ? /startup deadline exceeded/ : /exited before cache setup/);
+      const elapsed = Date.now() - startedAt;
+      assert.equal(requested, true, 'The real owned HTTP endpoint received discovery');
+      if (scenario === 'deadline') assert.ok(elapsed >= 14000 && elapsed < 18000, `Shared deadline elapsed ${elapsed}ms`);
+      else assert.ok(elapsed < 3000, `Browser exit must abort the pending request: ${elapsed}ms`);
+      assert.equal(browser.listenerCount('exit'), 0);
+    } finally {
+      clearTimeout(exitTimer);
+      server.closeAllConnections();
+      await new Promise(resolve => server.close(resolve));
+      rmSync(profile, { recursive: true, force: true });
+    }
+    assert.equal(existsSync(profile), false);
+    assert.equal(server.listening, false);
   }
 });

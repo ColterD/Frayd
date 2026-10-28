@@ -8,25 +8,36 @@ It does not authorize deployment or qualify arbitrary media, browsers or public 
 ## Current review follow-up
 
 Full review [5688243622](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5688243622)
-published five Minor issues. Native follow now retires the external player after
-transferring playback ownership and clears its modal class. Host/guest controls
-exercise fresh and retained native audio/video with the YouTube API mocked;
-actual external YouTube playback is not qualified. Party updates clamp captured
-timestamps under the state lock, preventing stale updates from counting elapsed
-playback twice. The pinned Rust test/build target passes 53 tests, Clippy and
-release compilation with existing warnings in unchanged code.
+and incremental review [5688495119](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5688495119)
+are accounted for in the [56-entry ledger](coderabbit-follow-up.md).
+Native follow retires external playback after transferring ownership and clears
+its modal class. Separate API/player readiness, current-player checks and latest
+desired state prevent unready calls, stale native restarts and lost pause/seek
+updates. Host/guest controls exercise fresh and retained audio/video with a mocked
+YouTube API; actual external YouTube playback remains unqualified.
 
-The browser harness waits for a complete valid port field, preserves equals signs
-in owned profile paths, and requires Node 22+ with global WebSocket. CI selects
-and verifies its preinstalled Node 22.23.4 entry without adding an action dependency.
-The frozen client/harness passes 97 Node tests and 29 actual-DOM cases.
-The [review ledger](coderabbit-follow-up.md) records all 53 published dispositions.
-Current hosted outcomes, source/image binding and any remaining manual gates are
-reported in the [draft PR](https://github.com/ColterD/Frayd/pull/2).
+Party updates clamp captured timestamps under the state lock, preventing stale
+updates from counting elapsed playback twice. The pinned Rust target passes
+53 tests, Clippy and release compilation; warnings in unchanged code remain.
+The frozen client/harness passes 105 Node tests and 29 actual-DOM cases, including
+real native decoding, parser-gated reader restoration and real protocol setup
+after an injected initial transport failure. Owned HTTP nonresponse and early
+exit controls verify bounded failure and cleanup.
 
-These source changes require a new immutable app image. The retained `5926`
-interactive results below remain historical; they do not qualify the changed
-app and server. No merge or live deployment is authorized.
+The harness waits for a complete port field and retries transient target-list
+readiness failures within one startup deadline. Unexpected targets stay fatal.
+Equals signs in owned profile paths are preserved. CI verifies its preinstalled
+Node 22.23.4 entry without adding an action dependency; local checks require
+Node 22+ with global WebSocket. Complex player, party and harness contracts were
+documented without changing the hosted 80% coverage threshold; its next measured
+result remains a separate gate.
+
+Current hosted outcomes, immutable source/image bindings and remaining manual
+gates are reported in the [draft PR](https://github.com/ColterD/Frayd/pull/2).
+The later `1ece1df` / `5d8c4f…` image passes full local HTTP/storage/DNS suites and
+targeted Vivaldi reader, guest, movie and two-client party checks. These results
+remain bound to that artifact; the subsequent readiness changes require a new
+image. No merge or live deployment is authorized.
 
 ## Reader-ready checkpoint (6810 / 5926)
 
@@ -69,12 +80,16 @@ The diagnostic retained a failed verdict, observed only file existence and proce
 liveness, and never opened that late endpoint. It did not establish a policy or
 DBus failure. Another matched run passed the browser cases.
 
-The corrected harness allows 15 seconds for discovery, keeps the overall 60-second
-guard, and still requires loopback endpoint validation and successful protocol
-setup before navigation. Bounded, redacted startup stderr remains available on
+The corrected harness uses one 15-second deadline for port discovery, the HTTP
+target-list response, WebSocket opening and bootstrap commands. It keeps the
+overall 60-second guard and requires loopback endpoint validation and successful
+protocol setup before navigation. Bounded, redacted startup stderr remains available on
 failure. The temporary late-file observer is removed after establishing the
 insufficient startup budget. A controlled 8.7-second delay before launching the
-same real browser distinguishes the old and corrected discovery budgets.
+same real browser distinguishes the old and corrected discovery budgets. A separate
+controlled 3.2-second delay on the real target-list fetch fails under the old
+three-second phase timeout and passes all 29 cases with the shared startup
+deadline. These are separate controlled delays, not one combined-delay test.
 
 Earlier verification head `f16897334b55e5d6c3da201a00791c9bd4855662` had
 [one complete hosted pass](https://github.com/ColterD/Frayd/actions/runs/40747689066/job/123025739721)

@@ -16,6 +16,10 @@ const productionFiles = ['client/index.html', 'client/js/app.js', 'client/js/par
   'client/vendor/plyr/plyr.min.js', 'client/vendor/plyr/plyr.min.css', 'client/vendor/plyr/plyr.svg', 'client/css/frayd.css'];
 const harnessFiles = ['tests/browser-regression.cjs', 'tests/fixtures/browser-driver.js', 'tests/fixtures/reader-probe.js', 'tests/fixtures/native-resume.mp4', 'tests/fixtures/generate-native-resume.sh'];
 function hash(path) { return createHash('sha256').update(readFileSync(path)).digest('hex'); }
+/**
+ * Resolve an existing BROWSER_BIN or PATH browser without installing or downloading
+ * software. Version probing and launch failures remain visible to the caller.
+ */
 function browserPath() {
   if (process.env.BROWSER_BIN) return realpathSync(process.env.BROWSER_BIN);
   for (const command of ['google-chrome', 'chromium', 'chromium-browser', 'chrome', 'chrome-headless-shell']) {
@@ -26,10 +30,18 @@ function browserPath() {
   }
   throw new Error('No browser found. Set BROWSER_BIN to an existing Chrome/Chromium executable; no download is performed.');
 }
+/**
+ * Signal the detached browser's entire process group, including with signal 0 for
+ * liveness. Only ESRCH means the group is gone; permission and other errors propagate.
+ */
 function signalGroup(pid, signal) {
   try { process.kill(-pid, signal); return true; }
   catch (error) { if (error.code === 'ESRCH') return false; throw error; }
 }
+/**
+ * Escalate TERM to KILL and confirm that the owned process group no longer exists.
+ * Reject unconfirmed shutdown so the runner retains its profile instead of deleting it.
+ */
 async function stopBrowserGroup(browser) {
   if (!browser?.pid) return;
   async function waitForExit(milliseconds) {
@@ -45,10 +57,18 @@ async function stopBrowserGroup(browser) {
   signalGroup(browser.pid, 'SIGKILL');
   if (!await waitForExit(2000)) throw new Error(`Owned browser process group ${browser.pid} did not exit after SIGKILL; profile retained`);
 }
+/**
+ * Remove DevTools listening lines and WebSocket capability URLs from diagnostics.
+ * This targets debugger capabilities; it is not a general secret or log sanitizer.
+ */
 function redactDebuggerCapabilities(message) {
   return String(message).replace(/DevTools listening on [^\r\n]*/g, 'Owned DevTools endpoint redacted')
     .replace(/wss?:\/\/[^\s"']+/g, '[debugger endpoint redacted]');
 }
+/**
+ * Reject when the wait exceeds its bound and always clear the timer. The underlying
+ * operation is not cancelled; callers must supply cancellation or clean it up separately.
+ */
 async function bounded(promise, message, milliseconds = 3000) {
   let timer;
   try {
@@ -57,9 +77,19 @@ async function bounded(promise, message, milliseconds = 3000) {
     })]);
   } finally { clearTimeout(timer); }
 }
+/**
+ * Spend one shared startup deadline discovering the owned blank page and configuring
+ * its cache before navigation. Retry transient HTTP readiness only; unexpected targets
+ * or debugger ownership fail closed. Keep the protocol open until caller teardown.
+ */
 async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
   const startedAt = Date.now();
   const deadline = startedAt + 15000;
+  function remainingStartupBudget() {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error('Owned browser startup deadline exceeded');
+    return remaining;
+  }
   const portFile = join(profile, 'DevToolsActivePort');
   let port;
   while (true) {
@@ -73,13 +103,50 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
     }
     await delay(20);
   }
-  const response = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(3000) });
-  if (!response.ok) throw new Error('Owned browser page discovery failed');
-  const pages = (await response.json()).filter(page => page.type === 'page');
-  if (pages.length !== 1 || pages[0].url !== 'about:blank') throw new Error('Owned browser must have exactly one blank page before navigation');
+  let pages;
+  const browserExited = new AbortController();
+  const onBrowserExit = () => browserExited.abort();
+  browser.once('exit', onBrowserExit);
+  try {
+    while (true) {
+      if (browser.exitCode !== null || browser.signalCode !== null) throw new Error('Owned browser exited before cache setup');
+      const signal = AbortSignal.any([AbortSignal.timeout(remainingStartupBudget()), browserExited.signal]);
+      let response;
+      let targets;
+      try {
+        response = await fetch(`http://127.0.0.1:${port}/json/list`, { signal });
+        if (response.ok) {
+          targets = await bounded(response.json(), 'Owned browser page discovery body timed out', remainingStartupBudget());
+        }
+      } catch (error) {
+        if (browser.exitCode !== null || browser.signalCode !== null) throw new Error('Owned browser exited before cache setup');
+        remainingStartupBudget();
+        if (!['TypeError', 'AbortError', 'TimeoutError'].includes(error.name)) throw error;
+        await delay(20);
+        continue;
+      }
+      remainingStartupBudget();
+      if (!response.ok) {
+        if (response.status === 408 || response.status === 429 || response.status >= 500) {
+          await delay(20);
+          continue;
+        }
+        throw new Error('Owned browser page discovery failed');
+      }
+      if (!Array.isArray(targets)) throw new Error('Invalid owned browser page discovery response');
+      pages = targets.filter(page => page.type === 'page');
+      if (pages.length === 0) {
+        await delay(20);
+        continue;
+      }
+      if (pages.length !== 1 || pages[0].url !== 'about:blank') throw new Error('Owned browser must have exactly one blank page before navigation');
+      break;
+    }
+  } finally { browser.removeListener('exit', onBrowserExit); }
   const endpoint = new URL(pages[0].webSocketDebuggerUrl);
   if (endpoint.protocol !== 'ws:' || endpoint.hostname !== '127.0.0.1' || endpoint.port !== String(port)
     || !/^\/devtools\/page\/[a-zA-Z0-9-]+$/.test(endpoint.pathname)) throw new Error('Unexpected owned browser page endpoint');
+  const openBudget = remainingStartupBudget();
   const socket = new WebSocket(endpoint.href);
   const pending = new Map();
   let sequence = 0;
@@ -96,11 +163,12 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
     for (const waiter of pending.values()) waiter.reject(new Error('Owned browser cache protocol connection failed'));
   });
   async function rpc(method, params = {}) {
+    const rpcBudget = remainingStartupBudget();
     const id = ++sequence;
     try {
       const result = new Promise((resolve, reject) => { pending.set(id, { resolve, reject }); });
       socket.send(JSON.stringify({ id, method, params }));
-      return await bounded(result, `Owned browser cache RPC ${method} timed out`);
+      return await bounded(result, `Owned browser cache RPC ${method} timed out`, rpcBudget);
     } finally { pending.delete(id); }
   }
   const receipt = { cacheDisabled: false, browserCacheCleared: false, configuredBeforeFixtureNavigation: false, protocolClosed: false };
@@ -116,7 +184,7 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
     await bounded(new Promise((resolve, reject) => {
       socket.addEventListener('open', resolve, { once: true });
       socket.addEventListener('error', () => reject(new Error('Owned browser cache protocol failed to open')), { once: true });
-    }), 'Owned browser cache protocol open timed out');
+    }), 'Owned browser cache protocol open timed out', openBudget);
     await rpc('Network.enable');
     await rpc('Network.setCacheDisabled', { cacheDisabled: true });
     await rpc('Network.clearBrowserCache');
@@ -130,6 +198,11 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
     throw error;
   }
 }
+/**
+ * Run the production client against an owned loopback fixture, process group and fresh
+ * profile. Record original and cleanup failures separately; remove the profile only
+ * after confirmed group shutdown, retaining it when shutdown cannot be established.
+ */
 async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, cacheSetup = configureOwnedBrowserCache } = {}) {
   if (Number(process.versions.node.split('.')[0]) < 22 || typeof WebSocket !== 'function') {
     throw new Error('Browser regressions require Node.js 22+ with the global WebSocket API');

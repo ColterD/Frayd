@@ -924,11 +924,26 @@ const isVideoId = (id) => LIBRARY.some(x => x.id === id && (x.kind === 'movie' |
 
 // ---- YouTube party playback (guests + host-load mirror) ----
 // loads YT iframe API once; ytPlayer mirrors host state. Looser drift (YT seek latency ~2s).
-let ytPlayer = null, ytId = null, ytReady = false, ytPending = null;
+let ytPlayer = null, ytId = null, ytReady = false, ytPlayerReady = false, ytDesired = null;
 const YT_DRIFT = 3;
+/**
+ * Mirror an external party stream after the iframe API and the current player are ready.
+ * Player callbacks must match the active instance; late readiness cannot take playback
+ * back from native media. Readiness applies the latest request for that video; queued
+ * API callbacks for superseded videos cannot create players. Host events broadcast only
+ * while external playback owns it.
+ * @param {string} vid YouTube video ID supplied by the party state.
+ * @param {string} title Display title for the external stream.
+ * @param {number} position Host position at updatedAt, in seconds.
+ * @param {boolean} playing Whether the host is advancing the playback clock.
+ * @param {number} updatedAt Unix timestamp used to compensate a playing stream for transit.
+ * @param {boolean} isHostOwn Whether this player mirrors local host commands.
+ */
 window.partyFollowExternal = (vid, title, position, playing, updatedAt, isHostOwn) => {
   partyPlaybackKind = 'external';
-  const expected = () => position + (playing ? Math.max(0, Date.now() / 1000 - updatedAt) : 0);
+  ytDesired = { vid, position, playing, updatedAt };
+  const expected = () => ytDesired.position
+    + (ytDesired.playing ? Math.max(0, Date.now() / 1000 - ytDesired.updatedAt) : 0);
   $('#video-modal').classList.add('on');
   $('#video-modal').classList.add('yt');
   $('#pb-title').textContent = title || 'YouTube';
@@ -944,17 +959,27 @@ window.partyFollowExternal = (vid, title, position, playing, updatedAt, isHostOw
     const iv = setInterval(() => { if (ytReady) { clearInterval(iv); cb(); } }, 200);
   };
   ensure(() => {
+    if (partyPlaybackKind !== 'external' || ytDesired?.vid !== vid) return;
+    const desired = ytDesired;
     if (ytId !== vid) {
       ytId = vid;
+      ytPlayerReady = false;
       if (ytPlayer) ytPlayer.destroy();
       ytPlayer = new YT.Player('yt-party', {
         videoId: vid,
         playerVars: { autoplay: 0, playsinline: 1 },
         events: {
-          onReady: () => { ytPlayer.seekTo(expected(), true); if (playing) ytPlayer.playVideo(); },
+          onReady: (e) => {
+            if (e.target !== ytPlayer || ytDesired?.vid !== vid) return;
+            ytPlayerReady = true;
+            if (partyPlaybackKind !== 'external') return;
+            e.target.seekTo(expected(), true);
+            if (ytDesired.playing) e.target.playVideo();
+          },
           // host: mirror player state into party broadcasts
           onStateChange: (e) => {
-            if (!isHostOwn || !window.partySend || partyPlaybackKind !== 'external') return;
+            if (e.target !== ytPlayer || !ytPlayerReady || !isHostOwn
+              || !window.partySend || partyPlaybackKind !== 'external') return;
             if (e.data === 1) window.partySend({ type: 'play', position: ytPlayer.getCurrentTime() });
             else if (e.data === 2 || e.data === 0) window.partySend({ type: 'pause', position: ytPlayer.getCurrentTime() });
           }
@@ -964,28 +989,41 @@ window.partyFollowExternal = (vid, title, position, playing, updatedAt, isHostOw
       if (isHostOwn) {
         clearInterval(window._ytSeekTimer);
         window._ytSeekTimer = setInterval(() => {
-          if (!ytPlayer || !ytPlayer.getCurrentTime || !window.partySend || partyPlaybackKind !== 'external') return;
+          if (!ytPlayerReady || !ytPlayer || !ytPlayer.getCurrentTime
+            || !window.partySend || partyPlaybackKind !== 'external') return;
           if (ytPlayer.getPlayerState() === 1) window.partySend({ type: 'seek', position: ytPlayer.getCurrentTime() });
         }, 2000);
       }
       return;
     }
-    if (!ytPlayer || !ytPlayer.seekTo) return;
+    if (!ytPlayerReady || !ytPlayer || !ytPlayer.seekTo) return;
     const cur = ytPlayer.getCurrentTime ? ytPlayer.getCurrentTime() : 0;
     const drift = Math.abs(cur - expected());
-    if (playing && drift > YT_DRIFT) ytPlayer.seekTo(expected(), true);
-    if (playing && ytPlayer.getPlayerState && ytPlayer.getPlayerState() !== 1) ytPlayer.playVideo();
-    if (!playing && ytPlayer.getPlayerState && ytPlayer.getPlayerState() === 1) ytPlayer.pauseVideo();
+    if (desired.playing && drift > YT_DRIFT) ytPlayer.seekTo(expected(), true);
+    if (desired.playing && ytPlayer.getPlayerState && ytPlayer.getPlayerState() !== 1) ytPlayer.playVideo();
+    if (!desired.playing && ytPlayer.getPlayerState && ytPlayer.getPlayerState() === 1) ytPlayer.pauseVideo();
   });
   void isHostOwn;
 };
 
+/**
+ * Transfer party playback to native media and apply the host's authoritative clock.
+ * A host's first echo may preserve its already active matching video, including local
+ * resume and pause state; guests and inactive players follow the received state.
+ * External pause callbacks run only after ownership changes to avoid a stale broadcast.
+ * @param {number} mediaId Library item whose kind selects native audio or video.
+ * @param {string} title Display title when the audio source changes.
+ * @param {number} position Host position at updatedAt, in seconds.
+ * @param {boolean} playing Whether playback should advance after synchronization.
+ * @param {number} updatedAt Unix timestamp used to compensate for transit.
+ * @param {{preserveActiveVideo?: boolean}} options Host-only active-video preservation.
+ */
 window.partyFollow = (mediaId, title, position, playing, updatedAt, options = {}) => {
   const expected = () => position + (playing ? Math.max(0, Date.now() / 1000 - updatedAt) : 0);
   const priorPlaybackKind = partyPlaybackKind;
   partyPlaybackKind = isVideoId(mediaId) ? 'video' : 'audio';
   // Transfer ownership before pausing so YouTube callbacks cannot echo a stale pause.
-  if (priorPlaybackKind === 'external') ytPlayer?.pauseVideo();
+  if (priorPlaybackKind === 'external' && ytPlayerReady) ytPlayer?.pauseVideo();
   $('#video-modal').classList.remove('yt');
   // video: load into Plyr modal, mirror play/pause/seek on the <video> element
   if (isVideoId(mediaId)) {
@@ -1137,6 +1175,13 @@ const plyr = new Plyr('#plyr-video', {
 let videoItem = null;
 let videoOpenGeneration = 0;
 
+/**
+ * Open a library video using saved progress only for this open generation and source.
+ * Plyr replaces its native element and can forward retired metadata; the resume handler
+ * therefore verifies element identity, item, generation and effective stream URL before
+ * seeking. A later close or open invalidates the pending progress response.
+ * @param {{id: number, title: string}} it Library video to load into the native modal.
+ */
 function openVideo(it) {
   const generation = ++videoOpenGeneration;
   partyPlaybackKind = 'video';
