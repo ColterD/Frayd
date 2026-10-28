@@ -4,6 +4,7 @@ import base64
 import hashlib
 import io
 import json
+import os
 import secrets
 import socket
 import subprocess
@@ -118,6 +119,16 @@ def ready():
             last_error = error
             time.sleep(0.5)
     raise AssertionError(f'QA server did not become ready: {last_error}')
+
+def wait_for_scan_idle():
+    """Wait for scan admission to clear using bounded disposable-app requests."""
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if not json.loads(request('/api/scan/status', timeout=2))['scanning']:
+            return
+        time.sleep(0.5)
+    raise AssertionError('disposable scan did not finish within 30 seconds')
+
 
 def assert_project_removed(project):
     """Reject any remaining task-owned containers, networks or volumes."""
@@ -338,6 +349,71 @@ def main():
             ready()
             assert request(f'/api/stream/{movie_id}') == converted
             print(f'PASS: actual H264/AC3 -> H264/AAC conversion at {output}; source hash/names unchanged; exact converted HTTP bytes persist after app restart')
+            docker('exec', name, 'touch', '/tmp/qa-ffprobe-release')
+            wait_for_scan_idle()
+            request('/api/progress', {'media_id': movie_id, 'position': 0.25}, token, expected=204)
+            assert json.loads(request(f'/api/progress/{movie_id}', token=token))['position'] == 0.25
+            old_outputs = set(docker('exec', name, 'find', '/data/transcodes', '-type', 'f', '-name', 'audio.mp4').stdout.decode().splitlines())
+            docker('exec', name, 'ffmpeg', '-v', 'error', '-f', 'lavfi', '-i',
+                   'color=c=blue:s=32x32:r=10:d=1.5', '-f', 'lavfi', '-i',
+                   'sine=frequency=880:sample_rate=48000:duration=1.5', '-c:v', 'libx264',
+                   '-pix_fmt', 'yuv420p', '-c:a', 'ac3', '-shortest', '/tmp/qa-replacement.mkv')
+            replacement_video = docker('exec', name, 'cat', '/tmp/qa-replacement.mkv').stdout
+            assert replacement_video != video and len(replacement_video) != len(video)
+            source = media / 'qa-video.mkv'
+            old_stat = source.stat()
+            source.write_bytes(replacement_video)
+            os.utime(source, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns + 5_000_000_000))
+            replacement_hash = hashlib.sha256(replacement_video).hexdigest()
+            assert source.stat().st_size != old_stat.st_size
+            assert source.stat().st_mtime_ns > old_stat.st_mtime_ns
+            print(f'PROBE: replaced only synthetic source for media {movie_id}; size {old_stat.st_size}->{source.stat().st_size}; mtime_ns {old_stat.st_mtime_ns}->{source.stat().st_mtime_ns}; previous cache {output}')
+            request('/api/scan', {}, token, expected=202)
+            wait_for_scan_idle()
+            assert request(f'/api/stream/{movie_id}', timeout=2) != converted, (
+                f'rescan served stale pre-replacement converted bytes for media {movie_id}')
+            assert json.loads(request(f'/api/progress/{movie_id}', token=token))['position'] == 0.25
+            for _ in range(60):
+                current_outputs = set(docker('exec', name, 'find', '/data/transcodes', '-type', 'f', '-name', 'audio.mp4').stdout.decode().splitlines())
+                new_outputs = current_outputs - old_outputs
+                if new_outputs:
+                    break
+                time.sleep(0.5)
+            else:
+                raise AssertionError('replacement source did not produce a new conversion UUID')
+            assert len(new_outputs) == 1, new_outputs
+            replacement_output = Path(new_outputs.pop())
+            assert replacement_output != output
+            assert replacement_output.parent.parent == Path('/data/transcodes') / str(movie_id)
+            assert replacement_output.parent.name != output.parent.name
+            uuid.UUID(replacement_output.parent.name)
+            replacement_codecs = json.loads(docker('exec', name, '/usr/bin/ffprobe', '-v', 'error',
+                '-show_entries', 'stream=codec_name', '-of', 'json', str(replacement_output)).stdout)
+            assert {stream['codec_name'] for stream in replacement_codecs['streams']} == {'h264', 'aac'}
+            replacement_converted = docker('exec', name, 'cat', str(replacement_output)).stdout
+            assert replacement_converted and replacement_converted not in (converted, replacement_video)
+            for _ in range(40):
+                if request(f'/api/stream/{movie_id}', timeout=2) == replacement_converted:
+                    break
+                time.sleep(0.1)
+            else:
+                raise AssertionError('replacement conversion was not published to HTTP streaming')
+            assert hashlib.sha256(source.read_bytes()).hexdigest() == replacement_hash
+            assert {path.name for path in media.iterdir()} == source_names | {'qa-ffprobe'}
+            docker('exec', name, 'sh', '-c', 'test ! -w /data/library/qa-video.mkv')
+            replacement_items = [item for item in json.loads(request('/api/library')) if item['title'] == 'qa-video']
+            assert len(replacement_items) == 1 and replacement_items[0]['id'] == movie_id
+            print(f'PASS: source replacement uses new H264/AAC cache {replacement_output}; old converted bytes rejected; source hash/names and media ID/progress preserved')
+            compose('restart', 'app')
+            ready()
+            docker('exec', name, 'touch', '/tmp/qa-ffprobe-release')
+            wait_for_scan_idle()
+            assert request(f'/api/stream/{movie_id}') == replacement_converted
+            assert json.loads(request(f'/api/progress/{movie_id}', token=token))['position'] == 0.25
+            assert hashlib.sha256(source.read_bytes()).hexdigest() == replacement_hash
+            assert {path.name for path in media.iterdir()} == source_names | {'qa-ffprobe'}
+            assert any(item['id'] == movie_id for item in json.loads(request('/api/library')))
+            print('PASS: replacement converted HTTP bytes, media ID and progress persist after app restart')
             compose('down')
 
     assert_project_removed(project)

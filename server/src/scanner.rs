@@ -221,8 +221,8 @@ pub fn scan(db: &Connection, db_path: String, root: std::path::PathBuf, thumbs_d
     count
 }
 
-/// Update source fingerprints and invalidate only comic page names when the source changes.
-/// Preserve identities, progress, unrelated metadata, and unchanged persisted page order.
+/// Update scan fingerprints and comic page names; clear converted playback only for known replacements.
+/// Preserve identity, user metadata, unchanged order and version-unqualified legacy playback.
 fn upsert_item(
     db: &Connection,
     db_path: String,
@@ -260,6 +260,8 @@ fn upsert_item(
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(path) DO UPDATE SET
                kind = ?1, mtime_secs = ?5, size_bytes = ?4,
+               transcode_path = CASE WHEN media.mtime_secs IS NOT NULL AND media.size_bytes IS NOT NULL
+                   THEN NULL ELSE media.transcode_path END,
                meta_json = CASE WHEN ?1 IN ('comic','manga') AND json_valid(media.meta_json)
                    THEN json_remove(media.meta_json,'$.pages') ELSE media.meta_json END
              WHERE media.mtime_secs IS NOT ?5 OR media.size_bytes IS NOT ?4",
@@ -309,8 +311,11 @@ fn upsert_item(
         if matches!(kind, "movie" | "episode") {
             crate::transcode::maybe_enqueue(db_path, id, path_pb, library_root.to_path_buf());
         }
+    } else if updated > 0 && matches!(kind, "movie" | "episode") {
+        // A replaced video can queue its current version without waiting for another scan.
+        crate::transcode::maybe_enqueue_for_existing(db_path,path.to_path_buf(),library_root.to_path_buf());
     } else if updated == 0 {
-        // existing item (no new metadata work): still needs thumbs + maybe transcode
+        // Existing unchanged items still need thumbnails and possibly a conversion.
         if let Some(thumbs) = thumbs_dir {
             let media_id: Option<i64> = db
                 .query_row("SELECT id FROM media WHERE path = ?1", [&path_str], |r| r.get(0))
@@ -374,6 +379,19 @@ mod tests {
         }
     }
 
+    /// Filling any unknown prior fingerprint component cannot qualify legacy playback as stale.
+    #[test]
+    fn initial_unknown_source_versions_preserve_legacy_playback_pointers() {
+        let library=Library::new(&["film.mkv"]);let src=library.0.join("film.mkv");
+        for (mtime,size) in [(None,Some(8)),(Some(i64::MAX),None),(None,None)] {
+            let db=open(":memory:");
+            db.execute("INSERT INTO media(id,kind,path,title,mtime_secs,size_bytes,transcode_path)
+                VALUES(1,'movie',?1,'Original',?2,?3,'legacy-unqualified')",rusqlite::params![src.to_str().unwrap(),mtime,size]).unwrap();
+            assert_eq!(scan(&db,String::new(),library.0.clone(),None),1);
+            assert_eq!(db.query_row("SELECT transcode_path FROM media WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),"legacy-unqualified");
+            assert_eq!(db.query_row("SELECT title FROM media WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),"Original");
+        }
+    }
     /// Backdated and legacy-null fingerprints still invalidate only the changed comic cache field.
     #[test]
     fn changed_or_missing_comic_fingerprints_clear_only_page_names() {

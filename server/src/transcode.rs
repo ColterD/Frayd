@@ -212,12 +212,37 @@ pub fn maybe_enqueue_for_existing(db_path: String, src: PathBuf, library: PathBu
     maybe_enqueue(db_path, id, src, library);
 }
 
+/// Capture the actual file's modification time and length without treating it as a content hash.
+fn source_version(src: &Path) -> Option<(std::time::SystemTime,u64)> {
+    let metadata=std::fs::metadata(src).ok()?;
+    Some((metadata.modified().ok()?,metadata.len()))
+}
+
+/// Publish only the converted file/database snapshot, after acquiring the bounded SQLite write lock.
+/// Checking the actual source inside this transaction also covers time spent waiting for that lock.
+fn publish_completed_job(db: &mut Connection, id: i64, src: &Path, completed: &Path,
+    database_version: (Option<i64>,Option<i64>), file_version: (std::time::SystemTime,u64)) -> rusqlite::Result<bool> {
+    let tx=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if source_version(src)!=Some(file_version) { return Ok(false); }
+    let changed=tx.execute("UPDATE media SET transcode_path=?1 WHERE id=?2 AND path=?3
+        AND mtime_secs IS ?4 AND size_bytes IS ?5 AND transcode_path IS NULL",
+        rusqlite::params![completed.to_string_lossy(),id,src.to_string_lossy(),database_version.0,database_version.1])?;
+    tx.commit()?;
+    Ok(changed==1)
+}
+
 /// Fail closed on database/cache/registry errors and persist the actual completed path.
 fn run_job(db_path: &str, media_id: i64, src: &Path, library: &Path) {
     let Ok(mut db) = crate::store::connect(db_path) else { return };
-    let eligible = db.query_row("SELECT 1 FROM media WHERE id=?1 AND path=?2 AND transcode_path IS NULL",
-        rusqlite::params![media_id,src.to_string_lossy()], |_| Ok(())).is_ok();
-    if !eligible || !needs_transcode(&src.to_string_lossy()) { return; }
+    let Ok(database_version)=db.query_row("SELECT mtime_secs,size_bytes FROM media WHERE id=?1 AND path=?2 AND transcode_path IS NULL",
+        rusqlite::params![media_id,src.to_string_lossy()],|row|Ok((row.get::<_,Option<i64>>(0)?,row.get::<_,Option<i64>>(1)?))) else { return };
+    let Some(file_version)=source_version(src) else { return };
+    let seconds=file_version.0.duration_since(std::time::UNIX_EPOCH).map_or(0,|time|time.as_secs() as i64);
+    if database_version.0.is_some_and(|mtime|mtime!=seconds)
+        || database_version.1.is_some_and(|size|size!=file_version.1 as i64) {
+        tracing::warn!(media_id,"transcode held: source awaits rescan"); return;
+    }
+    if !needs_transcode(&src.to_string_lossy()) { return; }
     let cache = std::env::var_os("FRAYD_TRANSCODES").map(PathBuf::from)
         .unwrap_or_else(|| Path::new(db_path).parent().unwrap_or(Path::new(".")).join("transcodes"));
     let Some((tmp,out)) = reserve_job(&mut db,&cache,library,media_id,src) else {
@@ -227,10 +252,9 @@ fn run_job(db_path: &str, media_id: i64, src: &Path, library: &Path) {
         discard_failed_job(&mut db,media_id,src,&tmp,&out,None);
         return;
     };
-    match db.execute("UPDATE media SET transcode_path=?1 WHERE id=?2 AND path=?3",
-        rusqlite::params![completed.to_string_lossy(),media_id,src.to_string_lossy()]) {
-        Ok(1) => return,
-        Ok(_) => tracing::warn!(media_id,"transcode publication held: source identity changed"),
+    match publish_completed_job(&mut db,media_id,src,&completed,database_version,file_version) {
+        Ok(true) => return,
+        Ok(false) => tracing::warn!(media_id,"transcode publication held: source or database version changed"),
         Err(error) => tracing::warn!(%error,media_id,"transcode completed but publication failed"),
     }
     discard_failed_job(&mut db,media_id,src,&tmp,&out,Some(&completed));
@@ -387,6 +411,69 @@ mod tests {
             .env("FRAYD_TEST_FAILED_JOBS_ROOT",&fixture.0).env("FRAYD_TRANSCODES",fixture.0.join("cache"))
             .env("PATH",std::env::join_paths(paths).unwrap()).output().unwrap();
         assert!(output.status.success(),"isolated failed-job worker: {}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+    }
+    /// A conversion must publish only its captured file/database version; unchanged jobs still complete.
+    #[test]
+    fn in_flight_conversion_rejects_changed_source_or_database_version() {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(root)=std::env::var_os("FRAYD_TEST_VERSION_ROOT") {
+            let root=PathBuf::from(root); let mode=std::env::var("FRAYD_TEST_VERSION_MODE").unwrap();
+            let db_path=root.join("db.sqlite"); let src=root.join("library/film.mkv");
+            let worker_db=db_path.clone();let worker_src=src.clone();let library=root.join("library");
+            let worker=std::thread::spawn(move || run_job(worker_db.to_str().unwrap(),1,&worker_src,&library));
+            let mut ready=false;
+            for _ in 0..500 { if root.join("ready").exists() {ready=true;break;} std::thread::sleep(std::time::Duration::from_millis(5)); }
+            if ready {
+                if mode=="source" {std::fs::write(&src,b"replaced while ffmpeg was running").unwrap();}
+                if mode=="database" {let db=crate::store::connect(db_path.to_str().unwrap()).unwrap();db.execute("UPDATE media SET mtime_secs=mtime_secs+1 WHERE id=1",[]).unwrap();}
+            }
+            let mut locker=crate::store::connect(db_path.to_str().unwrap()).unwrap();
+            let lock=if ready && mode=="locked-source" {
+                Some(locker.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap())
+            } else {None};
+            std::fs::write(root.join("release"),b"go").unwrap();
+            if let Some(lock)=lock {
+                let out:String=lock.query_row("SELECT path FROM transcode_artifacts WHERE role='final'",[],|r|r.get(0)).unwrap();
+                let mut completed=false;
+                for _ in 0..500 {if Path::new(&out).exists() {completed=true;break;}std::thread::sleep(std::time::Duration::from_millis(5));}
+                if completed {std::fs::write(&src,b"replaced while ffmpeg was running").unwrap();}
+                drop(lock);
+                worker.join().unwrap();
+                assert!(completed,"worker did not finish conversion before lock release");
+            } else {worker.join().unwrap();}
+            assert!(ready,"worker did not reach converter");
+            let db=crate::store::connect(db_path.to_str().unwrap()).unwrap();
+            let playback=db.query_row("SELECT transcode_path FROM media WHERE id=1",[],|r|r.get::<_,Option<String>>(0)).unwrap();
+            if mode=="unchanged" {
+                assert_eq!(std::fs::read(playback.unwrap()).unwrap(),b"converted fixture");
+                assert_eq!(db.query_row("SELECT COUNT(*) FROM transcode_artifacts",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+            } else {
+                assert_eq!(playback,None,"stale conversion published after {mode} version changed");
+                assert_eq!(db.query_row("SELECT COUNT(*) FROM transcode_artifacts",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+                assert_eq!(std::fs::read_dir(root.join("cache/1")).unwrap().count(),0);
+            }
+            let want:&[u8]=if mode=="source" || mode=="locked-source" {b"replaced while ffmpeg was running"} else {b"original"};
+            assert_eq!(std::fs::read(src).unwrap(),want); return;
+        }
+        let mut failures=Vec::new();
+        for mode in ["source","database","locked-source","unchanged"] {
+            let fixture=Fixture::new(); let src=fixture.source("film.mkv");
+            let db=crate::store::open(fixture.0.join("db.sqlite").to_str().unwrap());insert(&db,1,&src);
+            let meta=std::fs::metadata(&src).unwrap();
+            db.execute("UPDATE media SET mtime_secs=?1,size_bytes=?2 WHERE id=1",rusqlite::params![meta.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64,meta.len() as i64]).unwrap();drop(db);
+            let bin=fixture.0.join("bin");std::fs::create_dir(&bin).unwrap();
+            for (name,script) in [("ffprobe",b"#!/bin/sh\nprintf 'ac3\\n'\n".as_slice()),("ffmpeg",b"#!/bin/sh\nprintf ready > \"$FRAYD_TEST_VERSION_READY\"\nwhile [ ! -e \"$FRAYD_TEST_VERSION_RELEASE\" ]; do /bin/sleep 0.01; done\nfor destination do :; done\nprintf 'converted fixture' > \"$destination\"\n".as_slice())] {
+                let executable=bin.join(name);std::fs::write(&executable,script).unwrap();std::fs::set_permissions(executable,std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let mut paths=vec![bin];paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+            let output=Command::new(std::env::current_exe().unwrap()).args(["--exact","transcode::tests::in_flight_conversion_rejects_changed_source_or_database_version","--nocapture"])
+                .env("FRAYD_TEST_VERSION_ROOT",&fixture.0).env("FRAYD_TEST_VERSION_MODE",mode)
+                .env("FRAYD_TEST_VERSION_READY",fixture.0.join("ready")).env("FRAYD_TEST_VERSION_RELEASE",fixture.0.join("release"))
+                .env("FRAYD_TRANSCODES",fixture.0.join("cache")).env("PATH",std::env::join_paths(paths).unwrap()).output().unwrap();
+            println!("VERSION_CASE {mode}: {}",output.status);
+            if !output.status.success() {failures.push(format!("{mode}: {}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr)));}
+        }
+        assert!(failures.is_empty(),"{}",failures.join("\n"));
     }
     /// A completed file whose pointer cannot be published must not accumulate across retries.
     #[test]

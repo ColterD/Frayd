@@ -1344,6 +1344,44 @@ mod backend_regressions {
             scanning: std::sync::atomic::AtomicBool::new(false), auth_rl: auth::RateLimiter::new(300,10),
             party: Arc::new(party::Party::new()) })
     }
+    /// Known replacements must stream current source bytes while valid unchanged/unknown legacy playback survives.
+    #[tokio::test]
+    async fn source_replacement_does_not_stream_a_stale_conversion() {
+        for known_prior in [true,false] {
+            let root=std::env::temp_dir().join(format!("frayd-video-version-{}",uuid::Uuid::new_v4()));
+            let library=root.join("library");std::fs::create_dir_all(&library).unwrap();
+            let src=library.join("Film.mkv"); let genuine=library.join("Film.browser.mp4");
+            std::fs::write(&src,b"original").unwrap(); std::fs::write(&genuine,b"genuine legacy playback").unwrap();
+            let original=std::fs::metadata(&src).unwrap(); let actual_mtime=original.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+            let app=app_for(src.to_str().unwrap());
+            {
+                let db=app.db.lock().unwrap();
+                db.execute("UPDATE media SET kind='movie',mtime_secs=?1,size_bytes=8,transcode_path=?2 WHERE id=1",
+                    rusqlite::params![if known_prior {Some(actual_mtime)} else {None},genuine.to_str().unwrap()]).unwrap();
+                let meta=std::fs::metadata(&genuine).unwrap();
+                db.execute("INSERT INTO media(id,kind,path,title,mtime_secs,size_bytes) VALUES(2,'movie',?1,'Genuine',?2,?3)",
+                    rusqlite::params![genuine.to_str().unwrap(),meta.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64,meta.len() as i64]).unwrap();
+                if known_prior { assert_eq!(scanner::scan(&db,String::new(),library.clone(),None),0); }
+            }
+            let response=stream(State(app.clone()),Path(1),axum::http::HeaderMap::new()).await.into_response();
+            assert_eq!(response.status(),StatusCode::OK);
+            assert_eq!(axum::body::to_bytes(response.into_body(),8192).await.unwrap(),&b"genuine legacy playback"[..]);
+            std::fs::write(&src,b"new replacement source bytes").unwrap();
+            std::fs::File::open(&src).unwrap().set_times(std::fs::FileTimes::new().set_modified(original.modified().unwrap())).unwrap();
+            { let db=app.db.lock().unwrap();scanner::scan(&db,String::new(),library.clone(),None); }
+            let response=stream(State(app.clone()),Path(1),axum::http::HeaderMap::new()).await.into_response();
+            assert_eq!(response.status(),StatusCode::OK);
+            let want:&[u8]=if known_prior {b"new replacement source bytes"} else {b"genuine legacy playback"};
+            assert_eq!(axum::body::to_bytes(response.into_body(),8192).await.unwrap(),want,"stale playback for known_prior={known_prior}");
+            let db=app.db.lock().unwrap();
+            assert_eq!(db.query_row("SELECT position FROM progress WHERE media_id=1",[],|r|r.get::<_,f64>(0)).unwrap(),7.0);
+            assert_eq!(db.query_row("SELECT title FROM media WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),"Original");
+            assert_eq!(db.query_row("SELECT json_extract(meta_json,'$.synopsis') FROM media WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),"keep");
+            assert_eq!(db.query_row("SELECT id FROM media WHERE path=?1",[genuine.to_str().unwrap()],|r|r.get::<_,i64>(0)).unwrap(),2);
+            assert_eq!(std::fs::read(genuine).unwrap(),b"genuine legacy playback");
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
     /// Write a small real CBZ whose image bytes and natural page order are explicit.
     fn write_comic_fixture(path: &std::path::Path, pages: &[(&str,&[u8])]) {
         use std::io::Write;

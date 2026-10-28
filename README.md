@@ -6,10 +6,10 @@ This is an early-stage project. Start on your own computer and use trusted media
 
 ## Run with Docker
 
-Requirements: Git, Docker Engine and the Docker Compose plugin. Run these commands from a terminal:
+Requirements: Git, Docker Engine and the Docker Compose plugin. These commands target the fork draft under verification; the [upstream repository](https://github.com/kattiest/Frayd) does not yet contain all of this branch's fixes. Run these commands from a terminal:
 
 ```sh
-git clone https://github.com/kattiest/Frayd.git
+git clone --branch fix/coderabbit-all-findings --single-branch https://github.com/ColterD/Frayd.git
 cd Frayd
 docker compose config --quiet
 docker compose up -d --build --wait
@@ -95,7 +95,9 @@ cargo build --locked --release
 FRAYD_LIBRARY=/absolute/path/to/your/media cargo run --locked
 ```
 
-The native default port is 8484. Environment overrides include `FRAYD_DB`, `FRAYD_LIBRARY`, `FRAYD_THUMBS`, `FRAYD_TRANSCODES`, `FRAYD_PORT`, `FRAYD_UPNP`, and the optional PEM paths `FRAYD_CERT`/`FRAYD_KEY` for TLS. When `FRAYD_TRANSCODES` is unset, converted files go in `transcodes/` beside the database, under a media ID directory with a unique UUID directory for each conversion job; keep that cache writable and outside any read-only source library. Docker explicitly uses `/data/transcodes`. Existing converted media paths remain readable. Older `.frayd-tmp` files in a source library are not automatically migrated or removed; inspect and back up legacy files before deciding what to remove. Native runs do not have the Compose network isolation.
+The native default port is 8484. Environment overrides include `FRAYD_DB`, `FRAYD_LIBRARY`, `FRAYD_THUMBS`, `FRAYD_TRANSCODES`, `FRAYD_PORT`, `FRAYD_UPNP`, and the optional PEM paths `FRAYD_CERT`/`FRAYD_KEY` for TLS. When `FRAYD_TRANSCODES` is unset, converted files go in `transcodes/` beside the database, under a media ID directory with a unique UUID directory for each conversion job; keep that cache writable and outside any read-only source library. Docker explicitly uses `/data/transcodes`. Existing converted media references are preserved for unchanged sources. Older `.frayd-tmp` files in a source library are not automatically migrated or removed; inspect and back up legacy files before deciding what to remove. Native runs do not have the Compose network isolation.
+
+On rescan, a detectable change in a known source timestamp or byte length invalidates its current conversion reference. Conversion jobs also check the actual file version and database snapshot before publishing. Legacy references with initially unknown fingerprints are kept for compatibility; their original source version remains unverified. Rescan fingerprints use seconds plus byte length, so replacements preserving both values are undetected. Older completed cache files and ownership records remain until manual cleanup, so cache usage can grow across replacements. Back up data and inspect current playback references before removing historical outputs.
 
 From the repository root, with Node.js and Python 3.11+:
 
@@ -110,7 +112,7 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 python3 scripts/audit-dependencies.py
 ```
 
-The integration script defaults to the already-built `frayd-pr2-qa:local` and `frayd-pr2-proxy-qa:local` images (`--app-image` / `--proxy-image` can override them). It uses a unique disposable project, a randomly assigned loopback port and synthetic media. It checks first-owner setup, scan, comic and Range bytes, saved progress, recreation and logout. It also reserves the app's old IP on its own network, recreates only the app and requires HTTP recovery with the proxy container and start time unchanged. A blocked `ffprobe` test requires health, static root, library and progress requests to remain responsive while scanning a read-only library, then releases the probe and requires scan completion. It converts an actual H.264/AC3 fixture to H.264/AAC in the writable cache, checks unchanged source bytes and directory contents, and verifies exact converted HTTP bytes survive an app restart. Docker health checks use the database-independent `/api/health`; the app also checks its static root. The context check builds only synthetic client files and proves environment files and installer assets are excluded.
+The integration script defaults to the already-built `frayd-pr2-qa:local` and `frayd-pr2-proxy-qa:local` images (`--app-image` / `--proxy-image` can override them). It uses a unique disposable project, a randomly assigned loopback port and synthetic media. It checks first-owner setup, scan, comic and Range bytes, saved progress, recreation and logout. It also reserves the app's old IP on its own network, recreates only the app and requires HTTP recovery with the proxy container and start time unchanged. A blocked `ffprobe` test requires health, static root, library and progress requests to remain responsive while scanning a read-only library, then releases the probe and requires scan completion. It converts an actual H.264/AC3 fixture to H.264/AAC in the writable cache, checks unchanged source bytes and directory contents, and verifies exact converted HTTP bytes survive an app restart. It then deliberately replaces only that disposable source clip with distinct bytes, size and mtime, requires a new conversion UUID and stream instead of stale cached bytes, and preserves the media ID and saved progress across rescan and restart. Existing completed cache files may remain. Docker health checks use the database-independent `/api/health`; the app also checks its static root. The context check builds only synthetic client files and proves environment files and installer assets are excluded.
 
 These checks remove their own containers, networks and volume, preserve the original command failure if cleanup also fails, and never target the normal `frayd` project. They do not prove browser playback, every media format, watch-party behavior or public-hosting security. The app runs as UID/GID 10001; existing host data and custom cache paths must grant that user the required access. Read-only source mounts protect source bytes, while generated data requires writable space.
 

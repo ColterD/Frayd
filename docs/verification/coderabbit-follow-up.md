@@ -19,7 +19,8 @@ PR #2 remains draft and unmerged. No deployment is qualified or authorized here.
 | Latest completed full review | [5678108505](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5678108505), head `67bf71a79a50419047f9899354698e3e37f363ef`, publication batch 1/1. One Minor index finding; zero outside-diff, nitpick or tool warnings. Hosted documentation coverage 100%, 47 functions across 12 files, ten unsupported skips. |
 | Upstream synchronization | Upstream `kattiest/Frayd` commit `540b87acea05304c767a151d47456fceaaf7b29a` merged into fork main at `49de065f3fb0875425f5467b87ae161b43d7914e`, and into the PR branch at `fafad69434a5893cb1d1dbbcbdf56d87f0aab05b`. |
 | Security patch already on fork main | PR-branch patch `b840753a9cabb680b94733ae7a58b6b303619d17` was cherry-picked to fork main as `2789f37e55148e0ee69e7bba6bb5ee30b5f49225`. This fixes the original four EPUB-message sender-boundary findings in source; all four default-branch alerts now report fixed, not dismissed. It does not merge PR #2. |
-| Current combined work | Implementation `6af4c15` and ancestry-only merge `a6af5f5` include upstream synchronization, hygiene, cache/publication corrections and explicit ingestion trust. Fork main received the narrow ingestion patch at `a7a6dabccce971992d1ed47b00ef66f74811e6e7`. The pre-index app image below passes 28 Rust tests and full runtime qualification; the latest index follow-up passes 29 Rust tests, Clippy and release build. Post-index image/review results are recorded in the PR body; browser evidence stays tied to the unchanged client hash. |
+| Combined foundation | Implementation `6af4c15` and ancestry-only merge `a6af5f5` include upstream synchronization, hygiene, cache/publication corrections and explicit ingestion trust. Fork main received the narrow ingestion patch at `a7a6dabccce971992d1ed47b00ef66f74811e6e7`. The pre-index app image below passes 28 Rust tests and full runtime qualification; the latest index follow-up passes 29 Rust tests, Clippy and release build. Post-index image/review results are recorded in the PR body; browser evidence stays tied to the unchanged client hash. |
+| Current source-version follow-up | Follow-up to `b2a8504` corrects a validated summary observation: known source replacements invalidate current playback, and jobs publish only when actual file/database versions stay unchanged. All 32 Rust tests, Clippy and release build pass. Immutable image `a19b1132` and the real-codec red/green regression qualify this source; fresh hosted acceptance is recorded in the PR body. |
 
 Historical runtime images are immutable evidence boundaries:
 `sha256:cf030b02bc7703e5e0a5553971d28dac0238c6fc73b22cbd68d6cd99e88e8861`
@@ -31,9 +32,9 @@ These predate the upstream merge and latest backend corrections. Their successfu
 runs do not qualify the current combined application.
 
 The current backend 20-file manifest has SHA-256
-`bf60617923fff14821f15cd8cbc44cebf3579f1a27aedc9ba06439b027fe02c7`.
+`90652fcf1c56beace518ce9140ae809dd176310598c437e1c9514c5da525e8e2`.
 Reconciliation rehashed all 20 source inputs with zero mismatches. The final
-latest Rust run passed 23 unit plus six archive-reader tests (exit 0), Clippy
+latest Rust run passed 26 unit plus six archive-reader tests (exit 0), Clippy
 (exit 0, existing warnings) and release build (exit 0). Both client suites passed
 22 tests after the merge. Final normal-image build and runtime qualification also pass;
 31 build, nine verification and 20 backend inputs match with zero drift.
@@ -357,3 +358,36 @@ The post-index immutable build/runtime and next full review are separate gates
 whose latest results are recorded in the PR body. The index thread remains open
 until that acceptance is complete. The chosen title now names scan responsiveness,
 transcode isolation and fork-draft scope, addressing the qualitative title feedback.
+
+## Validated summary observation: converted-source freshness
+
+The zero-actionable `b2a8504` follow-up still noted stale converted media in its
+summary. This was a real defect. Actual scan/stream tests served old converted
+bytes after a known source replacement. Controlled in-flight jobs also published
+a stale path after the source or recorded database version changed. Each baseline
+failed before correction; unchanged and initial unknown-legacy controls passed.
+
+Rescan now clears the playback pointer only after a detectable change in known
+prior timestamp/size fields. Jobs compare both actual file version and the
+database snapshot under the publication write transaction; source changes during
+a database-lock wait are also rejected. Rejected new jobs use exact generated-job
+cleanup. IDs, progress, metadata and genuine files stay intact. Initial NULL
+fingerprints retain compatibility references whose original version is unverified.
+Historical completed files/provenance remain recorded; there is no automatic
+reaper or storage bound, and no hostile same-UID filesystem-race guarantee.
+
+All 32 Rust tests pass with Clippy/release checks. The repeatable Docker runner
+also proves the actual codec path: historical immutable `73df40ae` exited 1
+because it returned stale converted bytes after a 7,804→20,144-byte source change
+and a controlled five-second timestamp advance. Fixed application image
+`sha256:a19b1132c02e958e498f1cff4611c07ee55198c1ac5c3707acb5c7d02287abe3`
+exited 0 on the same scenario: old bytes were rejected, a new UUID conversion
+contained H264/AAC, exact new stream bytes survived restart, and media ID 2,
+progress 0.25, source hash and directory names stayed correct. Both red and green
+projects were independently checked for zero remaining containers, networks and
+volumes. The earlier read-only/source-preservation checks run before deliberate
+fixture replacement and remain intact.
+
+The new harness is included in the existing CI integration command. Its changes
+and the source-version fix require final-head CI and review acceptance; prior
+zero-comment results are not relabeled as a review of this new code.
