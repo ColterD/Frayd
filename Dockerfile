@@ -8,14 +8,14 @@ FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 frayd && useradd --uid 10001 --gid frayd --no-create-home frayd \
-    && mkdir -p /data/library /data/thumbs && chown -R frayd:frayd /data
+    && mkdir -p /data/library /data/thumbs /data/transcodes && chown -R frayd:frayd /data
 COPY --from=build /app/server/target/release/frayd-server /usr/local/bin/frayd-server
 COPY client/ /app/client/
 # ServeDir embeds /app/server/../client at compile time; the intermediate directory must exist.
 RUN mkdir -p /app/server
 USER 10001:10001
 WORKDIR /data
-ENV FRAYD_DB=/data/frayd.sqlite FRAYD_LIBRARY=/data/library FRAYD_THUMBS=/data/thumbs FRAYD_PORT=8484 FRAYD_UPNP=0
+ENV FRAYD_DB=/data/frayd.sqlite FRAYD_LIBRARY=/data/library FRAYD_THUMBS=/data/thumbs FRAYD_TRANSCODES=/data/transcodes FRAYD_PORT=8484 FRAYD_UPNP=0
 EXPOSE 8484
-HEALTHCHECK --interval=15s --timeout=5s --start-period=15s --retries=3 CMD curl --fail --silent http://127.0.0.1:8484/ > /dev/null && curl --fail --silent http://127.0.0.1:8484/api/setup > /dev/null || exit 1
+HEALTHCHECK --interval=15s --timeout=5s --start-period=15s --retries=3 CMD curl --fail --silent http://127.0.0.1:8484/ > /dev/null && curl --fail --silent http://127.0.0.1:8484/api/health > /dev/null || exit 1
 ENTRYPOINT ["frayd-server"]

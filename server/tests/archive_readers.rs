@@ -40,3 +40,22 @@ fn invalid_archives_return_none() {
     assert_eq!(epub::epub_toc(&path), None);
     assert_eq!(epub::read_zip_entry(&path, "one.xhtml"), None);
 }
+
+/// Characterize the alleged encoding regression against exact legacy UTF-8 cached names.
+#[test]
+fn legacy_unflagged_utf8_name_lookup_characterizes_zip9_fallback() {
+    let path = fixture("legacy-utf8.cbz");
+    let pages = comic::comic_pages(&path).unwrap();
+    assert_eq!(pages.len(), 2);
+    assert_eq!(comic::read_zip_entry(&path, "é2.png").unwrap(), b"legacy second image");
+    assert_eq!(comic::read_zip_entry(&path, &pages[0].0).unwrap(), b"legacy second image");
+}
+
+/// Guard saved page indices with UTF-8 bytes whose CP437 ordering would differ.
+#[test]
+fn unflagged_utf8_order_keeps_the_legacy_physical_page_at_saved_index() {
+    let path = fixture("legacy-utf8-order.cbz");
+    let pages = comic::comic_pages(&path).unwrap();
+    assert_eq!(pages.iter().map(|p| p.0.as_str()).collect::<Vec<_>>(), vec!["À.png", "Á.png", "Â.png"]);
+    assert_eq!(comic::read_zip_entry(&path,&pages[1].0).unwrap(), b"second physical page");
+}

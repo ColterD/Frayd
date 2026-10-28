@@ -15,3 +15,7 @@
 !client/**
 client/install/
 server/target/
+
+# Environment files must remain excluded after the client allowlist.
+**/.env
+**/.env.*

@@ -23,7 +23,7 @@ The first build downloads images and Rust dependencies, then runs locked Rust te
 
 ### Add your media
 
-By default, the named `data` volume holds the database, thumbnails and `/data/library`. To use an existing host media folder without copying it, create `compose.override.yaml` beside `compose.yaml`:
+By default, the named `data` volume holds the database, thumbnails, transcode cache and `/data/library`. To use an existing host media folder without copying it, create `compose.override.yaml` beside `compose.yaml`:
 
 ```yaml
 services:
@@ -44,7 +44,7 @@ docker compose config --quiet
 docker compose up -d --wait
 ```
 
-The app sees your files at `/data/library`, not their host path. The image sets `FRAYD_LIBRARY=/data/library`; this takes precedence over the library path saved in Settings. Change the mount source to select a different host folder. Choose **Scan library** after adding or changing media. The read-only media mount prevents the app from changing those source files. The database and thumbnails remain in the `data` volume.
+The app sees your files at `/data/library`, not their host path. The image sets `FRAYD_LIBRARY=/data/library`; this takes precedence over the library path saved in Settings. Change the mount source to select a different host folder. Choose **Scan library** after adding or changing media. The read-only media mount prevents the app from changing those source files. The database, thumbnails and converted playback files remain in the writable `data` volume, outside the source library.
 
 Alternatively, copy files into the default library volume (this uses additional disk space):
 
@@ -54,7 +54,7 @@ docker compose cp /absolute/path/to/your/media/. app:/data/library/
 
 ### Persistence, stopping and removal
 
-`/data/frayd.sqlite` stores accounts, sessions, library metadata and reading/playback progress. `/data/thumbs` holds generated thumbnails. These survive container recreation in the Compose `data` volume. Back up that volume with the app stopped for a consistent database copy; media bind mounts need their own backup.
+`/data/frayd.sqlite` stores accounts, sessions, library metadata and reading/playback progress. `/data/thumbs` holds generated thumbnails. `/data/transcodes/<media-id>/<job-UUID>/` holds converted playback files. These survive container recreation in the Compose `data` volume. Back up that volume with the app stopped for a consistent database copy; media bind mounts need their own backup.
 
 ```sh
 docker compose ps
@@ -63,7 +63,7 @@ docker compose start           # resume services
 docker compose down            # remove containers and networks, keep data
 ```
 
-To remove the deployment **and permanently delete its named volume**, including accounts, progress, thumbnails and any media copied into it:
+To remove the deployment **and permanently delete its named volume**, including accounts, progress, thumbnails, converted playback files and any media copied into it:
 
 ```sh
 docker compose down --volumes
@@ -93,19 +93,23 @@ cargo build --locked --release
 FRAYD_LIBRARY=/absolute/path/to/your/media cargo run --locked
 ```
 
-The native default port is 8484. Environment overrides include `FRAYD_DB`, `FRAYD_LIBRARY`, `FRAYD_THUMBS`, `FRAYD_PORT`, `FRAYD_UPNP`, and the optional PEM paths `FRAYD_CERT`/`FRAYD_KEY` for TLS. Native runs do not have the Compose network isolation.
+The native default port is 8484. Environment overrides include `FRAYD_DB`, `FRAYD_LIBRARY`, `FRAYD_THUMBS`, `FRAYD_TRANSCODES`, `FRAYD_PORT`, `FRAYD_UPNP`, and the optional PEM paths `FRAYD_CERT`/`FRAYD_KEY` for TLS. When `FRAYD_TRANSCODES` is unset, converted files go in `transcodes/` beside the database, under a media ID directory with a unique UUID directory for each conversion job; keep that cache writable and outside any read-only source library. Docker explicitly uses `/data/transcodes`. Existing converted media paths remain readable. Older `.frayd-tmp` files in a source library are not automatically migrated or removed; inspect and back up legacy files before deciding what to remove. Native runs do not have the Compose network isolation.
 
 From the repository root, with Node.js and Python 3.11+:
 
 ```sh
 node --test tests/client.test.cjs
 docker compose config --quiet
-docker compose build
+docker build -t frayd-pr2-qa:local .
+docker build -f Dockerfile.proxy -t frayd-pr2-proxy-qa:local .
+python3 scripts/check-build-context.py
 python3 scripts/integration.py
 python3 -m unittest discover -s tests -p 'test_*.py'
 python3 scripts/audit-dependencies.py
 ```
 
-The integration script uses already-built `frayd:local` and `frayd-proxy:local` images, a unique disposable project, a randomly assigned loopback port and a synthetic comic. It checks the page, first-owner setup, scan, comic and range bytes, saved progress, container recreation and logout. It removes its own project and volume in a `finally` block. It never targets the normal `frayd` project. It does not prove browser playback, every media format, watch-party behavior or public-hosting security.
+The integration script defaults to the already-built `frayd-pr2-qa:local` and `frayd-pr2-proxy-qa:local` images (`--app-image` / `--proxy-image` can override them). It uses a unique disposable project, a randomly assigned loopback port and synthetic media. It checks first-owner setup, scan, comic and Range bytes, saved progress, recreation and logout. It also reserves the app's old IP on its own network, recreates only the app and requires HTTP recovery with the proxy container and start time unchanged. A blocked `ffprobe` test requires health, static root, library and progress requests to remain responsive while scanning a read-only library, then releases the probe and requires scan completion. It converts an actual H.264/AC3 fixture to H.264/AAC in the writable cache, checks unchanged source bytes and directory contents, and verifies exact converted HTTP bytes survive an app restart. Docker health checks use the database-independent `/api/health`; the app also checks its static root. The context check builds only synthetic client files and proves environment files and installer assets are excluded.
+
+These checks remove their own containers, networks and volume, preserve the original command failure if cleanup also fails, and never target the normal `frayd` project. They do not prove browser playback, every media format, watch-party behavior or public-hosting security. The app runs as UID/GID 10001; existing host data and custom cache paths must grant that user the required access. Read-only source mounts protect source bytes, while generated data requires writable space.
 
 The dependency audit queries OSV for exact versions in `server/Cargo.lock`, prints its findings and exits nonzero on applicable advisories. It records one exact database disagreement: OSV flags `block-buffer 0.10.4` for `GHSA-qwgh-2vcv-g2f7`, while the publisher lists only `>=0.11.0,<0.12.1`. Each audit fetches the publisher advisory from the RustCrypto GitHub API and requires that exact identity, package and range before reporting this finding as `not_affected`. Changed, malformed or unavailable publisher evidence keeps the finding fatal. All other findings remain fatal. OSV network/API failures also fail the command. CI tests this narrow policy and runs the live query as a separate check. No application dependencies are added by these verification scripts.

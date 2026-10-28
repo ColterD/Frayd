@@ -85,3 +85,13 @@ CREATE TABLE IF NOT EXISTS playlist_items (
   pos INTEGER NOT NULL,
   PRIMARY KEY (playlist_id, pos)
 );
+
+-- Exact ownership records only: file-name suffixes never establish ownership.
+CREATE TABLE IF NOT EXISTS transcode_artifacts (
+  path TEXT PRIMARY KEY,
+  owner_media_id INTEGER NOT NULL REFERENCES media(id),
+  owner_source_path TEXT NOT NULL,
+  role TEXT NOT NULL CHECK(role IN ('temp','final')),
+  provenance TEXT NOT NULL CHECK(provenance IN ('generated','legacy_reference')),
+  CHECK(path != owner_source_path)
+);

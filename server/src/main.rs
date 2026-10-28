@@ -14,7 +14,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use std::process::Command;
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -34,6 +34,7 @@ pub struct App {
     pub party: Arc<party::Party>,
 }
 
+/// Initialize schemas, background scanning, and HTTP routes before accepting requests.
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -71,6 +72,7 @@ async fn main() {
     }
 
     let app = Router::new()
+        .route("/api/health", get(|| async { Json(serde_json::json!({"status": "ok"})) }))
         .route("/api/library", get(library_handler))
         .route("/api/stream/:id", get(stream))
         .route("/api/progress", post(set_progress))
@@ -464,15 +466,8 @@ async fn comic_pages(
     let Some(path) = media_path(&app, id).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match tokio::task::spawn_blocking(move || comic::comic_pages(std::path::Path::new(&path)))
-        .await
-        .ok()
-        .flatten()
-    {
-        Some(pages) => {
-            let names: Vec<&str> = pages.iter().map(|(n, _)| n.as_str()).collect();
-            Json(names).into_response()
-        }
+    match comic_page_names(&app, id, &path).await {
+        Some(names) => Json(names).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -485,28 +480,8 @@ async fn comic_page(
     let Some(path) = media_path(&app, id).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let name = {
-        let db = app.db.lock().unwrap();
-        let meta: Option<String> = db
-            .query_row("SELECT meta_json FROM media WHERE id = ?1", [id], |r| r.get(0))
-            .ok()
-            .flatten();
-        // page list cached in meta_json.pages; recompute if absent
-        let pages: Option<Vec<String>> = meta
-            .as_deref()
-            .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
-            .and_then(|v| v.get("pages").cloned())
-            .and_then(|p| serde_json::from_value(p).ok());
-        match pages {
-            Some(p) => p.get(n as usize).cloned(),
-            None => {
-                drop(db);
-                let db = app.db.lock().unwrap();
-                cache_page_list(&db, id, std::path::Path::new(&path))
-                    .and_then(|list| list.get(n as usize).cloned())
-            }
-        }
-    };
+    let name = comic_page_names(&app, id, &path).await
+        .and_then(|names| usize::try_from(n).ok().and_then(|index| names.get(index).cloned()));
     let Some(name) = name else { return StatusCode::NOT_FOUND.into_response() };
     let mime = mime_guess(&name);
     match tokio::task::spawn_blocking(move || {
@@ -526,36 +501,48 @@ async fn comic_page(
     }
 }
 
-/// Compute + persist page list into meta_json.pages. Returns names.
-fn cache_page_list(db: &Connection, id: i64, path: &std::path::Path) -> Option<Vec<String>> {
-    let pages = comic::comic_pages(path)?;
-    let names: Vec<String> = pages.into_iter().map(|(n, _)| n).collect();
-    let meta: Option<String> = db
-        .query_row("SELECT meta_json FROM media WHERE id = ?1", [id], |r| r.get(0))
-        .ok()
-        .flatten();
-    let mut v: serde_json::Value = meta
-        .as_deref()
-        .and_then(|m| serde_json::from_str(m).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    v["pages"] = serde_json::json!(names);
-    let _ = db.execute(
-        "UPDATE media SET meta_json = ?1 WHERE id = ?2",
-        rusqlite::params![v.to_string(), id],
-    );
+/// Share the existing page order between listing and content endpoints.
+/// Populate missing caches outside the DB lock, publishing only the cache field.
+async fn comic_page_names(app: &Arc<App>, id: i64, path: &str) -> Option<Vec<String>> {
+    {
+        let db = app.db.lock().unwrap();
+        let meta: Option<String> = db.query_row("SELECT meta_json FROM media WHERE id=?1",[id],|r|r.get(0)).ok().flatten();
+        let cached = meta.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| serde_json::from_value::<Vec<String>>(v["pages"].clone()).ok());
+        if let Some(names) = cached { return Some(names); }
+    }
+    let archive = PathBuf::from(path);
+    let pages = tokio::task::spawn_blocking(move || comic::comic_pages(&archive)).await.ok()??;
+    let names: Vec<String> = pages.into_iter().map(|(name,_)| name).collect();
+    let db = app.db.lock().unwrap();
+    // Patch only the cache field, preserving concurrent metadata changes.
+    let changed = db.execute("UPDATE media SET meta_json=json_set(COALESCE(meta_json,'{}'),
+        '$.pages',json(?1)) WHERE id=?2 AND path=?3",
+        rusqlite::params![serde_json::to_string(&names).ok()?,id,path]).ok()?;
+    if changed != 1 { return None; }
     Some(names)
+}
+
+/// Clear the scan admission flag on success, errors, and unwinding.
+struct ScanReset(Arc<App>);
+impl Drop for ScanReset {
+    /// Release scan admission even if the worker exits through an error or panic.
+    fn drop(&mut self) {
+        self.0.scanning.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Spawn a background library scan. Caller must have set `scanning` = true
 /// via compare_exchange; this just runs the scan and clears the flag after.
 fn run_scan(state: std::sync::Arc<App>, lib: PathBuf) {
     tokio::task::spawn_blocking(move || {
-        let db = state.db.lock().unwrap();
+        let _reset = ScanReset(state.clone());
+        let db = match store::connect(&state.db_path) {
+            Ok(db) => db,
+            Err(error) => { tracing::error!(%error, "scan database unavailable"); return; }
+        };
         let thumbs = thumbs_dir();
         let n = scanner::scan(&db, state.db_path.clone(), lib, Some(&thumbs));
-        state
-            .scanning
-            .store(false, std::sync::atomic::Ordering::SeqCst);
         tracing::info!("scan complete: {n} items");
     });
 }
@@ -1274,3 +1261,122 @@ async fn auth_me(
 
 
 
+
+#[cfg(test)]
+mod backend_regressions {
+    use super::*;
+    /// Isolate legacy metadata and saved progress without using an operator database.
+    fn app_for(path: &str) -> Arc<App> {
+        let db = store::open(":memory:");
+        db.execute("INSERT INTO media(id,kind,path,title,meta_json) VALUES(1,'comic',?1,'Original',?2)",
+            rusqlite::params![path,r#"{"pages":["À.png","Á.png","Â.png"],"synopsis":"keep"}"#]).unwrap();
+        db.execute("INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture')", []).unwrap();
+        db.execute("INSERT INTO progress(identity_id,media_id,position) VALUES(1,1,7)", []).unwrap();
+        Arc::new(App { db: Mutex::new(db), db_path: String::new(), library: None,
+            scanning: std::sync::atomic::AtomicBool::new(false), auth_rl: auth::RateLimiter::new(300,10),
+            party: Arc::new(party::Party::new()) })
+    }
+    /// Protect cached UTF-8 names, physical page bytes, metadata, and saved progress together.
+    #[tokio::test]
+    async fn legacy_comic_cache_keeps_listing_content_and_user_state_consistent() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"),"/tests/fixtures/legacy-utf8-order.cbz");
+        let app = app_for(path);
+        let response = comic_pages(State(app.clone()),Path(1)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let names: Vec<String> = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(names, vec!["À.png", "Á.png", "Â.png"]);
+        let response = comic_page(State(app.clone()),Path((1,1))).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(axum::body::to_bytes(response.into_body(),8192).await.unwrap(), &b"second physical page"[..]);
+        let db = app.db.lock().unwrap();
+        let meta: String = db.query_row("SELECT meta_json FROM media WHERE id=1", [], |r| r.get(0)).unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&meta).unwrap();
+        assert_eq!(meta["pages"], serde_json::json!(names));
+        assert_eq!(meta["synopsis"], "keep");
+        assert_eq!(db.query_row("SELECT position FROM progress WHERE media_id=1",[],|r|r.get::<_,f64>(0)).unwrap(),7.0);
+    }
+    /// Catch listing responses that disagree with the page order already used for content.
+    #[tokio::test]
+    async fn listing_honors_persisted_page_order_used_by_content() {
+        let path=concat!(env!("CARGO_MANIFEST_DIR"),"/tests/fixtures/legacy-utf8-order.cbz");
+        let app=app_for(path);
+        app.db.lock().unwrap().execute(r#"UPDATE media SET meta_json=json_set(meta_json,'$.pages',json('["Á.png","À.png","Â.png"]'))"#,[]).unwrap();
+        let response=comic_pages(State(app.clone()),Path(1)).await.into_response();
+        let names:Vec<String>=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),8192).await.unwrap()).unwrap();
+        assert_eq!(names,vec!["Á.png","À.png","Â.png"]);
+        let response=comic_page(State(app.clone()),Path((1,1))).await.into_response();
+        assert_eq!(axum::body::to_bytes(response.into_body(),8192).await.unwrap(),&b"first physical page"[..]);
+    }
+    /// Ensure lazy listing publication cannot replace unrelated metadata or user progress.
+    #[tokio::test]
+    async fn missing_comic_cache_populates_only_cache_fields() {
+        let path=concat!(env!("CARGO_MANIFEST_DIR"),"/tests/fixtures/legacy-utf8-order.cbz");
+        let app=app_for(path);
+        app.db.lock().unwrap().execute("UPDATE media SET meta_json=json_remove(meta_json,'$.pages')",[]).unwrap();
+        assert_eq!(comic_pages(State(app.clone()),Path(1)).await.into_response().status(),StatusCode::OK);
+        let db=app.db.lock().unwrap();
+        let meta:String=db.query_row("SELECT meta_json FROM media WHERE id=1",[],|r|r.get(0)).unwrap();
+        let meta:serde_json::Value=serde_json::from_str(&meta).unwrap();
+        assert_eq!(meta["pages"],serde_json::json!(["À.png","Á.png","Â.png"]));
+        assert_eq!(meta["synopsis"],"keep");
+        assert_eq!(db.query_row("SELECT position FROM progress WHERE media_id=1",[],|r|r.get::<_,f64>(0)).unwrap(),7.0);
+    }
+    /// Exercise the real scan while a separate thread deliberately holds App.db.
+    #[tokio::test]
+    async fn scan_uses_worker_connection_while_application_database_is_locked() {
+        let root = std::env::temp_dir().join(format!("frayd-scan-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("library")).unwrap();
+        let path = root.join("db.sqlite");
+        drop(store::open(path.to_str().unwrap()));
+        let mut app = app_for("unused.cbz");
+        Arc::get_mut(&mut app).unwrap().db_path = path.to_string_lossy().into_owned();
+        app.scanning.store(true,std::sync::atomic::Ordering::SeqCst);
+        let (locked_tx,locked_rx)=std::sync::mpsc::channel();
+        let (release_tx,release_rx)=std::sync::mpsc::channel();
+        let held_app=app.clone();
+        let holder=std::thread::spawn(move || {
+            let _lock=held_app.db.lock().unwrap();
+            locked_tx.send(()).unwrap(); release_rx.recv().unwrap();
+        });
+        locked_rx.recv().unwrap();
+        run_scan(app.clone(),root.join("library"));
+        for _ in 0..100 {
+            if !app.scanning.load(std::sync::atomic::Ordering::SeqCst) { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let still_scanning = app.scanning.load(std::sync::atomic::Ordering::SeqCst);
+        release_tx.send(()).unwrap(); holder.join().unwrap();
+        assert!(!still_scanning,"scan waited for App.db mutex");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    /// Ensure failed opening and unwinding both allow a later scan to be admitted.
+    #[tokio::test]
+    async fn scan_connection_failure_and_unwinding_clear_admission() {
+        let mut app = app_for("unused.cbz");
+        Arc::get_mut(&mut app).unwrap().db_path = "/nonexistent/frayd/fixture.db".into();
+        app.scanning.store(true,std::sync::atomic::Ordering::SeqCst);
+        run_scan(app.clone(),PathBuf::from("/nonexistent"));
+        for _ in 0..100 {
+            if !app.scanning.load(std::sync::atomic::Ordering::SeqCst) { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(!app.scanning.load(std::sync::atomic::Ordering::SeqCst));
+        app.scanning.store(true,std::sync::atomic::Ordering::SeqCst);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _reset=ScanReset(app.clone()); panic!("fixture unwind");
+        }));
+        assert!(result.is_err());
+        assert!(!app.scanning.load(std::sync::atomic::Ordering::SeqCst));
+    }
+    /// Verify unreadable archives leave metadata intact rather than publishing an empty cache.
+    #[tokio::test]
+    async fn failed_comic_refresh_preserves_old_metadata() {
+        let app = app_for("/does-not-exist.cbz");
+        app.db.lock().unwrap().execute(r#"UPDATE media SET meta_json='{"synopsis":"keep"}'"#,[]).unwrap();
+        let before: String = app.db.lock().unwrap().query_row("SELECT meta_json FROM media",[],|r|r.get(0)).unwrap();
+        assert_eq!(comic_pages(State(app.clone()),Path(1)).await.into_response().status(),StatusCode::NOT_FOUND);
+        assert_eq!(comic_page(State(app.clone()),Path((1,0))).await.into_response().status(),StatusCode::NOT_FOUND);
+        let after: String = app.db.lock().unwrap().query_row("SELECT meta_json FROM media",[],|r|r.get(0)).unwrap();
+        assert_eq!(before,after);
+    }
+}

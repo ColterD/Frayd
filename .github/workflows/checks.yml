@@ -17,12 +17,21 @@ jobs:
           node --check client/js/app.js
           node --check client/js/party.js
           node --test tests/client.test.cjs
+      - name: Python lint (locked Ruff)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/frayd-python-lint"
+          "$RUNNER_TEMP/frayd-python-lint/bin/python" -m pip install --disable-pip-version-check --require-hashes --no-deps --only-binary=:all: -r .github/requirements-ci.txt
+          "$RUNNER_TEMP/frayd-python-lint/bin/ruff" check --no-cache --select E4,E7,E9,F,B905 scripts tests
       - name: Compose validation
         run: docker compose config --quiet
       - name: Locked Rust tests, Clippy, release build and runtime images
-        run: docker compose build
+        run: |
+          docker build -t frayd-pr2-qa:local .
+          docker build -f Dockerfile.proxy -t frayd-pr2-proxy-qa:local .
       - name: Disposable HTTP and persistence integration
-        run: python3 scripts/integration.py
+        run: |
+          python3 scripts/check-build-context.py
+          python3 scripts/integration.py
   dependency-audit:
     runs-on: ubuntu-24.04
     timeout-minutes: 5

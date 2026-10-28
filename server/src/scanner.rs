@@ -38,8 +38,7 @@ fn extract_thumb(src: &Path, kind: &str, media_id: i64, thumbs_dir: &Path) -> Op
         }
         return None;
     }
-    let Some(src) = src.to_str() else { return None };
-    let src_str = src;
+    let src = src.to_str()?;
     let status = if matches!(kind, "movie" | "episode") {
         // poster frame at 10% in (seeking to 0 often hits black/logos)
         let dur = ffprobe_duration(src)?;
@@ -176,11 +175,10 @@ fn ffprobe_duration(src: &str) -> Option<f64> {
     std::str::from_utf8(&out.stdout).ok()?.trim().parse().ok()
 }
 
+/// Open an initialized database for standalone scans and fixtures.
 #[allow(dead_code)] // used by ad-hoc scans/tests
 pub fn open(path: &str) -> Connection {
-    let db = Connection::open(path).expect("open db");
-    db.execute_batch(include_str!("../schema.sql")).expect("schema");
-    db
+    crate::store::open(path)
 }
 
 /// Incremental scan of a library root. Returns number of new/updated items.
@@ -188,9 +186,10 @@ pub fn scan(db: &Connection, db_path: String, root: std::path::PathBuf, thumbs_d
     if let Some(t) = thumbs_dir {
         let _ = std::fs::create_dir_all(t);
     }
+    let owned = crate::transcode::reconcile_artifacts(db);
     let mut count = 0;
     let mut seen_manga_dirs: Vec<std::path::PathBuf> = Vec::new();
-    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+    for entry in WalkDir::new(&root).into_iter().filter_map(Result::ok) {
         // manga: directory of loose images under a "manga"-ish parent → one item per dir
         if entry.file_type().is_dir() && !seen_manga_dirs.iter().any(|d| d == entry.path()) {
             let dir = entry.path();
@@ -202,10 +201,10 @@ pub fn scan(db: &Connection, db_path: String, root: std::path::PathBuf, thumbs_d
                 || name_manga(dir.parent().and_then(|p| p.file_name()));
             if parent_manga && std::fs::read_dir(dir).map(|rd| {
                 rd.filter_map(|e| e.ok())
-                    .any(|e| e.file_type().map_or(false, |t| t.is_file()))
+                    .any(|e| e.file_type().is_ok_and(|t| t.is_file()))
             }).unwrap_or(false) {
                 seen_manga_dirs.push(dir.to_path_buf());
-                count += upsert_item(db, db_path.clone(), dir, "manga", thumbs_dir);
+                count += upsert_item(db, db_path.clone(), dir, "manga", thumbs_dir, &root);
             }
             continue;
         }
@@ -213,13 +212,11 @@ pub fn scan(db: &Connection, db_path: String, root: std::path::PathBuf, thumbs_d
             continue;
         }
         let path = entry.path();
-        // skip our own transcode outputs (also purge any mistakenly-scanned rows)
-        if path.file_name().and_then(|f| f.to_str()).map(|f| f.ends_with(".browser.mp4") || f.ends_with(".browser.tmp.mp4")).unwrap_or(false) {
-            let _ = db.execute("DELETE FROM media WHERE path = ?1", [path.to_string_lossy().as_ref()]);
+        if owned.contains(path.to_string_lossy().as_ref()) {
             continue;
         }
         let Some(kind) = classify(path) else { continue };
-        count += upsert_item(db, db_path.clone(), path, kind, thumbs_dir);
+        count += upsert_item(db, db_path.clone(), path, kind, thumbs_dir, &root);
     }
     count
 }
@@ -231,6 +228,7 @@ fn upsert_item(
     path: &Path,
     kind: &str,
     thumbs_dir: Option<&Path>,
+    library_root: &Path,
 ) -> usize {
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
@@ -306,7 +304,7 @@ fn upsert_item(
         );
         // movies/shows: background transcode if audio codec isn't browser-playable
         if matches!(kind, "movie" | "episode") {
-            crate::transcode::maybe_enqueue(db_path, id, path_pb);
+            crate::transcode::maybe_enqueue(db_path, id, path_pb, library_root.to_path_buf());
         }
     } else if updated == 0 {
         // existing item (no new metadata work): still needs thumbs + maybe transcode
@@ -327,7 +325,7 @@ fn upsert_item(
                 .ok()
                 .flatten();
             if has.is_none() {
-                crate::transcode::maybe_enqueue_for_existing(db_path, path.to_path_buf());
+                crate::transcode::maybe_enqueue_for_existing(db_path, path.to_path_buf(), library_root.to_path_buf());
             }
         }
     }
@@ -373,61 +371,22 @@ mod tests {
         }
     }
 
+    /// Distinguish genuine exact-suffix sources from artifacts using ownership, never names.
     #[test]
-    fn scan_does_not_index_transcode_artifacts() {
-        let library = Library::new(&[
-            "Big Buck Bunny.browser.mp4",
-            "Big Buck Bunny.browser.tmp.mp4",
-            // Scanning a temporary output used to enqueue another conversion of it.
-            "Big Buck Bunny.browser.tmp.browser.tmp.mp4",
-            "Big Buck Bunny.browser.tmp.browser.mp4",
-        ]);
-        let db = open(":memory:");
-
-        assert_eq!(scan(&db, String::new(), library.0.clone(), None), 0);
-        let count: i64 = db.query_row("SELECT COUNT(*) FROM media", [], |row| row.get(0)).unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn scan_purges_artifact_rows_and_preserves_sources_and_similar_names() {
-        let sources = [
-            "Big Buck Bunny.mkv",
-            "Big Buck Bunny.mp4",
-            "Big Buck Bunny.tmp.mp4",
-            "Big Buck Bunny.browser.mkv",
-            "Big Buck Bunny.browser.tmp.mkv",
-            "Big Buck Bunny.browser.tmp trailer.mp4",
-            "Big Buck Bunny.browser.tmp.mp4.mp4",
-        ];
-        let artifacts = ["Big Buck Bunny.browser.mp4", "Big Buck Bunny.browser.tmp.mp4"];
-        let names: Vec<&str> = sources.iter().chain(artifacts.iter()).copied().collect();
+    fn scan_preserves_genuine_browser_suffix_sources_and_progress() {
+        let names = ["film.browser.mp4", "film.browser.tmp.mp4", "film.browser.mkv", "unreferenced.browser.mp4"];
         let library = Library::new(&names);
         let db = open(":memory:");
-        for name in &names {
-            // Existing rows suppress unrelated metadata probes and background transcodes.
-            db.execute(
-                "INSERT INTO media (kind, path, title, mtime_secs, transcode_path)
-                 VALUES ('movie', ?1, ?2, ?3, 'already-converted')",
-                rusqlite::params![library.0.join(name).to_str().unwrap(), name, i64::MAX],
-            ).unwrap();
+        db.execute("INSERT INTO identities (id,kind,key) VALUES (1,'device','fixture')", []).unwrap();
+        for (index, name) in names.iter().enumerate() {
+            db.execute("INSERT INTO media (id,kind,path,title,mtime_secs,transcode_path) VALUES (?1,'movie',?2,?3,?4,'done')",
+                rusqlite::params![index as i64 + 1, library.0.join(name).to_str().unwrap(), name, i64::MAX]).unwrap();
+            if index < 3 { db.execute("INSERT INTO progress(identity_id,media_id,position) VALUES (1,?1,42)", [index as i64 + 1]).unwrap(); }
         }
-        let original_ids: Vec<i64> = sources.iter().map(|name| {
-            db.query_row("SELECT id FROM media WHERE path = ?1",
-                [library.0.join(name).to_str().unwrap()], |row| row.get(0)).unwrap()
-        }).collect();
-
-        assert_eq!(scan(&db, String::new(), library.0.clone(), None), 0);
-        for (name, id) in sources.iter().zip(original_ids) {
-            let actual: i64 = db.query_row("SELECT id FROM media WHERE path = ?1",
-                [library.0.join(name).to_str().unwrap()], |row| row.get(0)).unwrap();
-            assert_eq!(actual, id, "source row changed: {name}");
-        }
-        let count: usize = db.query_row("SELECT COUNT(*) FROM media", [], |row| row.get(0)).unwrap();
-        assert_eq!(count, sources.len());
-        for name in &names {
-            assert!(library.0.join(name).exists(), "scan removed file: {name}");
-        }
-        assert_eq!(scan(&db, String::new(), library.0.clone(), None), 0);
+        scan(&db, String::new(), library.0.clone(), None);
+        let count: i64 = db.query_row("SELECT COUNT(*) FROM media JOIN progress ON media.id=progress.media_id WHERE progress.position=42", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM media",[],|r|r.get::<_,i64>(0)).unwrap(),4);
+        for name in names { assert!(library.0.join(name).exists()); }
     }
 }

@@ -191,3 +191,50 @@ test('party guest request picker follows library replacements', async () => {
   assert.match(b.nodes.get('#party-stage').innerHTML, /data-media="10"/);
   assert.doesNotMatch(b.nodes.get('#party-stage').innerHTML, /data-media="9"/);
 });
+
+/** Load the real client scripts and render a joined guest's request picker. */
+async function guestPicker(library) {
+  const b = browser();
+  b.respond(async url => ({ ok: true, json: async () => url === '/api/library' ? library : null }));
+  await b.run('loadLibrary()');
+  vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), b.context);
+  b.nodes.get('#party-code-input').value = 'ABCD';
+  b.run('PartyUI.open()');
+  b.nodes.get('#pt-join').onclick();
+  b.sockets[0].onmessage({ data: JSON.stringify({ type: 'state', is_host: false, state: { queue: [], position: 0 } }) });
+  return b;
+}
+
+test('party guest picker finds a song after twenty comics', async () => {
+  const library = Array.from({ length: 20 }, (_, id) => ({ id, kind: 'comic', title: 'Comic ' + id }));
+  library.push({ id: 21, kind: 'music', title: 'Song' });
+  const b = await guestPicker(library);
+  const html = b.nodes.get('#party-stage').innerHTML;
+  assert.match(html, /data-media="21"/);
+  assert.doesNotMatch(html, /Comic/);
+});
+
+test('party guest picker preserves playable order, escapes titles and limits playable entries', async () => {
+  const library = [
+    { id: 1, kind: 'ebook', title: 'Book' },
+    { id: 2, kind: 'manga', title: 'Manga' },
+    { id: 3, kind: 'unknown', title: 'Unknown' },
+    { id: 4, kind: 'episode', title: 'Unsupported episode' },
+    { id: 5, kind: 'movie', title: '<Movie> & "title"' },
+    { id: 6, kind: 'show', title: 'Show' },
+    { id: 7, kind: 'music', title: 'Music' },
+    { id: 8, kind: 'audiobook', title: 'Audiobook' },
+    ...Array.from({ length: 18 }, (_, index) => ({ id: index + 9, kind: 'music', title: 'Track ' + index })),
+  ];
+  const b = await guestPicker(library);
+  const html = b.nodes.get('#party-stage').innerHTML;
+  assert.deepEqual([...html.matchAll(/data-media="(\d+)"/g)].map(match => Number(match[1])),
+    [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]);
+  assert.match(html, /data-title="&lt;Movie&gt; &amp; &quot;title&quot;"/);
+  assert.doesNotMatch(html, /<Movie>/);
+  b.run('partyFollow(7, "Music", 12, false, 0)');
+  assert.equal(b.nodes.get('#pb-audio').src, '/api/stream/7');
+  b.run('partyFollow(8, "Audiobook", 4, false, 0)');
+  assert.equal(b.nodes.get('#pb-audio').src, '/api/stream/8');
+  assert.equal(b.nodes.get('#plyr-video').src, '');
+});
