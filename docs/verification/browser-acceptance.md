@@ -10,7 +10,7 @@ It does not authorize deployment or qualify arbitrary media, browsers or public 
 Full review [5688243622](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5688243622)
 and incremental reviews [5688495119](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5688495119)
 and [5688787475](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5688787475)
-are accounted for in the [61-entry ledger](coderabbit-follow-up.md).
+are accounted for in the [review ledger](coderabbit-follow-up.md).
 Native follow retires external playback after transferring ownership and clears
 its modal class. External follow likewise pauses native audio/video after taking
 ownership, without broadcasting stale native pause events. Separate API/player readiness, current-player checks and latest
@@ -21,7 +21,7 @@ YouTube API; actual external YouTube playback remains unqualified.
 Party updates clamp captured timestamps under the state lock, preventing stale
 updates from counting elapsed playback twice. The pinned Rust target passes
 53 tests, Clippy and release compilation; warnings in unchanged code remain.
-The frozen client/harness passes 119 Node tests and 30 actual-DOM cases, including
+The frozen client/harness passes 133 Node tests and 30 actual-DOM cases, including
 real native decoding, parser-gated reader restoration and real protocol setup
 after an injected initial transport failure. Owned HTTP nonresponse and early
 exit controls verify bounded failure and cleanup.
@@ -33,7 +33,8 @@ Node 22.23.4 entry without adding an action dependency; local checks require
 Node 22+ with global WebSocket. Native host events retain the original media
 element and check its actual state. Delayed native loads require the current
 generation, playback owner, element and stream; an external handoff invalidates
-them. A decoded-video case proves queued stale pause suppression while preserving
+them. Party Start keeps one pending request owner, and reused external players
+consult the current host sender rather than a role captured by an earlier session. A decoded-video case proves queued stale pause suppression while preserving
 a legitimate pause. Synthetic metadata fixtures explicitly model and restore
 metadata readiness rather than treating an event dispatch as a state change. Complex player, party and harness contracts were
 documented without changing the hosted 80% coverage threshold; its next measured

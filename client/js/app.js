@@ -970,14 +970,15 @@ const YT_DRIFT = 3;
  * Player callbacks must match the active instance; late readiness cannot take playback
  * back from native media. Readiness applies the latest request for that video; queued
  * API callbacks for superseded videos cannot create players. Host events broadcast only
- * while external playback owns it. Native players pause after ownership transfers so
- * their pause events cannot overwrite external party state.
+ * while external playback owns it. The current party sender supplies host authority
+ * across role/session changes, including when the same iframe is reused. Native players
+ * pause after ownership transfers so their pause events cannot overwrite external party state.
  * @param {string} vid YouTube video ID supplied by the party state.
  * @param {string} title Display title for the external stream.
  * @param {number} position Host position at updatedAt, in seconds.
  * @param {boolean} playing Whether the host is advancing the playback clock.
  * @param {number} updatedAt Unix timestamp used to compensate a playing stream for transit.
- * @param {boolean} isHostOwn Whether this player mirrors local host commands.
+ * @param {boolean} isHostOwn Legacy caller hint; current partySend determines host authority.
  */
 window.partyFollowExternal = (vid, title, position, playing, updatedAt, isHostOwn) => {
   partyPlaybackKind = 'external';
@@ -1004,6 +1005,16 @@ window.partyFollowExternal = (vid, title, position, playing, updatedAt, isHostOw
   ensure(() => {
     if (partyPlaybackKind !== 'external' || ytDesired?.vid !== vid) return;
     const desired = ytDesired;
+    // Rebind one seek mirror for the current session even when reusing the iframe.
+    clearInterval(window._ytSeekTimer);
+    window._ytSeekTimer = null;
+    if (window.partySend) {
+      window._ytSeekTimer = setInterval(() => {
+        if (!ytPlayerReady || !ytPlayer || !ytPlayer.getCurrentTime
+          || !window.partySend || partyPlaybackKind !== 'external') return;
+        if (ytPlayer.getPlayerState() === 1) window.partySend({ type: 'seek', position: ytPlayer.getCurrentTime() });
+      }, 2000);
+    }
     if (ytId !== vid) {
       ytId = vid;
       ytPlayerReady = false;
@@ -1021,22 +1032,13 @@ window.partyFollowExternal = (vid, title, position, playing, updatedAt, isHostOw
           },
           // host: mirror player state into party broadcasts
           onStateChange: (e) => {
-            if (e.target !== ytPlayer || !ytPlayerReady || !isHostOwn
+            if (e.target !== ytPlayer || !ytPlayerReady
               || !window.partySend || partyPlaybackKind !== 'external') return;
             if (e.data === 1) window.partySend({ type: 'play', position: ytPlayer.getCurrentTime() });
             else if (e.data === 2 || e.data === 0) window.partySend({ type: 'pause', position: ytPlayer.getCurrentTime() });
           }
         }
       });
-      // host: periodic seek mirror (YT has no 'seeked' event)
-      if (isHostOwn) {
-        clearInterval(window._ytSeekTimer);
-        window._ytSeekTimer = setInterval(() => {
-          if (!ytPlayerReady || !ytPlayer || !ytPlayer.getCurrentTime
-            || !window.partySend || partyPlaybackKind !== 'external') return;
-          if (ytPlayer.getPlayerState() === 1) window.partySend({ type: 'seek', position: ytPlayer.getCurrentTime() });
-        }, 2000);
-      }
       return;
     }
     if (!ytPlayerReady || !ytPlayer || !ytPlayer.seekTo) return;
@@ -1055,7 +1057,7 @@ window.partyFollowExternal = (vid, title, position, playing, updatedAt, isHostOw
  * resume and pause state; guests and inactive players follow the received state.
  * External pause callbacks run only after ownership changes to avoid a stale broadcast.
  * @param {number} mediaId Library item whose kind selects native audio or video.
- * @param {string} title Display title when the audio source changes.
+ * @param {string} title Display title for the active native stream.
  * @param {number} position Host position at updatedAt, in seconds.
  * @param {boolean} playing Whether playback should advance after synchronization.
  * @param {number} updatedAt Unix timestamp used to compensate for transit.
@@ -1080,12 +1082,18 @@ window.partyFollow = (mediaId, title, position, playing, updatedAt, options = {}
     }
     const generation = ++nativeLoadGeneration;
     const changed = partyFollowId !== mediaId;
+    const item = LIBRARY.find(entry => entry.id === mediaId);
+    const activating = priorPlaybackKind !== 'video'
+      || !$('#video-modal').classList.contains('on') || videoItem?.id !== mediaId;
     partyFollowId = mediaId;
-    if (changed) {
-      pbAudio.pause();
-      video.src = `/api/stream/${mediaId}`;
-      $('#video-modal').classList.add('on');
+    pbAudio.pause();
+    $('#video-modal').classList.add('on');
+    $('#vm-title').textContent = title || item.title || '—';
+    if (activating) {
+      videoItem = item;
+      trackProgress(video, videoItem);
     }
+    if (changed) video.src = `/api/stream/${mediaId}`;
     const onMeta = () => {
       if (!ownsNativeLoad(video, 'video', mediaId, generation)) return;
       if (changed || Math.abs(video.currentTime - expected()) > 2) video.currentTime = expected();

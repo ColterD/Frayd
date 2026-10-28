@@ -452,8 +452,49 @@
     equal(media.paused, false, 'Reactivated video follows playing state');
     check(plyr.currentTime < 2, 'Reactivated video follows party load position');
     PartyUI.close();
+    const cachedActivations = [];
+    for (const transition of ['close', 'local audio']) {
+      partyFollow(10, 'Cached movie', 12, true, Date.now() / 1000);
+      equal(partyFollowId, 10, 'Video follow ID remains cached before native transition');
+      const sourceMutations = [];
+      let audioSourceInstalled = false;
+      const observer = new MutationObserver(records => {
+        sourceMutations.push(...records.filter(record => record.target === media));
+        if (records.some(record => record.target === audio)) audioSourceInstalled = true;
+      });
+      observer.observe(media, { attributes: true, attributeFilter: ['src'] });
+      const audioReadyDescriptor = Object.getOwnPropertyDescriptor(audio, 'readyState');
+      try {
+        if (transition === 'close') document.getElementById('vm-back').click();
+        else {
+          observer.observe(audio, { attributes: true, attributeFilter: ['src'] });
+          Object.defineProperty(audio, 'readyState', { configurable: true, value: 0 });
+          playAudio({ id: 11, kind: 'music', title: 'Local audio before cached return' });
+          await until(() => audioSourceInstalled, 'local audio source assigned after progress response');
+          // HTTP204 has no decoded metadata; deliver modeled readiness after its listener is installed.
+          Object.defineProperty(audio, 'readyState', { configurable: true, value: 1 });
+          audio.dispatchEvent(new Event('loadedmetadata'));
+          await until(() => !audio.paused, 'local audio starts before cached video return');
+        }
+        observer.takeRecords();
+        sourceMutations.length = 0;
+        partyFollow(10, 'Cached movie', 24, true, Date.now() / 1000);
+        await delay(10);
+        check(document.getElementById('video-modal').classList.contains('on'), 'Cached video follow reopens the native modal');
+        equal(audio.paused, true, 'Cached video follow pauses local audio');
+        equal(media.paused, false, 'Cached video resumes playback');
+        equal(videoItem.id, 10, 'Cached video restores progress identity');
+        equal(sourceMutations.length, 0, 'Cached video activation does not reassign the stream');
+        cachedActivations.push({ transition, modalOpen: true, audioPaused: audio.paused,
+          nativePlaying: !media.paused, progressMediaId: videoItem.id, sourceAssignments: sourceMutations.length });
+      } finally {
+        observer.disconnect();
+        if (audioReadyDescriptor) Object.defineProperty(audio, 'readyState', audioReadyDescriptor);
+        else delete audio.readyState;
+      }
+    }
     return { beforeKind: 'audio', afterKind: partyPlaybackKind, audioPaused: audio.paused,
-      videoPaused: media.paused, videoPosition: plyr.currentTime, productionHostHandler: true };
+      videoPaused: media.paused, videoPosition: plyr.currentTime, productionHostHandler: true, cachedActivations, localAudioMetadataModeledAndRestored: true };
   });
   await run('host preserves an active paused video in real Plyr', () => {
     LIBRARY = [{ id: 10, kind: 'movie' }, { id: 11, kind: 'movie' }];
@@ -511,7 +552,9 @@
       const originalReady = ytReady;
       const observations = [];
       let mock;
+      let playerCreations = 0;
       window.YT = { Player: function (id, config) {
+        playerCreations++;
         mock = { state: 2, position: 0, pauses: 0, ready: false, commands: [],
           requireReady() { if (!this.ready) throw new Error('Mock YouTube player is not ready'); },
           emitReady() { this.ready = true; config.events.onReady({ target: this }); },
@@ -630,8 +673,48 @@
           localActivations.push({ kind: localKind, externalPauses: mock.pauses,
             externalStopped: mock.state === 2, nativePlaying: !localMedia.paused });
         }
+        let roleReuse = null;
+        if (isHost && kind === 'music') {
+          function openRole(host) {
+            PartyUI.close();
+            PartyUI.open();
+            document.getElementById('party-code-input').value = 'ABCD';
+            document.getElementById('pt-join').click();
+            socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: host,
+              state: { external_url: 'same-role-video', media_id: null, title: 'Role reuse fixture',
+                queue: [], position: 0, playing: false, updated_at: Date.now() / 1000 } }) });
+            return socket;
+          }
+          const beforeRolePlayerCount = playerCreations;
+          const guestSocket = openRole(false);
+          mock.emitReady();
+          const reusedPlayer = mock;
+          mock.playVideo(); mock.pauseVideo();
+          equal(guestSocket.sent, [], 'Guest-created external player cannot broadcast host commands');
+          const hostSocket = openRole(true);
+          check(mock === reusedPlayer && playerCreations === beforeRolePlayerCount + 1, 'Host session reuses the guest-created iframe');
+          hostSocket.sent.length = 0;
+          mock.position = 37;
+          mock.playVideo(); mock.pauseVideo(); mock.playVideo();
+          equal(hostSocket.sent.map(command => command.type), ['play', 'pause', 'play'], 'Current host sender receives one command per reused-player event');
+          await until(() => hostSocket.sent.some(command => command.type === 'seek'), 'reused guest player gets current host seek poller');
+          equal(hostSocket.sent.filter(command => command.type === 'seek').length, 1, 'Reused host player has one seek poller');
+          check(hostSocket.sent.every(command => command.position === 37), 'Current host events use current external position');
+          const hostCommands = hostSocket.sent.map(command => command.type);
+          const nextGuest = openRole(false);
+          mock.playVideo(); mock.pauseVideo(); mock.playVideo();
+          await delay(2200);
+          equal(nextGuest.sent, [], 'Host-to-guest reuse cannot publish state or seek');
+          equal(hostSocket.sent.map(command => command.type), hostCommands, 'Departed host socket receives no reused-player events');
+          PartyUI.close();
+          mock.playVideo(); mock.pauseVideo();
+          equal(nextGuest.sent, [], 'Leave clears the current external sender');
+          equal(playerCreations, beforeRolePlayerCount + 1, 'Role changes never create a duplicate player');
+          roleReuse = { samePlayer: true, hostCommands, guestCommands: 0, departedHostCommands: 0,
+            playerCreations: 1, realSeekPoller: true, externalPlaybackMocked: true };
+        }
         return { queuedAudioControl: { stalePauseBroadcasts: 0, legitimatePauseBroadcasts: 1 },
-          retiredVideoMetadataIgnored: true, observations, latestPendingStateViaAppFollow: { position: 20, playing: false }, localActivations,
+          retiredVideoMetadataIgnored: true, observations, latestPendingStateViaAppFollow: { position: 20, playing: false }, localActivations, roleReuse,
           productionPartyStateHandler: true, mockedYouTubeAPI: true, actualYouTubePlayback: false };
       } finally {
         PartyUI.close();

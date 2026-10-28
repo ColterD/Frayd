@@ -105,6 +105,7 @@ function browser() {
     WebSocket: class {
       constructor() { this.readyState = 1; this.sent = []; sockets.push(this); }
       send(message) { this.sent.push(JSON.parse(message)); }
+      close() { this.readyState = 3; }
     },
   });
   context.window = context;
@@ -1149,3 +1150,105 @@ for (const entry of ['playAudio', 'openVideo']) for (const phase of ['progress',
     assert.equal(media.currentTime, 0);
   });
 }
+
+for (const transition of ['close', 'local audio']) {
+  test(`cached video follow after ${transition} reactivates presentation and progress ownership without reloading`, async () => {
+    const b = browser();
+    b.run('LIBRARY = [{ id: 9, kind: "movie", title: "Cached movie" }, { id: 10, kind: "music", title: "Local audio" }]; openVideo(LIBRARY[0])');
+    await settle();
+    b.run('partyFollow(9, "Cached movie", 12, true, Date.now()/1000)');
+    const media = b.nodes.get('#plyr-video');
+    if (transition === 'close') b.nodes.get('#vm-back').onclick();
+    else { b.run('playAudio(LIBRARY[1])'); await settle(); }
+    let sourceAssignments = 0;
+    const source = media.src;
+    Object.defineProperty(media, 'src', { configurable: true, get: () => source,
+      set() { sourceAssignments++; } });
+    b.run('partyFollow(9, "Cached movie", 24, true, Date.now()/1000)');
+    await settle();
+    assert.equal(b.nodes.get('#video-modal').classList.contains('on'), true);
+    assert.equal(b.nodes.get('#pb-audio').paused, true);
+    assert.equal(media.paused, false);
+    assert.equal(b.run('videoItem.id'), 9);
+    assert.equal(sourceAssignments, 0);
+    b.requests.length = 0;
+    media.pause();
+    await settle();
+    const saves = b.requests.filter(r => r.url === '/api/progress').map(r => JSON.parse(r.options.body));
+    assert.ok(saves.some(save => save.media_id === 9 && save.position >= 24 && save.position < 26));
+  });
+}
+
+/** Exercise role authority through the production party socket handler while keeping
+ * the YouTube boundary controlled and exposing only the current seek timer tick. */
+function externalRoleSession() {
+  const b = browser();
+  const players = youtubePlayerFixture(b);
+  vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), b.context);
+  function joinSession(isHost) {
+    b.run('PartyUI.open()');
+    b.nodes.get('#party-code-input').value = 'ABCD';
+    b.nodes.get('#pt-join').onclick();
+    const socket = b.sockets.at(-1);
+    socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: isHost,
+      state: { external_url: 'same-role-video', media_id: null, title: 'Same external video',
+        queue: [], position: 0, playing: false, updated_at: Date.now()/1000 } }) });
+    return socket;
+  }
+  function emit(player, state) {
+    player.getCurrentTime = () => 37;
+    player.getPlayerState = () => state;
+    player.config.events.onStateChange({ target: player, data: state });
+  }
+  function seekTick() { b.intervals.get(b.context._ytSeekTimer)?.(); }
+  return { b, players, join: joinSession, emit, seekTick };
+}
+
+test('guest-created YouTube player follows the current host sender for play pause and seek without duplication', () => {
+  const f = externalRoleSession();
+  const guest = f.join(false);
+  const player = f.players[0];
+  player.emitReady();
+  f.emit(player, 1);
+  f.seekTick();
+  assert.deepEqual(guest.sent, []);
+  f.b.run('PartyUI.close()');
+  const host = f.join(true);
+  host.sent.length = 0;
+  f.emit(player, 1);
+  f.emit(player, 2);
+  f.emit(player, 1);
+  f.seekTick();
+  assert.deepEqual(host.sent.map(command => command.type), ['play', 'pause', 'play', 'seek']);
+  assert.ok(host.sent.every(command => command.position === 37));
+  assert.equal(f.players.length, 1);
+  assert.equal(f.b.intervals.size, 1);
+  f.b.run('partyFollowExternal("same-role-video", "Repeated host state", 37, false, Date.now()/1000, false)');
+  host.sent.length = 0;
+  f.emit(player, 1);
+  f.seekTick();
+  assert.deepEqual(host.sent.map(command => command.type), ['play', 'seek']);
+  assert.equal(f.players.length, 1);
+  assert.equal(f.b.intervals.size, 1);
+});
+
+test('reused YouTube callbacks cannot send through a departed host or a guest session', () => {
+  const f = externalRoleSession();
+  const host = f.join(true);
+  const player = f.players[0];
+  player.emitReady();
+  host.sent.length = 0;
+  f.b.run('PartyUI.close()');
+  f.emit(player, 1);
+  f.emit(player, 2);
+  f.seekTick();
+  assert.deepEqual(host.sent, []);
+  const guest = f.join(false);
+  f.emit(player, 1);
+  f.emit(player, 2);
+  f.seekTick();
+  assert.deepEqual(guest.sent, []);
+  assert.deepEqual(host.sent, []);
+  assert.equal(f.players.length, 1);
+  assert.ok(f.b.intervals.size <= 1);
+});

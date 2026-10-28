@@ -17,10 +17,10 @@ Navigation: [source boundaries](#source-and-delivery-boundaries),
 [comic cache follow-up](#optional-comic-page-cache-write-follow-up).
 
 Updated 2026-10-28 UTC for [fork draft PR #2](https://github.com/ColterD/Frayd/pull/2).
-This ledger accounts for **48 CodeRabbit issue/diagnostic entries**, including
-original and subsequent findings, outside-diff comments, nitpicks and published
-tool diagnostics. Summary-only risks and GitHub CodeQL alerts are recorded
-separately and are not added to that count.
+The disposition table tracks original and subsequent CodeRabbit findings,
+outside-diff comments, nitpicks and published tool diagnostics. Summary-only risks
+and GitHub CodeQL alerts have separate sections. Current measured counts and
+head-specific acceptance are recorded in the PR body.
 PR #2 remains draft and unmerged. No deployment is qualified or authorized here.
 
 ## Source and delivery boundaries
@@ -136,6 +136,12 @@ A resolved review thread and a passing check are separate evidence.
 | [DOC-GROUP-SHUTDOWN](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5688787475) | Minor, unverified wording suggestion | A tool objects to the cleanup sentence's compound modifier. | The text now says the runner confirms that the process group it owns has stopped before deleting the profile. This preserves the failure-retention contract; no language-tool pass is claimed. |
 | [QUEUED-NATIVE-PAUSE](https://github.com/ColterD/Frayd/pull/2#discussion_r4405615196) | Minor | The fixture dispatches pause synchronously although native media queues it, masking a stale host pause after a rapid external-to-native return. | Decoded native playback reproduces the queued ordering. Actual current-element/state guards ignore a trusted stale pause delivered while playing and publish one legitimate paused event. Queue-faithful audio controls and all 119 Node / 30 DOM cases pass; the prior synchronous-only fixture was insufficient. |
 | [PENDING-NATIVE-LOAD](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5689101822) | Minor, outside diff | A native metadata callback can run after external handoff and restart native playback that was already paused. | External handoff invalidates native loads; delayed callbacks require the current generation, kind, element and exact stream. Local progress promises and metadata callbacks cannot resume retired media, even after a return to native playback. Ten focused baseline failures become green; all 119 Node / 30 DOM cases pass. |
+| [CACHED-VIDEO-ACTIVATION](https://github.com/ColterD/Frayd/pull/2#discussion_r4405902934) | Minor | Following a cached movie after closing its modal or starting local audio can leave the video hidden and audio playing because activation depends on source replacement. | Both baselines fail before correction. Handoff, presentation and current item/progress identity now refresh on every nonpreserved follow; only source assignment remains conditional. Both DOM paths activate with zero video-source assignments; the shared 133 Node / 30 DOM run passes. |
+| [LEDGER-DECLARATION](https://github.com/ColterD/Frayd/pull/2#discussion_r4405902986) | Minor | The introduction still declared 48 records while the rendered table had grown to 61. | The introduction now describes the table without duplicating its mutable count. The PR body and GFM receipt record the measured count for each source revision; historical source-specific counts remain qualified. |
+| [PARTY-START-OWNER](https://github.com/ColterD/Frayd/pull/2#discussion_r4406015132) | Minor | Overlapping Start responses can replace the first host socket and end the party they just created. | One pending request owns Start through HTTP and JSON completion. Leave and Join invalidate stale responses; failures permit retry without releasing a newer request. Staggered-response baselines fail; all 18 focused party tests and the shared 133 Node / 30 DOM run pass. |
+| [YOUTUBE-HOST-SENDER](https://github.com/ColterD/Frayd/pull/2#discussion_r4406015143) | Major | A reused player retains the guest session's host flag, preventing Play/Pause publication after hosting the same video. | The inline anchor is party.js, but the captured callback is in app.js. Callbacks and one rebound seek poller use the current host sender, retaining identity/readiness/ownership guards. Guest-to-host reuse publishes play, pause and seek with one player; guest/departed sessions send nothing. The shared 133 Node / 30 DOM run passes; the external adapter is mocked. |
+
+Full review [5689608434](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5689608434) covers `a7a6dab` through `776b030`: 41 selected files and the SVG/MP4 filters. Its cached-video comment repeats CACHED-VIDEO-ACTIVATION and is supporting evidence, not another requirement. It adds PARTY-START-OWNER and YOUTUBE-HOST-SENDER. Published coverage is 81.82% against 80%, across 132 functions and 24 files, with 15 unsupported skips. These are that source revision's service results.
 
 Full review [5688243622](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5688243622) selected 41 files and filtered one SVG and one MP4. It published the five Minor requirements above. The formal review contains no additional nitpick, outside-diff or tool section; the shared comment warns that some details were omitted to fit its size limit. Published findings are tracked here without claiming disclosure of every internal warning.
 

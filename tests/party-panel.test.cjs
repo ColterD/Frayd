@@ -4,7 +4,7 @@ const { join } = require('node:path');
 const { test } = require('node:test');
 const vm = require('node:vm');
 
-function panel() {
+function panel(fetch) {
   const nodes = new Map();
   const requests = [];
   function parse(html) {
@@ -38,6 +38,7 @@ function panel() {
       querySelectorAll: selector => selector === '.pt-request' ? requests : [],
       addEventListener: (name, handler) => { if (name === 'DOMContentLoaded') loaded = handler; },
     },
+    fetch,
     localStorage: { frayd_identity: 'panel-test' },
     esc: value => String(value),
     WebSocket: class {
@@ -163,4 +164,122 @@ test('Hide and Leave labels describe their distinct actions', () => {
   const html = readFileSync(join(__dirname, '../client/index.html'), 'utf8');
   assert.match(html, /id="pt-hide" aria-label="Hide controls \(stay connected\)"[^>]*>Hide<\/button>/);
   assert.match(html, /id="pt-close" aria-label="Leave party"[^>]*>Leave<\/button>/);
+});
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+for (const phase of ['HTTP', 'JSON']) {
+  test(`overlapping Start clicks during pending ${phase} keep the first host socket alive`, async () => {
+    const responses = [];
+    const body = deferred();
+    const bodyStarted = deferred();
+    const p = panel(() => {
+      const response = deferred();
+      responses.push(response);
+      return response.promise;
+    });
+    p.run('PartyUI.open()');
+    const start = p.nodes.get('#pt-host').onclick;
+    const first = start();
+    if (phase === 'JSON') {
+      responses[0].resolve({ ok: true, json: () => { bodyStarted.resolve(); return body.promise; } });
+      await bodyStarted.promise;
+    }
+    p.run('PartyUI.hide(); PartyUI.open()');
+    const second = p.nodes.get('#pt-host').onclick();
+    if (phase === 'HTTP') responses[0].resolve({ ok: true, json: async () => ({ code: 'ABCD' }) });
+    else body.resolve({ code: 'ABCD' });
+    await first;
+    const socket = p.sockets[0];
+    socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: true, state: { title: 'Song', position: 0 } }) });
+    for (const response of responses.slice(1)) response.resolve({ ok: true, json: async () => ({ code: 'ABCD' }) });
+    await second;
+    assert.equal(socket.closed, 0, 'second Start must not close the first host socket and end its party');
+    assert.equal(p.sockets.length, 1);
+    assert.equal(responses.length, 1);
+    assert.match(p.nodes.get('#party-stage').innerHTML, /you are host/);
+    p.run('PartyUI.close(); PartyUI.open()');
+    const next = p.nodes.get('#pt-host').onclick();
+    responses.at(-1).resolve({ ok: true, json: async () => ({ code: 'EFGH' }) });
+    await next;
+    assert.equal(p.sockets.length, 2);
+    assert.match(p.sockets[1].url, /EFGH/);
+  });
+}
+
+for (const failure of ['HTTP', 'network', 'JSON']) {
+  test(`Start can retry after ${failure} failure`, async () => {
+    let calls = 0;
+    const p = panel(async () => {
+      calls++;
+      if (calls > 1) return { ok: true, json: async () => ({ code: 'ABCD' }) };
+      if (failure === 'network') throw new Error('offline');
+      return { ok: failure !== 'HTTP', status: 503, json: async () => { throw new Error('invalid JSON'); } };
+    });
+    p.run('PartyUI.open()');
+    await p.nodes.get('#pt-host').onclick();
+    assert.equal(p.sockets.length, 0);
+    assert.match(p.nodes.get('#party-stage').innerHTML, /Could not start party/);
+    await p.nodes.get('#pt-host').onclick();
+    assert.equal(p.sockets.length, 1);
+  });
+}
+
+for (const phase of ['HTTP', 'JSON']) {
+  for (const action of ['Leave', 'Join']) {
+    test(`${action} cancels a Start pending ${phase} without stale connection resurrection`, async () => {
+      const response = deferred();
+      const body = deferred();
+      const bodyStarted = deferred();
+      const p = panel(() => response.promise);
+      p.run('PartyUI.open()');
+      const start = p.nodes.get('#pt-host').onclick();
+      if (phase === 'JSON') {
+        response.resolve({ ok: true, json: () => { bodyStarted.resolve(); return body.promise; } });
+        await bodyStarted.promise;
+      }
+      let guest;
+      if (action === 'Leave') p.nodes.get('#pt-close').onclick();
+      else guest = p.joinParty('EFGH');
+      if (phase === 'HTTP') response.resolve({ ok: true, json: async () => ({ code: 'ABCD' }) });
+      else body.resolve({ code: 'ABCD' });
+      await start;
+      assert.equal(p.sockets.length, action === 'Join' ? 1 : 0);
+      if (guest) {
+        assert.equal(guest.closed, 0);
+        assert.match(p.nodes.get('#party-stage').innerHTML, /Code: <b>EFGH/);
+      }
+    });
+  }
+}
+
+test('a cancelled Start failure cannot clear a newer pending Start or paint its error', async () => {
+  const responses = [];
+  const oldBody = deferred();
+  const bodyStarted = deferred();
+  const p = panel(() => {
+    const response = deferred();
+    responses.push(response);
+    return response.promise;
+  });
+  p.run('PartyUI.open()');
+  const old = p.nodes.get('#pt-host').onclick();
+  responses[0].resolve({ ok: true, json: () => { bodyStarted.resolve(); return oldBody.promise; } });
+  await bodyStarted.promise;
+  p.run('PartyUI.close(); PartyUI.open()');
+  const current = p.nodes.get('#pt-host').onclick();
+  oldBody.reject(new Error('old body failed'));
+  await old;
+  await p.nodes.get('#pt-host').onclick();
+  assert.equal(responses.length, 2, 'old completion must not unlock the current Start');
+  assert.doesNotMatch(p.nodes.get('#party-stage').innerHTML, /Could not start party/);
+  responses[1].resolve({ ok: true, json: async () => ({ code: 'EFGH' }) });
+  await current;
+  assert.equal(p.sockets.length, 1);
+  assert.match(p.sockets[0].url, /EFGH/);
 });

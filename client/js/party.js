@@ -8,12 +8,14 @@ const PartyUI = (() => {
   let isHost = false;
   let state = null;
   let partyCode = null;
+  let pendingStart = null;
 
   const $ = (s) => document.querySelector(s);
 
   function open() { $('#party-modal').classList.add('on'); render(); }
   function hide() { $('#party-modal').classList.remove('on'); }
   function resetSession() {
+    pendingStart = null;
     ws = null; partyCode = null; isHost = false; state = null; pending = []; members = [];
     hostLoadedMedia = null; hostLoadedExt = null;
     window.partySend = null;
@@ -30,14 +32,25 @@ const PartyUI = (() => {
   }
 
   async function host() {
-    const r = await fetch('/api/party', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ identity: identity() })
-    });
-    if (!r.ok) return renderError('Could not start party (' + r.status + ')');
-    const { code } = await r.json();
-    connect(code);
+    if (pendingStart) return;
+    // This token spans both awaits; session reset cancels its authority to connect.
+    const start = {};
+    pendingStart = start;
+    try {
+      const r = await fetch('/api/party', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ identity: identity() })
+      });
+      if (pendingStart !== start) return;
+      if (!r.ok) return renderError('Could not start party (' + r.status + ')');
+      const { code } = await r.json();
+      if (pendingStart === start) connect(code);
+    } catch {
+      if (pendingStart === start) renderError('Could not start party');
+    } finally {
+      if (pendingStart === start) pendingStart = null;
+    }
   }
 
   function join() {
