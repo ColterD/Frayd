@@ -351,6 +351,7 @@ def main():
             compose('up', '-d', '--wait', '--wait-timeout', '90')
             base = 'http://' + compose('port', 'proxy', '8080').stdout.decode().strip()
             name = compose('ps', '-q', 'app').stdout.decode().strip()
+            ready()
             assert request(f'/api/stream/{media_id}') == fixture
             docker('exec', name, 'sh', '-c', 'test ! -w /data/library/qa-comic.cbz')
             print('PASS: documented read-only media bind mount serves exact fixture bytes')
