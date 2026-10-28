@@ -28,6 +28,8 @@ pub struct App {
     pub library: Option<PathBuf>,
     /// True while a scan is running (single scan at a time).
     pub scanning: std::sync::atomic::AtomicBool,
+    /// Login/setup/password attempts: 10 per 5 min per IP.
+    pub auth_rl: auth::RateLimiter,
     /// Active listening party (single party — household scale).
     pub party: Arc<party::Party>,
 }
@@ -56,6 +58,7 @@ async fn main() {
         db_path: db_path.clone(),
         library: library.clone(),
         scanning: std::sync::atomic::AtomicBool::new(false),
+        auth_rl: auth::RateLimiter::new(300, 10),
         party: Arc::new(party::Party::new()),
     });
 
@@ -196,8 +199,12 @@ struct LoginReq {
 /// TODO(M5): argon2id + sessions/tokens.
 async fn auth_login(
     State(app): State<std::sync::Arc<App>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<LoginReq>,
 ) -> impl IntoResponse {
+    if !app.auth_rl.check(&auth::client_ip(&headers, "unknown")) {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error": "too many attempts — wait 5 minutes"})));
+    }
     let db = app.db.lock().unwrap();
     let exists: Option<i64> = db
         .query_row(
@@ -292,6 +299,9 @@ async fn auth_change_password(
     headers: axum::http::HeaderMap,
     Json(req): Json<ChangePwReq>,
 ) -> impl IntoResponse {
+    if !app.auth_rl.check(&format!("pw:{}", auth::client_ip(&headers, "unknown"))) {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error": "too many attempts — wait 5 minutes"}))).into_response();
+    }
     if req.new.len() < 4 {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "new password too short (min 4)"}))).into_response();
     }
@@ -334,8 +344,12 @@ struct SetupReq {
 /// Only works while ZERO accounts exist; the created account is always admin.
 async fn auth_setup(
     State(app): State<std::sync::Arc<App>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<SetupReq>,
 ) -> impl IntoResponse {
+    if !app.auth_rl.check(&auth::client_ip(&headers, "unknown")) {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error": "too many attempts — wait 5 minutes"}))).into_response();
+    }
     if req.password.len() < 4 {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "password too short (min 4)"}))).into_response();
     }

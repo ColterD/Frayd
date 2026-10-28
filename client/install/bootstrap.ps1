@@ -41,7 +41,11 @@ Set-Location Frayd\server
 cargo build --release
 
 # --- env file ---
-"FRAYD_LIBRARY=$Lib" | Out-File -Encoding utf8 .env
+@"
+FRAYD_LIBRARY=$Lib
+# Public internet exposure? Uncomment for shorter sessions (days):
+# FRAYD_SESSION_DAYS=7
+"@ | Out-File -Encoding utf8 .env
 
 # --- autostart: Startup folder shortcut (no admin needed) ---
 $startup = [Environment]::GetFolderPath("Startup")

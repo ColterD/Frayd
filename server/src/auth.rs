@@ -47,7 +47,13 @@ pub fn verify_login(db: &Connection, key: &str, password: &str) -> Result<bool, 
         .is_ok())
 }
 
-const SESSION_TTL_SECS: i64 = 30 * 24 * 3600;
+/// Session TTL: FRAYD_SESSION_DAYS env (default 30). Public exposure: set 1-7.
+pub fn session_ttl_secs() -> i64 {
+    std::env::var("FRAYD_SESSION_DAYS").ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(30)
+        .clamp(1, 365) * 24 * 3600
+}
 
 /// Mint a session token for identity. 128-bit random, hex-encoded.
 pub fn create_session(db: &Connection, identity_id: i64) -> Result<String, String> {
@@ -57,10 +63,43 @@ pub fn create_session(db: &Connection, identity_id: i64) -> Result<String, Strin
     db.execute(
         "INSERT INTO sessions (token, identity_id, expires_at)
          VALUES (?1, ?2, unixepoch() + ?3)",
-        rusqlite::params![token, identity_id, SESSION_TTL_SECS],
+        rusqlite::params![token, identity_id, session_ttl_secs()],
     )
     .map_err(|e| e.to_string())?;
     Ok(token)
+}
+
+/// Sliding-window rate limiter (in-process). Key = bucket name + client ip.
+pub struct RateLimiter {
+    hits: std::sync::Mutex<std::collections::HashMap<String, Vec<i64>>>,
+    window: i64,
+    max: usize,
+}
+
+impl RateLimiter {
+    pub fn new(window_secs: i64, max_hits: usize) -> Self {
+        Self { hits: std::sync::Mutex::new(std::collections::HashMap::new()), window: window_secs, max: max_hits }
+    }
+    /// true = allowed, false = rate-limited
+    pub fn check(&self, key: &str) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        let mut map = self.hits.lock().unwrap();
+        let v = map.entry(key.to_string()).or_default();
+        v.retain(|t| *t > now - self.window);
+        if v.len() >= self.max { return false; }
+        v.push(now);
+        true
+    }
+}
+
+/// Best-effort client IP from proxy headers, else socket addr text.
+pub fn client_ip(headers: &axum::http::HeaderMap, fallback: &str) -> String {
+    headers.get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 /// Resolve an Authorization: Bearer token to identity_id, sliding-expiry refresh.
@@ -74,7 +113,7 @@ pub fn identity_from_token(db: &Connection, token: &str) -> Option<i64> {
         .ok()?;
     let _ = db.execute(
         "UPDATE sessions SET expires_at = unixepoch() + ?2 WHERE token = ?1",
-        rusqlite::params![token, SESSION_TTL_SECS],
+        rusqlite::params![token, session_ttl_secs()],
     );
     Some(id)
 }
