@@ -183,3 +183,43 @@ test('native driver releases held bytes when retired metadata never arrives', { 
   assert.equal(releases, 1);
   assert.equal(plyr.config.blankVideo, 'original');
 });
+
+
+test('cache startup failure retains its cause and bounded redacted browser stderr', { timeout: 8000 }, async () => {
+  const fixtureDirectory = mkdtempSync(join(tmpdir(), 'frayd-cache-startup-failure-'));
+  const browserScript = join(fixtureDirectory, 'browser.cjs');
+  const resultDirectory = join(fixtureDirectory, 'result');
+  writeFileSync(browserScript, `#!/usr/bin/env node
+if (process.argv.includes('--version')) { console.log('Owned startup stderr fixture'); process.exit(0); }
+console.error('x'.repeat(9000));
+// A nonfunctional marker, never an actual browser debugging capability.
+console.error('DevTools listening on ws://127.0.0.1:1/devtools/browser/owned-startup-debugger-marker');
+console.error('harmless owned startup diagnostic');
+setInterval(() => {}, 1000);
+`, { mode: 0o700 });
+  const runner = resolve(__dirname, 'browser-regression.cjs');
+  const invocation = spawn(process.execPath, ['-e', `
+    require(${JSON.stringify(runner)}).main({ evidenceDirectory: ${JSON.stringify(resultDirectory)} })
+      .catch(error => { console.error(error.stack); process.exitCode = 1; });
+  `], { env: { ...process.env, BROWSER_BIN: browserScript }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let stdout = '';
+  let stderr = '';
+  invocation.stdout.on('data', bytes => { stdout += bytes; });
+  invocation.stderr.on('data', bytes => { stderr += bytes; });
+  try {
+    const [code] = await once(invocation, 'exit');
+    assert.equal(code, 1, stderr);
+    const result = JSON.parse(stdout);
+    assert.match(result.runnerError, /Owned browser did not expose its cache-control endpoint/);
+    assert.equal(typeof result.startupStderr, 'string');
+    assert.ok(result.startupStderr.length <= 8192);
+    assert.match(result.startupStderr, /harmless owned startup diagnostic/);
+    assert.match(result.startupStderr, /Owned DevTools endpoint redacted/);
+    assert.doesNotMatch(stdout, /owned-startup-debugger-marker|ws:\/\/127/);
+    assert.equal(Object.values(result.cleanup).every(Boolean), true);
+    assert.deepEqual(result.cleanupErrors, []);
+  } finally {
+    if (invocation.exitCode === null) invocation.kill('SIGKILL');
+    rmSync(fixtureDirectory, { recursive: true, force: true });
+  }
+});

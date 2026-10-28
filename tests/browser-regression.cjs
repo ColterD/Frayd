@@ -342,7 +342,10 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
     }
   }
   output ??= { provenance, cases: [], errors: [], passed: 0, failed: 1, complete: false, unexpectedRequests };
-  if (runError) output.runnerError = redactDebuggerCapabilities(runError.stack);
+  if (runError) {
+    output.runnerError = redactDebuggerCapabilities(runError.stack);
+    if (!cacheControl) output.startupStderr = redactDebuggerCapabilities(logs).slice(-8192);
+  }
   output.cacheControl = cacheControl;
   output.mediaGate = { held: Boolean(heldMedia), pending: pendingMedia, events: mediaGateEvents };
   output.cleanupErrors = cleanupErrors;

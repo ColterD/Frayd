@@ -5,7 +5,52 @@
 This records bounded manual acceptance using an isolated library and database.
 It does not authorize deployment or qualify arbitrary media, browsers or public hosting.
 
-## Source and fixture boundaries
+## Current checkpoint (6810 / 5926)
+
+Checked 2026-10-28. Tested source `6810cc2488bc1a6a0284ff2bdf140d43bd2a1fd5`
+builds app `sha256:5926bed415ff0455796396218dc1851a1139818fb40588b84561666c424fa8fe`
+with proxy `sha256:70c8658365d70d40979de2f191387b2e5e08bea22b44f960c0e77f751f67fb83`.
+The app script is `d676ea713c0975ea5a3236ea98e1bb6e98f11b9c4ab7823d6c1165a5dee29646`.
+All 31 build, 19 verification and 20 backend inputs match the tested commit.
+
+The current harness passes 91 Node tests, 20 Python tests and 25 real-DOM cases,
+including five native H.264 decoding controls and parser-gated reader restoration.
+The normal build reuses the qualified 51-test Rust/Clippy/release stage after
+confirming identical backend inputs and output binary; it is not fresh Rust
+execution. New-image health and seven exact-byte HTTP asset checks pass, with
+zero remaining smoke-project resources. Full local HTTP/storage and DNS suites
+were **not rerun** on this image; their earlier full pass belongs to image `055`.
+
+**The reader fix passes actual Vivaldi acceptance on image `5926`.** Three full
+close/reopen cycles returned the saved raw-LF annotation and visibly painted it.
+Chapter II→I restored the mark, and page 3/8 survived close/reopen. A guest
+selection returned HTTP 401 with sign-in feedback and no optimistic mark.
+A targeted movie check restored the actual HTTP progress value 190.989149 seconds,
+then advanced to 204.628872 with readyState 4 and a decoded 1920-pixel frame.
+The host and peer loaded app/party response bodies match the tested hashes;
+index bytes were verified on the server, without a captured browser index body.
+
+**Current party smoke remains held.** Browser control detached twice at action
+boundaries; the approach stopped without a reset. The earlier `1bf` image passed
+the five-category and two-client party matrix. Those observations remain bound
+to that image; no current two-client pass is claimed. New whitespace selection
+and unsupported-selection checks were not repeated in this targeted run.
+The controlled parser gate proves the lost-message lifecycle class; the precise
+scheduling trigger of the earlier Vivaldi failure remains an inference.
+
+The sections below retain historical source/image observations and their original
+gates. They do not describe current acceptance unless explicitly bound to this
+checkpoint. The final [ordering and reader readiness](#deterministic-native-ordering-and-reader-readiness)
+section explains the current controlled regression evidence. Both `6810cc2` hosted builds failed (jobs `123020052092` and `123020014328`);
+both stopped before any browser case because the test-owned cache-control endpoint
+was unavailable. This is a harness startup failure, not a reproduced product
+regression. A diagnostic-only harness change retains the original failure and includes bounded,
+redacted owned-browser startup stderr in the failed receipt. Its failure control
+and current 25-case local browser run pass; the next hosted run must expose the
+missing startup evidence before a causal correction can be chosen. Actual-browser acceptance remains
+separate gates. No merge or deployment is authorized.
+
+## Historical source and fixture boundaries
 
 - Baseline application: `sha256:cd880c88f8c97dbebe771a3303455c714b3a03dde732cc8474634575b7f4cf58`, matching source `b852a7f87bc1ad9e3921d7b98202ccc2b719b70c`; prior accepted PR head `ccaa308e1395f0080e8c5b7de209f8ca043efb24` adds historical documentation.
 - First corrected runtime source: `407afbccb94697738025ae8c394d755814e79997`, committed before its image build. Application image: `sha256:958c9f9011cbeedec1d81433a8cae89efdc58bfbd990b2e33568f31b6b656b2d`. Its pinned build passes 45 Rust tests, Clippy and release compilation; observations below apply only to this first corrected image.
@@ -39,7 +84,7 @@ The earlier 958-image passes below remain historical observations of that exact
 artifact; they are not presented as browser qualification of this later image.
 At that checkpoint, browser acceptance was held for input recovery and
 a fresh script-payload binding. The later owner-correlated Vivaldi tab now responds;
-current-image payload binding and media rechecks remain required. The full latest-image HTTP/storage integration and same-version stopped-volume recovery pass; these automated/storage results do not close the browser gates.
+current-image payload binding and media rechecks remain required. At that historical checkpoint, full HTTP/storage integration and same-version stopped-volume recovery pass; these automated/storage results do not close the browser gates.
 
 ## Earlier automated qualification (9fe)
 
@@ -54,13 +99,13 @@ build reused the qualified 51-test Rust/Clippy/release stage with identical serv
 inputs and output binary; no fresh Rust execution is claimed for that cache hit.
 Nine real-DOM cases pass separately, as described below.
 
-The retained interactive fixture still runs the earlier 858 image. Current-source
-manual media acceptance still requires a new image, loaded-payload binding and
+At that checkpoint, the retained interactive fixture ran the earlier 858 image.
+Manual media acceptance required a new image, loaded-payload binding and
 actual media actions. Browser control has now recovered as described below. Earlier
 958 observations, 858 backup recovery and these new automated results each retain
 their own source/image limits.
 
-## Acceptance matrix
+## Historical acceptance matrix (baseline / 958)
 
 | Scenario and exact action | Baseline observation | First corrected image (958) |
 |---|---|---|
@@ -88,7 +133,7 @@ and source/image bindings. Automated regression tests cover the related identity
 isolation correction separately; this page does not make account/device identifiers
 into a private boundary for guest library/media access.
 
-## Limits and cleanup
+## Historical control recovery and cleanup
 
 The owned fixture and test tabs remain available for current-source media checks.
 Earlier input attempts timed out while accessibility reads worked; those receipts
@@ -98,8 +143,8 @@ provider and guest entry responded in 0.34 seconds. The provider's “Chrome” 
 was not evidence of an installed Google Chrome browser. This correlation restores
 control on the newly identified tab; it does not explain the earlier timeouts.
 
-The control recovery still used the older 858 image. Latest-source acceptance
-requires a qualified new image and freshly bound payload. These test resources
+That control recovery used the older 858 image and did not qualify later images
+or their loaded payloads. These test resources
 remain separate from the live deployment. Browser observations do not establish
 physical audio output, full-duration playback, every codec/archive, external
 YouTube behavior, latency/soak/reconnect, public-hosting security or deployment.
@@ -252,9 +297,9 @@ fresh and retained-audio paths. The video party button uses the same reopen API.
 These corrections address the actual overlay hit-test gap and the reproduced
 state where video and audio remained active together.
 
-The combined local source passes 85 Node tests, 20 Python tests and 24 browser
-cases, including the five native decoding cases. Its new image, current Vivaldi
-media checks and hosted acceptance remain separate required gates.
+At that earlier checkpoint, the combined source passed 85 Node tests, 20 Python
+tests and 24 browser cases, including five native decoding cases. Its then-pending
+image, Vivaldi and hosted gates are historical; see the current checkpoint above.
 
 ## Deterministic native ordering and reader readiness
 
@@ -287,7 +332,7 @@ origin and exact WindowProxy checks remain in force.
 The combined source passes 90 Node tests, 20 Python tests and 25 browser cases,
 including parser-gated restoration, actual open/close/reopen, chapter revisits,
 stale ready messages and all five native H.264 controls. Earlier Vivaldi category
-passes remain bound to their recorded image. The rebuilt reader and full current
-acceptance must still be checked in that browser; the controlled lost-listener
-class is proven, while the precise trigger of the earlier live observation remains
-an inference.
+passes remain bound to their recorded image. The rebuilt `5926` reader passes
+the three actual Vivaldi reopen cycles described above. Current two-client party
+smoke remains held by browser detachment. The controlled lost-listener class is
+proven; the precise trigger of the earlier live observation remains an inference.
