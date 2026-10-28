@@ -902,6 +902,19 @@ function beginNativePlayback(kind) {
 }
 
 /**
+ * Compare the configured native source, falling back to its effective stream.
+ * Plyr installs source children; native audio and party loads may set src directly.
+ * @param {HTMLMediaElement} media Native element whose stream is being checked.
+ * @param {number} id Expected library stream ID.
+ * @returns {boolean} Whether the canonical stream URL matches.
+ */
+function hasNativeStream(media, id) {
+  const source = media.src || media.querySelector('source')?.src || media.currentSrc || '';
+  return new URL(source, window.location.origin).href
+    === new URL(`/api/stream/${id}`, window.location.origin).href;
+}
+
+/**
  * Accept a delayed native load only while its generation, player and exact stream
  * still own playback. External handoff and newer native commands retire callbacks
  * even when a later command reuses the same media ID or native element.
@@ -914,9 +927,7 @@ function beginNativePlayback(kind) {
 function ownsNativeLoad(media, kind, id, generation) {
   if (nativeLoadGeneration !== generation || partyPlaybackKind !== kind
     || media !== (kind === 'video' ? plyr.media : pbAudio)) return false;
-  const source = media.src || media.querySelector('source')?.src || media.currentSrc || '';
-  return new URL(source, window.location.origin).href
-    === new URL(`/api/stream/${id}`, window.location.origin).href;
+  return hasNativeStream(media, id);
 }
 
 function playAudio(it) {
@@ -1072,16 +1083,12 @@ window.partyFollow = (mediaId, title, position, playing, updatedAt, options = {}
     const video = plyr.media;
     // A host's first state echoes their local load; Plyr may use a source child.
     if (options.preserveActiveVideo && priorPlaybackKind === 'video'
-      && $('#video-modal').classList.contains('on')) {
-      const source = video.src || video.querySelector('source')?.src || video.currentSrc || '';
-      const stream = new URL(`/api/stream/${mediaId}`, window.location.origin).href;
-      if (new URL(source, window.location.origin).href === stream) {
-        partyFollowId = mediaId;
-        return;
-      }
+      && $('#video-modal').classList.contains('on') && hasNativeStream(video, mediaId)) {
+      partyFollowId = mediaId;
+      return;
     }
     const generation = ++nativeLoadGeneration;
-    const changed = partyFollowId !== mediaId;
+    const changed = !hasNativeStream(video, mediaId);
     const item = LIBRARY.find(entry => entry.id === mediaId);
     const activating = priorPlaybackKind !== 'video'
       || !$('#video-modal').classList.contains('on') || videoItem?.id !== mediaId;
@@ -1108,9 +1115,7 @@ window.partyFollow = (mediaId, title, position, playing, updatedAt, options = {}
   $('#video-modal').classList.remove('on', 'yt');
   plyr.pause();
   $('#playerbar').classList.add('on');
-  // A locally loaded host stream already has its source installed.
-  if (pbAudio.src.endsWith(`/api/stream/${mediaId}`)) partyFollowId = mediaId;
-  const changed = partyFollowId !== mediaId;
+  const changed = !hasNativeStream(pbAudio, mediaId);
   partyFollowId = mediaId;
   if (changed) {
     $('#pb-title').textContent = title || '—';

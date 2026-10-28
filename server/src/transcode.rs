@@ -193,7 +193,7 @@ fn job_namespace(tmp: &Path, out: &Path, id: i64) -> Option<PathBuf> {
 }
 
 /// Check the exact consistent generated pair and all media references while holding a write transaction.
-fn job_state(db: &Connection, id: i64, src: &Path, tmp: &Path, out: &Path, allow_unknown: bool) -> Option<String> {
+fn job_state(db: &Connection, id: i64, src: &Path, tmp: &Path, out: &Path, allowed_states: &[&str]) -> Option<String> {
     let rows = db.prepare("SELECT path,role,lifecycle FROM transcode_artifacts
         WHERE owner_media_id=?1 AND owner_source_path=?2 AND provenance='generated'
         AND path IN (?3,?4)").ok()?.query_map(rusqlite::params![id,src.to_str()?,tmp.to_str()?,out.to_str()?],
@@ -201,8 +201,7 @@ fn job_state(db: &Connection, id: i64, src: &Path, tmp: &Path, out: &Path, allow
         .collect::<rusqlite::Result<Vec<_>>>().ok()?;
     if rows.len()!=2 || !rows.iter().any(|r| r.0==tmp.to_string_lossy() && r.1=="temp")
         || !rows.iter().any(|r| r.0==out.to_string_lossy() && r.1=="final")
-        || rows[0].2!=rows[1].2 || (! ["pending","retiring"].contains(&rows[0].2.as_str())
-            && !(allow_unknown && rows[0].2=="unknown")) { return None; }
+        || rows[0].2!=rows[1].2 || !allowed_states.contains(&rows[0].2.as_str()) { return None; }
     let owner: i64 = db.query_row("SELECT COUNT(*) FROM media WHERE id=?1 AND path=?2",
         rusqlite::params![id,src.to_str()?],|row|row.get(0)).ok()?;
     let references: i64 = db.query_row("SELECT COUNT(*) FROM media WHERE path IN (?1,?2)
@@ -215,6 +214,33 @@ fn job_state(db: &Connection, id: i64, src: &Path, tmp: &Path, out: &Path, allow
     Some(rows[0].2.clone())
 }
 
+/// Grant recovery authority only to the exact completed pair displaced by a known source replacement.
+/// The caller holds an immediate transaction after clearing the old pointer; retain the returned lease
+/// until commit so a live converter and a partially updated registry cannot acquire retirement authority.
+pub(crate) fn retire_replaced_job(db: &Connection, db_path: &str, library: &Path,
+    id: i64, src: &Path, out: &Path) -> rusqlite::Result<Option<File>> {
+    if !cfg!(target_os = "linux") { return Ok(None); }
+    let Some(parent)=out.parent() else { return Ok(None) };
+    let tmp=parent.join("audio.tmp.mp4");
+    let Some(job)=job_namespace(&tmp,out,id) else { return Ok(None) };
+    let cache=std::env::var_os("FRAYD_TRANSCODES").map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(db_path).parent().unwrap_or(Path::new(".")).join("transcodes"));
+    let Some(cache)=prepare_cache(&cache,library) else { return Ok(None) };
+    if job.parent().and_then(Path::parent)!=Some(cache.as_path()) { return Ok(None); }
+    let lease_path=job.join("lease");
+    let Ok(metadata)=std::fs::symlink_metadata(&lease_path) else { return Ok(None) };
+    if !metadata.is_file() || metadata.file_type().is_symlink() { return Ok(None); }
+    let Ok(lease)=OpenOptions::new().read(true).write(true).open(lease_path) else { return Ok(None) };
+    if lease.try_lock().is_err() { return Ok(None); }
+    if job_state(db,id,src,&tmp,out,&["completed"]).is_none() { return Ok(None); }
+    let changed=db.execute("UPDATE transcode_artifacts SET lifecycle='retiring' WHERE path IN (?1,?2) AND lifecycle='completed'",
+        rusqlite::params![tmp.to_string_lossy(),out.to_string_lossy()])?;
+    if changed!=2 || job_state(db,id,src,&tmp,out,&["retiring"]).is_none() {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(Some(lease))
+}
+
 /// Retire a proven inactive/current finished worker under its lease; durable retiring survives filesystem/commit gaps.
 /// Unknown and completed pairs never grant cleanup authority, even when currently unreferenced.
 fn discard_failed_job(db: &mut Connection, id: i64, src: &Path, tmp: &Path, out: &Path, completed: Option<&Path>) -> bool {
@@ -222,13 +248,13 @@ fn discard_failed_job(db: &mut Connection, id: i64, src: &Path, tmp: &Path, out:
         if completed.is_some_and(|path| path != out) { return None; }
         let job = job_namespace(tmp,out,id)?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).ok()?;
-        let state = job_state(&tx,id,src,tmp,out,false)?;
+        let state = job_state(&tx,id,src,tmp,out,&["pending","retiring"])?;
         if !job.exists() && state!="retiring" { return None; }
         if tx.execute("UPDATE transcode_artifacts SET lifecycle='retiring' WHERE path IN (?1,?2)",
             rusqlite::params![tmp.to_str()?,out.to_str()?]).ok()?!=2 { return None; }
         tx.commit().ok()?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).ok()?;
-        if job_state(&tx,id,src,tmp,out,false)?.as_str()!="retiring" { return None; }
+        if job_state(&tx,id,src,tmp,out,&["pending","retiring"])?.as_str()!="retiring" { return None; }
         job_namespace(tmp,out,id)?;
         if job.exists() {
             for path in [tmp,out,&job.join("lease")] {
@@ -321,7 +347,7 @@ fn publish_completed_job(db: &mut Connection, id: i64, src: &Path, completed: &P
     if lease.completed!=completed || source_version(src)!=Some(file_version) { return Ok(false); }
     let tmp=completed.parent().map(|job|job.join("audio.tmp.mp4")).ok_or(rusqlite::Error::InvalidQuery)?;
     let expected=if lease.reclaimable {"pending"} else {"unknown"};
-    if job_state(&tx,id,src,&tmp,completed,!lease.reclaimable).as_deref()!=Some(expected) { return Ok(false); }
+    if job_state(&tx,id,src,&tmp,completed,&[expected]).as_deref()!=Some(expected) { return Ok(false); }
     if tx.execute("UPDATE transcode_artifacts SET lifecycle='completed' WHERE path IN (?1,?2) AND lifecycle=?3",
         rusqlite::params![tmp.to_string_lossy(),completed.to_string_lossy(),expected])?!=2 { return Ok(false); }
     let changed=tx.execute("UPDATE media SET transcode_path=?1 WHERE id=?2 AND path=?3

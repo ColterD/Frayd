@@ -1252,3 +1252,31 @@ test('reused YouTube callbacks cannot send through a departed host or a guest se
   assert.equal(f.players.length, 1);
   assert.ok(f.b.intervals.size <= 1);
 });
+
+for (const kind of ['video', 'audio']) {
+  test(`effective ${kind} stream replaces a local source despite a retained party ID`, async () => {
+    const b = browser();
+    const entry = kind === 'video' ? 'openVideo' : 'playAudio';
+    b.run(`LIBRARY = [{ id: 9, kind: '${kind === 'video' ? 'movie' : 'music'}', title: 'Party nine' },
+      { id: 10, kind: '${kind === 'video' ? 'movie' : 'music'}', title: 'Local ten' }];
+      partyFollow(9, 'Party nine', 12, true, Date.now()/1000); ${entry}(LIBRARY[1])`);
+    await settle();
+    const media = b.nodes.get(kind === 'video' ? '#plyr-video' : '#pb-audio');
+    media.currentTime = 203;
+    assert.equal(media.src, '/api/stream/10');
+    assert.equal(b.run('partyFollowId'), 9);
+    b.run("partyFollow(9, 'Party nine', 24, true, Date.now()/1000)");
+    await settle();
+    b.requests.length = 0;
+    media.pause();
+    await settle();
+    const saves = b.requests.filter(r => r.url === '/api/progress').map(r => JSON.parse(r.options.body));
+    if (kind === 'video') {
+      assert.equal(b.run('videoItem.id'), 9);
+      assert.ok(!saves.some(save => save.media_id === 9 && save.position === 203), JSON.stringify(saves));
+      assert.ok(saves.some(save => save.media_id === 9 && save.position >= 24 && save.position < 26));
+    }
+    assert.equal(media.src, '/api/stream/9');
+    assert.ok(media.currentTime >= 24 && media.currentTime < 26);
+  });
+}

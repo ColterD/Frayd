@@ -30,7 +30,7 @@ docker compose config --quiet
 git diff --check
 ```
 
-CI selects its preinstalled Node.js 22.23.4 x64 toolcache entry and verifies the exact executable version before adding it to the job PATH. A missing or changed cache entry fails the job; updating this CI version requires checking the runner image and the official Node release. Local checks support Node.js 22+ with the global WebSocket API.
+CI requires Node.js 22.23.4 on its Linux x64 runner. It reuses an exact valid toolcache entry or downloads the official archive with a pinned SHA-256 into temporary job storage, then verifies the executable version before adding it to PATH. Updating the CI version requires checking the official release and archive checksum together. Local checks support Node.js 22+ with the global WebSocket API.
 
 For the Linux x86_64 hash-locked lint environment, create a temporary directory and retain its path for cleanup:
 

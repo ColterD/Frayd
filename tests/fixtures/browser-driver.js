@@ -313,8 +313,10 @@
       active.dispatchEvent(new Event('seeked'));
       equal(forwarded.map(message => message.type), ['pause', 'seek'], 'Active host event forwarding respects actual paused state');
       partyFollowId = null;
+      const sourceBeforeFollow = { src: active.getAttribute('src'), child: active.querySelector('source')?.getAttribute('src') };
       window.partyFollow(id, 'Fixture movie', 12, false, Date.now() / 1000);
-      check(active.getAttribute('src') === `/api/stream/${id}`, 'Follower uses current Plyr media');
+      equal({ src: active.getAttribute('src'), child: active.querySelector('source')?.getAttribute('src') },
+        sourceBeforeFollow, 'Follower retains the current matching Plyr source without reassigning it');
       // HTTP204 supplies no metadata: model readiness explicitly for this synthetic event.
       const readyDescriptor = Object.getOwnPropertyDescriptor(active, 'readyState');
       try {
@@ -355,6 +357,62 @@
   window.fetch = (url, options) => /^\/api\/progress\/(10|11)\?/.test(String(url))
     ? Promise.resolve(new Response(JSON.stringify({ position: 203 }), { headers: { 'Content-Type': 'application/json' } }))
     : originalFetch(url, options);
+  for (const kind of ['video', 'audio']) {
+    await run(`effective ${kind} stream replaces local playback despite a retained party ID`, async () => {
+      delete window.partySend;
+      const priorLibrary = LIBRARY;
+      LIBRARY = [{ id: 9, kind: kind === 'video' ? 'movie' : 'music', title: 'Party nine' },
+        { id: 10, kind: kind === 'video' ? 'movie' : 'music', title: 'Local ten' }];
+      partyFollow(9, 'Party nine', 12, false, Date.now() / 1000);
+      const previous = plyr.media;
+      if (kind === 'video') openVideo(LIBRARY[1]);
+      else playAudio(LIBRARY[1]);
+      const audio = document.getElementById('pb-audio');
+      await until(() => kind === 'video' ? plyr.media !== previous : audio.src.endsWith('/api/stream/10'),
+        'local source installed after saved progress resolves');
+      const media = kind === 'video' ? plyr.media : audio;
+      const readyDescriptor = Object.getOwnPropertyDescriptor(media, 'readyState');
+      const durationDescriptor = Object.getOwnPropertyDescriptor(media, 'duration');
+      const priorFetch = window.fetch;
+      const saves = [];
+      try {
+        Object.defineProperty(media, 'readyState', { configurable: true, value: 1 });
+        Object.defineProperty(media, 'duration', { configurable: true, value: 634 });
+        media.dispatchEvent(new Event('loadedmetadata'));
+        media.currentTime = 203;
+        equal(partyFollowId, 9, 'Party ID remains nine while local source is ten');
+        const localSource = media.src || media.querySelector('source')?.src || media.currentSrc;
+        check(localSource.endsWith('/api/stream/10'), 'Actual local source is ten');
+        window.fetch = (url, options) => {
+          if (String(url) === '/api/progress') saves.push(JSON.parse(options.body));
+          return priorFetch(url, options);
+        };
+        partyFollow(9, 'Party nine', 24, true, Date.now() / 1000);
+        await delay(20);
+        media.pause();
+        await delay(20);
+        const source = media.src || media.querySelector('source')?.src || media.currentSrc;
+        if (kind === 'video') {
+          equal(videoItem.id, 9, 'Progress identity returns to party nine');
+          check(!saves.some(save => save.media_id === 9 && save.position === 203),
+            `Local ten position must not be saved as nine: ${JSON.stringify(saves)}`);
+          check(saves.some(save => save.media_id === 9 && save.position >= 24 && save.position < 26),
+            'Pause saves the party nine position');
+        }
+        check(source.endsWith('/api/stream/9'), `Actual stream returns to nine: ${source}`);
+        check(media.currentTime >= 24 && media.currentTime < 26, 'Party clock replaces local position');
+        return { source, position: media.currentTime, saves, localProgressSettled: true,
+          metadataReadinessModeledAndRestored: true };
+      } finally {
+        LIBRARY = priorLibrary;
+        window.fetch = priorFetch;
+        if (readyDescriptor) Object.defineProperty(media, 'readyState', readyDescriptor);
+        else delete media.readyState;
+        if (durationDescriptor) Object.defineProperty(media, 'duration', durationDescriptor);
+        else delete media.duration;
+      }
+    });
+  }
   let socket;
   window.WebSocket = class {
     constructor() { this.readyState = 1; this.sent = []; socket = this; }
@@ -743,7 +801,7 @@
     () => nativeResume('after prior party lifecycle', true));
   await api('result', { cases, errors, mediaDiagnostics, nativeMedia, passed: cases.filter(item => item.status === 'PASS').length,
     failed: cases.filter(item => item.status === 'FAIL').length,
-    limits: ['IDs10/11 use synthetic media events; native20/21/22 decode the owned H264 fixture. Other codecs, physical output and two-client synchronization remain untested.',
+    limits: ['IDs9/10/11 use synthetic media events; native20/21/22 decode the owned H264 fixture. Other codecs, physical output and two-client synchronization remain untested.',
       'Vendored Plyr retains synthetic event forwarding from detached media; no naturally occurring late event user path is established.',
       'Disposable loopback API; no deployed service, user profile, account, or existing browser session accessed.'] });
 })().catch(error => fetch('/__fixture/result', { method: 'POST', headers: { 'Content-Type': 'application/json' },

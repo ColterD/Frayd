@@ -357,7 +357,7 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
           'Content-Length': end - start + 1, ...(range ? { 'Content-Range': `bytes ${start}-${end}/${media.length}` } : {}) });
         return response.end(media.subarray(start, end + 1));
       }
-      if (/^\/api\/stream\/(10|11)$/.test(path)) { response.writeHead(204); return response.end(); }
+      if (/^\/api\/stream\/(9|10|11)$/.test(path)) { response.writeHead(204); return response.end(); }
       if (path === '/favicon.ico') { response.writeHead(204); return response.end(); }
       const staticFile = path === '/' ? 'client/index.html'
         : path === '/__fixture/browser-driver.js' ? 'tests/fixtures/browser-driver.js'
@@ -414,13 +414,13 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
       cacheControl = cacheSession.receipt;
       return result;
     })(), exited, timedOut]);
-    const expectedCases = 30;
+    const expectedCases = 32;
     const complete = observed.cases.length === expectedCases
       && new Set(observed.cases.map(item => item.name)).size === expectedCases
       && observed.cases.every(item => item.status === 'PASS')
       && observed.passed === expectedCases && observed.failed === 0;
     output = { provenance, ...observed, expectedCases, complete, unexpectedRequests, nativeRequests,
-      fixtureConfiguration: { iconUrl: '/vendor/plyr/plyr.svg', mediaResponses: 'IDs10/11 HTTP204; IDs20/21/22 owned120s H264 MP4 with Range support',
+      fixtureConfiguration: { iconUrl: '/vendor/plyr/plyr.svg', mediaResponses: 'IDs9/10/11 HTTP204; IDs20/21/22 owned120s H264 MP4 with Range support',
         browserSandbox: 'Disabled only for this disposable headless process; EPUB iframe keeps sandbox=allow-scripts.' } };
     if (!complete || observed.failed || observed.errors.length || unexpectedRequests.length) process.exitCode = 1;
   } catch (error) {

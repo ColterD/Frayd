@@ -1,38 +1,45 @@
 //! Listening party: host-controlled playback over WebSocket.
-//! One party at a time (household scale). Guests join by short code,
-//! request tracks, host approves. Host sends play/pause/seek/queue state.
+//! One active party per household; every replacement starts a fresh generation.
 
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
 use rand::Rng;
 use serde_json::Value;
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::mpsc;
 
 #[derive(Default)]
 pub struct Party {
-    /// 4-char join code; None = no party active.
-    pub code: StdMutex<Option<String>>,
-    /// Host identity key.
-    pub host: StdMutex<Option<String>>,
-    /// Names of connected guests (for host UI).
-    pub guests: StdMutex<HashSet<String>>,
-    /// Playback state broadcast to everyone.
-    pub state: StdMutex<PlaybackState>,
-    pub active: AtomicBool,
-    /// Live member sockets: (key, tx) — host + guests, for fan-out.
-    pub members: StdMutex<Vec<(String, Tx)>>,
+    // Serializes generation transitions with authorization, registration, frames and cleanup.
+    // All operations under this lock are synchronous; no guard crosses an await.
+    session: StdMutex<Session>,
 }
 
-impl Party {
-    /// Names: host first, then guests. For members-list UI.
-    pub fn member_names(&self, host: &str) -> Vec<String> {
-        let mut v = vec![format!("{host} (host)")];
-        v.extend(self.guests.lock().unwrap().iter().cloned());
-        v
-    }
+#[derive(Default)]
+struct Session {
+    generation: Arc<()>,
+    code: Option<String>,
+    host: Option<String>,
+    state: PlaybackState,
+    members: Vec<Member>,
+}
+
+struct Member {
+    key: String,
+    socket: Arc<()>,
+    tx: Tx,
+}
+
+/// Authorization captured before upgrade and checked again when the socket registers.
+pub struct Admission {
+    generation: Arc<()>,
+}
+
+struct Connection {
+    admission: Admission,
+    key: String,
+    is_host: bool,
+    socket: Arc<()>,
 }
 
 #[derive(Default, Clone, serde::Serialize)]
@@ -61,54 +68,132 @@ pub struct QueueItem {
 pub type Tx = mpsc::UnboundedSender<Message>;
 
 impl Party {
+    /// Starts with no active generation or connected members.
     pub fn new() -> Self {
-        Self {
-            code: StdMutex::new(None),
-            host: StdMutex::new(None),
-            guests: StdMutex::new(HashSet::new()),
-            state: StdMutex::new(PlaybackState {
-                updated_at: now(),
-                ..Default::default()
-            }),
-            active: AtomicBool::new(false),
-            members: StdMutex::new(Vec::new()),
-        }
+        Self::default()
     }
 
-    /// Broadcast JSON to every live member.
-    pub fn broadcast(&self, v: &Value) {
-        let text = Message::Text(v.to_string());
-        self.members.lock().unwrap().retain(|(_, tx)| {
-            tx.send(text.clone()).is_ok()
-        });
-    }
-
-    /// Host creates a party, returns join code.
+    /// Replaces the old party atomically, retiring its sockets and playback state.
     pub fn create(&self, host: &str) -> String {
-        let code: String = rand::thread_rng()
-            .sample_iter(&rand::distributions::Alphanumeric)
-            .filter(|c| c.is_ascii_alphabetic())
-            .take(4)
-            .map(char::from)
-            .collect::<String>()
-            .to_uppercase();
-        *self.code.lock().unwrap() = Some(code.clone());
-        *self.host.lock().unwrap() = Some(host.to_string());
-        self.active.store(true, Ordering::SeqCst);
+        let mut session = self.session.lock().unwrap();
+        let code = loop {
+            let code = rand::thread_rng()
+                .sample_iter(&rand::distributions::Alphanumeric)
+                .filter(|c| c.is_ascii_alphabetic())
+                .take(4)
+                .map(char::from)
+                .collect::<String>()
+                .to_uppercase();
+            if session.code.as_ref() != Some(&code) {
+                break code;
+            }
+        };
+        session.broadcast(&serde_json::json!({"type": "ended"}));
+        *session = Session {
+            code: Some(code.clone()),
+            host: Some(host.to_string()),
+            state: PlaybackState { updated_at: now(), ..Default::default() },
+            ..Default::default()
+        };
         code
     }
 
-    pub fn is_host(&self, key: &str) -> bool {
-        self.host.lock().unwrap().as_deref() == Some(key)
+    /// Captures the matching generation before identity resolution and HTTP upgrade.
+    /// Keeping this token alive prevents allocation reuse from reviving stale admissions.
+    pub fn authorize(&self, code: &str) -> Option<Admission> {
+        let session = self.session.lock().unwrap();
+        if !session.code.as_ref()?.eq_ignore_ascii_case(code) {
+            return None;
+        }
+        Some(Admission {
+            generation: session.generation.clone(),
+        })
     }
 
-    /// Host-only state mutation, then broadcast.
-    pub fn host_update(&self, msg: &Value) -> bool {
-        self.host_update_at(msg, now())
+    /// Rejects upgrades whose generation retired while identity resolution was in flight.
+    /// Identity roles are derived under the same lock; latest registration owns its key.
+    fn register(&self, admission: Admission, key: String, tx: Tx) -> Option<Connection> {
+        let mut session = self.session.lock().unwrap();
+        if session.code.is_none() || !Arc::ptr_eq(&session.generation, &admission.generation) {
+            return None;
+        }
+        let connection = Connection {
+            admission,
+            is_host: session.host.as_deref() == Some(&key),
+            key,
+            socket: Arc::new(()),
+        };
+        // Latest socket for an identity owns its membership; older callbacks lose authority.
+        session.members.retain(|m| m.key != connection.key);
+        session.members.push(Member {
+            key: connection.key.clone(), socket: connection.socket.clone(), tx: tx.clone(),
+        });
+        let _ = tx.send(Message::Text(serde_json::json!({
+            "type": "state", "state": session.state, "is_host": connection.is_host,
+        }).to_string()));
+        session.broadcast_members();
+        Some(connection)
     }
 
-    fn host_update_at(&self, msg: &Value, timestamp: i64) -> bool {
-        if !self.active.load(Ordering::SeqCst) {
+    /// Checks both generation and socket ownership before relaying or mutating any frame.
+    fn receive(&self, connection: &Connection, value: &Value) {
+        let mut session = self.session.lock().unwrap();
+        if !session.contains(connection) {
+            return;
+        }
+        if connection.is_host {
+            if session.host_update_at(value, now()) {
+                session.broadcast(&serde_json::json!({"type": "state", "state": session.state}));
+            }
+        } else if value["type"] == "request" {
+            session.broadcast(&serde_json::json!({
+                "type": "request", "media_id": value["media_id"],
+                "by": connection.key, "title": value["title"],
+            }));
+        }
+    }
+
+    /// Only the currently registered socket can remove membership or end its generation.
+    fn disconnect(&self, connection: &Connection) {
+        let mut session = self.session.lock().unwrap();
+        if !session.contains(connection) {
+            return;
+        }
+        if connection.is_host {
+            session.broadcast(&serde_json::json!({"type": "ended"}));
+            *session = Session::default();
+        } else {
+            session.members.retain(|m| !Arc::ptr_eq(&m.socket, &connection.socket));
+            session.broadcast_members();
+        }
+    }
+}
+
+impl Session {
+    /// A reused join code or identity key never gives an old socket authority.
+    fn contains(&self, connection: &Connection) -> bool {
+        Arc::ptr_eq(&self.generation, &connection.admission.generation)
+            && self.members.iter().any(|m| Arc::ptr_eq(&m.socket, &connection.socket))
+    }
+
+    /// Enqueues synchronously while the caller holds the session transition lock.
+    fn broadcast(&self, value: &Value) {
+        let text = Message::Text(value.to_string());
+        for member in &self.members {
+            let _ = member.tx.send(text.clone());
+        }
+    }
+
+    /// Derives names from current sockets, avoiding a second guest registry to retire.
+    fn broadcast_members(&self) {
+        let mut names = vec![format!("{} (host)", self.host.as_deref().unwrap_or("host"))];
+        names.extend(self.members.iter().filter(|m| Some(&m.key) != self.host.as_ref()).map(|m| m.key.clone()));
+        self.broadcast(&serde_json::json!({"type": "members", "members": names}));
+    }
+
+    /// Applies a host command while preserving the existing monotonic playback timeline.
+    fn host_update_at(&mut self, msg: &Value, timestamp: i64) -> bool {
+        if self.code.is_none() {
             return false;
         }
         let action = msg["type"].as_str();
@@ -116,8 +201,8 @@ impl Party {
             return false;
         }
         let position = msg["position"].as_f64().filter(|p| p.is_finite() && *p >= 0.0);
-        let mut st = self.state.lock().unwrap();
-        // Concurrent callers can capture timestamps before acquiring this lock.
+        let st = &mut self.state;
+        // Clamp out-of-order timestamps to the current timeline reference.
         let timestamp = timestamp.max(st.updated_at);
         // Preserve elapsed playback before replacing the timeline's reference time.
         if st.playing {
@@ -178,19 +263,9 @@ impl Party {
         true
     }
 
-    pub fn end(&self) {
-        self.active.store(false, Ordering::SeqCst);
-        *self.code.lock().unwrap() = None;
-        *self.host.lock().unwrap() = None;
-        self.guests.lock().unwrap().clear();
-        self.members.lock().unwrap().clear();
-        *self.state.lock().unwrap() = PlaybackState {
-            updated_at: now(),
-            ..Default::default()
-        };
-    }
 }
 
+/// Unix seconds used as the playback timeline reference.
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -198,93 +273,49 @@ fn now() -> i64 {
         .as_secs() as i64
 }
 
-/// WS handler: member loop. Host controls state; guests request tracks.
-/// All state changes broadcast to every member via the registry.
-pub async fn member_socket(party: Arc<Party>, socket: WebSocket, key: String, is_host: bool) {
+/// Every frame and disconnect is scoped to the registered generation and socket.
+pub async fn member_socket(party: Arc<Party>, socket: WebSocket, admission: Admission, key: String) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-
-    party.members.lock().unwrap().push((key.clone(), tx.clone()));
-    if is_host {
-        // rejoining host replaces any stale entry
-        party.members.lock().unwrap().retain(|(k, _)| k != &key || true);
-    } else {
-        party.guests.lock().unwrap().insert(key.clone());
-    }
-
-    // initial state snapshot
-    let snapshot = {
-        let st = party.state.lock().unwrap();
-        serde_json::json!({ "type": "state", "state": *st, "is_host": is_host })
-    };
-    if sink.send(Message::Text(snapshot.to_string())).await.is_err() {
-        return;
-    }
-    if !is_host {
-        let names = party.member_names(party.host.lock().unwrap().as_deref().unwrap_or("host"));
-        party.broadcast(&serde_json::json!({ "type": "members", "members": names }));
-    }
-
-    // outbound pump: server→client
-    let out_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if sink.send(msg).await.is_err() {
+    let Some(connection) = party.register(admission, key, tx) else { return };
+    let mut out_task = tokio::spawn(async move {
+        while let Some(message) = rx.recv().await {
+            if sink.send(message).await.is_err() {
                 break;
             }
         }
     });
-
-    // inbound: client→server
-    while let Some(Ok(msg)) = stream.next().await {
-        let text = match msg {
-            Message::Text(t) => t,
-            Message::Close(_) => break,
-            _ => continue,
-        };
-        let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
-        match v["type"].as_str() {
-            // guest asks for a track → relay to host + show as pending on host UI
-            Some("request") if !is_host => {
-                let req = serde_json::json!({
-                    "type": "request", "media_id": v["media_id"], "by": key,
-                    "title": v["title"],
-                });
-                party.broadcast(&req);
-            }
-            // host control → mutate party state, broadcast new state to all
-            Some(t) if is_host && matches!(t, "play" | "pause" | "seek" | "load" | "approve" | "skip") => {
-                if party.host_update(&v) {
-                    let st = party.state.lock().unwrap();
-                    party.broadcast(&serde_json::json!({ "type": "state", "state": *st }));
+    loop {
+        // Retiring membership drops its sender and terminates the old socket as well.
+        tokio::select! {
+            _ = &mut out_task => break,
+            message = stream.next() => {
+                match message {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                            party.receive(&connection, &value);
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                    _ => {}
                 }
             }
-            _ => {}
         }
     }
-
-    // cleanup
-    party.members.lock().unwrap().retain(|(k, _)| k != &key);
-    if is_host {
-        party.broadcast(&serde_json::json!({ "type": "ended" }));
-        party.end();
-    } else {
-        party.guests.lock().unwrap().remove(&key);
-        let names = party.member_names(party.host.lock().unwrap().as_deref().unwrap_or("host"));
-        party.broadcast(&serde_json::json!({ "type": "members", "members": names }));
-    }
+    party.disconnect(&connection);
     out_task.abort();
 }
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Seeds a deterministic timeline without depending on wall-clock progress.
     fn playing_party() -> Party {
         let party = Party::new();
-        party.active.store(true, Ordering::SeqCst);
-        *party.state.lock().unwrap() = PlaybackState {
+        party.create("host");
+        party.session.lock().unwrap().state = PlaybackState {
             media_id: Some(1),
             position: 10.0,
             playing: true,
@@ -299,12 +330,13 @@ mod tests {
         let party = playing_party();
         let mut timeline = Vec::new();
         for timestamp in [120, 110, 120, 130] {
-            assert!(party.host_update_at(&json!({"type": "approve", "title": "Next"}), timestamp));
-            let state = party.state.lock().unwrap();
+            assert!(party.session.lock().unwrap().host_update_at(&json!({"type": "approve", "title": "Next"}), timestamp));
+            let session = party.session.lock().unwrap();
+            let state = &session.state;
             timeline.push((state.position, state.updated_at));
         }
         assert_eq!(timeline, [(30.0, 120), (30.0, 120), (30.0, 120), (40.0, 130)]);
-        assert_eq!(party.state.lock().unwrap().queue.len(), 4);
+        assert_eq!(party.session.lock().unwrap().state.queue.len(), 4);
     }
 
     #[test]
@@ -323,8 +355,9 @@ mod tests {
             (json!({"type": "skip"}), 139, 0.0, true, 140),
             (json!({"type": "pause"}), 150, 10.0, false, 150),
         ] {
-            assert!(party.host_update_at(&message, timestamp));
-            let state = party.state.lock().unwrap();
+            assert!(party.session.lock().unwrap().host_update_at(&message, timestamp));
+            let session = party.session.lock().unwrap();
+            let state = &session.state;
             assert_eq!((state.position, state.playing, state.updated_at),
                 (expected_position, expected_playing, expected_time), "{message} at {timestamp}");
         }
@@ -333,30 +366,30 @@ mod tests {
     #[test]
     fn play_pause_use_supplied_position_and_legacy_commands_preserve_elapsed_time() {
         let party = playing_party();
-        assert!(party.host_update_at(&json!({"type": "pause", "position": 47.5}), 120));
-        let paused = party.state.lock().unwrap().clone();
+        assert!(party.session.lock().unwrap().host_update_at(&json!({"type": "pause", "position": 47.5}), 120));
+        let paused = party.session.lock().unwrap().state.clone();
         assert_eq!(paused.position, 47.5);
         assert!(!paused.playing);
-        assert!(party.host_update_at(&json!({"type": "play"}), 130));
-        assert_eq!(party.state.lock().unwrap().position, 47.5);
-        assert!(party.host_update_at(&json!({"type": "pause"}), 140));
-        assert_eq!(party.state.lock().unwrap().position, 57.5);
-        assert!(party.host_update_at(&json!({"type": "play", "position": 72.0}), 150));
-        assert_eq!(party.state.lock().unwrap().position, 72.0);
+        assert!(party.session.lock().unwrap().host_update_at(&json!({"type": "play"}), 130));
+        assert_eq!(party.session.lock().unwrap().state.position, 47.5);
+        assert!(party.session.lock().unwrap().host_update_at(&json!({"type": "pause"}), 140));
+        assert_eq!(party.session.lock().unwrap().state.position, 57.5);
+        assert!(party.session.lock().unwrap().host_update_at(&json!({"type": "play", "position": 72.0}), 150));
+        assert_eq!(party.session.lock().unwrap().state.position, 72.0);
     }
 
     #[test]
     fn approve_and_empty_skip_materialize_the_running_timeline() {
         let party = playing_party();
-        assert!(party.host_update_at(&json!({"type": "approve", "media_id": 2, "title": "Next"}), 120));
-        assert_eq!(party.state.lock().unwrap().position, 30.0);
-        assert_eq!(party.state.lock().unwrap().updated_at, 120);
-        assert!(party.host_update_at(&json!({"type": "skip"}), 125));
-        let next = party.state.lock().unwrap().clone();
+        assert!(party.session.lock().unwrap().host_update_at(&json!({"type": "approve", "media_id": 2, "title": "Next"}), 120));
+        assert_eq!(party.session.lock().unwrap().state.position, 30.0);
+        assert_eq!(party.session.lock().unwrap().state.updated_at, 120);
+        assert!(party.session.lock().unwrap().host_update_at(&json!({"type": "skip"}), 125));
+        let next = party.session.lock().unwrap().state.clone();
         assert_eq!(next.media_id, Some(2));
         assert_eq!(next.position, 0.0);
-        assert!(party.host_update_at(&json!({"type": "skip"}), 135));
-        let empty = party.state.lock().unwrap().clone();
+        assert!(party.session.lock().unwrap().host_update_at(&json!({"type": "skip"}), 135));
+        let empty = party.session.lock().unwrap().state.clone();
         assert_eq!(empty.position, 10.0);
         assert_eq!(empty.updated_at, 135);
         assert_eq!(empty.media_id, None);
@@ -366,16 +399,112 @@ mod tests {
     fn invalid_positions_fall_back_without_rewinding_and_load_resets() {
         for position in [json!(-1), json!("NaN"), Value::Null] {
             let party = playing_party();
-            assert!(party.host_update_at(&json!({"type": "pause", "position": position}), 120));
-            assert_eq!(party.state.lock().unwrap().position, 30.0);
+            assert!(party.session.lock().unwrap().host_update_at(&json!({"type": "pause", "position": position}), 120));
+            assert_eq!(party.session.lock().unwrap().state.position, 30.0);
         }
         let party = playing_party();
-        let before = serde_json::to_value(&*party.state.lock().unwrap()).unwrap();
-        assert!(!party.host_update_at(&json!({"type": "unknown"}), 120));
-        assert_eq!(serde_json::to_value(&*party.state.lock().unwrap()).unwrap(), before);
-        assert!(party.host_update_at(&json!({"type": "pause"}), 125));
-        assert_eq!(party.state.lock().unwrap().position, 35.0);
-        assert!(party.host_update_at(&json!({"type": "load", "media_id": 3}), 130));
-        assert_eq!(party.state.lock().unwrap().position, 0.0);
+        let before = serde_json::to_value(&party.session.lock().unwrap().state).unwrap();
+        assert!(!party.session.lock().unwrap().host_update_at(&json!({"type": "unknown"}), 120));
+        assert_eq!(serde_json::to_value(&party.session.lock().unwrap().state).unwrap(), before);
+        assert!(party.session.lock().unwrap().host_update_at(&json!({"type": "pause"}), 125));
+        assert_eq!(party.session.lock().unwrap().state.position, 35.0);
+        assert!(party.session.lock().unwrap().host_update_at(&json!({"type": "load", "media_id": 3}), 130));
+        assert_eq!(party.session.lock().unwrap().state.position, 0.0);
+    }
+
+    /// Registers a socket channel so tests exercise the production ownership checks.
+    fn connect(party: &Party, code: &str, key: &str) -> (Connection, mpsc::UnboundedReceiver<Message>) {
+        let admission = party.authorize(code).unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        (party.register(admission, key.to_string(), tx).unwrap(), rx)
+    }
+
+    /// Collects queued protocol envelopes without starting an outbound socket task.
+    fn drain(rx: &mut mpsc::UnboundedReceiver<Message>) -> Vec<Value> {
+        let mut messages = Vec::new();
+        while let Ok(Message::Text(text)) = rx.try_recv() {
+            messages.push(serde_json::from_str(&text).unwrap());
+        }
+        messages
+    }
+
+    #[test]
+    fn replacement_rejects_stale_registration_even_when_code_and_host_are_reused() {
+        let party = Party::new();
+        let code = party.create("host");
+        let delayed = party.authorize(&code.to_lowercase()).unwrap();
+        party.create("host");
+        // Force a short-code collision: only the generation conveys authority.
+        party.session.lock().unwrap().code = Some(code.clone());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        assert!(party.register(delayed, "host".into(), tx).is_none());
+        assert!(party.authorize("missing").is_none());
+        let (host, _) = connect(&party, &code, "host");
+        party.receive(&host, &json!({"type":"load", "title":"current"}));
+        assert_eq!(party.session.lock().unwrap().state.title.as_deref(), Some("current"));
+    }
+
+    #[test]
+    fn stale_host_frames_and_guest_cleanup_cannot_touch_replacement() {
+        let party = Party::new();
+        let old_code = party.create("host");
+        let (old_host, mut old_host_rx) = connect(&party, &old_code, "host");
+        let (old_guest, mut old_guest_rx) = connect(&party, &old_code, "guest");
+        party.receive(&old_host, &json!({"type":"load", "external_url":"old", "position":27}));
+        party.receive(&old_host, &json!({"type":"approve", "title":"old queue"}));
+        let code = party.create("host");
+        assert!(drain(&mut old_host_rx).iter().any(|v| v["type"] == "ended"));
+        assert!(drain(&mut old_guest_rx).iter().any(|v| v["type"] == "ended"));
+        let (host, mut host_rx) = connect(&party, &code, "host");
+        let (_guest, mut guest_rx) = connect(&party, &code, "guest");
+        {
+            let session = party.session.lock().unwrap();
+            assert_eq!(session.state.external_url, None);
+            assert_eq!(session.state.position, 0.0);
+            assert!(!session.state.playing);
+            assert!(session.state.queue.is_empty());
+            assert_eq!(session.members.len(), 2);
+        }
+        party.receive(&host, &json!({"type":"load", "external_url":"new"}));
+        drain(&mut host_rx);
+        drain(&mut guest_rx);
+        for message in [json!({"type":"load", "external_url":"stale"}), json!({"type":"pause"}), json!({"type":"approve", "title":"stale"})] {
+            party.receive(&old_host, &message);
+        }
+        party.receive(&old_guest, &json!({"type":"request", "title":"stale request"}));
+        party.disconnect(&old_guest);
+        party.disconnect(&old_host);
+        let session = party.session.lock().unwrap();
+        assert_eq!(session.code.as_deref(), Some(code.as_str()));
+        assert_eq!(session.state.external_url.as_deref(), Some("new"));
+        assert!(session.state.playing);
+        assert!(session.state.queue.is_empty());
+        assert_eq!(session.members.len(), 2);
+        assert!(drain(&mut host_rx).is_empty());
+        assert!(drain(&mut guest_rx).is_empty());
+    }
+
+    #[test]
+    fn duplicate_sockets_lose_frame_and_cleanup_authority_without_removing_current_members() {
+        let party = Party::new();
+        let code = party.create("host");
+        let (old_host, _) = connect(&party, &code, "host");
+        let (host, mut host_rx) = connect(&party, &code, "host");
+        let (old_guest, _) = connect(&party, &code, "guest");
+        let (_guest, mut guest_rx) = connect(&party, &code, "guest");
+        drain(&mut host_rx);
+        drain(&mut guest_rx);
+        party.receive(&old_host, &json!({"type":"load", "title":"stale"}));
+        party.receive(&old_guest, &json!({"type":"request", "title":"stale"}));
+        party.disconnect(&old_host);
+        party.disconnect(&old_guest);
+        assert!(drain(&mut host_rx).is_empty());
+        assert_eq!(party.session.lock().unwrap().members.len(), 2);
+        party.receive(&host, &json!({"type":"load", "title":"current"}));
+        assert!(drain(&mut guest_rx).iter().any(|v| v["state"]["title"] == "current"));
+        party.disconnect(&host);
+        assert!(drain(&mut guest_rx).iter().any(|v| v["type"] == "ended"));
+        assert!(party.authorize(&code).is_none());
+        assert!(party.session.lock().unwrap().members.is_empty());
     }
 }

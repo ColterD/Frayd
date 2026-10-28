@@ -12,11 +12,23 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Select preinstalled Node.js 22.23.4
+      - name: Set up Node.js 22.23.4
         shell: bash
         run: |
+          test "$(uname -s)" = "Linux"
+          test "$(uname -m)" = "x86_64"
           FRAYD_NODE_BIN_DIRECTORY="$RUNNER_TOOL_CACHE/node/22.23.4/x64/bin"
-          test -x "$FRAYD_NODE_BIN_DIRECTORY/node"
+          if ! test -x "$FRAYD_NODE_BIN_DIRECTORY/node" || test "$("$FRAYD_NODE_BIN_DIRECTORY/node" --version)" != "v22.23.4"; then
+            FRAYD_NODE_TEMP_DIRECTORY="$(mktemp -d "$RUNNER_TEMP/frayd-node-22.23.4.XXXXXXXX")"
+            FRAYD_NODE_ARCHIVE="$FRAYD_NODE_TEMP_DIRECTORY/node-v22.23.4-linux-x64.tar.xz"
+            trap 'rm -f -- "$FRAYD_NODE_ARCHIVE"' EXIT
+            curl --fail --silent --show-error --location --retry 2 --max-time 120 \
+              --output "$FRAYD_NODE_ARCHIVE" https://nodejs.org/dist/v22.23.4/node-v22.23.4-linux-x64.tar.xz
+            # Official v22.23.4 SHASUMS256.txt; verify before extracting or executing.
+            printf '%s  %s\n' 1805bcd35e6815559bd2eb97db438d3fdb0eb3a5e6a977b7c1badca76337e9ce "$FRAYD_NODE_ARCHIVE" | sha256sum --check --status
+            tar -xJf "$FRAYD_NODE_ARCHIVE" -C "$FRAYD_NODE_TEMP_DIRECTORY"
+            FRAYD_NODE_BIN_DIRECTORY="$FRAYD_NODE_TEMP_DIRECTORY/node-v22.23.4-linux-x64/bin"
+          fi
           test "$("$FRAYD_NODE_BIN_DIRECTORY/node" --version)" = "v22.23.4"
           printf '%s\n' "$FRAYD_NODE_BIN_DIRECTORY" >> "$GITHUB_PATH"
       - name: Client tests

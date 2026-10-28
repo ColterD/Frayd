@@ -675,18 +675,9 @@ async fn party_ws(
     Query(q): Query<std::collections::HashMap<String, String>>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    // validate: party exists + code matches
-    let code_ok = app
-        .party
-        .code
-        .lock()
-        .unwrap()
-        .as_deref()
-        .map(|c| c.eq_ignore_ascii_case(&code))
-        .unwrap_or(false);
-    if !code_ok {
+    let Some(admission) = app.party.authorize(&code) else {
         return StatusCode::NOT_FOUND.into_response();
-    }
+    };
 
     // resolve identity: token first, LAN fallback
     let key = {
@@ -698,8 +689,7 @@ async fn party_ws(
             Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
         }
     };
-    let is_host = app.party.is_host(&key);
-    ws.on_upgrade(move |socket| party::member_socket(app.party.clone(), socket, key, is_host))
+    ws.on_upgrade(move |socket| party::member_socket(app.party.clone(), socket, admission, key))
         .into_response()
 }
 

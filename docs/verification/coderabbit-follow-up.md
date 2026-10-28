@@ -140,6 +140,11 @@ A resolved review thread and a passing check are separate evidence.
 | [LEDGER-DECLARATION](https://github.com/ColterD/Frayd/pull/2#discussion_r4405902986) | Minor | The introduction still declared 48 records while the rendered table had grown to 61. | The introduction now describes the table without duplicating its mutable count. The PR body and GFM receipt record the measured count for each source revision; historical source-specific counts remain qualified. |
 | [PARTY-START-OWNER](https://github.com/ColterD/Frayd/pull/2#discussion_r4406015132) | Minor | Overlapping Start responses can replace the first host socket and end the party they just created. | One pending request owns Start through HTTP and JSON completion. Leave and Join invalidate stale responses; failures permit retry without releasing a newer request. Staggered-response baselines fail; all 18 focused party tests and the shared 133 Node / 30 DOM run pass. |
 | [YOUTUBE-HOST-SENDER](https://github.com/ColterD/Frayd/pull/2#discussion_r4406015143) | Major | A reused player retains the guest session's host flag, preventing Play/Pause publication after hosting the same video. | The inline anchor is party.js, but the captured callback is in app.js. Callbacks and one rebound seek poller use the current host sender, retaining identity/readiness/ownership guards. Guest-to-host reuse publishes play, pause and seek with one player; guest/departed sessions send nothing. The shared 133 Node / 30 DOM run passes; the external adapter is mocked. |
+| [NODE-PROVISIONING](https://github.com/ColterD/Frayd/pull/2#discussion_r4406484592) | Major | CI requires an exact preinstalled Node cache path that a runner image may not contain. | A valid exact-version cache remains the fast path; a missing/invalid entry uses the official archive with pinned SHA-256 before extraction and an exact runtime guard. Twelve controlled checks pass, including actual Node download/WebSocket, no-network cache reuse and corrupt-archive rejection. Prior hosted passes do not reproduce missing-cache failure; no new action dependency was added. |
+| [EFFECTIVE-STREAM-IDENTITY](https://github.com/ColterD/Frayd/pull/2#discussion_r4406484598) | Major | A local media selection can replace the element source while the cached last-party ID remains unchanged; refollow can misattribute another movie's position. | Both Node and real DOM baselines reproduce media 9 receiving media 10's position and audio retaining stream 10. Source change and ownership guards now share the effective stream comparison. All 93 client tests, 135 combined Node tests and 32 DOM cases pass. Actually matching child sources retain zero source reassignment; audio progress ownership is a separate pre-existing limit. |
+| [REPLACED-SOURCE-RETIREMENT](https://github.com/ColterD/Frayd/pull/2#discussion_r4406484606) | Major | Clearing a known replaced source's playback pointer leaves the completed generated pair outside recovery. | The pointer-clear transaction retires only the exact registered, inactive, unreferenced prior pair after containment and lease checks. Three real recovery cycles remove six stale rows and three directories while preserving the historical neighbor. Five scanner tests cover 17 modes; the normal combined Rust suite passes 57 tests. Unknown, referenced, active and unrelated history retain protection. |
+
+Full review [5690203516](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5690203516) covers `a7a6dab` through `0fbbedf`: 41 selected files and two filtered assets. It publishes NODE-PROVISIONING, EFFECTIVE-STREAM-IDENTITY and REPLACED-SOURCE-RETIREMENT, all Major. No additional nitpick, outside-diff or tool section is published. Its execution check succeeds; finding disposition depends on the corrections and verification above. The full review publishes no new docstring metric; the prior incremental score is 80.60% against 80%, with 134 functions in 24 files and two unsupported skips.
 
 Full review [5689608434](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5689608434) covers `a7a6dab` through `776b030`: 41 selected files and the SVG/MP4 filters. Its cached-video comment repeats CACHED-VIDEO-ACTIVATION and is supporting evidence, not another requirement. It adds PARTY-START-OWNER and YOUTUBE-HOST-SENDER. Published coverage is 81.82% against 80%, across 132 functions and 24 files, with 15 unsupported skips. These are that source revision's service results.
 
@@ -672,3 +677,25 @@ scan-phase and proxy recovery scenarios all pass in the same run. Both baseline
 and fixed fixtures have zero owned containers, networks or volumes after cleanup.
 The configured CI integration command includes this case. Final-head CI and full
 review remain acceptance gates for the combined change.
+
+## Replacement party sessions
+
+An isolated two-client real YouTube run exposed a separate server defect: after
+a guest left and created a new party with the same player, the old host's
+disconnect broadcast `ended` into that replacement. This is a runtime finding,
+not an extra CodeRabbit disposition-table entry.
+
+[Party state](../../server/src/party.rs) now has one transition lock, private
+generation tokens and per-socket tokens. Creation retires the old registry and
+resets playback atomically. [WebSocket admission](../../server/src/main.rs)
+captures and rechecks its generation after identity resolution. Stale
+registrations, frames and cleanup cannot mutate a replacement or a newer socket
+with the same identity. The current host's Leave still ends the current party.
+
+The real WebSocket baseline fails and the corrected five-scenario harness
+passes. Eight focused party tests include the five existing timeline controls;
+the normal combined Rust suite passes 57 tests. The server proactively closes
+retired sockets, so old wire commands are not asserted as delivered; production
+receive-path unit controls prove stale-frame rejection. Actual two-client
+YouTube Play/Pause must be repeated against the rebuilt server before claiming
+that final browser acceptance.
