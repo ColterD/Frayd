@@ -76,6 +76,7 @@ async fn main() {
         .route("/api/auth/logout", post(auth_logout))
         .route("/api/auth/me", get(auth_me))
         .route("/api/auth/password", post(auth_change_password))
+        .route("/api/setup", get(setup_status).post(auth_setup))
         .route("/api/admin/perms", get(list_perms).post(set_perm))
         .route("/api/admin/settings", get(get_settings).post(set_setting))
         .route("/api/thumb/:id", get(thumb))
@@ -93,6 +94,12 @@ async fn main() {
         .route("/api/annotations", post(create_annotation))
         .route("/api/annotations", axum::routing::delete(delete_annotation))
         .nest_service("/", ServeDir::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../client")))
+        .layer(
+            tower_http::cors::CorsLayer::new()
+                .allow_origin(tower_http::cors::Any)
+                .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::DELETE])
+                .allow_headers([axum::http::header::AUTHORIZATION, axum::http::header::CONTENT_TYPE]),
+        )
         .with_state(state.clone());
 
     // Port: FRAYD_PORT env > settings.port > 8484
@@ -305,6 +312,57 @@ async fn auth_change_password(
     match auth::change_password(&db, &key, &req.old, &req.new) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+/// GET /api/setup → {needed: bool} — true while zero accounts exist.
+async fn setup_status(State(app): State<std::sync::Arc<App>>) -> impl IntoResponse {
+    let db = app.db.lock().unwrap();
+    let have: i64 = db
+        .query_row("SELECT COUNT(*) FROM identities WHERE kind='account'", [], |r| r.get(0))
+        .unwrap_or(0);
+    Json(serde_json::json!({ "needed": have == 0 }))
+}
+
+#[derive(serde::Deserialize)]
+struct SetupReq {
+    email: String,
+    password: String,
+}
+
+/// POST /api/setup {email, password} — one-shot owner creation.
+/// Only works while ZERO accounts exist; the created account is always admin.
+async fn auth_setup(
+    State(app): State<std::sync::Arc<App>>,
+    Json(req): Json<SetupReq>,
+) -> impl IntoResponse {
+    if req.password.len() < 4 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "password too short (min 4)"}))).into_response();
+    }
+    let db = app.db.lock().unwrap();
+    let have: i64 = db
+        .query_row("SELECT COUNT(*) FROM identities WHERE kind='account'", [], |r| r.get(0))
+        .unwrap_or(0);
+    if have > 0 {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({"error": "setup already done — log in instead"}))).into_response();
+    }
+    if let Err(e) = auth::create_account(&db, &req.email, &req.password) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response();
+    }
+    let iid: i64 = db
+        .query_row("SELECT id FROM identities WHERE kind='account' AND key = ?1", [&req.email], |r| r.get(0))
+        .unwrap_or(0);
+    let _ = db.execute(
+        "INSERT INTO user_perms (identity_id, is_admin) VALUES (?1, 1)
+         ON CONFLICT(identity_id) DO UPDATE SET is_admin = 1",
+        rusqlite::params![iid],
+    );
+    match auth::create_session(&db, iid) {
+        Ok(token) => {
+            let name = req.email.split('@').next().unwrap_or("owner").to_string();
+            (StatusCode::OK, Json(serde_json::json!({"token": token, "name": name, "is_admin": true}))).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response(),
     }
 }
 

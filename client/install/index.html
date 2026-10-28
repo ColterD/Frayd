@@ -52,6 +52,14 @@
 
   <div class="status" id="stat"></div>
 
+  <div id="setup" style="display:none; margin-top:18px; border-top:1px solid var(--line); padding-top:16px">
+    <label>Create your owner account (this becomes the admin)</label>
+    <input type="email" id="s-email" placeholder="you@example.com" style="margin-bottom:8px">
+    <input type="password" id="s-pw" placeholder="Password (min 4 chars)">
+    <button class="btn" id="s-go">Create owner &amp; sign in</button>
+    <div class="status" id="s-stat"></div>
+  </div>
+
   <ol class="steps">
     <li>Pick your OS, enter your media folder path</li>
     <li>Copy the command, paste it in a terminal (PowerShell on Windows)</li>
@@ -101,18 +109,45 @@ $('#copy').onclick = () => { navigator.clipboard.writeText($('#cmd').textContent
 
 // poll for a live server: localhost then LAN hostname
 const targets = ['http://localhost:8484', `http://${location.hostname}:8484`].filter((v, i, a) => a.indexOf(v) === i);
-let found = false;
+let liveBase = null;
 async function poll() {
   for (const t of targets) {
     try {
       const r = await fetch(t + '/api/library', { mode: 'no-cors', signal: AbortSignal.timeout(2500) });
-      if (r.type === 'opaque' || r.ok) { found = true; $('#stat').innerHTML = `<span class="ok">✓ Server is live at ${t} — go log in</span> <a href="${t}" style="color:var(--acc)">open Frayd →</a>`; return; }
+      if (r.type === 'opaque' || r.ok) { liveBase = t; break; }
     } catch {}
   }
-  if (!found) $('#stat').textContent = 'Waiting for your server to come up…';
-  setTimeout(poll, 3000);
+  if (!liveBase) { $('#stat').textContent = 'Waiting for your server to come up…'; setTimeout(poll, 3000); return; }
+  $('#stat').innerHTML = `<span class="ok">✓ Server is live at ${liveBase}</span> <a href="${liveBase}" style="color:var(--acc)">open Frayd →</a>`;
+  // setup needed? (only works same-origin or with CORS; best-effort)
+  try {
+    const s = await (await fetch(liveBase + '/api/setup', { signal: AbortSignal.timeout(2500) })).json();
+    if (s.needed) $('#setup').style.display = 'block';
+    else $('#s-stat').innerHTML = '<span class="ok">Owner already set up — just log in.</span>';
+  } catch {
+    // CORS-blocked (page hosted off-origin): direct them to the app; app handles first-login bootstrap
+    $('#s-stat').innerHTML = 'Can’t check setup from here — open Frayd and log in; first account becomes admin.';
+  }
 }
 poll();
+
+$('#s-go')?.addEventListener('click', async () => {
+  const email = $('#s-email').value.trim(), pw = $('#s-pw').value;
+  if (!email.includes('@') || pw.length < 4) { $('#s-stat').innerHTML = '<span class="err">Email + password (min 4) required</span>'; return; }
+  try {
+    const r = await fetch(liveBase + '/api/setup', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password: pw }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok) {
+      $('#s-stat').innerHTML = `<span class="ok">✓ Owner created. You're signed in.</span> <a href="${liveBase}" style="color:var(--acc)">Open Frayd →</a>`;
+      $('#setup').style.display = 'none';
+    } else {
+      $('#s-stat').innerHTML = `<span class="err">${j.error || 'Failed (' + r.status + ')'}</span>`;
+    }
+  } catch { $('#s-stat').innerHTML = '<span class="err">Could not reach server</span>'; }
+});
 </script>
 </body>
 </html>
