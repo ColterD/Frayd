@@ -27,6 +27,7 @@ pub fn needs_transcode(src: &str) -> bool {
 /// Backfill only distinct, unambiguous legacy final references. Never infer temp ownership.
 /// Remove only generated artifact media rows without user data or competing ownership.
 /// Legacy playback references do not prove generation and never authorize row deletion.
+/// Indexed legacy targets remain scan eligible; unindexed playback retains compatibility exclusion.
 /// This is walk-independent, so missing registered artifacts are reconciled too.
 pub fn reconcile_artifacts(db: &Connection) -> HashSet<String> {
     let result = db.execute_batch("INSERT OR IGNORE INTO transcode_artifacts
@@ -47,7 +48,8 @@ pub fn reconcile_artifacts(db: &Connection) -> HashSet<String> {
     let mut owned = HashSet::new();
     let Ok(mut statement) = db.prepare("SELECT a.path FROM transcode_artifacts a JOIN media m
         ON m.id=a.owner_media_id AND m.path=a.owner_source_path WHERE a.path != m.path
-        AND NOT EXISTS (SELECT 1 FROM media other WHERE other.transcode_path=a.path AND other.id != m.id)") else { return owned };
+        AND NOT EXISTS (SELECT 1 FROM media other WHERE other.transcode_path=a.path AND other.id != m.id)
+        AND NOT (a.provenance='legacy_reference' AND EXISTS (SELECT 1 FROM media indexed_media WHERE indexed_media.path=a.path))") else { return owned };
     let Ok(rows) = statement.query_map([], |r| r.get::<_, String>(0)) else { return owned };
     for path in rows.flatten() { owned.insert(path); }
     drop(statement);
@@ -295,7 +297,8 @@ mod tests {
         OR EXISTS (SELECT 1 FROM media other WHERE other.transcode_path=a.path AND other.id != a.owner_media_id)"#,
         r#"SELECT a.path FROM transcode_artifacts a JOIN media m
         ON m.id=a.owner_media_id AND m.path=a.owner_source_path WHERE a.path != m.path
-        AND NOT EXISTS (SELECT 1 FROM media other WHERE other.transcode_path=a.path AND other.id != m.id)"#,
+        AND NOT EXISTS (SELECT 1 FROM media other WHERE other.transcode_path=a.path AND other.id != m.id)
+        AND NOT (a.provenance='legacy_reference' AND EXISTS (SELECT 1 FROM media indexed_media WHERE indexed_media.path=a.path))"#,
         r#"DELETE FROM media WHERE path=?1
             AND EXISTS (SELECT 1 FROM transcode_artifacts a WHERE a.path=media.path AND a.provenance='generated')
             AND NOT EXISTS (SELECT 1 FROM progress WHERE media_id=media.id)
@@ -350,21 +353,21 @@ mod tests {
             plan
         }).collect::<Vec<_>>();
         for (index,alias,column) in [(0,"x","transcode_path"),(1,"other","transcode_path"),
-            (2,"other","transcode_path"),(3,"transcode_artifacts","owner_media_id")] {
+            (2,"other","transcode_path"),(2,"indexed_media","path"),(3,"transcode_artifacts","owner_media_id")] {
             assert!(plans[index].iter().any(|line|line.contains(&format!("SEARCH {alias} USING"))
                 && line.contains(&format!("({column}=?)"))),"unindexed correlated lookup: {:?}",plans[index]);
         }
         assert_eq!(db.execute(ARTIFACT_PLAN_QUERIES[0],[]).unwrap(),1);
         assert_eq!(db.query_row(ARTIFACT_PLAN_QUERIES[1],[],|row|row.get::<_,i64>(0)).unwrap(),1);
         let ownership_count=db.prepare(ARTIFACT_PLAN_QUERIES[2]).unwrap().query_map([],|row|row.get::<_,String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap().len();
-        assert_eq!(ownership_count,6001);
+        assert_eq!(ownership_count,6000);
         assert_eq!(db.execute(ARTIFACT_PLAN_QUERIES[3],["/cache/1/audio.tmp.mp4"]).unwrap(),1);
-        for _ in 0..2 { assert_eq!(reconcile_artifacts(&db).len(),6001); }
+        for _ in 0..2 { assert_eq!(reconcile_artifacts(&db).len(),6000); }
         assert_eq!(db.query_row("SELECT COUNT(*) FROM media",[],|row|row.get::<_,i64>(0)).unwrap(),3004);
         assert_eq!(db.query_row("SELECT COUNT(*) FROM transcode_artifacts",[],|row|row.get::<_,i64>(0)).unwrap(),6002);
         assert_eq!(db.query_row("SELECT COUNT(*) FROM media WHERE id BETWEEN 3002 AND 3005",[],|row|row.get::<_,i64>(0)).unwrap(),4);
         assert_eq!(db.query_row("SELECT position FROM progress WHERE media_id=3002",[],|row|row.get::<_,f64>(0)).unwrap(),42.0);
-        println!("RESULTS backfill_inserted=1 conflicts=1 owned_paths=6001 cleanup_removed=1 final_media=3004 final_artifacts=6002 protected_media=4 progress=42 repeated_reconciliation=2");
+        println!("RESULTS backfill_inserted=1 conflicts=1 owned_paths=6000 cleanup_removed=1 final_media=3004 final_artifacts=6002 protected_media=4 progress=42 repeated_reconciliation=2");
     }
 
     /// Reject preexisting namespace objects before any outside write or ownership publication.

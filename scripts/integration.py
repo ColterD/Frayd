@@ -7,6 +7,7 @@ import json
 import os
 import secrets
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -15,7 +16,7 @@ import urllib.error
 import urllib.request
 import uuid
 import zipfile
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -128,6 +129,19 @@ def wait_for_scan_idle():
             return
         time.sleep(0.5)
     raise AssertionError('disposable scan did not finish within 30 seconds')
+
+
+def legacy_fixture_snapshot(database):
+    """Read only nonsecret media/progress columns from the disposable fixture DB."""
+    with closing(sqlite3.connect(database.resolve().as_uri() + '?mode=ro', uri=True)) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute('BEGIN')
+        assert connection.execute('PRAGMA quick_check').fetchone()[0] == 'ok'
+        media = [dict(row) for row in connection.execute(
+            'SELECT id,kind,path,title,size_bytes,mtime_secs,transcode_path FROM media WHERE id IN (1,2) ORDER BY id')]
+        progress = [dict(row) for row in connection.execute(
+            'SELECT identity_id,media_id,position,completed,updated_at FROM progress WHERE identity_id=1 AND media_id=2')]
+        return {'media': media, 'progress': progress}
 
 
 def assert_project_removed(project):
@@ -414,7 +428,85 @@ def main():
             assert {path.name for path in media.iterdir()} == source_names | {'qa-ffprobe'}
             assert any(item['id'] == movie_id for item in json.loads(request('/api/library')))
             print('PASS: replacement converted HTTP bytes, media ID and progress persist after app restart')
-            compose('down')
+            compose('down', '--volumes')
+
+        with tempfile.TemporaryDirectory(prefix=project + '-legacy-') as directory:
+            data = Path(directory)
+            data.chmod(0o777)
+            library = data / 'library'
+            library.mkdir(mode=0o755)
+            for cache in ['thumbs', 'transcodes']:
+                (data / cache).mkdir()
+                (data / cache).chmod(0o777)
+            legacy_source = library / 'Film.mkv'
+            genuine_source = library / 'Film.browser.mp4'
+            legacy_source.write_bytes(video)
+            genuine_source.write_bytes(converted)
+            assert len(converted) != len(replacement_converted)
+            timestamp = int(time.time()) - 10
+            for path in [legacy_source, genuine_source]:
+                os.utime(path, (timestamp, timestamp))
+            database = data / 'frayd.sqlite'
+            with closing(sqlite3.connect(database)) as connection:
+                connection.executescript((ROOT / 'server/schema.sql').read_text())
+                connection.executescript((ROOT / 'server/schema_annotations.sql').read_text())
+                connection.execute("INSERT INTO media(id,kind,path,title,size_bytes,mtime_secs,transcode_path) VALUES(1,'movie',?,'Legacy film',?,?,?)",
+                    ('/data/library/Film.mkv', len(video), timestamp, '/data/library/Film.browser.mp4'))
+                connection.execute("INSERT INTO media(id,kind,path,title,size_bytes,mtime_secs) VALUES(2,'movie',?,'Genuine browser source',?,?)",
+                    ('/data/library/Film.browser.mp4', len(converted), timestamp))
+                connection.execute("INSERT INTO identities(id,kind,key) VALUES(1,'device','qa-legacy-device')")
+                connection.execute('INSERT INTO progress(identity_id,media_id,position,updated_at) VALUES(1,2,42,12345)')
+                connection.commit()
+            database.chmod(0o666)
+            before_legacy = legacy_fixture_snapshot(database)
+            legacy_hash = hashlib.sha256(video).hexdigest()
+            config['services']['app']['volumes'] = [
+                {'type': 'bind', 'source': str(data), 'target': '/data',
+                 'bind': {'create_host_path': False}},
+                {'type': 'bind', 'source': str(library), 'target': '/data/library',
+                 'read_only': True, 'bind': {'create_host_path': False}},
+            ]
+            config_data = json.dumps(config).encode()
+            with cleanup_project(compose):
+                compose('up', '-d', '--wait', '--wait-timeout', '90')
+                base = 'http://' + compose('port', 'proxy', '8080').stdout.decode().strip()
+                name = compose('ps', '-q', 'app').stdout.decode().strip()
+                ready()
+                wait_for_scan_idle()
+                assert legacy_fixture_snapshot(database) == before_legacy
+                assert request('/api/stream/2') == converted
+                assert json.loads(request('/api/progress/2?identity=qa-legacy-device'))['position'] == 42
+                genuine_source.write_bytes(replacement_converted)
+                os.utime(genuine_source, (timestamp + 5, timestamp + 5))
+                genuine_hash = hashlib.sha256(replacement_converted).hexdigest()
+                print(f'PROBE: genuine legacy-referenced media2 Film.browser.mp4 source size {len(converted)}->{len(replacement_converted)}, mtime {timestamp}->{timestamp + 5}; media1 legacy pointer retained')
+                request('/api/scan', {}, expected=202)
+                wait_for_scan_idle()
+                after_legacy = legacy_fixture_snapshot(database)
+                assert len(after_legacy['media']) == 2
+                assert after_legacy['media'][0] == before_legacy['media'][0]
+                assert after_legacy['progress'] == before_legacy['progress']
+                assert hashlib.sha256(legacy_source.read_bytes()).hexdigest() == legacy_hash
+                assert hashlib.sha256(genuine_source.read_bytes()).hexdigest() == genuine_hash
+                assert {path.name for path in library.iterdir()} == {'Film.mkv', 'Film.browser.mp4'}
+                assert request('/api/stream/2') == replacement_converted
+                assert json.loads(request('/api/progress/2?identity=qa-legacy-device'))['position'] == 42
+                genuine_row = after_legacy['media'][1]
+                assert genuine_row['size_bytes'] == len(replacement_converted), (
+                    f"legacy-referenced genuine media2 stored size {genuine_row['size_bytes']} != actual {len(replacement_converted)} after scan")
+                expected_genuine = {**before_legacy['media'][1], 'size_bytes': len(replacement_converted), 'mtime_secs': timestamp + 5}
+                assert genuine_row == expected_genuine
+                docker('exec', name, 'sh', '-c', 'test ! -w /data/library/Film.browser.mp4')
+                print(f"PASS: legacy-referenced genuine media2 DB size {before_legacy['media'][1]['size_bytes']}->{genuine_row['size_bytes']}, mtime refreshed; both IDs/titles, progress42, source hashes/names and legacy reference preserved")
+                compose('restart', 'app')
+                ready()
+                wait_for_scan_idle()
+                assert legacy_fixture_snapshot(database) == after_legacy
+                assert request('/api/stream/2') == replacement_converted
+                assert json.loads(request('/api/progress/2?identity=qa-legacy-device'))['position'] == 42
+                assert hashlib.sha256(legacy_source.read_bytes()).hexdigest() == legacy_hash
+                assert hashlib.sha256(genuine_source.read_bytes()).hexdigest() == genuine_hash
+                print('PASS: genuine legacy-reference metadata, device progress and exact source bytes persist after restart')
 
     assert_project_removed(project)
     print(f'PASS: task-owned {project} containers, networks and volume removed')

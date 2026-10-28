@@ -379,6 +379,47 @@ mod tests {
         }
     }
 
+    /// Indexed genuine legacy targets refresh normally; generated and unindexed compatibility paths stay excluded.
+    #[test]
+    fn indexed_legacy_playback_targets_refresh_without_losing_artifact_exclusions() {
+        let names=["Film.mkv","Film.browser.mp4","generated.browser.tmp.mp4","Other.mkv","Other.browser.mp4"];
+        let library=Library::new(&names); let db=open(":memory:");
+        for name in names {std::fs::write(library.0.join(name),b"original").unwrap();}
+        for (index,name) in names[..4].iter().enumerate() {
+            let path=library.0.join(name);let meta=std::fs::metadata(&path).unwrap();
+            db.execute(r#"INSERT INTO media(id,kind,path,title,mtime_secs,size_bytes,meta_json)
+                VALUES(?1,'movie',?2,?3,?4,?5,'{"synopsis":"keep"}')"#,
+                rusqlite::params![index as i64+1,path.to_str().unwrap(),name,meta.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64,meta.len() as i64]).unwrap();
+        }
+        db.execute("UPDATE media SET transcode_path=?1 WHERE id=1",[library.0.join(names[1]).to_str().unwrap()]).unwrap();
+        db.execute("UPDATE media SET transcode_path=?1 WHERE id=4",[library.0.join(names[4]).to_str().unwrap()]).unwrap();
+        db.execute("INSERT INTO transcode_artifacts VALUES(?1,1,?2,'temp','generated')",
+            rusqlite::params![library.0.join(names[2]).to_str().unwrap(),library.0.join(names[0]).to_str().unwrap()]).unwrap();
+        db.execute_batch("INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture');
+            INSERT INTO progress(identity_id,media_id,position) VALUES(1,2,42),(1,3,7);").unwrap();
+        let genuine=library.0.join(names[1]);let modified=std::fs::metadata(&genuine).unwrap().modified().unwrap();
+        let new_bytes=b"genuine replacement with a different size";std::fs::write(&genuine,new_bytes).unwrap();
+        std::fs::File::open(&genuine).unwrap().set_times(std::fs::FileTimes::new().set_modified(modified)).unwrap();
+        let generated=library.0.join(names[2]);std::fs::write(&generated,b"changed generated output remains excluded").unwrap();
+        let thumbs=library.0.join("thumbs");std::fs::create_dir(&thumbs).unwrap();
+        for id in 1..=4 {std::fs::write(thumbs.join(format!("{id}.jpg")),b"fixture thumbnail").unwrap();}
+        let changed=scan(&db,String::new(),library.0.clone(),Some(&thumbs));
+        assert_eq!(db.query_row("SELECT size_bytes FROM media WHERE id=2",[],|r|r.get::<_,i64>(0)).unwrap(),new_bytes.len() as i64);
+        assert_eq!(changed,1);
+        assert_eq!(scan(&db,String::new(),library.0.clone(),Some(&thumbs)),0);
+        assert_eq!(db.query_row("SELECT thumb_path FROM media WHERE id=2",[],|r|r.get::<_,String>(0)).unwrap(),thumbs.join("2.jpg").to_string_lossy());
+        assert_eq!(db.query_row("SELECT size_bytes FROM media WHERE id=3",[],|r|r.get::<_,i64>(0)).unwrap(),8);
+        assert_eq!(db.query_row("SELECT thumb_path FROM media WHERE id=3",[],|r|r.get::<_,Option<String>>(0)).unwrap(),None);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM media",[],|r|r.get::<_,i64>(0)).unwrap(),4);
+        assert_eq!(db.query_row("SELECT id FROM media WHERE path=?1",[genuine.to_str().unwrap()],|r|r.get::<_,i64>(0)).unwrap(),2);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM media WHERE path=?1",[library.0.join(names[4]).to_str().unwrap()],|r|r.get::<_,i64>(0)).unwrap(),0);
+        assert_eq!(db.query_row("SELECT position FROM progress WHERE media_id=2",[],|r|r.get::<_,f64>(0)).unwrap(),42.0);
+        assert_eq!(db.query_row("SELECT position FROM progress WHERE media_id=3",[],|r|r.get::<_,f64>(0)).unwrap(),7.0);
+        assert_eq!(db.query_row("SELECT json_extract(meta_json,'$.synopsis') FROM media WHERE id=2",[],|r|r.get::<_,String>(0)).unwrap(),"keep");
+        assert_eq!(std::fs::read(genuine).unwrap(),new_bytes);
+        assert_eq!(std::fs::read(generated).unwrap(),b"changed generated output remains excluded");
+        for name in names {assert!(library.0.join(name).exists());}
+    }
     /// Filling any unknown prior fingerprint component cannot qualify legacy playback as stale.
     #[test]
     fn initial_unknown_source_versions_preserve_legacy_playback_pointers() {
