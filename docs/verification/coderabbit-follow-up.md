@@ -15,11 +15,12 @@ reviewed head. Baseline failures below used that source with disposable fixtures
 there was no access to an operator database or library.
 
 The tested application image is
-`sha256:cf030b02bc7703e5e0a5553971d28dac0238c6fc73b22cbd68d6cd99e88e8861`;
+`sha256:0f7b830c6e19a52cebb5816f9e14f9ae472d9092743157b8ababd35f09c8d03b`;
 the proxy is
 `sha256:543d71e7db7b987f1e41dfb0a297efe5f020c141b2dbc39a859fd2473df7bbe2`.
-These identities bind the reported local runtime checks, rather than an untested
-moving branch head. All 20 backend and 32 image-build input hashes were rechecked
+The rebuilt app includes the follow-up cleanup and namespace corrections. Final
+runtime qualification exited 0 against these exact immutable image IDs. Earlier
+`247ff29` observations are retained as historical controls where identified. All 20 backend and 32 image-build input hashes were rechecked
 against the final local source with zero mismatches. Publication and hosted checks
 must bind their results to the eventual PR commit. Private local receipts are
 summarized here with the actual observations; the committed tests and commands
@@ -42,7 +43,7 @@ below allow repetition without those receipts.
 | CR-09 | Trivial | Baseline diagnostic tests failed. Final tests expose captured byte/text stderr, preserve the original error through cleanup failures, and exercise a real synthetic Docker executable exiting 23 with its diagnostic intact. Cleanup failure after success remains fatal. | Local subprocess pass; no actual Docker outage induced. |
 | CR-10 | Trivial | Original ignore rules failed the sentinel context oracle. Final real scratch-image/export check excludes synthetic `.env` variants and installer sentinels while retaining normal JS. The disposable runtime also checks image/HTTP exclusion. | Local Docker pass; sentinels contain no real secrets. |
 | D-01 | Lint | Original B905 reproduced. Explicit `zip(..., strict=True)` passes selected Ruff rules; result-count mismatch remains fatal. | Local pass, including the exact CI lint block. |
-| D-02 | Documentation | Meaningful docs added to changed production callables and new helpers. Local AST count is 3/3 audit script and 13/13 named audit-test callables/classes documented. | **Pending hosted CodeRabbit result >=80%.** Local AST counting is not the hosted metric; the threshold was not lowered. |
+| D-02 | Documentation | Meaningful docs added to changed production callables and new helpers. Local AST count is 3/3 audit script and 13/13 named audit-test callables/classes documented. | **Hosted pass on `247ff29`: 100.00% >=80%, 39 functions across 12 files; nine unsupported skips.** Must recheck later source changes; threshold unchanged. |
 
 ## Initial PR #2 documentation review
 
@@ -87,7 +88,8 @@ docker compose config --quiet
 git diff --check
 ```
 
-Recorded result: every command exited 0; 11 client tests and 13 Python tests passed.
+Initial recorded result: every command exited 0; 11 client tests and 13 Python tests passed.
+The follow-up adds the stopped-container regression: 14 Python tests now pass.
 The client and Python suites were rerun while reconciling this ledger, with the
 same counts and exit 0. Client DOM/network boundaries are synthetic VM fixtures.
 Python tests cover audit pagination/count/publisher policy and subprocess errors.
@@ -115,8 +117,9 @@ python3 -u scripts/integration.py
 python3 scripts/audit-dependencies.py
 ```
 
-Recorded exit 0 for each command. The application build runs `cargo test --locked`
-(14 unit + 6 archive-reader tests), `cargo clippy --locked --all-targets` and
+Recorded exit 0 for each command. The original application build ran `cargo test --locked`
+(14 unit + 6 archive-reader tests); the rebuilt follow-up passes 18 unit + 6 archive-reader
+tests, 24 total. Both builds run `cargo clippy --locked --all-targets` and
 `cargo build --locked --release`. Clippy retained seven existing binary warnings
 and five duplicate integration warnings; there is no claim of warning-free Rust.
 The live OSV run checked 209 locked packages with no applicable finding and retained
@@ -153,7 +156,11 @@ the ZIP characterization cases passed and do not establish an encoding regressio
 
 A second disposable app started from the baseline SQLite schema plus annotations,
 with no artifact registry, persisted UTF-8 comic page order, progress, metadata,
-and genuine browser-suffixed media. It used the final application image above.
+and genuine browser-suffixed media. This earlier compatibility/browser run used
+`sha256:cf030b02bc7703e5e0a5553971d28dac0238c6fc73b22cbd68d6cd99e88e8861`
+on implementation `247ff29`; it is historical proof for the unchanged archive and
+client paths, separate from the final rebuilt runtime. Those compatibility unit
+controls also pass in the follow-up 24-test Rust suite.
 After startup and again after restart, 19 exact HTTP requests (each curl exit 0)
 and eight DB invariants passed:
 
@@ -193,11 +200,65 @@ legacy QA containers/networks were removed; no live deployment was modified.
 
 ## Outstanding acceptance gates
 
-1. **Hosted CodeRabbit D-02:** run the next review on the final PR commit and record
-   its actual function documentation coverage, requiring at least 80%. Local docs
-   and AST counts are supporting evidence only. A successful review status alone
-   does not close this gate or any unobserved scenario.
+1. **Hosted review after follow-up corrections:** review 5677717042 on `247ff29`
+   measured 100.00% function documentation coverage (39 functions, 12 files; nine
+   unsupported skips), passing the unchanged 80% requirement. Two new Minor items
+   concern stopped-container cleanup verification and failed-job registry/directory
+   growth. Local corrections pass; a later-head hosted review remains pending. Its summary-only
+   prolonged-database-lock cleanup risk is also under assessment. The published
+   selected-file list has 23 entries; it does not identify the exact 12 coverage
+   files. Do not treat a successful check status as a finding disposition.
 2. **Hosted final-head checks and owner acceptance:** confirm both workflow jobs on
    the published PR commit and retain draft status until acceptance. No deployment,
    production restart, real-data migration, browser decoder qualification, arbitrary
    codec support or complete watch-party protocol result is claimed here.
+
+## Hosted follow-up observations
+
+The hosted Docker builds and Rust checks passed on `247ff29`, but integration
+failed on both push and PR runs: Ubuntu Docker rejects a fixed reservation IP on
+a daemon-allocated subnet. The one-line harness correction uses dynamic allocation
+and keeps the actual changed-IP and unchanged-proxy assertions. The final-image local rerun
+passed in 8.51 seconds with full Range/WebSocket, scan-phase, conversion and
+cleanup checks. Its app IP changed from 192.168.112.2 to 192.168.112.4 while proxy
+ID/start time remained unchanged; all twelve scan-phase reads returned expected
+data in 0–5 ms in this fixture. Actual conversion and restart stream bytes passed.
+Cleanup checked stopped containers too and confirmed no owned resources. The
+corrected Ubuntu hosted run remains pending.
+
+GitHub Advanced Security separately reported six path/command diagnostics in
+transcode output handling. Static triage maps every reported source to the
+`trigger_scan` route callback, which accepts server-built state and no HTTP body,
+query or path values. Output components are operator configuration plus numeric
+IDs, UUIDs and fixed filenames; the executable is fixed and no shell parses its
+arguments. No alerts were suppressed or dismissed. A separate pre-existing
+media-ID directory symlink gap was identified and is being corrected with a
+negative containment test; all 24 Rust tests, Clippy, release build and the final
+immutable-image runtime suite pass locally. Hosted reanalysis remains pending.
+
+## Review 5677717042 correction oracles
+
+- **FRESH-01, Minor:** the old final cleanup check missed a real stopped labelled
+  container. The corrected shared assertion includes all container states and
+  rejects that same fixture; after removal, all resource checks pass. The unit
+  regression failed first, then the 14-test Python suite and lint passed. Network
+  and volume listings retain their supported flags.
+- **FRESH-02, Minor:** two actual failed conversion jobs left four registry rows
+  before correction. The negative oracle requires no per-job row/directory growth
+  on repeat failure, retaining neighboring and legacy artifacts. Both failing
+  controls now pass, together with all 24 Rust tests, Clippy and the final Docker
+  runtime suite. Hosted reanalysis remains pending.
+- **Summary-only database-lock risk:** cleanup must retain provenance if a lock
+  prevents exact ownership validation. The follow-up tests a lock beyond the
+  normal busy timeout and an explicit retry after release. A persistent lock can
+  leave a reported held job; no automatic global orphan reaper is claimed.
+- **Independent namespace guard:** a pre-existing media-ID symlink previously
+  permitted a job outside the canonical cache. The correction rejects symlink or
+  non-directory parents and atomically creates a fresh UUID job directory before
+  registering outputs. Private cache ownership remains required; check-then-use
+  paths do not establish resistance to a hostile same-UID writer replacing parents.
+
+These corrections do not dismiss the six CodeQL alerts. The route now explicitly
+binds startup-created application state in a zero-argument callback; HTTP input
+is not accepted as a cache/output path. Hosted reanalysis and the subsequent
+CodeRabbit review remain pending; this is not a claim that their checks passed.

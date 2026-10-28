@@ -119,6 +119,14 @@ def ready():
             time.sleep(0.5)
     raise AssertionError(f'QA server did not become ready: {last_error}')
 
+def assert_project_removed(project):
+    """Reject any remaining task-owned containers, networks or volumes."""
+    for resource in ('container', 'network', 'volume'):
+        flags = ('-a',) if resource == 'container' else ()
+        remaining = docker(resource, 'ls', '-q', *flags, '--filter', f'label=com.docker.compose.project={project}').stdout.strip()
+        assert not remaining, (resource, project, remaining)
+
+
 def main():
     """Exercise isolated container HTTP, persistence, DNS and read-only media paths."""
     global base
@@ -203,7 +211,7 @@ def main():
         compose('rm', '-f', 'app')
         config['services']['reserve'] = {
             'image': args.proxy_image, 'entrypoint': ['sleep', '120'],
-            'networks': {'isolated': {'ipv4_address': old_ip}},
+            'networks': {'isolated': {}},
             'read_only': True, 'cap_drop': ['ALL'],
         }
         config_data = json.dumps(config).encode()
@@ -332,9 +340,7 @@ def main():
             print(f'PASS: actual H264/AC3 -> H264/AAC conversion at {output}; source hash/names unchanged; exact converted HTTP bytes persist after app restart')
             compose('down')
 
-    for resource in ('container', 'network', 'volume'):
-        remaining = docker(resource, 'ls', '-q', '--filter', f'label=com.docker.compose.project={project}').stdout.strip()
-        assert not remaining, (resource, project, remaining)
+    assert_project_removed(project)
     print(f'PASS: task-owned {project} containers, networks and volume removed')
 
 

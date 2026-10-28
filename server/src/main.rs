@@ -71,6 +71,8 @@ async fn main() {
         run_scan(state.clone(), lib);
     }
 
+    // The scan trigger consumes server-owned state and no HTTP-provided arguments.
+    let scan_state = state.clone();
     let app = Router::new()
         .route("/api/health", get(|| async { Json(serde_json::json!({"status": "ok"})) }))
         .route("/api/library", get(library_handler))
@@ -85,7 +87,7 @@ async fn main() {
         .route("/api/admin/perms", get(list_perms).post(set_perm))
         .route("/api/admin/settings", get(get_settings).post(set_setting))
         .route("/api/thumb/:id", get(thumb))
-        .route("/api/scan", post(trigger_scan))
+        .route("/api/scan", post(move || trigger_scan(State(scan_state.clone()))))
         .route("/api/scan/status", get(scan_status))
         .route("/api/party", post(party_create))
         .route("/api/party/:code/ws", get(party_ws))

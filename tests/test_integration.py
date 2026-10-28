@@ -81,5 +81,24 @@ class DockerFailureTests(unittest.TestCase):
         self.assertIs(caught.exception, cleanup)
 
 
+class CleanupInventoryTests(unittest.TestCase):
+    """Exercise the Docker listing contract for stopped cleanup leftovers."""
+
+    def test_stopped_labelled_container_prevents_cleanup_success(self):
+        """Stopped containers appear only when Docker is asked for all states."""
+        def list_resources(*args):
+            """Model Docker's default running-only view of one stopped container."""
+            output = b'stopped-fixture' if args[0] == 'container' and '-a' in args else b''
+            return subprocess.CompletedProcess(args, 0, stdout=output)
+
+        with (
+            patch.object(integration, 'docker', side_effect=list_resources),
+            self.assertRaises(AssertionError) as caught,
+        ):
+            integration.assert_project_removed('frayd-cleanup-fixture')
+        self.assertEqual(caught.exception.args[0],
+                         ('container', 'frayd-cleanup-fixture', b'stopped-fixture'))
+
+
 if __name__ == '__main__':
     unittest.main()
