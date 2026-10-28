@@ -48,7 +48,7 @@ and proxy `sha256:70c8658365d70d40979de2f191387b2e5e08bea22b44f960c0e77f751f67fb
 Verification source `bb26bdc04d3476270ac96721af843618e8997e00` adds the browser
 harness and CI wiring without changing runtime inputs. Both immutable images pass
 the full HTTP/storage and controlled DNS-failure suites; their disposable projects
-have zero remaining resources. All 47 client and 17 Python tests pass. The normal
+have zero remaining resources. All 47 client and 17 Python tests pass at that checkpoint. The normal
 build reused the qualified 51-test Rust/Clippy/release stage with identical server
 inputs and output binary; no fresh Rust execution is claimed for that cache hit.
 Nine real-DOM cases pass separately, as described below.
@@ -156,3 +156,19 @@ It uses fixture APIs and a local icon sprite override. This closes the bounded
 mocked-DOM coverage gap; it does not close the held manual media matrix or
 qualify an immutable browser environment. See [Development](../development.md#real-dom-regression)
 for the repeatable command and browser provisioning limits.
+
+### Browser harness cleanup correction
+
+A hosted browser run failed while removing its temporary profile (`ENOTEMPTY`),
+masking the preceding outcome. A controlled launcher/child fixture reproduced the
+lifecycle gap: stopping only the launcher leaves a descendant writing and
+recreating the profile. The runner now stops only its newly created process group
+with bounded TERM/KILL waits before one profile removal, and reports original
+runner errors separately from cleanup errors. The two lifecycle controls bring the Node total to 49; all nine
+real-DOM cases also pass locally. Full Chrome was unavailable locally; hosted
+confirmation remains required, and the original masked outcome is unknown.
+
+The controlled DNS fixture also binds only to its resolved container interface,
+instead of all interfaces. Its real DNS recovery test still passes against the
+same qualified images. No CodeQL suppression or dismissal was added; fresh hosted
+analysis must confirm the alert disposition.

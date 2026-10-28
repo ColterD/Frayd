@@ -8,7 +8,7 @@ const { createHash } = require('node:crypto');
 const { readFileSync, existsSync, mkdtempSync, rmSync, mkdirSync, writeFileSync, realpathSync } = require('node:fs');
 const { join, resolve, extname, delimiter } = require('node:path');
 const { tmpdir } = require('node:os');
-const { once } = require('node:events');
+const { setTimeout: delay } = require('node:timers/promises');
 
 const root = resolve(__dirname, '..');
 const evidenceDir = join(root, '.codex/evidence/pr2-real-dom');
@@ -26,7 +26,26 @@ function browserPath() {
   }
   throw new Error('No browser found. Set BROWSER_BIN to an existing Chrome/Chromium executable; no download is performed.');
 }
-async function main() {
+function signalGroup(pid, signal) {
+  try { process.kill(-pid, signal); return true; }
+  catch (error) { if (error.code === 'ESRCH') return false; throw error; }
+}
+async function stopBrowserGroup(browser) {
+  if (!browser?.pid) return;
+  async function waitForExit(milliseconds) {
+    const deadline = Date.now() + milliseconds;
+    while (signalGroup(browser.pid, 0)) {
+      if (Date.now() >= deadline) return false;
+      await delay(25);
+    }
+    return true;
+  }
+  signalGroup(browser.pid, 'SIGTERM');
+  if (await waitForExit(750)) return;
+  signalGroup(browser.pid, 'SIGKILL');
+  if (!await waitForExit(2000)) throw new Error(`Owned browser process group ${browser.pid} did not exit after SIGKILL; profile retained`);
+}
+async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir } = {}) {
   let browser;
   let profile;
   let timer;
@@ -37,6 +56,10 @@ async function main() {
   let posts = [];
   let logs = '';
   let output;
+  let provenance;
+  let runError;
+  const cleanupErrors = [];
+  let browserGroupStopped = false;
   let resolveResult;
   const result = new Promise(resolve => { resolveResult = resolve; });
   const unexpectedRequests = [];
@@ -112,7 +135,7 @@ async function main() {
   server.on('connection', socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
   try {
     const executable = browserPath();
-    const provenance = {
+    provenance = {
       capturedAt: new Date().toISOString(),
       repository: 'ColterD/Frayd',
       head: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8', timeout: 10000 }).trim(),
@@ -127,7 +150,7 @@ async function main() {
     browser = spawn(executable, ['--headless', '--no-sandbox', '--disable-gpu', '--disable-background-networking',
       '--disable-component-update', '--disable-sync', '--no-first-run', '--no-default-browser-check',
       '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1', '--disable-features=MediaRouter',
-      `--user-data-dir=${profile}`, url], { stdio: ['ignore', 'ignore', 'pipe'] });
+      `--user-data-dir=${profile}`, url], { detached: true, stdio: ['ignore', 'ignore', 'pipe'] });
     browser.stderr.on('data', bytes => { logs = (logs + bytes.toString()).slice(-12000); });
     const exited = new Promise((_, reject) => {
       browser.once('error', reject);
@@ -144,23 +167,31 @@ async function main() {
       fixtureConfiguration: { iconUrl: '/vendor/plyr/plyr.svg', mediaResponses: 'HTTP 204, no codec bytes',
         browserSandbox: 'Disabled only for this disposable headless process; EPUB iframe keeps sandbox=allow-scripts.' } };
     if (!complete || observed.failed || observed.errors.length || unexpectedRequests.length) process.exitCode = 1;
+  } catch (error) {
+    runError = error;
   } finally {
     clearTimeout(timer);
-    if (browser && browser.exitCode === null) {
-      const stopped = once(browser, 'exit');
-      browser.kill('SIGKILL');
-      await stopped;
+    try { await stopBrowserGroup(browser); browserGroupStopped = true; }
+    catch (error) { cleanupErrors.push(error.stack); }
+    try {
+      if (pendingAnnotation) pendingAnnotation.destroy();
+      for (const socket of sockets) socket.destroy();
+      await new Promise(resolve => server.close(resolve));
+    } catch (error) { cleanupErrors.push(error.stack); }
+    if (profile && browserGroupStopped) {
+      try { removeProfile(profile, { recursive: true, force: true }); }
+      catch (error) { cleanupErrors.push(error.stack); }
     }
-    if (pendingAnnotation) pendingAnnotation.destroy();
-    for (const socket of sockets) socket.destroy();
-    await new Promise(resolve => server.close(resolve));
-    if (profile) rmSync(profile, { recursive: true, force: true });
   }
-  output.cleanup = { browserExited: browser.exitCode !== null || browser.signalCode !== null,
-    profileRemoved: !existsSync(profile), serverClosed: !server.listening };
-  if (!Object.values(output.cleanup).every(Boolean)) process.exitCode = 1;
-  mkdirSync(evidenceDir, { recursive: true });
-  writeFileSync(join(evidenceDir, 'result.json'), JSON.stringify(output, null, 2) + '\n');
+  output ??= { provenance, cases: [], errors: [], passed: 0, failed: 1, complete: false, unexpectedRequests };
+  if (runError) output.runnerError = runError.stack;
+  output.cleanupErrors = cleanupErrors;
+  output.cleanup = { browserExited: !browser?.pid || browser.exitCode !== null || browser.signalCode !== null,
+    browserGroupStopped, profileRemoved: !profile || !existsSync(profile), serverClosed: !server.listening };
+  if (runError || cleanupErrors.length || !Object.values(output.cleanup).every(Boolean)) process.exitCode = 1;
+  mkdirSync(evidenceDirectory, { recursive: true });
+  writeFileSync(join(evidenceDirectory, 'result.json'), JSON.stringify(output, null, 2) + '\n');
   console.log(JSON.stringify(output, null, 2));
 }
-main().catch(error => { console.error(error.stack); process.exitCode = 1; });
+module.exports = { main, stopBrowserGroup };
+if (require.main === module) main().catch(error => { console.error(error.stack); process.exitCode = 1; });

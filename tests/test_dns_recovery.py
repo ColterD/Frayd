@@ -33,7 +33,7 @@ def serve_dns(control):
     """Return the controlled app A record, with one explicitly armed SERVFAIL."""
     state = Path(control)
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server:
-        server.bind(('0.0.0.0', 53))
+        server.bind((socket.gethostbyname(socket.gethostname()), 53))
         print('DNS ready', flush=True)
         while True:
             packet, peer = server.recvfrom(4096)

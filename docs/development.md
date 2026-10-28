@@ -84,7 +84,8 @@ node tests/browser-regression.cjs
 Set `BROWSER_BIN` to an existing executable when it is not discoverable on PATH.
 The runner performs no browser download and adds no npm package. It serves a
 loopback-only fixture, creates a new temporary browser profile and removes that
-profile after the run. It executes the production client, generated sandboxed
+profile after the run, after stopping its owned process group with bounded waits.
+Runner and cleanup failures remain separate in the result. It executes the production client, generated sandboxed
 EPUB frame and vendored Plyr. Fixture APIs control annotation responses; player
 events are synthetic and do not establish decoded playback or physical audio.
 The fixture redirects Plyr's icon URL to the existing local sprite.
