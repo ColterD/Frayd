@@ -11,5 +11,3 @@ DONOTUPLOAD/
 server/thumbs/
 server/frayd.db
 server/frayd.db-*
-client/install/bootstrap.sh
-client/install/bootstrap.ps1
