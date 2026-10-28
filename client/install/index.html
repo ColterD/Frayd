@@ -46,6 +46,18 @@
   <label>Where is your media folder?</label>
   <input type="text" id="lib" placeholder="e.g. /home/you/Media or C:\Users\you\Media">
 
+  <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+    <input type="checkbox" id="tunnel-cb" style="width:auto">
+    Set up remote access (outside your home network)
+  </label>
+  <div id="tunnel-opts" style="display:none">
+    <label>How do you want to reach your server when you're away?</label>
+    <select id="tunnel" style="width:100%;background:#0D0E12;color:#fff;border:1px solid var(--line);border-radius:8px;padding:10px 12px;font-size:14px">
+      <option value="tailscale">Tailscale — easiest, free, private mesh VPN (recommended)</option>
+      <option value="cloudflared">Cloudflare Tunnel — public HTTPS URL, needs a Cloudflare account + domain</option>
+    </select>
+  </div>
+
   <button class="btn" id="gen" disabled>Generate install command</button>
   <pre id="cmd" style="display:none"></pre>
   <button class="btn" id="copy" style="display:none; background:#16181E; border:1px solid #2a2d36">Copy command</button>
@@ -86,7 +98,8 @@ document.querySelectorAll('.os button').forEach(b => b.onclick = () => {
 });
 
 const lib = () => $('#lib').value.trim() || '';
-const q = (s) => new URLSearchParams({ os, lib: s }).toString();
+const tunnel = () => $('#tunnel-cb').checked ? $('#tunnel').value : '';
+const q = (s) => new URLSearchParams({ os, lib: s, tunnel: tunnel() }).toString();
 
 function gen() {
   if (!os) return;
@@ -94,11 +107,17 @@ function gen() {
   const base = 'https://raw.githubusercontent.com/kattiest/Frayd/main/client/install';
   let cmd;
   if (os === 'win') {
-    const libPs = l ? ` -Lib "${l}"` : '';
-    cmd = `cd $env:TEMP; irm "${base}/bootstrap.ps1?$(q(l))" | iex; # or:\n# irm "${base}/bootstrap.ps1" -OutFile frayd-install.ps1; .\\frayd-install.ps1${libPs}`;
+    const args = [];
+    if (l) args.push(`-Lib "${l}"`);
+    if (tunnel()) args.push(`-Tunnel ${tunnel()}`);
+    const argStr = args.length ? ' ' + args.join(' ') : '';
+    cmd = `cd $env:TEMP; irm "${base}/bootstrap.ps1?$(q(l))" | iex; # or:\n# irm "${base}/bootstrap.ps1" -OutFile frayd-install.ps1; .\\frayd-install.ps1${argStr}`;
   } else {
-    const libSh = l ? ` '${l}'` : '';
-    cmd = `curl -fsSL "${base}/bootstrap.sh" -o frayd-install.sh && bash frayd-install.sh${libSh}`;
+    const args = [];
+    if (l) args.push(`'${l}'`);
+    if (tunnel()) args.push(`--tunnel ${tunnel()}`);
+    const argStr = args.length ? ' ' + args.join(' ') : '';
+    cmd = `curl -fsSL "${base}/bootstrap.sh" -o frayd-install.sh && bash frayd-install.sh${argStr}`;
   }
   $('#cmd').textContent = cmd;
   $('#cmd').style.display = 'block';
@@ -106,6 +125,8 @@ function gen() {
 }
 $('#gen').onclick = gen;
 $('#lib').addEventListener('input', gen);
+$('#tunnel-cb').onchange = () => { $('#tunnel-opts').style.display = $('#tunnel-cb').checked ? 'block' : 'none'; gen(); };
+$('#tunnel').onchange = gen;
 $('#copy').onclick = () => { navigator.clipboard.writeText($('#cmd').textContent); $('#copy').textContent = 'Copied!'; setTimeout(() => $('#copy').textContent = 'Copy command', 1500); };
 
 // poll for a live server: localhost then LAN hostname
