@@ -7,16 +7,16 @@ It does not authorize deployment or qualify arbitrary media, browsers or public 
 
 ## Current review follow-up
 
-Full review [5688243622](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5688243622)
-and incremental reviews [5688495119](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5688495119)
-and [5688787475](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5688787475)
-are accounted for in the [review ledger](coderabbit-follow-up.md).
+Full review [5690203516](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5690203516)
+and incremental review [5690407263](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5690407263)
+are accounted for with the earlier findings in the [review ledger](coderabbit-follow-up.md).
 Native follow retires external playback after transferring ownership and clears
 its modal class. External follow likewise pauses native audio/video after taking
 ownership, without broadcasting stale native pause events. Separate API/player readiness, current-player checks and latest
 desired state prevent unready calls, stale native restarts and lost pause/seek
 updates. Host/guest controls exercise fresh and retained audio/video with a mocked
-YouTube API; actual external YouTube playback remains unqualified.
+YouTube API. That suite does not qualify actual external playback by itself;
+the real-player checkpoint below is separate.
 
 Party updates clamp captured timestamps under the state lock, preventing stale
 updates from counting elapsed playback twice. The Rust target contains 57 tests. CI requires locked tests, Clippy and release
@@ -24,7 +24,10 @@ compilation; warnings in unchanged code remain.
 The frozen client/harness passes 135 Node tests and 32 actual-DOM cases, including
 real native decoding, parser-gated reader restoration and real protocol setup
 after an injected initial transport failure. Owned HTTP nonresponse and early
-exit controls verify bounded failure and cleanup.
+exit controls verify bounded failure and cleanup. The effective-stream regression waits
+for the requested stream and the video progress request; it uses no fixed pause
+delay and imposes no audio progress-save requirement. The Linux-only replacement
+retirement oracle is compiled only on Linux, matching its production contract.
 
 The harness waits for a complete port field and retries transient target-list
 readiness failures within one startup deadline. Unexpected targets stay fatal.
@@ -46,10 +49,38 @@ result remains a separate gate.
 
 Current hosted outcomes, immutable source/image bindings and remaining manual
 gates are reported in the [draft PR](https://github.com/ColterD/Frayd/pull/2).
-The later `1ece1df` / `5d8c4f…` image passes full local HTTP/storage/DNS suites and
-targeted Vivaldi reader, guest, movie and two-client party checks. These results
-remain bound to that artifact; the subsequent readiness changes require a new
-image. No merge or live deployment is authorized.
+Historical `1ece1df` / `5d8c4f…` results remain bound to that artifact. The current
+runtime checkpoint below uses a newly built server; no merge or live deployment
+is authorized.
+
+## Actual YouTube session checkpoint (5d63 / 767fe)
+
+Checked 2026-10-28. Runtime source `5d63ac240e25878daa0ecb1df862c70610764b59`
+builds app `sha256:767fe73fa6ae69b488588e0d5d79315cf893a3d9deb19a1b94eb94d7615e7c77`,
+with server binary `ea5bebfbb197e46b6484f958c7cbd603e13cc1791f25fa424f6f15612d9f4221`
+and the unchanged `70c865…` proxy. Fresh Docker Rust tests (57), Clippy, release,
+full HTTP/storage integration and controlled DNS recovery pass. All qualification
+projects have zero remaining containers, networks and volumes, including stopped
+containers. The owned test app retains its data/config and all five sample hashes.
+
+Two fresh isolated headless contexts load the exact production app `1d7211…`
+and party `4816…` payloads. They use the actual public YouTube API and official
+video `aqz-KE-bpKQ`, with both players muted. A leaves its guest session with no
+sender, then hosts the same ID using its exact original player object. B leaves
+its old host session and joins A; the replacement party survives.
+
+Actual A `pauseVideo()` emits an outbound pause, B receives authoritative
+`playing:false`, and both APIs report paused state 2. Actual A `playVideo()`
+emits play, B receives `playing:true`, and both report state 1. B's clock advances
+4.39715 → 6.90061 seconds over 2.504 seconds. This is one behavioral observation,
+not a latency or general synchronization benchmark. No Party UI play/pause
+shortcut or synthetic player callback supplies the result.
+
+Both owned contexts/parties close, the browser exits, its profile is removed,
+and both old room codes reject WebSocket upgrades with HTTP 404. The owner
+browser is untouched. Audible output, iframe-button input, cross-machine and
+long-duration playback remain unqualified; API states/clocks are not decoded
+frame or physical-audio measurements.
 
 ## Reader-ready checkpoint (6810 / 5926)
 
@@ -76,7 +107,7 @@ then advanced to 204.628872 with readyState 4 and a decoded 1920-pixel frame.
 The host and peer loaded app/party response bodies match the tested hashes;
 index bytes were verified on the server, without a captured browser index body.
 
-**Current party smoke remains held.** Browser control detached twice at action
+**That checkpoint’s party smoke was held.** Browser control detached twice at action
 boundaries; the approach stopped without a reset. The earlier `1bf` image passed
 the five-category and two-client party matrix. Those observations remain bound
 to that image; no current two-client pass is claimed. New whitespace selection

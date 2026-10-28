@@ -394,6 +394,7 @@ mod tests {
     }
 
     /// Known replacement grants retirement only to its exact inactive, unreferenced generated pair.
+    #[cfg(target_os = "linux")]
     #[test]
     fn known_replacement_retires_only_the_prior_completed_pair() {
         // Keep the real scanner entry point but suppress asynchronous codec workers in this isolated child.

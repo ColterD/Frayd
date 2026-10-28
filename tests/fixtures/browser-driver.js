@@ -388,9 +388,13 @@
           return priorFetch(url, options);
         };
         partyFollow(9, 'Party nine', 24, true, Date.now() / 1000);
-        await delay(20);
+        await until(() => (media.src || media.querySelector('source')?.src || media.currentSrc).endsWith('/api/stream/9'),
+          'effective party nine stream replaces local ten');
         media.pause();
-        await delay(20);
+        if (kind === 'video') {
+          await until(() => saves.some(save => save.media_id === 9 && save.position >= 24 && save.position < 26),
+            'asynchronous pause saves party nine progress');
+        }
         const source = media.src || media.querySelector('source')?.src || media.currentSrc;
         if (kind === 'video') {
           equal(videoItem.id, 9, 'Progress identity returns to party nine');

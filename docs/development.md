@@ -89,8 +89,12 @@ loopback-only fixture and creates a new temporary browser profile. It removes th
 profile only after confirming its owned process group has stopped with bounded waits.
 If shutdown fails, the runner retains the profile and reports the cleanup error.
 Runner and cleanup failures remain separate in the result. It executes the production client, generated sandboxed
-EPUB frame and vendored Plyr. Fixture APIs control annotation responses; player
-events are synthetic and do not establish decoded playback or physical audio.
+EPUB frame and vendored Plyr. Fixture APIs control annotation responses.
+Media IDs 9/10/11 use synthetic player events. Native IDs 20/21/22 use the short
+owned H.264 fixture; six controls require readyState 4, video width 160 and a
+positive decoded-frame count. That fixture does not qualify physical audio,
+other codecs or distinct-client timing. Separate real-player observations are
+recorded in the [browser acceptance checkpoints](verification/browser-acceptance.md).
 The fixture redirects Plyr's icon URL to the existing local sprite.
 
 The output records the actual browser version, executable hash and tested source
