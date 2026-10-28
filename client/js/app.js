@@ -678,8 +678,14 @@ async function showChunk(n, opts = {}) {
           const sel = window.getSelection();
           if (!sel || sel.isCollapsed || !sel.rangeCount) return;
           const range = sel.getRangeAt(0);
-          const text = sel.toString().trim();
-          if (!text) return;
+          const text = range.toString();
+          if (!text.trim()) return;
+          if (range.startContainer !== range.endContainer || range.startContainer.nodeType !== Node.TEXT_NODE) {
+            sel.removeAllRanges();
+            parent.postMessage({ type: 'highlight-selection-error' }, '*');
+            return;
+          }
+          const length = range.endOffset - range.startOffset;
           // Paint only after the parent confirms that the highlight was saved.
           // Serialize the original range before clearing the selection.
           // Count preceding chars in body text.
@@ -688,7 +694,7 @@ async function showChunk(n, opts = {}) {
           pre.setEnd(range.startContainer, range.startOffset);
           const offset = pre.toString().length;
           sel.removeAllRanges();
-          parent.postMessage({type:'highlight', cfi: 'char:' + offset + ':' + text.length, text, page: Math.round(window.scrollX / PW)}, '*');
+          parent.postMessage({type:'highlight', cfi: 'char:' + offset + ':' + length, text, page: Math.round(window.scrollX / PW)}, '*');
         });
       <\/script></head>`);
     // re-apply saved highlights for this chapter (char-offset based)
@@ -748,6 +754,8 @@ window.addEventListener('message', async (e) => {
     showChunk(n, e.data.dir < 0 ? { atEnd: true } : {});
   } else if (e.data?.type === 'geom') {
     console.log('[ebook geom]', e.data);
+  } else if (e.data?.type === 'highlight-selection-error') {
+    $('#em-searchinfo').textContent = 'Select text without crossing formatting or paragraph breaks.';
   } else if (e.data?.type === 'highlight') {
     if (typeof e.data.cfi !== 'string' || !/^char:\d+:\d+$/.test(e.data.cfi)
       || typeof e.data.text !== 'string' || !e.data.text.trim()) return;

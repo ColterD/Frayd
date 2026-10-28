@@ -106,7 +106,7 @@ function browser() {
     context, nodes, requests, intervals, sockets,
     run: source => vm.runInContext(source, context),
     respond: fn => { response = fn; },
-    message: data => listeners.get('message')({ data, origin: 'null', source: nodes.get('#em-frame').contentWindow }),
+    message: (data, overrides = {}) => listeners.get('message')({ data, origin: 'null', source: nodes.get('#em-frame').contentWindow, ...overrides }),
     page: (page, pages) => listeners.get('message')({
       data: { type: 'page', page, pages }, origin: 'null', source: nodes.get('#em-frame').contentWindow,
     }),
@@ -413,21 +413,31 @@ test('pending highlight completion keeps captured book and chapter without touch
 });
 
 
-test('generated reader selection paints only after a saved highlight is injected', async () => {
+async function generatedSelection(options = {}) {
   const { b } = highlightReader();
   b.respond(async () => ({ text: async () => '<html><head></head><body>prefix Hello world</body></html>' }));
   await b.run('showChunk(1)');
-  const script = b.nodes.get('#em-frame').srcdoc.match(/<script>([\s\S]*?)<\/script>/)[1];
+  const generatedHtml = b.nodes.get('#em-frame').srcdoc;
+  const scriptOpen = generatedHtml.indexOf('<script>');
+  assert.ok(scriptOpen >= 0, 'generated reader script opening wrapper is missing');
+  const scriptStart = scriptOpen + '<script>'.length;
+  const scriptClose = generatedHtml.indexOf('</script>', scriptStart);
+  assert.ok(scriptClose >= 0, 'generated reader script closing wrapper is missing');
+  const script = generatedHtml.slice(scriptStart, scriptClose);
   const messages = [];
   const frameListeners = [];
   const documentListeners = new Map();
-  const textNode = { nodeValue: 'prefix Hello world' };
+  const text = options.text ?? 'Hello';
+  const textNode = { nodeType: options.nodeType ?? 3, nodeValue: 'prefix ' + text + ' world' };
   let painted = 0;
   let selectionCleared = false;
   const selection = {
     isCollapsed: false, rangeCount: 1,
-    getRangeAt: () => ({ startContainer: textNode, startOffset: 7 }),
-    toString: () => 'Hello', removeAllRanges: () => { selectionCleared = true; },
+    getRangeAt: () => ({
+      startContainer: textNode, endContainer: options.crossNode ? { nodeType: 3 } : textNode,
+      startOffset: 7, endOffset: 7 + text.length, toString: () => text,
+    }),
+    toString: () => text, removeAllRanges: () => { selectionCleared = true; },
   };
   const frame = {
     addEventListener: (name, fn) => { if (name === 'message') frameListeners.push(fn); },
@@ -446,13 +456,70 @@ test('generated reader selection paints only after a saved highlight is injected
       return { currentNode: textNode, nextNode: () => { if (visited) return false; visited = true; return true; } };
     },
   };
-  vm.runInNewContext(script, { window: frame, document, parent: { postMessage: data => messages.push(data) }, NodeFilter: { SHOW_TEXT: 4 } });
-  documentListeners.get('mouseup')();
-  assert.equal(painted, 0);
-  assert.equal(selectionCleared, true);
-  assert.equal(messages[0].cfi, 'char:7:5');
-  for (const listener of frameListeners) listener({ data: { type: 'inject-hl', items: [{ off: 7, len: 5, color: 'yellow' }] } });
-  assert.equal(painted, 1);
+  vm.runInNewContext(script, {
+    window: frame, document, parent: { postMessage: data => messages.push(data) },
+    NodeFilter: { SHOW_TEXT: 4 }, Node: { TEXT_NODE: 3 },
+  });
+  return {
+    b, messages, select: () => documentListeners.get('mouseup')(),
+    painted: () => painted, selectionCleared: () => selectionCleared,
+    inject: data => { for (const listener of frameListeners) listener({ data }); },
+  };
+}
+
+test('generated reader selection paints only after a saved highlight is injected', async () => {
+  const reader = await generatedSelection();
+  reader.select();
+  assert.equal(reader.painted(), 0);
+  assert.equal(reader.selectionCleared(), true);
+  assert.equal(reader.messages[0].cfi, 'char:7:5');
+  reader.inject({ type: 'inject-hl', items: [{ off: 7, len: 5, color: 'yellow' }] });
+  assert.equal(reader.painted(), 1);
+});
+
+for (const [name, options] of [['cross-node', { crossNode: true }], ['element-node', { nodeType: 1 }]]) {
+  test(`generated reader rejects ${name} selection before annotation save`, async () => {
+    const reader = await generatedSelection(options);
+    reader.select();
+    assert.equal(reader.selectionCleared(), true);
+    assert.equal(reader.painted(), 0);
+    assert.equal(reader.messages[0].type, 'highlight-selection-error');
+    await reader.b.message(reader.messages[0]);
+    assert.equal(reader.b.requests.filter(request => request.url === '/api/annotations').length, 0);
+    assert.equal(reader.b.nodes.get('#em-searchinfo').textContent, 'Select text without crossing formatting or paragraph breaks.');
+  });
+}
+
+test('generated reader preserves exact leading whitespace text and range length', async () => {
+  const reader = await generatedSelection({ text: '  Hello' });
+  reader.select();
+  assert.equal(reader.messages[0].cfi, 'char:7:7');
+  assert.equal(reader.messages[0].text, '  Hello');
+  reader.b.respond(async () => ({ status: 201 }));
+  await reader.b.message(reader.messages[0]);
+  const saved = JSON.parse(reader.b.requests.find(request => request.url === '/api/annotations').options.body);
+  assert.equal(saved.cfi, 'char:7:7');
+  assert.equal(saved.text, '  Hello');
+  reader.inject({ type: 'inject-hl', items: [{ off: 7, len: 7, color: 'yellow' }] });
+  assert.equal(reader.painted(), 1);
+});
+
+test('generated reader ignores whitespace-only selections', async () => {
+  const reader = await generatedSelection({ text: '   ' });
+  reader.select();
+  assert.deepEqual(reader.messages, []);
+  assert.equal(reader.painted(), 0);
+});
+
+test('highlight selection errors require the active opaque reader and use constant UI text', async () => {
+  const { b } = highlightReader();
+  const message = { type: 'highlight-selection-error', text: 'untrusted text' };
+  await b.message(message, { source: {} });
+  await b.message(message, { origin: 'https://attacker.invalid' });
+  assert.equal(b.nodes.get('#em-searchinfo').textContent, '');
+  await b.message(message);
+  assert.equal(b.nodes.get('#em-searchinfo').textContent, 'Select text without crossing formatting or paragraph breaks.');
+  assert.deepEqual(b.requests, []);
 });
 
 
