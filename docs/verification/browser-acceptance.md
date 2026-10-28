@@ -113,3 +113,27 @@ than the five-second answer-validity setting. The readiness deadline stays at
 the normal integration runner also captures bounded diagnostics before cleanup
 if its real Docker DNS recovery gate fails. These controlled config-mounted
 results do not qualify a newly built image or the held browser cases.
+
+## Real DOM regression follow-up
+
+The standalone `node tests/browser-regression.cjs` harness passes nine cases
+against production scripts and the actual vendored player in an isolated
+headless browser. It checks exact CFI/text and restored marks for plain text,
+leading/trailing whitespace, existing search/highlight splits, and body style or
+script text before the selection. Cross-node, next-node offset-zero and
+whitespace-only selections follow the explicit no-save contract. Annotation
+paint waits for HTTP 201, and a repeated saved selection sends no second POST.
+
+The actual Plyr source setter replaces and detaches the media element twice.
+Current-element play/pause/seek events reach host callbacks once per event, and
+follower seeks affect that current element. Synthetic events on detached elements
+can still be forwarded by the vendored library; the probe records this behavior
+without claiming a naturally occurring late-event failure. Empty fixture streams
+and synthetic events do not establish decoded playback or two-client timing.
+
+The runner records the supplied browser version/executable hash and production
+file hashes, and verifies cleanup of its own temporary profile/process/listener.
+It uses fixture APIs and a local icon sprite override. This closes the bounded
+mocked-DOM coverage gap; it does not close the held manual media matrix or
+qualify an immutable browser environment. See [Development](../development.md#real-dom-regression)
+for the repeatable command and browser provisioning limits.

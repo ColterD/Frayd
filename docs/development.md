@@ -49,10 +49,11 @@ docker build -f Dockerfile.proxy -t frayd-proxy-qa:local .
 docker run --rm --network none --read-only --tmpfs /tmp --entrypoint nginx frayd-proxy-qa:local -t
 python3 scripts/check-build-context.py
 python3 scripts/integration.py
+python3 tests/test_dns_recovery.py
 python3 scripts/audit-dependencies.py
 ```
 
-The [Dockerfile](../Dockerfile) runs locked Rust tests, Clippy and the release build. [Checks CI](../.github/workflows/checks.yml) runs client syntax/tests, locked Python lint, Compose validation, both image builds, context/integration checks, Python tests and the live dependency audit. Native Cargo commands, `git diff --check` and the standalone nginx configuration probe are additional local checks; the workflow does not invoke them separately. [CodeQL](../.github/workflows/codeql.yml) provides separate source/workflow analysis. Remote reviews, coverage and check conclusions must be read for the actual PR head; this guide does not reproduce their hosted results.
+The [Dockerfile](../Dockerfile) runs locked Rust tests, Clippy and the release build. [Checks CI](../.github/workflows/checks.yml) runs client syntax/tests, real browser DOM regressions, locked Python lint, Compose validation, both image builds, context/integration and controlled DNS-failure checks, Python tests and the live dependency audit. Native Cargo commands, `git diff --check` and the standalone nginx configuration probe are additional local checks; the workflow does not invoke them separately. [CodeQL](../.github/workflows/codeql.yml) provides separate source/workflow analysis. Remote reviews, coverage and check conclusions must be read for the actual PR head; this guide does not reproduce their hosted results.
 
 ## Disposable QA scope
 
@@ -71,3 +72,27 @@ One narrow database disagreement is handled explicitly: OSV flags `block-buffer 
 ## Browser acceptance
 
 The automated suite does not substitute for the [manual browser acceptance matrix](verification/browser-acceptance.md). That page records its exact media, image/source identities, observed failures and corrected-image acceptance status separately from historical integration results.
+
+### Real DOM regression
+
+With an existing Chrome/Chromium executable on PATH, run:
+
+```sh
+node tests/browser-regression.cjs
+```
+
+Set `BROWSER_BIN` to an existing executable when it is not discoverable on PATH.
+The runner performs no browser download and adds no npm package. It serves a
+loopback-only fixture, creates a new temporary browser profile and removes that
+profile after the run. It executes the production client, generated sandboxed
+EPUB frame and vendored Plyr. Fixture APIs control annotation responses; player
+events are synthetic and do not establish decoded playback or physical audio.
+The fixture redirects Plyr's icon URL to the existing local sprite.
+
+The output records the actual browser version, executable hash and tested source
+hashes. CI uses its runner-provided browser and fails if no browser is available;
+this is a changing test environment, not an immutable browser qualification.
+Keep the browser supplied by your operating system or CI image updated. No new
+npm dependency is introduced, and the Cargo audit does not scan that external
+browser. These DOM checks complement the manual media matrix; they do not close
+its held interactive acceptance cases.

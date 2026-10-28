@@ -17,6 +17,8 @@ jobs:
           node --check client/js/app.js
           node --check client/js/party.js
           node --test tests/*.test.cjs
+      - name: Real browser DOM regressions
+        run: node tests/browser-regression.cjs
       - name: Python lint (locked Ruff)
         run: |
           python3 -m venv "$RUNNER_TEMP/frayd-python-lint"
