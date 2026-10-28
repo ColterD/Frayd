@@ -6,7 +6,7 @@ This is the historical verification ledger, not a setup guide or a current-head
 acceptance report. Use [Development](../development.md#canonical-checks) for the
 maintained command list. Every result below applies only to its recorded source,
 image and scenario. Earlier pending gates describe their historical checkpoint;
-they do not reopen later completed work. Current-head hosted acceptance belongs to
+they do not reopen work completed later. Hosted acceptance for the current head belongs to
 the [draft PR description](https://github.com/ColterD/Frayd/pull/2). Draft status
 and no-deployment boundaries remain in force until owner acceptance.
 
@@ -17,7 +17,7 @@ Navigation: [source boundaries](#source-and-delivery-boundaries),
 [comic cache follow-up](#optional-comic-page-cache-write-follow-up).
 
 Updated 2026-10-28 UTC for [fork draft PR #2](https://github.com/ColterD/Frayd/pull/2).
-This ledger accounts for **33 CodeRabbit issue/diagnostic entries**, including
+This ledger accounts for **39 CodeRabbit issue/diagnostic entries**, including
 original and subsequent findings, outside-diff comments, nitpicks and published
 tool diagnostics. Summary-only risks and GitHub CodeQL alerts are recorded
 separately and are not added to that count.
@@ -114,6 +114,13 @@ A resolved review thread and a passing check are separate evidence.
 | [STALE-RESERVATION](https://github.com/ColterD/Frayd/pull/2#discussion_r4401439268) | Major | Killed conversions and cleanup timeouts can leave pending registry pairs and large partial outputs without a reachable retry. | Real killed-worker and five-second DB-lock/rescan baseline reproduced. Lifecycle/lease recovery passes the focused controls and all 51 Rust tests locally; Linux converter liveness is verified separately. Completed, unknown, active, referenced and uncertain artifacts remain protected. The exact bf3cb589/858879bf immutable-image build and HTTP suite pass; latest-head CI/review and held manual browser acceptance are recorded in the PR description. |
 
 | [BACKUP-CHECKSUM](https://github.com/ColterD/Frayd/pull/2#discussion_r4402135393) | Minor | The guide printed a checksum but did not persist it or enforce verification before extraction. | The private sidecar is stored beside the archive and the restore block exits before extraction on failure. Intact/relocated, corrupted and missing-checksum gate controls pass. The exact updated blocks also pass one same-image Docker round trip; a corrupted copy exits before extraction and leaves the destination empty of files. Current-head hosted acceptance remains in the PR description. |
+
+| [HIGHLIGHT-DUPLICATE](https://github.com/ColterD/Frayd/pull/2#discussion_r4402386926) | Unspecified | Selecting an already-saved highlight sends another POST because the cached duplicate check runs after the request. | A guard checks kind, chapter and CFI before POST. Repeated-save and preloaded-save baselines fail with excess requests; five focused controls and all 47 client tests pass after correction. Real-browser acceptance retains its separate gate. |
+| [DOC-COMPLETED-WORK](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5685026287) | Minor, unverified wording suggestion | The historical-checkpoint sentence used an unclear compound modifier. | It now says “work completed later.” LanguageTool is unavailable locally; no LanguageTool pass is claimed. |
+| [DOC-CURRENT-HEAD](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5685026287) | Minor, unverified wording suggestion | The documentation index used awkward current-head acceptance wording. | It now says “Hosted acceptance for the current head.” |
+| [DOC-MOVIE-ACTION](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5685026287) | Minor, unverified wording suggestion | The movie action repeated the observation-column wording. | The action now says “confirm decoded playback”; the recorded observations and held acceptance remain unchanged. |
+| [DOC-MEDIA-BACKUP](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5685026287) | Minor, unverified wording suggestion | The separately mounted media instruction repeated “separately.” | It now identifies mounted media as a separate data source. The named-volume restore proof does not cover external media. |
+| [REAL-DOM-COVERAGE](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5685026287) | Trivial, unverified coverage suggestion | Mocked Range/TreeWalker and Plyr behavior cannot prove actual DOM selection offsets or source replacement. | Open: a bounded headless-browser regression is being assessed. Interactive latest-image browser acceptance is held; unit passes do not close this item. |
 
 The `d835f40` full review selected 30 files and excluded one deleted SVG. The earlier
 `3b7a5f5` review selected five files and skipped `tests/test_integration.py` as

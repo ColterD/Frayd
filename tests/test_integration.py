@@ -140,6 +140,24 @@ class ReadinessTests(unittest.TestCase):
                 self.assertEqual(str(caught.exception), f'QA server did not become ready: {error}')
                 self.assertEqual(request.call_count, 2)
 
+    def test_dns_diagnostics_preserve_original_readiness_failure(self):
+        """Unavailable diagnostic commands cannot replace a proxy readiness timeout."""
+        original = AssertionError('persistent proxy502')
+        output = io.StringIO()
+        with (
+            patch.object(integration, 'ready', side_effect=original),
+            patch.object(integration, 'docker', side_effect=OSError('unavailable')) as docker,
+            contextlib.redirect_stderr(output),
+            self.assertRaises(AssertionError) as caught,
+        ):
+            integration.dns_recovery_ready('qa-proxy', 'qa-app')
+        self.assertIs(caught.exception, original)
+        self.assertEqual(docker.call_count, 5)
+        for call in docker.call_args_list:
+            self.assertEqual(call.kwargs, {'timeout': 5})
+        self.assertIn('DIAGNOSTIC Docker DNS unavailable: OSError', output.getvalue())
+        self.assertNotIn('Config', str(docker.call_args_list))
+
 
 if __name__ == '__main__':
     unittest.main()

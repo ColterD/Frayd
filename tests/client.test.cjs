@@ -380,6 +380,8 @@ test('highlight waits for creation and retains saved state for chapter revisit w
   b.respond(async () => ({ status: 201 }));
   b.message(highlightMessage);
   await settle();
+  assert.equal(b.requests.filter(request => request.url === '/api/annotations').length, 1);
+  assert.equal(b.nodes.get('#em-searchinfo').textContent, 'Highlight saved');
   assert.equal(b.run('ebook.annots.length'), 1);
   assert.equal(posted.length, 1);
   b.respond(async () => ({ text: async () => '<html><head></head><body>Hello world</body></html>' }));
@@ -392,6 +394,36 @@ test('highlight waits for creation and retains saved state for chapter revisit w
   assert.equal(posted[1].items[0].off, 0);
   assert.equal(posted[1].items[0].len, 5);
 });
+
+test('an already loaded highlight reports saved without posting or painting again', async () => {
+  const { b, posted } = highlightReader();
+  b.run('ebook.annots = [{ kind: "highlight", spine_idx: 1, cfi: "char:0:5" }]');
+  b.nodes.get('#em-searchinfo').textContent = 'Search results';
+  await b.message(highlightMessage);
+  assert.deepEqual(b.requests, []);
+  assert.deepEqual(posted, []);
+  assert.equal(b.run('ebook.annots.length'), 1);
+  assert.equal(b.nodes.get('#em-searchinfo').textContent, 'Highlight saved');
+});
+
+for (const [name, annotation] of [
+  ['another chapter', { kind: 'highlight', spine_idx: 0, cfi: 'char:0:5' }],
+  ['another range', { kind: 'highlight', spine_idx: 1, cfi: 'char:6:5' }],
+  ['another kind', { kind: 'bookmark', spine_idx: 1, cfi: 'char:0:5' }],
+]) {
+  test(`an annotation for ${name} does not block a new highlight`, async () => {
+    const { b, posted } = highlightReader();
+    b.run(`ebook.annots = [${JSON.stringify(annotation)}]`);
+    b.respond(async () => ({ status: 201 }));
+    await b.message(highlightMessage);
+    assert.equal(b.requests.length, 1);
+    assert.equal(b.requests[0].options.method, 'POST');
+    assert.equal(JSON.parse(b.requests[0].options.body).cfi, 'char:0:5');
+    assert.equal(b.run('ebook.annots.length'), 2);
+    assert.equal(posted.length, 1);
+    assert.equal(b.nodes.get('#em-searchinfo').textContent, 'Highlight saved');
+  });
+}
 
 test('pending highlight completion keeps captured book and chapter without touching a new reader', async () => {
   for (const status of [201, 401]) {

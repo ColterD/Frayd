@@ -121,6 +121,29 @@ def ready():
             time.sleep(0.5)
     raise AssertionError(f'QA server did not become ready: {last_error}')
 
+def dns_recovery_ready(proxy, app):
+    """Preserve bounded DNS and upstream diagnostics before failed QA cleanup."""
+    try:
+        ready()
+    except AssertionError:
+        probes = [
+            ('proxy identity', ('inspect', '--format', '{{.Id}} {{.State.StartedAt}}', proxy)),
+            ('app network', ('inspect', '--format', '{{json .NetworkSettings.Networks}}', app)),
+            ('direct app health', ('exec', app, 'curl', '--fail', '--silent', '--max-time', '2',
+                                   'http://127.0.0.1:8484/api/health')),
+            ('Docker DNS', ('exec', proxy, 'nslookup', 'app', '127.0.0.11')),
+            ('proxy errors', ('logs', '--tail', '30', proxy)),
+        ]
+        for label, args in probes:
+            try:
+                result = docker(*args, timeout=5)
+                print(f'DIAGNOSTIC {label}: {(result.stdout + result.stderr).decode(errors="replace")[:12000]}',
+                      file=sys.stderr)
+            except Exception as error:
+                print(f'DIAGNOSTIC {label} unavailable: {type(error).__name__}', file=sys.stderr)
+        raise
+
+
 def wait_for_scan_idle():
     """Wait for scan admission to clear using bounded disposable-app requests."""
     deadline = time.monotonic() + 30
@@ -293,7 +316,7 @@ def main():
         assert new_ip != old_ip, (old_ip, new_ip)
         print(f"PROBE: app IP {old_ip} -> {new_ip}; proxy {proxy_before['Id']} StartedAt={proxy_before['State']['StartedAt']}")
         started = time.monotonic()
-        ready()
+        dns_recovery_ready(proxy_name, name)
         recovered = time.monotonic() - started
         assert recovered < 25, recovered
         proxy_after = json.loads(docker('inspect', proxy_name).stdout)[0]

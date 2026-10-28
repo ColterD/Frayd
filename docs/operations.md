@@ -155,7 +155,7 @@ fi
 docker run --rm -i --network none --user 0:0 --entrypoint tar -v "$DEST_VOLUME:/data" "$IMAGE" -C /data -xpf - < "$BACKUP_DIR/data.tar"
 ```
 
-6. Start only the destination project with the same image and verify HTTP health, library/media bytes, accounts and saved progress, plus SQLite `PRAGMA integrity_check` and selected database IDs/progress. If verification fails, stop the destination and retain the original volume/image; do not delete the source or retry extraction over populated data. Back up separately mounted media separately.
+6. Start only the destination project with the same image and verify HTTP health, library/media bytes, accounts and saved progress, plus SQLite `PRAGMA integrity_check` and selected database IDs/progress. If verification fails, stop the destination and retain the original volume/image; do not delete the source or retry extraction over populated data. Back up separately mounted media as a separate data source.
 
 The latest synthetic round trip passed in one uninterrupted invocation on image
 `sha256:858879bf50c7050dfb55f93723e8fa74fbde77e4a2447e00eb574d9e45bca0b5`,

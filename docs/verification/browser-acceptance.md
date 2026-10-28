@@ -44,7 +44,7 @@ a fresh script-payload binding. The full latest-image HTTP/storage integration a
 
 | Scenario and exact action | Baseline observation | First corrected image (958) |
 |---|---|---|
-| Movie: open, observe decoded playback, seek, Back, read saved progress, reopen | Decode/seek pass. Saved 203.002927 seconds; reopen starts at zero. A second seek/reopen also restarts. | Blocked on browser input recovery. A pre-binding restart observation is inconclusive; two bound-payload iterations and the actual progress response are still required. |
+| Movie: open, confirm decoded playback, seek, Back, read saved progress, reopen | Decode/seek pass. Saved 203.002927 seconds; reopen starts at zero. A second seek/reopen also restarts. | Blocked on browser input recovery. A pre-binding restart observation is inconclusive; two bound-payload iterations and the actual progress response are still required. |
 | Music: play, seek, close, reopen | Carefree advances; saved/resumed near 106 seconds. | Blocked on post-fix browser input recovery. |
 | Audiobook: play, seek, close, reopen | Alice advances; saved/resumed near 1,076 seconds. | Blocked on post-fix browser input recovery. |
 | EPUB: navigate, close, reopen | Chapter 3, page 2/3 restores. | Blocked on post-fix browser input recovery. |
@@ -95,3 +95,21 @@ the committed readiness-corrected runner passed the complete suite against the
 same immutable image. Both successes do not retroactively erase the first failure
 or establish its cause. This automated HTTP/storage result does not close the
 blocked browser oracles above.
+
+## Transient DNS error follow-up
+
+Hosted head `f3206f3` had one explicit app-IP-change recovery timeout and one
+successful same-head run. The failed job did not retain DNS answers, so its
+specific cause remains unknown. A separate controlled regression replaced the
+real app IP, verified direct health on the new app and injected one DNS SERVFAIL.
+With the original configuration, the unchanged proxy retained the old peer and
+returned 502 beyond 20 seconds. With `resolver_timeout 2s`, the same scenario
+requeried DNS after 2.000 seconds and recovered in 2.01 seconds.
+
+This follows the [pinned Nginx error retry path](https://github.com/nginx/nginx/blob/140aa942711868a8daeb95810bc9a81f272ada72/src/http/modules/ngx_http_upstream_zone_module.c#L761-L767):
+non-NXDOMAIN errors use the resolver timeout, whose default is 30 seconds, rather
+than the five-second answer-validity setting. The readiness deadline stays at
+20 seconds. `tests/test_dns_recovery.py` repeats the controlled fault in CI;
+the normal integration runner also captures bounded diagnostics before cleanup
+if its real Docker DNS recovery gate fails. These controlled config-mounted
+results do not qualify a newly built image or the held browser cases.

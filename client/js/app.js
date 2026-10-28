@@ -767,6 +767,11 @@ window.addEventListener('message', async (e) => {
     };
     const isCurrent = () => ebook === book && ebook.chunk === chapter
       && $('#em-frame').contentWindow === frameWindow;
+    if ((book.annots || []).some(a => a.kind === 'highlight'
+      && a.spine_idx === chapter && a.cfi === annotation.cfi)) {
+      $('#em-searchinfo').textContent = 'Highlight saved';
+      return;
+    }
     $('#em-searchinfo').textContent = 'Saving highlight…';
     try {
       const response = await fetch('/api/annotations', {

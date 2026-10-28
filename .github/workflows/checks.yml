@@ -32,6 +32,7 @@ jobs:
         run: |
           python3 scripts/check-build-context.py
           python3 scripts/integration.py
+          python3 tests/test_dns_recovery.py
   dependency-audit:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
