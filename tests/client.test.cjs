@@ -108,9 +108,9 @@ function browser() {
     context, nodes, requests, intervals, sockets,
     run: source => vm.runInContext(source, context),
     respond: fn => { response = fn; },
-    message: (data, overrides = {}) => listeners.get('message')({ data, origin: 'null', source: nodes.get('#em-frame').contentWindow, ...overrides }),
+    message: (data, overrides = {}) => listeners.get('message')({ data: { generation: vm.runInContext('ebook?.document?.generation', context), ...data }, origin: 'null', source: nodes.get('#em-frame').contentWindow, ...overrides }),
     page: (page, pages) => listeners.get('message')({
-      data: { type: 'page', page, pages }, origin: 'null', source: nodes.get('#em-frame').contentWindow,
+      data: { type: 'page', page, pages, generation: vm.runInContext('ebook?.document?.generation', context) }, origin: 'null', source: nodes.get('#em-frame').contentWindow,
     }),
   };
 }
@@ -121,7 +121,7 @@ function progress(browser) {
 
 test('closing an ebook preserves the last reported fractional chapter position', () => {
   const b = browser();
-  b.run('ebook = { it: { id: 7 }, chunk: 2, spine: ["a", "b", "c"] }');
+  b.run('ebook = { it: { id: 7 }, chunk: 2, spine: ["a", "b", "c"], document: { generation: 1, ready: true } }');
   b.page(3, 5);
   b.nodes.get('#em-close').onclick();
   assert.deepEqual(progress(b), [2.5, 2.5]);
@@ -130,7 +130,7 @@ test('closing an ebook preserves the last reported fractional chapter position',
 
 test('closing before any page report saves a finite chapter position', () => {
   const b = browser();
-  b.run('ebook = { it: { id: 7 }, chunk: 0, spine: ["a"] }');
+  b.run('ebook = { it: { id: 7 }, chunk: 0, spine: ["a"], document: { generation: 1, ready: true } }');
   b.nodes.get('#em-close').onclick();
   assert.deepEqual(progress(b), [0]);
 });
@@ -138,7 +138,7 @@ test('closing before any page report saves a finite chapter position', () => {
 test('changing chapters resets the previous fractional position before layout reports', async () => {
   const b = browser();
   b.respond(async () => ({ text: async () => '<html><head></head><body>Chapter</body></html>' }));
-  b.run('ebook = { it: { id: 7 }, chunk: 0, spine: ["a", "b"] }');
+  b.run('ebook = { it: { id: 7 }, chunk: 0, spine: ["a", "b"], document: { generation: 1, ready: true } }');
   b.page(3, 5);
   await b.run('showChunk(1)');
   b.nodes.get('#em-close').onclick();
@@ -151,7 +151,7 @@ test('closing while the next chapter fetch is pending saves the new chapter posi
   b.respond(url => url.includes('/chunk/')
     ? new Promise(resolve => { finishFetch = resolve; })
     : Promise.resolve({ ok: true }));
-  b.run('ebook = { it: { id: 7 }, chunk: 0, spine: ["a", "b"] }');
+  b.run('ebook = { it: { id: 7 }, chunk: 0, spine: ["a", "b"], document: { generation: 1, ready: true } }');
   b.page(3, 5);
   const loading = b.run('showChunk(1)');
   b.nodes.get('#em-close').onclick();
@@ -163,7 +163,7 @@ test('closing while the next chapter fetch is pending saves the new chapter posi
 test('closing a resumed chapter before layout preserves the requested fraction', async () => {
   const b = browser();
   b.respond(async () => ({ text: async () => '<html><head></head><body>Chapter</body></html>' }));
-  b.run('ebook = { it: { id: 7 }, chunk: 0, spine: ["a", "b"] }');
+  b.run('ebook = { it: { id: 7 }, chunk: 0, spine: ["a", "b"], document: { generation: 1, ready: true } }');
   await b.run('showChunk(1, { frac: 0.75 })');
   b.nodes.get('#em-close').onclick();
   assert.deepEqual(progress(b), [1.75]);
@@ -419,7 +419,7 @@ test('audio resume preserves saved time with available or delayed metadata', asy
 
 function highlightReader() {
   const b = browser();
-  b.run('ebook = { it: { id: 7 }, chunk: 1, spine: ["a", "b"], annots: [] }');
+  b.run('ebook = { it: { id: 7 }, chunk: 1, spine: ["a", "b"], annots: [], document: { generation: 1, ready: true, items: [] } }');
   const posted = [];
   b.nodes.get('#em-frame').contentWindow.postMessage = data => posted.push(data);
   return { b, posted };
@@ -466,14 +466,13 @@ test('highlight waits for creation and retains saved state for chapter revisit w
   assert.equal(b.run('ebook.annots.length'), 1);
   assert.equal(posted.length, 1);
   b.respond(async () => ({ text: async () => '<html><head></head><body>Hello world</body></html>' }));
-  const timers = [];
-  b.context.setTimeout = fn => timers.push(fn);
   await b.run('showChunk(0)');
   await b.run('showChunk(1)');
-  for (const timer of timers) timer();
-  assert.equal(posted.length, 2);
-  assert.equal(posted[1].items[0].off, 0);
-  assert.equal(posted[1].items[0].len, 5);
+  assert.equal(posted.length, 1);
+  b.message({ type: 'reader-ready' });
+  assert.equal(posted.length, 3);
+  assert.equal(posted[2].items[0].off, 0);
+  assert.equal(posted[2].items[0].len, 5);
 });
 
 test('an already loaded highlight reports saved without posting or painting again', async () => {
@@ -530,6 +529,7 @@ async function generatedSelection(options = {}) {
   const { b } = highlightReader();
   b.respond(async () => ({ text: async () => '<html><head></head><body>prefix Hello world</body></html>' }));
   await b.run('showChunk(1)');
+  b.message({ type: 'reader-ready' });
   const generatedHtml = b.nodes.get('#em-frame').srcdoc;
   const scriptOpen = generatedHtml.indexOf('<script>');
   assert.ok(scriptOpen >= 0, 'generated reader script opening wrapper is missing');
@@ -569,14 +569,15 @@ async function generatedSelection(options = {}) {
       return { currentNode: textNode, nextNode: () => { if (visited) return false; visited = true; return true; } };
     },
   };
+  const frameParent = { postMessage: data => messages.push(data) };
   vm.runInNewContext(script, {
-    window: frame, document, parent: { postMessage: data => messages.push(data) },
+    window: frame, document, parent: frameParent,
     NodeFilter: { SHOW_TEXT: 4 }, Node: { TEXT_NODE: 3 },
   });
   return {
     b, messages, select: () => documentListeners.get('mouseup')(),
     painted: () => painted, selectionCleared: () => selectionCleared,
-    inject: data => { for (const listener of frameListeners) listener({ data }); },
+    inject: data => { for (const listener of frameListeners) listener({ data: { ...data, generation: b.run('ebook.document.generation') }, source: frameParent }); },
   };
 }
 

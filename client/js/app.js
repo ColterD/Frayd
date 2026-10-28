@@ -480,18 +480,26 @@ function closeComic() {
 
 // ---------- ebook reader ----------
 let ebook = null; // { it, spine, chunk }
+let ebookOpenGeneration = 0;
+let ebookDocumentGeneration = 0;
 
 async function openEbook(it) {
+  const opening = ++ebookOpenGeneration;
+  ebook = null;
   const spine = await (await fetch(`/api/epub/${it.id}/spine`)).json();
   if (!Array.isArray(spine) || !spine.length) return;
   const annots = await fetch(`/api/annotations/${it.id}?identity=${encodeURIComponent(IDENTITY)}`, { headers: authHeaders() })
     .then(r => r.ok ? r.json() : []).catch(() => []);
-  ebook = { it, spine, chunk: 0, annots, toc: [] };
+  if (opening !== ebookOpenGeneration) return;
+  const book = { it, spine, chunk: 0, annots, toc: [] };
+  ebook = book;
   $('#em-title').textContent = it.title;
   $('#ebook-modal').classList.add('on');
   // TOC (best-effort)
-  ebook.toc = await fetch(`/api/epub/${it.id}/toc`).then(r => r.ok ? r.json() : []).catch(() => []);
+  book.toc = await fetch(`/api/epub/${it.id}/toc`).then(r => r.ok ? r.json() : []).catch(() => []);
+  if (ebook !== book || opening !== ebookOpenGeneration) return;
   resumeFor(it.id).then(p => {
+    if (ebook !== book || opening !== ebookOpenGeneration) return;
     const ch = p ? Math.min(Math.floor(p.position), spine.length - 1) : 0;
     const frac = p ? p.position - Math.floor(p.position) : 0;
     showChunk(ch, { frac });
@@ -500,6 +508,10 @@ async function openEbook(it) {
 
 async function showChunk(n, opts = {}) {
   if (!ebook) return;
+  const book = ebook;
+  const readerDocument = { generation: ++ebookDocumentGeneration, ready: false };
+  book.document = readerDocument;
+  const isCurrent = () => ebook === book && book.document === readerDocument;
   ebook.chunk = Math.max(0, Math.min(n, ebook.spine.length - 1));
   ebook.pendingCol = opts.atEnd ? Infinity : opts.frac != null ? opts.frac : 0;
   ebook.lastFrac = opts.atEnd ? 0.999 : (opts.frac ?? 0);
@@ -507,6 +519,7 @@ async function showChunk(n, opts = {}) {
   const base = chunkUrl.includes('/') ? chunkUrl.slice(0, chunkUrl.lastIndexOf('/') + 1) : '';
   try {
     let html = await (await fetch(`/api/epub/${ebook.it.id}/chunk/${ebook.chunk}`)).text();
+    if (!isCurrent()) return;
     const PW = ebookPageW(), PAD = 28; // page margin; column gap must be 2*PAD (see stride below)
     const FRAME_H = Math.round((document.getElementById('em-frame')?.clientHeight || window.innerHeight * 0.78) / window.innerHeight * 100);
     // rewrite relative src/href to asset endpoint (skip absolute, data:, #anchors, mailto)
@@ -528,10 +541,13 @@ async function showChunk(n, opts = {}) {
         img{max-width:100%}
       </style>
       <script>
+        const generation = ${readerDocument.generation};
+        const sendReader = data => parent.postMessage({ ...data, generation }, '*');
+        const restoredHighlights = new Set();
         const PW = ${PW}, PAD = ${PAD}; // inner page padding (visual margin, kills edge-butt)
         const STEP = ${PW}; // column (PW-2*PAD) + gap (2*PAD) = exactly PW: viewport = one page, no bleed
         let col = 0;
-        function report() { parent.postMessage({type:'page', page: col + 1, pages: pageCount()}, '*'); }
+        function report() { sendReader({type:'page', page: col + 1, pages: pageCount()}); }
         function pageCount() {
           const pages = Math.round((document.documentElement.scrollWidth - ${PW}) / STEP) + 1;
           return Math.max(1, pages - 1); // minus the blank filler column
@@ -548,10 +564,10 @@ async function showChunk(n, opts = {}) {
           if (e.data === 'next' || e.data === 'prev') {
             const last = pageCount() - 1;
             if (e.data === 'next') {
-              if (col >= last) parent.postMessage({type:'chapter', dir:1}, '*');
+              if (col >= last) sendReader({type:'chapter', dir:1});
               else { col++; snap(); report(); }
             } else {
-              if (col <= 0) parent.postMessage({type:'chapter', dir:-1}, '*');
+              if (col <= 0) sendReader({type:'chapter', dir:-1});
               else { col--; snap(); report(); }
             }
           } else if (typeof e.data === 'object' && e.data?.type === 'goto') {
@@ -567,18 +583,19 @@ async function showChunk(n, opts = {}) {
           const sp = document.createElement('div');
           sp.style.cssText = 'width:1px;height:100%;break-before:column';
           document.body.appendChild(sp);
-          // resume position: parent messages {type:'goto', col} after load
-          col = 0; report();
+          // All listeners and body are ready; parent now sends this document's resume and marks.
+          col = 0;
+          sendReader({ type: 'reader-ready' });
         });
-        // parent-driven resume: apply once, after first page report (layout settled)
+        // Parent-driven resume and highlights are bound to this document generation.
         window.addEventListener('message', (e) => {
-          if (typeof e.data === 'object' && e.data?.type === 'resume') {
+          if (e.source === parent && e.data?.generation === generation && e.data?.type === 'resume') {
             const lastReal = pageCount(); // filler excluded from count
             const c = e.data.col === 'end' ? lastReal - 1
               : Math.round(e.data.col * (lastReal - 1)); // fraction → column
             col = Math.max(0, Math.min(c, lastReal - 1));
             snap(); report();
-          } else if (e.data?.type === 'inject-hl') {
+          } else if (e.source === parent && e.data?.generation === generation && e.data?.type === 'inject-hl') {
             // highlight restore runs HERE (sandbox: parent can't touch our DOM)
             const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
             const nodes = [];
@@ -586,6 +603,8 @@ async function showChunk(n, opts = {}) {
             let pos = 0;
             const offs = nodes.map(n => { const st = pos; pos += n.nodeValue.length; return { n, st }; });
             for (const h of [...e.data.items].sort((a, b) => b.off - a.off)) {
+              const key = h.off + ':' + h.len;
+              if (restoredHighlights.has(key)) continue;
               for (const { n, st } of offs) {
                 const en = st + n.nodeValue.length;
                 if (h.off >= st && h.off + h.len <= en) {
@@ -595,7 +614,7 @@ async function showChunk(n, opts = {}) {
                   const m = document.createElement('mark');
                   m.className = 'user-highlight';
                   m.style.setProperty('--hl', h.color);
-                  try { r.surroundContents(m); } catch {}
+                  try { r.surroundContents(m); restoredHighlights.add(key); } catch {}
                   break;
                 }
               }
@@ -607,10 +626,10 @@ async function showChunk(n, opts = {}) {
           if (typeof e.data === 'object' && e.data?.type === 'geom') {
             const b = document.documentElement;
             const lastText = [...document.body.children].filter(n => n.nodeType === 1).pop();
-            parent.postMessage({ type: 'geom', innerWidth: window.innerWidth,
+            sendReader({ type: 'geom', innerWidth: window.innerWidth,
               scrollWidth: b.scrollWidth, clientWidth: b.clientWidth,
               scrollLeft: window.scrollX, col, STEP,
-              bodyPad: getComputedStyle(b).paddingLeft + '/' + getComputedStyle(b).paddingRight }, '*');
+              bodyPad: getComputedStyle(b).paddingLeft + '/' + getComputedStyle(b).paddingRight });
           }
         });
         // in-chapter search: wrap matches in <mark>, report count + positions
@@ -650,7 +669,7 @@ async function showChunk(n, opts = {}) {
                 window.scrollTo({ left: Math.round(first.getBoundingClientRect().left + window.scrollX - PW / 2), behavior: 'instant' });
               }
             }
-            parent.postMessage({type:'search-results', count: hits.length}, '*');
+            sendReader({type:'search-results', count: hits.length});
           }
         });
         window.addEventListener('message', (e) => {
@@ -663,7 +682,7 @@ async function showChunk(n, opts = {}) {
             nx.classList.add('current');
             const pw = PW;
             window.scrollTo({ left: Math.round(nx.getBoundingClientRect().left + window.scrollX - PW / 2), behavior: 'instant' });
-            parent.postMessage({type:'search-hit', idx: (cur + 1) % marks.length + 1, total: marks.length}, '*');
+            sendReader({type:'search-hit', idx: (cur + 1) % marks.length + 1, total: marks.length});
           }
         });
         const searchStyle = document.createElement('style');
@@ -682,7 +701,7 @@ async function showChunk(n, opts = {}) {
           if (!text.trim()) return;
           if (range.startContainer !== range.endContainer || range.startContainer.nodeType !== Node.TEXT_NODE) {
             sel.removeAllRanges();
-            parent.postMessage({ type: 'highlight-selection-error' }, '*');
+            sendReader({ type: 'highlight-selection-error' });
             return;
           }
           const length = range.endOffset - range.startOffset;
@@ -694,7 +713,7 @@ async function showChunk(n, opts = {}) {
           pre.setEnd(range.startContainer, range.startOffset);
           const offset = pre.toString().length;
           sel.removeAllRanges();
-          parent.postMessage({type:'highlight', cfi: 'char:' + offset + ':' + length, text, page: Math.round(window.scrollX / PW)}, '*');
+          sendReader({type:'highlight', cfi: 'char:' + offset + ':' + length, text, page: Math.round(window.scrollX / PW)});
         });
       <\/script></head>`);
     // re-apply saved highlights for this chapter (char-offset based)
@@ -703,25 +722,12 @@ async function showChunk(n, opts = {}) {
       const m = a.cfi.match(/^char:(\d+):(\d+)$/);
       return m ? { off: +m[1], len: +m[2], color: a.color || 'yellow' } : null;
     }).filter(Boolean).sort((a, b) => b.off - a.off); // reverse: offsets stay valid
-    if (inject.length) {
-      html = html.replace(/<body[^>]*>/i, (m) => m + '<span id="__hlroot"></span>');
-    }
-    $('#em-frame').srcdoc = html;
-    // resume position after iframe layout settles (want 'end' = last real page)
-    const want = ebook.pendingCol;
+    readerDocument.items = inject;
+    readerDocument.want = ebook.pendingCol === Infinity ? 'end' : ebook.pendingCol;
     ebook.pendingCol = 0;
-    $('#em-frame').addEventListener('load', () => {
-      setTimeout(() => {
-        $('#em-frame').contentWindow?.postMessage({ type: 'resume', col: want === Infinity ? 'end' : want }, '*'); // want: 'end' | fraction-of-chapter 0..1
-      }, 80);
-    }, { once: true });
-    // highlights injected via postMessage (sandbox-safe; same job as before)
-    if (inject.length) {
-      const items = inject.map(h => ({ off: h.off, len: h.len, color: h.color }));
-      const send = () => $('#em-frame').contentWindow?.postMessage({ type: 'inject-hl', items }, '*');
-      setTimeout(send, 100); // after resume/first layout
-    }
+    $('#em-frame').srcdoc = html;
   } catch {
+    if (!isCurrent()) return;
     $('#em-frame').srcdoc = '<p style="font-family:sans-serif;color:#333">Failed to load chapter.</p>';
   }
 }
@@ -737,7 +743,11 @@ let ebookResizeT = null;
 window.addEventListener('resize', () => {
   if (!ebook || !$('#ebook-modal').classList.contains('on')) return;
   clearTimeout(ebookResizeT);
-  ebookResizeT = setTimeout(() => showChunk(ebook.chunk), 300);
+  const book = ebook;
+  const readerDocument = book.document;
+  ebookResizeT = setTimeout(() => {
+    if (ebook === book && book.document === readerDocument) showChunk(book.chunk, { frac: book.lastFrac });
+  }, 300);
 });
 window.addEventListener('message', async (e) => {
   if (!ebook) return;
@@ -746,6 +756,16 @@ window.addEventListener('message', async (e) => {
   const frameWindow = $('#em-frame').contentWindow;
   if (e.origin !== 'null' || !frameWindow || e.source !== frameWindow) return;
   if (!e.data || typeof e.data !== 'object' || Array.isArray(e.data)) return;
+  const readerDocument = ebook.document;
+  if (!readerDocument || e.data.generation !== readerDocument.generation) return;
+  if (e.data.type === 'reader-ready') {
+    if (readerDocument.ready) return;
+    readerDocument.ready = true;
+    frameWindow.postMessage({ type: 'resume', col: readerDocument.want, generation: readerDocument.generation }, '*');
+    if (readerDocument.items.length) frameWindow.postMessage({ type: 'inject-hl', generation: readerDocument.generation, items: readerDocument.items }, '*');
+    return;
+  }
+  if (!readerDocument.ready) return;
   if (e.data?.type === 'chapter') {
     if (e.data.dir !== -1 && e.data.dir !== 1) return;
     const n = ebook.chunk + e.data.dir;
@@ -766,6 +786,7 @@ window.addEventListener('message', async (e) => {
       cfi: e.data.cfi, text: e.data.text, color: 'yellow'
     };
     const isCurrent = () => ebook === book && ebook.chunk === chapter
+      && book.document === readerDocument && readerDocument.ready
       && $('#em-frame').contentWindow === frameWindow;
     if ((book.annots || []).some(a => a.kind === 'highlight'
       && a.spine_idx === chapter && a.cfi === annotation.cfi)) {
@@ -791,7 +812,7 @@ window.addEventListener('message', async (e) => {
       if (!isCurrent()) return;
       if (!exists) {
         const [, off, len] = annotation.cfi.match(/^char:(\d+):(\d+)$/);
-        frameWindow.postMessage({ type: 'inject-hl', items: [{ off: +off, len: +len, color: annotation.color }] }, '*');
+        frameWindow.postMessage({ type: 'inject-hl', generation: readerDocument.generation, items: [{ off: +off, len: +len, color: annotation.color }] }, '*');
       }
       $('#em-searchinfo').textContent = 'Highlight saved';
     } catch {
@@ -855,8 +876,11 @@ function renderToc() {
   });
 }
 function closeEbook() {
+  ++ebookOpenGeneration;
+  clearTimeout(ebookResizeT);
   $('#ebook-modal').classList.remove('on');
   if (ebook) { syncProgress(ebook.it.id, ebook.chunk + (ebook.lastFrac ?? 0)); ebook = null; }
+  $('#em-frame').srcdoc = '';
   $('#em-frame').src = 'about:blank';
   $('#em-search').value = '';
   $('#em-searchinfo').textContent = '';

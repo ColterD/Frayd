@@ -51,8 +51,7 @@
     const loaded = new Promise(resolve => frame.addEventListener('load', resolve, { once: true }));
     await showChunk(0);
     await loaded;
-    // Production restores saved highlights after its own 100 ms timer.
-    await delay(160);
+    await until(() => ebook?.document?.ready, 'current reader ready');
     equal((await probe()).opaqueOrigin, 'null', 'Reader must have opaque sandbox origin');
   }
   async function run(name, fn) {
@@ -111,13 +110,28 @@
     const originalBlank = plyr.config.blankVideo;
     if (decodableBlank) plyr.config.blankVideo = '/api/stream/21';
     const previous = plyr.media;
-    previous.addEventListener('loadedmetadata', event => {
+    const retiredMetadata = event => {
       trace.push({ event: 'retired-native-metadata', trusted: event.isTrusted,
         retired: previous !== plyr.media, src: previous.currentSrc,
         currentDuration: plyr.media.duration, currentTime: plyr.currentTime });
-    }, { once: true });
+    };
+    previous.addEventListener('loadedmetadata', retiredMetadata, { once: true });
     try {
+      if (decodableBlank) await api('hold-media', { path: `/api/stream/${id}` });
       openVideo({ id, kind: 'movie', title: 'Native resume' });
+      if (decodableBlank) {
+        await until(async () => {
+          const state = await api('media-gate');
+          check(state.pending > 0 || !trace.some(event => event.event === 'native:loadedmetadata:trusted=true'),
+            'Requested movie metadata bypassed the held server stream (browser media cache)');
+          return state.pending > 0;
+        }, 'requested movie byte request at the held server stream');
+        await until(() => trace.some(event => event.event === 'retired-native-metadata' && event.trusted && event.retired),
+          'retired cancellation blank metadata before requested movie release');
+        const release = await api('release-media', {});
+        check(release.released && release.waited > 0, 'Requested native bytes must be held and explicitly released');
+        trace.push({ event: 'requested-stream-released', waited: release.waited });
+      }
       await until(() => {
         if (plyr.media.error?.code === 3 || plyr.media.error?.code === 4) {
           const error = new Error(`Native H264 decode unavailable: ${plyr.media.error.message}`);
@@ -143,10 +157,14 @@
         `Native saved${expectedPosition} resume: ${JSON.stringify(trace)}`);
       return { trace: trace.slice(), decodedWidth: plyr.media.videoWidth, nativeEvents: true };
     } finally {
-      document.removeEventListener('loadedmetadata', nativeMetadata, true);
-      plyr.off('loadedmetadata', wrappedMetadata);
-      document.getElementById('vm-back').click();
-      plyr.config.blankVideo = originalBlank;
+      try { if (decodableBlank) await api('release-media', {}); }
+      finally {
+        previous.removeEventListener('loadedmetadata', retiredMetadata);
+        document.removeEventListener('loadedmetadata', nativeMetadata, true);
+        plyr.off('loadedmetadata', wrappedMetadata);
+        document.getElementById('vm-back').click();
+        plyr.config.blankVideo = originalBlank;
+      }
     }
   }
   await run('native decoded plain movie resume before any party hooks',
@@ -157,6 +175,43 @@
     () => nativeResume('close and reopen', true));
   await run('native different movie without saved progress starts at zero',
     () => nativeResume('new movie without saved progress', false, 21, 0));
+  await run('saved marks survive parser-gated reader startup', async () => {
+    const saved = [{ kind: 'highlight', spine_idx: 0, cfi: 'char:7:6', text: 'target', color: 'yellow' }];
+    await api('configure', { body: '<p id="target">prefix target suffix</p>', annotations: saved, parserGate: true });
+    ebook = { it: { id: 7 }, spine: ['one.xhtml', 'two.xhtml'], chunk: 0, annots: saved };
+    document.getElementById('ebook-modal').classList.add('on');
+    const loaded = new Promise(resolve => frame.addEventListener('load', resolve, { once: true }));
+    await showChunk(0, { frac: 0.5 });
+    await until(async () => (await api('parser-state')).held, 'parser blocked before generated listener');
+    await delay(240); // Negative control: the old one-shot 100 ms restore expires here.
+    await api('release-parser', {});
+    await loaded;
+    await delay(80);
+    const observed = await probe();
+    equal(observed.marks, ['target'], 'Saved mark restored after actual listener readiness');
+    equal((await api('state')).posts, [], 'Restore requires no new annotation POST');
+    const retiredGeneration = ebook.document.generation;
+    frame.contentWindow.postMessage({ type: 'inject-hl', generation: retiredGeneration,
+      items: [{ off: 7, len: 6, color: 'yellow' }] }, '*');
+    equal((await probe()).marks, ['target'], 'Repeated restore does not nest marks');
+    document.getElementById('em-close').click();
+    await api('configure', { body: '<p id="target">prefix target suffix</p>', annotations: saved });
+    await openEbook({ id: 7, title: 'Reopened saved book' });
+    await until(() => ebook?.document?.ready, 'reopened document ready');
+    equal((await probe()).marks, ['target'], 'Account reopen restores saved annotation');
+    const reopenedGeneration = ebook.document.generation;
+    await showChunk(1);
+    await until(() => ebook.document.ready, 'second TOC chapter ready');
+    equal((await probe()).marks, [], 'Other chapter has no saved mark');
+    await showChunk(0);
+    await until(() => ebook.document.ready, 'first TOC chapter ready');
+    equal((await probe()).marks, ['target'], 'TOC revisit restores exactly once');
+    // The opaque WindowProxy remains the same across these documents.
+    await probe('ready', { generation: reopenedGeneration });
+    equal((await probe()).marks, ['target'], 'Stale ready cannot duplicate current marks');
+    return { marks: observed.marks, parserHeldBeyondOldTimer: true, posts: 0,
+      reopen: true, tocRevisit: true, duplicateRestoreIdempotent: true, staleReadyIgnored: true };
+  });
   await run('plain text save, 201 paint, reload and duplicate', () => highlight({
     body: '<p id="target">prefix target suffix</p>', start: 7, end: 13, text: 'target', offset: 7,
   }));

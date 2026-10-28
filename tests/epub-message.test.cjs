@@ -72,9 +72,9 @@ function browser() {
 const highlight = { type: 'highlight', cfi: 'char:0:5', text: 'Hello' };
 function reader() {
   const b = browser();
-  b.run('ebook = { it: { id: 7 }, chunk: 1, spine: ["a", "b", "c"] }');
+  b.run('ebook = { it: { id: 7 }, chunk: 1, spine: ["a", "b", "c"], document: { generation: 1, ready: true, items: [] } }');
   b.send = (data, overrides = {}) => b.message({
-    data, origin: 'null', source: b.nodes.get('#em-frame').contentWindow, ...overrides,
+    data: data && typeof data === "object" && !Array.isArray(data) ? { generation: b.run("ebook?.document?.generation"), ...data } : data, origin: 'null', source: b.nodes.get('#em-frame').contentWindow, ...overrides,
   });
   return b;
 }
@@ -165,11 +165,12 @@ test('reader chapter reports preserve both directions and enforce spine boundari
   assert.equal(b.run('ebook.chunk'), 2);
   b.send({ type: 'chapter', dir: 1 });
   assert.equal(b.requests.length, 1);
+  b.run('ebook.document.ready = true');
   b.send({ type: 'chapter', dir: -1 });
   await new Promise(setImmediate);
   assert.equal(b.run('ebook.chunk'), 1);
   assert.equal(b.run('ebook.lastFrac'), 0.999);
-  b.run('ebook.chunk = 0');
+  b.run('ebook.chunk = 0; ebook.document.ready = true');
   b.send({ type: 'chapter', dir: -1 });
   assert.deepEqual(b.requests.map(r => r.url), ['/api/epub/7/chunk/2', '/api/epub/7/chunk/1']);
 });
@@ -183,4 +184,77 @@ test('reader single-page, final-page, empty search and geometry reports remain a
   assert.equal(b.nodes.get('#em-searchinfo').textContent, 'No hits');
   b.send({ type: 'geom', innerWidth: 760 });
   assert.equal(b.requests.length, 2);
+});
+
+test('ready restores resume and saved marks once, and rejects stale generations on the same WindowProxy', async () => {
+  const b = reader();
+  const posted = [];
+  b.nodes.get('#em-frame').contentWindow.postMessage = data => posted.push(data);
+  b.respond(async () => ({ text: async () => '<html><head></head><body>Hello</body></html>' }));
+  b.run('ebook.annots = [{ kind: "highlight", spine_idx: 1, cfi: "char:0:5", color: "yellow" }]');
+  await b.run('showChunk(1, { frac: 0.75 })');
+  const generation = b.run('ebook.document.generation');
+  assert.deepEqual(posted, []);
+  b.send({ type: 'reader-ready', generation: generation - 1 });
+  b.send({ type: 'page', page: 1, pages: 4 });
+  assert.deepEqual(posted, []);
+  assert.equal(b.requests.length, 1);
+  b.send({ type: 'reader-ready', generation });
+  assert.deepEqual(JSON.parse(JSON.stringify(posted)), [
+    { type: 'resume', col: 0.75, generation },
+    { type: 'inject-hl', generation, items: [{ off: 0, len: 5, color: 'yellow' }] },
+  ]);
+  b.send({ type: 'reader-ready', generation });
+  assert.equal(posted.length, 2);
+  await b.run('showChunk(1, { atEnd: true })');
+  b.send({ type: 'reader-ready', generation });
+  b.send({ ...highlight, generation });
+  assert.equal(posted.length, 2);
+  assert.equal(b.requests.length, 2);
+  b.send({ type: 'reader-ready' });
+  assert.equal(posted[2].col, 'end');
+  b.nodes.get('#em-close').onclick();
+  b.send({ type: 'reader-ready', generation: b.run('ebookDocumentGeneration') });
+  assert.equal(posted.length, 4);
+});
+
+test('late chapter fetch cannot replace the latest chapter or a closed reader', async () => {
+  const b = reader();
+  const finish = [];
+  b.respond(() => new Promise(resolve => finish.push(resolve)));
+  const old = b.run('showChunk(0)');
+  const current = b.run('showChunk(2)');
+  finish[1]({ text: async () => '<html><head></head><body>Current</body></html>' });
+  await current;
+  const html = b.nodes.get('#em-frame').srcdoc;
+  finish[0]({ text: async () => '<html><head></head><body>Retired</body></html>' });
+  await old;
+  assert.equal(b.nodes.get('#em-frame').srcdoc, html);
+  const closed = b.run('showChunk(1)');
+  b.nodes.get('#em-close').onclick();
+  finish[2]({ text: async () => '<html><head></head><body>Closed</body></html>' });
+  await closed;
+  assert.equal(b.nodes.get('#em-frame').srcdoc, '');
+});
+
+test('closed or superseded book opening cannot publish its late TOC and resume', async () => {
+  const b = reader();
+  let finishToc;
+  b.respond(async url => {
+    if (url.includes('/spine')) return { json: async () => ['chapter.xhtml'] };
+    if (url.includes('/annotations/')) return { ok: true, json: async () => [] };
+    if (url.includes('/toc')) return new Promise(resolve => { finishToc = resolve; });
+    return { ok: true, json: async () => null };
+  });
+  const opening = b.run('openEbook({ id: 9, title: "Old" })');
+  await new Promise(setImmediate);
+  b.nodes.get('#em-close').onclick();
+  b.run('ebook = { it: { id: 10 }, chunk: 0, spine: ["new"], toc: [], document: { generation: 10, ready: true } }');
+  finishToc({ ok: true, json: async () => [{ title: 'Old TOC' }] });
+  await opening;
+  await new Promise(setImmediate);
+  assert.equal(b.run('ebook.it.id'), 10);
+  assert.equal(b.run('ebook.toc.length'), 0);
+  assert.equal(b.requests.some(request => request.url.includes('/chunk/') || request.url.includes('/progress/9')), false);
+  assert.equal(b.nodes.get('#em-frame').srcdoc, '');
 });

@@ -45,11 +45,94 @@ async function stopBrowserGroup(browser) {
   signalGroup(browser.pid, 'SIGKILL');
   if (!await waitForExit(2000)) throw new Error(`Owned browser process group ${browser.pid} did not exit after SIGKILL; profile retained`);
 }
-async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir } = {}) {
+function redactDebuggerCapabilities(message) {
+  return String(message).replace(/DevTools listening on [^\r\n]*/g, 'Owned DevTools endpoint redacted')
+    .replace(/wss?:\/\/[^\s"']+/g, '[debugger endpoint redacted]');
+}
+async function bounded(promise, message, milliseconds = 3000) {
+  let timer;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), milliseconds);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
+  const deadline = Date.now() + 5000;
+  const portFile = join(profile, 'DevToolsActivePort');
+  while (!existsSync(portFile)) {
+    if (browser.exitCode !== null || browser.signalCode !== null) throw new Error('Owned browser exited before cache setup');
+    if (Date.now() >= deadline) throw new Error('Owned browser did not expose its cache-control endpoint');
+    await delay(20);
+  }
+  const port = Number(readFileSync(portFile, 'utf8').split('\n')[0]);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid owned browser cache-control port');
+  const response = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(3000) });
+  if (!response.ok) throw new Error('Owned browser page discovery failed');
+  const pages = (await response.json()).filter(page => page.type === 'page');
+  if (pages.length !== 1 || pages[0].url !== 'about:blank') throw new Error('Owned browser must have exactly one blank page before navigation');
+  const endpoint = new URL(pages[0].webSocketDebuggerUrl);
+  if (endpoint.protocol !== 'ws:' || endpoint.hostname !== '127.0.0.1' || endpoint.port !== String(port)
+    || !/^\/devtools\/page\/[a-zA-Z0-9-]+$/.test(endpoint.pathname)) throw new Error('Unexpected owned browser page endpoint');
+  const socket = new WebSocket(endpoint.href);
+  const pending = new Map();
+  let sequence = 0;
+  socket.addEventListener('message', event => {
+    let message;
+    try { message = JSON.parse(event.data); }
+    catch { for (const waiter of pending.values()) waiter.reject(new Error('Invalid owned browser protocol response')); return; }
+    const waiter = pending.get(message.id);
+    if (!waiter) return;
+    if (message.error) waiter.reject(new Error(`Owned browser cache RPC failed (${message.error.code})`));
+    else waiter.resolve(message.result);
+  });
+  socket.addEventListener('error', () => {
+    for (const waiter of pending.values()) waiter.reject(new Error('Owned browser cache protocol connection failed'));
+  });
+  async function rpc(method, params = {}) {
+    const id = ++sequence;
+    try {
+      const result = new Promise((resolve, reject) => { pending.set(id, { resolve, reject }); });
+      socket.send(JSON.stringify({ id, method, params }));
+      return await bounded(result, `Owned browser cache RPC ${method} timed out`);
+    } finally { pending.delete(id); }
+  }
+  const receipt = { cacheDisabled: false, browserCacheCleared: false, configuredBeforeFixtureNavigation: false, protocolClosed: false };
+  async function close() {
+    if (socket.readyState !== WebSocket.CLOSED) {
+      const closed = new Promise(resolve => socket.addEventListener('close', resolve, { once: true }));
+      socket.close();
+      await bounded(closed, 'Owned browser cache protocol close timed out');
+    }
+    receipt.protocolClosed = true;
+  }
+  try {
+    await bounded(new Promise((resolve, reject) => {
+      socket.addEventListener('open', resolve, { once: true });
+      socket.addEventListener('error', () => reject(new Error('Owned browser cache protocol failed to open')), { once: true });
+    }), 'Owned browser cache protocol open timed out');
+    await rpc('Network.enable');
+    await rpc('Network.setCacheDisabled', { cacheDisabled: true });
+    await rpc('Network.clearBrowserCache');
+    const navigation = await rpc('Page.navigate', { url: fixtureUrl });
+    if (navigation.errorText) throw new Error('Owned browser fixture navigation failed');
+    Object.assign(receipt, { cacheDisabled: true, browserCacheCleared: true, configuredBeforeFixtureNavigation: true });
+    // Keep Network overrides active until the runner finishes all media cases.
+    return { receipt, close };
+  } catch (error) {
+    await close();
+    throw error;
+  }
+}
+async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, cacheSetup = configureOwnedBrowserCache } = {}) {
   let browser;
   let profile;
   let timer;
   let pendingAnnotation;
+  let parserGate = false;
+  let parserResponse;
+  let heldMedia = null;
+  let pendingMedia = 0;
   const sockets = new Set();
   let body = '';
   let annotations = [];
@@ -58,12 +141,24 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir } 
   let output;
   let provenance;
   let runError;
+  let cacheControl;
+  let cacheSession;
   const cleanupErrors = [];
   let browserGroupStopped = false;
   let resolveResult;
   const result = new Promise(resolve => { resolveResult = resolve; });
   const unexpectedRequests = [];
   const nativeRequests = [];
+  const mediaGateEvents = [];
+  function releaseMedia(reason) {
+    const gate = heldMedia;
+    heldMedia = null;
+    if (gate) {
+      mediaGateEvents.push({ event: 'release', path: gate.path, waited: gate.waited, reason });
+      gate.release();
+    }
+    return { released: Boolean(gate), waited: gate?.waited || 0 };
+  }
   const probe = readFileSync(join(root, 'tests/fixtures/reader-probe.js'), 'utf8');
   const contentTypes = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml' };
   const server = createServer(async (request, response) => {
@@ -78,12 +173,31 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir } 
         input += chunk;
         if (input.length > 1024 * 1024) throw new Error('Fixture request exceeds size bound');
       }
+      if (path === '/__fixture/hold-media' && request.method === 'POST') {
+        const target = JSON.parse(input).path;
+        if (!/^\/api\/stream\/(20|22)$/.test(target)) return json({ error: 'Unknown requested native stream' }, 400);
+        if (heldMedia) return json({ error: 'Previous native stream hold still active' }, 409);
+        let release;
+        const promise = new Promise(resolve => { release = resolve; });
+        heldMedia = { path: target, promise, release, waited: 0 };
+        mediaGateEvents.push({ event: 'hold', path: target });
+        return json({ held: true, path: target });
+      }
+      if (path === '/__fixture/media-gate') return json({ held: Boolean(heldMedia), pending: pendingMedia });
+      if (path === '/__fixture/release-media' && request.method === 'POST') return json(releaseMedia('driver'));
       if (path === '/__fixture/configure' && request.method === 'POST') {
         if (pendingAnnotation) throw new Error('Previous annotation response still pending');
         const fixture = JSON.parse(input);
         body = fixture.body;
+        parserGate = Boolean(fixture.parserGate);
         annotations = fixture.annotations;
         posts = [];
+        return json({ ok: true });
+      }
+      if (path === '/__fixture/parser.js') { parserResponse = response; return; }
+      if (path === '/__fixture/parser-state') return json({ held: Boolean(parserResponse) });
+      if (path === '/__fixture/release-parser' && request.method === 'POST') {
+        if (parserResponse) { parserResponse.writeHead(200, { 'Content-Type': 'text/javascript' }); parserResponse.end(''); parserResponse = null; }
         return json({ ok: true });
       }
       if (path === '/__fixture/state') return json({ posts, annotations });
@@ -106,10 +220,12 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir } 
         pendingAnnotation = response;
         return;
       }
-      if (path === '/api/epub/7/chunk/0') {
+      if (/^\/api\/epub\/7\/chunk\/[01]$/.test(path)) {
         response.writeHead(200, { 'Content-Type': 'text/html' });
-        return response.end(`<!doctype html><html><head><meta charset="utf-8"><script>${probe}</script></head><body>${body}</body></html>`);
+        return response.end(`<!doctype html><html><head><meta charset="utf-8">${parserGate ? `<script src="http://127.0.0.1:${server.address().port}/__fixture/parser.js"></script>` : ''}<script>${probe}</script></head><body>${body}</body></html>`);
       }
+      if (path === '/api/epub/7/spine') return json(['one.xhtml', 'two.xhtml']);
+      if (path === '/api/epub/7/toc') return json([]);
       if (path === '/api/annotations/7') return json(annotations);
       if (path === '/api/progress/20' || path === '/api/progress/22') { nativeRequests.push({ path, status: 200, position: 64 }); return json({ position: 64 }); }
       if (path === '/api/progress/21') { nativeRequests.push({ path, status: 200, position: 0 }); return json({ position: 0 }); }
@@ -117,8 +233,15 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir } 
       if (path === '/api/progress') return json({});
       if (path === '/api/library') return json([]);
       if (/^\/api\/stream\/(20|21|22)$/.test(path)) {
-        // A cached cancellation blank can finish before the requested movie.
-        if (path === '/api/stream/20' || path === '/api/stream/22') await delay(150);
+        const gate = heldMedia;
+        if (gate?.path === path) {
+          gate.waited++;
+          pendingMedia++;
+          mediaGateEvents.push({ event: 'held-request', path });
+          try { await gate.promise; }
+          finally { pendingMedia--; }
+          if (response.destroyed) return;
+        }
         const media = readFileSync(join(root, 'tests/fixtures/native-resume.mp4'));
         const range = request.headers.range?.match(/^bytes=(\d+)-(\d*)$/);
         const start = range ? Number(range[1]) : 0;
@@ -166,18 +289,30 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir } 
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
     profile = mkdtempSync(join(tmpdir(), 'frayd-browser-regression-'));
     const url = `http://127.0.0.1:${server.address().port}/`;
+    const ownedCacheControl = cacheSetup === configureOwnedBrowserCache;
     browser = spawn(executable, ['--headless', '--no-sandbox', '--disable-gpu', '--disable-background-networking',
       '--disable-component-update', '--disable-sync', '--no-first-run', '--no-default-browser-check',
       '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1', '--disable-features=MediaRouter',
-      `--user-data-dir=${profile}`, url], { detached: true, stdio: ['ignore', 'ignore', 'pipe'] });
-    browser.stderr.on('data', bytes => { logs = (logs + bytes.toString()).slice(-12000); });
+      ...(ownedCacheControl ? ['--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0'] : []),
+      `--user-data-dir=${profile}`, ownedCacheControl ? 'about:blank' : url], { detached: true, stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderrPending = '';
+    browser.stderr.on('data', bytes => {
+      stderrPending += bytes.toString();
+      const lines = stderrPending.split('\n');
+      stderrPending = lines.pop();
+      logs = (logs + lines.map(redactDebuggerCapabilities).join('\n') + '\n').slice(-12000);
+    });
     const exited = new Promise((_, reject) => {
       browser.once('error', reject);
       browser.once('exit', (code, signal) => reject(new Error(`Browser exited before result: ${code}/${signal}; ${logs}`)));
     });
     const timedOut = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`Browser regression exceeded 60 seconds; ${logs}`)), 60000); });
-    const observed = await Promise.race([result, exited, timedOut]);
-    const expectedCases = 24;
+    const observed = await Promise.race([(async () => {
+      cacheSession = await cacheSetup({ profile, fixtureUrl: url, browser });
+      cacheControl = cacheSession.receipt;
+      return result;
+    })(), exited, timedOut]);
+    const expectedCases = 25;
     const complete = observed.cases.length === expectedCases
       && new Set(observed.cases.map(item => item.name)).size === expectedCases
       && observed.cases.every(item => item.status === 'PASS')
@@ -190,10 +325,14 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir } 
     runError = error;
   } finally {
     clearTimeout(timer);
+    releaseMedia('runner-cleanup');
+    try { await cacheSession?.close(); }
+    catch (error) { cleanupErrors.push(redactDebuggerCapabilities(error.stack)); }
     try { await stopBrowserGroup(browser); browserGroupStopped = true; }
     catch (error) { cleanupErrors.push(error.stack); }
     try {
       if (pendingAnnotation) pendingAnnotation.destroy();
+      if (parserResponse) parserResponse.destroy();
       for (const socket of sockets) socket.destroy();
       await new Promise(resolve => server.close(resolve));
     } catch (error) { cleanupErrors.push(error.stack); }
@@ -203,11 +342,13 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir } 
     }
   }
   output ??= { provenance, cases: [], errors: [], passed: 0, failed: 1, complete: false, unexpectedRequests };
-  if (runError) output.runnerError = runError.stack;
+  if (runError) output.runnerError = redactDebuggerCapabilities(runError.stack);
+  output.cacheControl = cacheControl;
+  output.mediaGate = { held: Boolean(heldMedia), pending: pendingMedia, events: mediaGateEvents };
   output.cleanupErrors = cleanupErrors;
   output.cleanup = { browserExited: !browser?.pid || browser.exitCode !== null || browser.signalCode !== null,
     browserGroupStopped, profileRemoved: !profile || !existsSync(profile), serverClosed: !server.listening };
-  if (runError || cleanupErrors.length || !Object.values(output.cleanup).every(Boolean)) process.exitCode = 1;
+  if (runError || cleanupErrors.length || heldMedia || pendingMedia || !Object.values(output.cleanup).every(Boolean)) process.exitCode = 1;
   mkdirSync(evidenceDirectory, { recursive: true });
   writeFileSync(join(evidenceDirectory, 'result.json'), JSON.stringify(output, null, 2) + '\n');
   console.log(JSON.stringify(output, null, 2));

@@ -255,3 +255,39 @@ state where video and audio remained active together.
 The combined local source passes 85 Node tests, 20 Python tests and 24 browser
 cases, including the five native decoding cases. Its new image, current Vivaldi
 media checks and hosted acceptance remain separate required gates.
+
+## Deterministic native ordering and reader readiness
+
+One `eb386fe` hosted browser job restored the movie correctly at 64.3081 seconds
+but failed its timing precondition: requested metadata arrived before retired
+metadata. Another job passed. The corrected test explicitly holds requested bytes
+until trusted retired metadata is observed, then releases them. Cache is disabled
+before navigation in the harness's own fresh headless profile, with observable
+held/released counts; cache bypass cannot silently turn the scenario into a pass.
+A missing event fails within a bound, and both driver and runner cleanup release
+holds. No existing browser profile or Vivaldi connection is controlled by this
+harness protocol. The same gate reproduces the old app's native resume failure and
+passes the corrected app; the fixed 150 ms timing margin is removed.
+
+Actual `eb386fe` Vivaldi checks pass all five media categories and party controls,
+but a bounded account-highlight reopen case has no yellow paint through 9.9
+seconds despite a correct annotation HTTP 200. The parent `srcdoc` already contains
+the prepared restore marker. One ordinary Chapter II → I round trip restores the
+paint without another annotation POST. This isolates a lifecycle/delivery problem
+from persistence but does not identify its exact scheduling trigger.
+
+A real DOM parser gate reproduces the lost-listener class: the correct saved
+annotation remains unpainted after the old timer sends before the reader listener
+is ready. The correction waits for a generated reader-ready acknowledgement after
+listeners and body load, binds restoration and messages to the active document
+generation, and ignores stale book/chapter callbacks. Close clears `srcdoc` and
+pending resize work. Repeated restore cannot nest duplicate marks. The opaque
+origin and exact WindowProxy checks remain in force.
+
+The combined source passes 90 Node tests, 20 Python tests and 25 browser cases,
+including parser-gated restoration, actual open/close/reopen, chapter revisits,
+stale ready messages and all five native H.264 controls. Earlier Vivaldi category
+passes remain bound to their recorded image. The rebuilt reader and full current
+acceptance must still be checked in that browser; the controlled lost-listener
+class is proven, while the precise trigger of the earlier live observation remains
+an inference.

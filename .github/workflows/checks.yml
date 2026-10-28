@@ -16,6 +16,7 @@ jobs:
         run: |
           node --check client/js/app.js
           node --check client/js/party.js
+          bash -n tests/fixtures/generate-native-resume.sh
           node --test tests/*.test.cjs
       - name: Real browser DOM regressions
         run: node tests/browser-regression.cjs

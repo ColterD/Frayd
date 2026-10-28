@@ -17,7 +17,7 @@ Navigation: [source boundaries](#source-and-delivery-boundaries),
 [comic cache follow-up](#optional-comic-page-cache-write-follow-up).
 
 Updated 2026-10-28 UTC for [fork draft PR #2](https://github.com/ColterD/Frayd/pull/2).
-This ledger accounts for **47 CodeRabbit issue/diagnostic entries**, including
+This ledger accounts for **48 CodeRabbit issue/diagnostic entries**, including
 original and subsequent findings, outside-diff comments, nitpicks and published
 tool diagnostics. Summary-only risks and GitHub CodeQL alerts are recorded
 separately and are not added to that count.
@@ -122,6 +122,7 @@ A resolved review thread and a passing check are separate evidence.
 | [AST-DNS-LOGS](https://github.com/ColterD/Frayd/pull/2#discussion_r4403256467) | Tool diagnostic, CWE-78 | The AST tool claims incoming-request command data at the fixture's Docker logs call. | Not actionable on the supported call path: the container name is a fixed suffix of a generated hex project name, passed as one argv token. No incoming request supplies it and no shell interprets it. Static triage only; no suppression or timeout-as-security claim. |
 | [AST-DNS-REMOVE](https://github.com/ColterD/Frayd/pull/2#discussion_r4403256467) | Tool diagnostic, CWE-78 | The AST tool makes the same claim at container removal. | Not actionable: removal iterates only the fixture's generated fixed-suffix names through an argv list. Static source/caller evidence supports this disposition; no command-injection fix or suppression is claimed. |
 | [AST-DNS-NETWORK](https://github.com/ColterD/Frayd/pull/2#discussion_r4403256467) | Tool diagnostic, CWE-78 | The AST tool makes the same claim at network removal. | Not actionable: the network argument is the locally generated fixed-prefix hex project name, never request data, and execution uses an argv list without a shell. Static triage only; the independent cleanup bounds address reliability. |
+| [NATIVE-ORDER](https://github.com/ColterD/Frayd/pull/2#discussion_r4404067848) | Major | A fixed delay did not guarantee retired-media metadata before requested metadata; one hosted test failed despite correctly resuming playback. | The test holds requested bytes until trusted retired metadata is observed, then releases them. Cache is disabled before navigation in its own fresh headless profile; held/released counts prove the gate is exercised. Missing-event and aborted-browser cleanup are bounded. The attached GitHub Actions diagnostic is supporting evidence for this same requirement, counted once. |
 
 The `d835f40` full review selected 30 files and excluded one deleted SVG. The earlier
 `3b7a5f5` review selected five files and skipped `tests/test_integration.py` as

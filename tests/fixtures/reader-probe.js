@@ -3,6 +3,7 @@ window.addEventListener('message', event => {
   if (event.source !== parent || event.data?.type !== 'regression-probe') return;
   const { id, action, start, end, nextNode } = event.data;
   try {
+    if (action === 'ready') parent.postMessage({ type: 'reader-ready', generation: event.data.generation }, '*');
     if (action === 'select') {
       const target = document.getElementById('target');
       const walker = document.createTreeWalker(target, NodeFilter.SHOW_TEXT);
