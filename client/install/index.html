@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Install Frayd</title>
+<style>
+  :root { --bg:#0D0E12; --panel:#15161c; --line:#262833; --fg:#fff; --mut:#8A8F9E; --acc:#5B46F6; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; background:var(--bg); color:var(--fg);
+    font:15px/1.5 system-ui,-apple-system,sans-serif; display:flex; align-items:center; justify-content:center; padding:24px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:14px; max-width:560px; width:100%; padding:28px; }
+  h1 { margin:0 0 4px; font-size:22px; } h1 span { color:var(--acc); }
+  p.sub { margin:0 0 20px; color:var(--mut); font-size:13px; }
+  label { display:block; font-size:13px; color:var(--mut); margin:14px 0 6px; }
+  input[type=text] { width:100%; background:#0D0E12; color:#fff; border:1px solid var(--line);
+    border-radius:8px; padding:10px 12px; font-size:14px; }
+  .os { display:flex; gap:8px; margin:14px 0; }
+  .os button { flex:1; background:#16181E; color:var(--fg); border:1px solid var(--line); border-radius:8px;
+    padding:10px; cursor:pointer; font-size:14px; }
+  .os button.on { border-color:var(--acc); background:var(--acc); }
+  pre { background:#0D0E12; border:1px solid var(--line); border-radius:8px; padding:12px;
+    font:12px/1.5 ui-monospace,Menlo,monospace; white-space:pre-wrap; word-break:break-all; color:#c8cce0; }
+  .btn { width:100%; margin-top:14px; background:var(--acc); color:#fff; border:none; border-radius:8px;
+    padding:12px; font-size:15px; cursor:pointer; }
+  .btn:disabled { opacity:.5; cursor:default; }
+  .status { margin-top:14px; font-size:13px; color:var(--mut); min-height:20px; }
+  .status .ok { color:#4ade80; } .status .err { color:#f87171; }
+  .steps { color:var(--mut); font-size:13px; padding-left:18px; margin:10px 0 0; }
+  .steps li { margin:6px 0; }
+  code { background:#0D0E12; border:1px solid var(--line); border-radius:4px; padding:1px 5px; font-size:12px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Install <span>Frayd</span></h1>
+  <p class="sub">Self-hosted media server. Free, local-first, no accounts but your own.</p>
+
+  <label>Your operating system</label>
+  <div class="os">
+    <button data-os="linux">Linux</button>
+    <button data-os="mac">macOS</button>
+    <button data-os="win">Windows</button>
+  </div>
+
+  <label>Where is your media folder?</label>
+  <input type="text" id="lib" placeholder="e.g. /home/you/Media or C:\Users\you\Media">
+
+  <button class="btn" id="gen" disabled>Generate install command</button>
+  <pre id="cmd" style="display:none"></pre>
+  <button class="btn" id="copy" style="display:none; background:#16181E; border:1px solid #2a2d36">Copy command</button>
+
+  <div class="status" id="stat"></div>
+
+  <ol class="steps">
+    <li>Pick your OS, enter your media folder path</li>
+    <li>Copy the command, paste it in a terminal (PowerShell on Windows)</li>
+    <li>It installs everything, builds, and starts on boot — a few minutes</li>
+    <li>This page turns <span class="ok">green</span> when your server answers</li>
+    <li>Log in — first account becomes the admin</li>
+  </ol>
+</div>
+
+<script>
+'use strict';
+const $ = (s) => document.querySelector(s);
+let os = null;
+
+const UA = navigator.userAgent;
+const detected = /Win/i.test(UA) ? 'win' : /Mac/i.test(UA) ? 'mac' : /Linux|X11/i.test(UA) ? 'linux' : null;
+if (detected) { document.querySelector(`[data-os="${detected}"]`).classList.add('on'); os = detected; $('#gen').disabled = false; }
+
+document.querySelectorAll('.os button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('.os button').forEach(x => x.classList.remove('on'));
+  b.classList.add('on'); os = b.dataset.os; $('#gen').disabled = false;
+  gen();
+});
+
+const lib = () => $('#lib').value.trim() || '';
+const q = (s) => new URLSearchParams({ os, lib: s }).toString();
+
+function gen() {
+  if (!os) return;
+  const l = lib();
+  const base = 'https://raw.githubusercontent.com/kattiest/Frayd/main/client/install';
+  let cmd;
+  if (os === 'win') {
+    const libPs = l ? ` -Lib "${l}"` : '';
+    cmd = `cd $env:TEMP; irm "${base}/bootstrap.ps1?$(q(l))" | iex; # or:\n# irm "${base}/bootstrap.ps1" -OutFile frayd-install.ps1; .\\frayd-install.ps1${libPs}`;
+  } else {
+    const libSh = l ? ` '${l}'` : '';
+    cmd = `curl -fsSL "${base}/bootstrap.sh" -o frayd-install.sh && bash frayd-install.sh${libSh}`;
+  }
+  $('#cmd').textContent = cmd;
+  $('#cmd').style.display = 'block';
+  $('#copy').style.display = 'block';
+}
+$('#gen').onclick = gen;
+$('#lib').addEventListener('input', gen);
+$('#copy').onclick = () => { navigator.clipboard.writeText($('#cmd').textContent); $('#copy').textContent = 'Copied!'; setTimeout(() => $('#copy').textContent = 'Copy command', 1500); };
+
+// poll for a live server: localhost then LAN hostname
+const targets = ['http://localhost:8484', `http://${location.hostname}:8484`].filter((v, i, a) => a.indexOf(v) === i);
+let found = false;
+async function poll() {
+  for (const t of targets) {
+    try {
+      const r = await fetch(t + '/api/library', { mode: 'no-cors', signal: AbortSignal.timeout(2500) });
+      if (r.type === 'opaque' || r.ok) { found = true; $('#stat').innerHTML = `<span class="ok">✓ Server is live at ${t} — go log in</span> <a href="${t}" style="color:var(--acc)">open Frayd →</a>`; return; }
+    } catch {}
+  }
+  if (!found) $('#stat').textContent = 'Waiting for your server to come up…';
+  setTimeout(poll, 3000);
+}
+poll();
+</script>
+</body>
+</html>

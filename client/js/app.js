@@ -83,7 +83,11 @@ $('#settings-btn')?.addEventListener('click', async () => {
       + `<div class="perm-row"><span class="k">Media folder</span><input class="s-library" value="${esc(settings.library_path ?? '')}" placeholder="/home/you/Media" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px;flex:1"><button class="p-scan">Scan now</button></div>`
       + `<div class="perm-row" style="border:none"><span class="s">Suggested layout (any subset):</span></div>`
       + `<div class="perm-row" style="border:none"><pre class="s" style="color:#8A8F9E;font-size:12px;margin:0;line-height:1.5">Media/\n  Movies/    *.mp4 *.mkv\n  Shows/     S01E01 files\n  Music/     *.mp3 *.flac\n  Audiobooks/ *.m4b *.mp3\n  Ebooks/    *.epub\n  Comics/    *.cbz *.cbr\n  Manga/     folder of images under a *manga* dir</pre></div>`
-      + `<button id="s-net-save" style="margin-top:10px;width:100%;background:#5B46F6;color:#fff;border:none;border-radius:8px;padding:10px;cursor:pointer">Save network settings</button>`;
+      + `<button id="s-net-save" style="margin-top:10px;width:100%;background:#5B46F6;color:#fff;border:none;border-radius:8px;padding:10px;cursor:pointer">Save network settings</button>`
+      + (account ? `<div class="party-sec">Your password</div>
+      <div class="perm-row"><span class="k">Current</span><input type="password" class="pw-old" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px"></div>
+      <div class="perm-row"><span class="k">New (min 4)</span><input type="password" class="pw-new" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px"></div>
+      <button id="s-pw-save" style="margin-top:10px;width:100%;background:#16181E;color:#fff;border:1px solid #2a2d36;border-radius:8px;padding:10px;cursor:pointer">Change password</button>` : '');
     stage.querySelectorAll('.p-save').forEach(b => b.onclick = async () => {
       const row = b.closest('.perm-row');
       const kinds = [...row.querySelector('.p-kinds').selectedOptions].map(o => o.value);
@@ -124,6 +128,17 @@ $('#settings-btn')?.addEventListener('click', async () => {
       e.target.textContent = r.ok ? '✓ Saved — restart to apply port/TLS' : '✗ Failed';
       setTimeout(() => { e.target.textContent = 'Save network settings'; }, 2000);
     };
+    $('#s-pw-save')?.addEventListener('click', async (e) => {
+      const old_ = stage.querySelector('.pw-old').value, nw = stage.querySelector('.pw-new').value;
+      if (nw.length < 4) { e.target.textContent = 'Too short (min 4)'; return; }
+      const r = await fetch('/api/auth/password', {
+        method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ old: old_, new: nw }),
+      });
+      if (r.ok) { e.target.textContent = '✓ Changed'; stage.querySelector('.pw-old').value = stage.querySelector('.pw-new').value = ''; }
+      else { const j = await r.json().catch(() => ({})); e.target.textContent = j.error || '✗ Failed'; }
+      setTimeout(() => { e.target.textContent = 'Change password'; }, 2500);
+    });
     // library: save path then scan (scan picks up new path without restart)
     const scanBtn = stage.querySelector('.p-scan');
     scanBtn.onclick = async () => {

@@ -75,6 +75,7 @@ async fn main() {
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/logout", post(auth_logout))
         .route("/api/auth/me", get(auth_me))
+        .route("/api/auth/password", post(auth_change_password))
         .route("/api/admin/perms", get(list_perms).post(set_perm))
         .route("/api/admin/settings", get(get_settings).post(set_setting))
         .route("/api/thumb/:id", get(thumb))
@@ -270,6 +271,41 @@ async fn auth_logout(
         auth::delete_session(&db, &token);
     }
     StatusCode::NO_CONTENT
+}
+
+#[derive(serde::Deserialize)]
+struct ChangePwReq {
+    old: String,
+    new: String,
+}
+
+/// POST /api/auth/password {old, new} — change own password (requires session).
+async fn auth_change_password(
+    State(app): State<std::sync::Arc<App>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<ChangePwReq>,
+) -> impl IntoResponse {
+    if req.new.len() < 4 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "new password too short (min 4)"}))).into_response();
+    }
+    let db = app.db.lock().unwrap();
+    let Some(tok) = bearer_token(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(iid) = auth::identity_from_token(&db, &tok) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Ok(key) = db.query_row(
+        "SELECT key FROM identities WHERE id = ?1 AND kind='account'",
+        rusqlite::params![iid],
+        |r| r.get::<_, String>(0),
+    ) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    match auth::change_password(&db, &key, &req.old, &req.new) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": e}))).into_response(),
+    }
 }
 
 /// Extract bearer token from Authorization header.

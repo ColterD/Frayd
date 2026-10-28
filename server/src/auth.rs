@@ -79,6 +79,25 @@ pub fn identity_from_token(db: &Connection, token: &str) -> Option<i64> {
     Some(id)
 }
 
+/// Change password: verify old, write new argon2id hash. Returns Err on bad old pw.
+pub fn change_password(db: &Connection, key: &str, old: &str, new: &str) -> Result<(), String> {
+    match verify_login(db, key, old) {
+        Ok(true) => {}
+        _ => return Err("current password is wrong".into()),
+    }
+    let salt = SaltString::generate(&mut OsRng);
+    let hash = Argon2::default()
+        .hash_password(new.as_bytes(), &salt)
+        .map_err(|e| e.to_string())?
+        .to_string();
+    db.execute(
+        "UPDATE identities SET secret_hash = ?2 WHERE kind='account' AND key = ?1",
+        rusqlite::params![key, hash],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 pub fn delete_session(db: &Connection, token: &str) {
     let _ = db.execute("DELETE FROM sessions WHERE token = ?1", [token]);
 }
