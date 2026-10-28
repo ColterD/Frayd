@@ -1,12 +1,10 @@
 # CodeRabbit follow-up verification
 
 Updated 2026-10-28 UTC for [fork draft PR #2](https://github.com/ColterD/Frayd/pull/2).
-This ledger accounts for **27 CodeRabbit issue/diagnostic entries**: the original
-12, two initial PR #2 documentation comments, two subsequent cleanup findings,
-one outside-diff cache finding, one unverified wording diagnostic and the final
-full-review index finding, the later count-consistency comment and three final
-documentation/harness comments, proxy-command alignment, the later legacy refresh finding exact image provenance and EPUB spine invalidation. Summary-only
-risks and GitHub CodeQL alerts are recorded separately, not added to that count.
+This ledger accounts for **29 CodeRabbit issue/diagnostic entries**, including
+original and subsequent findings, outside-diff comments, nitpicks and published
+tool diagnostics. Summary-only risks and GitHub CodeQL alerts are recorded
+separately and are not added to that count.
 PR #2 remains draft and unmerged. No deployment is qualified or authorized here.
 
 ## Source and delivery boundaries
@@ -23,10 +21,11 @@ PR #2 remains draft and unmerged. No deployment is qualified or authorized here.
 | Whole-PR review on `9a22ad2` | [5678944739](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5678944739), batch 1/1, one Minor legacy-reference scanner exclusion; zero outside-diff items, nitpicks or tool diagnostics. Coverage 100%, 56 functions across 12 files, ten unsupported skips. The prior proxy-command thread was addressed and resolved. |
 | Whole-PR review on `a634a5f` | [5679275186](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5679275186), batch 1/1, one Minor image-provenance documentation request; zero outside-diff items, nitpicks or tool diagnostics. Coverage 100%, 58 functions across 12 files, ten unsupported skips. Legacy-refresh runtime thread addressed and resolved. |
 | Whole-PR review on `6028ec0` | [5679402211](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5679402211), batch 1/1, one Minor EPUB spine invalidation issue; zero outside-diff items, nitpicks or tool diagnostics. Coverage 100%, 58 functions across 12 files, ten unsupported skips. Image-provenance thread addressed and resolved; all ten checks passed. |
+| Whole-PR review on `041b4cc` | [5679720492](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5679720492), batch 1/1, two Minor historical-evidence/comic-cache-write items; zero outside-diff items, nitpicks or tool diagnostics. Coverage 100%, 64 functions across 12 files, ten unsupported skips; all ten checks passed. |
 | Upstream synchronization | Upstream `kattiest/Frayd` commit `540b87acea05304c767a151d47456fceaaf7b29a` merged into fork main at `49de065f3fb0875425f5467b87ae161b43d7914e`, and into the PR branch at `fafad69434a5893cb1d1dbbcbdf56d87f0aab05b`. |
 | Security patch already on fork main | PR-branch patch `b840753a9cabb680b94733ae7a58b6b303619d17` was cherry-picked to fork main as `2789f37e55148e0ee69e7bba6bb5ee30b5f49225`. This fixes the original four EPUB-message sender-boundary findings in source; all four default-branch alerts now report fixed, not dismissed. It does not merge PR #2. |
 | Combined foundation | Implementation `6af4c15` and ancestry-only merge `a6af5f5` include upstream synchronization, hygiene, cache/publication corrections and explicit ingestion trust. Fork main received the narrow ingestion patch at `a7a6dabccce971992d1ed47b00ef66f74811e6e7`. The pre-index app image below passes 28 Rust tests and full runtime qualification; the latest index follow-up passes 29 Rust tests, Clippy and release build. Post-index image/review results are recorded in the PR body; browser evidence stays tied to the unchanged client hash. |
-| Current source-version follow-up | Follow-up to `b2a8504` corrects a validated summary observation: known source replacements invalidate current playback, and jobs publish only when actual file/database versions stay unchanged. All 32 Rust tests, Clippy and release build pass. Immutable image `a19b1132` and the real-codec red/green regression qualify this source; fresh hosted acceptance is recorded in the PR body. |
+| Historical source-version follow-up | Follow-up to `b2a8504` corrects a validated summary observation: known source replacements invalidate current playback, and jobs publish only when actual file/database versions stay unchanged. All 32 Rust tests, Clippy and release build pass. Immutable image `a19b1132` and the real-codec red/green regression qualify this source; fresh hosted acceptance is recorded in the PR body. |
 
 Historical runtime images are immutable evidence boundaries:
 `sha256:cf030b02bc7703e5e0a5553971d28dac0238c6fc73b22cbd68d6cd99e88e8861`
@@ -37,19 +36,24 @@ was the later cleanup/namespace build. The proxy was
 These predate the upstream merge and latest backend corrections. Their successful
 runs do not qualify the current combined application.
 
-The current backend 20-file manifest has SHA-256
-`90652fcf1c56beace518ce9140ae809dd176310598c437e1c9514c5da525e8e2`.
-Reconciliation rehashed all 20 source inputs with zero mismatches. The final
-latest Rust run passed 26 unit plus six archive-reader tests (exit 0), Clippy
-(exit 0, existing warnings) and release build (exit 0). Both client suites passed
-22 tests after the merge. Final normal-image build and runtime qualification also pass;
-31 build, nine verification and 20 backend inputs match with zero drift.
+The following qualification is **historical and superseded**: backend manifest
+`90652fcf1c56beace518ce9140ae809dd176310598c437e1c9514c5da525e8e2`
+and its 26-unit/six-archive Rust run, Clippy/release and A19 image/runtime checks
+qualify the earlier source-version correction matching `5451980`. They do not
+qualify later code. The committed EPUB follow-up at
+`c9bd0e11c1f6d8ae602546b95cab244c6ece58db` supersedes that block with manifest
+`1519753e3b2ba671b9a7ddb5698c54ab6bd1d2b52ec64878156d4afa11a67142`,
+38 Rust tests and the full `c4ecab94711e3c8a2972e6cd096be9e17238f8e618398cd1eb30c7e9e42f63f9`
+image qualification recorded under the EPUB follow-up below. Later corrections
+have their own source/image/result bindings; final acceptance belongs to the
+actual PR head and is recorded in its description.
 
 ## CodeRabbit dispositions
 
 Severity is the original published severity. “Historical pass” describes the
-bounded source/image scenario recorded below; the new combined runtime still needs
-qualification. A resolved review thread and a passing check are separate evidence.
+bounded source/image scenario recorded below. Each qualification applies only
+to its recorded inputs; current-head acceptance is recorded in the PR description.
+A resolved review thread and a passing check are separate evidence.
 
 | ID | Severity | Verified observation / disposition | Current limit |
 |---|---|---|---|
@@ -83,6 +87,9 @@ qualification. A resolved review thread and a passing check are separate evidenc
 | [DOC-IMAGE-PROVENANCE](https://github.com/ColterD/Frayd/pull/2#discussion_r4398020230) | Minor, documentation | The legacy-refresh red/green section used short image IDs without source-commit bindings. | Full immutable image digests and verified source-commit bindings are recorded in that section; local receipts distinguish build-time working trees from their later commits. |
 
 | [EPUB-REFRESH](https://github.com/ColterD/Frayd/pull/2#discussion_r4398119571) | Minor | Changed ebook fingerprints retain cached `$.spine`, so a replaced EPUB can expose stale chapter navigation. | Actual scanner/chapter and Docker baselines retain the stale three-entry spine and return 404 for the new first chapter. Ebook-only invalidation and snapshot-guarded field-only lazy-cache publication fix the Rust regression; all 38 Rust tests and Clippy pass. Fixed-image full runtime qualification passes; hosted acceptance is recorded in the PR body. |
+
+| [DOC-HISTORICAL](https://github.com/ColterD/Frayd/pull/2#discussion_r4398359380) | Minor, documentation | A superseded manifest and 32-test qualification were incorrectly described as current. | The block is explicitly historical and superseded by the committed EPUB follow-up, with each source/image result kept in its own boundary. |
+| [COMIC-CACHE-WRITE](https://github.com/ColterD/Frayd/pull/2#discussion_r4398359394) | Minor | A refused optional comic page-cache write turns a successfully parsed archive into HTTP 404. | A valid archive plus a refused SQLite cache write reproduces HTTP 404. The minimal inline result handling now serves computed pages on write errors, while a successful zero-row update still returns None/404 without cache mutation. Both controls, all 40 Rust tests and fixed-image full runtime qualification pass; current-head hosted acceptance is recorded in the PR description. |
 
 The latest full review selected 24 files and excluded one deleted SVG. The earlier
 `3b7a5f5` review selected five files and skipped `tests/test_integration.py` as
@@ -555,3 +562,55 @@ field and source hashes remain intact. Restart preserves the new reading order
 and exact bytes. The prior conversion, source-replacement, legacy-reference and
 proxy/scan-phase scenarios also pass. Final-head CI and full review remain gates;
 the prior successful reviews are not relabeled as review of this source.
+
+## Optional comic page-cache write follow-up
+
+Review `5679720492` identified a compatibility regression in optional cache
+publication: a SQLite write error discarded an already computed archive page
+list, making a valid page return HTTP 404. The baseline Rust handler regression
+uses a trigger that refuses cache writes and observes that 404. The bounded
+inline result handling now distinguishes success with one updated row, success
+with zero updated rows and a database error. A database error logs the held cache
+write and returns the computed page list; zero rows still reject stale
+publication with None/HTTP 404. The guarded publication SQL and fingerprint
+predicate are byte-identical to the baseline. No helper, schema or dependency
+was added.
+
+Committed source and harness
+`b852a7f87bc1ad9e3921d7b98202ccc2b719b70c` pass all 40 Rust tests (34 unit
+and six archive tests) and locked Clippy with existing style warnings. The
+positive trigger-refusal test verifies exact page bytes and list content without
+cache mutation; a separate ignored-update trigger verifies the zero-row guard.
+The backend manifest is
+`9fce609cd7c132f48bae1f5fff5b03c6874e52bee1eaed4e0b7a557f4ef42133`.
+Fixed-image full runtime qualification passes as recorded below.
+
+The baseline runtime image is
+`sha256:c4ecab94711e3c8a2972e6cd096be9e17238f8e618398cd1eb30c7e9e42f63f9`,
+matching committed source `c9bd0e11c1f6d8ae602546b95cab244c6ece58db`.
+With the fixture's targeted SQLite refusal trigger active,
+`/api/comic/4/pages` returns HTTP 404 instead of 200; the runner exits 1 at that
+expected assertion after all earlier scenarios pass. Its task-owned containers,
+networks and volumes are independently confirmed absent.
+
+The fixed image is
+`sha256:cd880c88f8c97dbebe771a3303455c714b3a03dde732cc8474634575b7f4cf58`,
+built after committing source and harness as
+`b852a7f87bc1ad9e3921d7b98202ccc2b719b70c`. All 31 image, nine verification
+and 20 backend inputs match that commit and freeze. Binary SHA-256 is
+`e33f03a60d996d5227110d1447759a5b015c123951e5910a1d70072450831e87`.
+Both runtime commands use the harness at `b852a7f` and immutable proxy
+`sha256:543d71e7db7b987f1e41dfb0a297efe5f020c141b2dbc39a859fd2473df7bbe2`;
+only the application image argument differs. The normal Docker build passes
+40 Rust tests, Clippy and release compilation.
+
+The fixed full runner exits 0 with the refusal trigger still installed. Comic
+ID 4 returns HTTP 200 with page list `['001.png']` and exact original PNG bytes
+for page 0; page 1 correctly returns HTTP 404. SQLite metadata still has no pages
+cache, and the row's ID/title/custom metadata, device progress 0 and source bytes
+remain unchanged. Restart repeats the same successful reads without a cache write.
+The real EPUB replacement, legacy-reference refresh, conversion/source replacement,
+scan-phase and proxy recovery scenarios all pass in the same run. Both baseline
+and fixed fixtures have zero owned containers, networks or volumes after cleanup.
+The configured CI integration command includes this case. Final-head CI and full
+review remain acceptance gates for the combined change.
