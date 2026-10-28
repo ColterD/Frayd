@@ -144,6 +144,38 @@ def legacy_fixture_snapshot(database):
         return {'media': media, 'progress': progress}
 
 
+def epub_fixture(chapters):
+    """Build a deterministic EPUB whose manifest order matches supplied XHTML entries."""
+    entries = {
+        'mimetype': b'application/epub+zip',
+        'META-INF/container.xml': b'<container><rootfiles><rootfile full-path="book.opf"/></rootfiles></container>',
+        'book.opf': ('<package><manifest>' + ''.join(
+            f'<item id="c{index}" href="{name}" media-type="application/xhtml+xml"/>'
+            for index, (name, _) in enumerate(chapters)) + '</manifest><spine>' + ''.join(
+            f'<itemref idref="c{index}"/>' for index in range(len(chapters))) + '</spine></package>').encode(),
+        **dict(chapters),
+    }
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, 'w') as archive:
+        for name, content in entries.items():
+            info = zipfile.ZipInfo(name, date_time=(2000, 1, 1, 0, 0, 0))
+            archive.writestr(info, content)
+    return buffer.getvalue()
+
+
+def epub_fixture_snapshot(database):
+    """Read the synthetic ebook metadata and device progress in one read-only snapshot."""
+    with closing(sqlite3.connect(database.resolve().as_uri() + '?mode=ro', uri=True)) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute('BEGIN')
+        media = dict(connection.execute(
+            'SELECT id,kind,path,title,size_bytes,mtime_secs,meta_json FROM media WHERE id=3').fetchone())
+        metadata = json.loads(media.pop('meta_json'))
+        progress = dict(connection.execute(
+            'SELECT identity_id,media_id,position,completed,updated_at FROM progress WHERE identity_id=1 AND media_id=3').fetchone())
+        return {'media': media, 'metadata': metadata, 'progress': progress}
+
+
 def assert_project_removed(project):
     """Reject any remaining task-owned containers, networks or volumes."""
     for resource in ('container', 'network', 'volume'):
@@ -442,9 +474,21 @@ def main():
             genuine_source = library / 'Film.browser.mp4'
             legacy_source.write_bytes(video)
             genuine_source.write_bytes(converted)
+            old_chapters = [('old-one.xhtml', b'<html><body>OLD ONE</body></html>'),
+                            ('old-two.xhtml', b'<html><body>OLD TWO</body></html>'),
+                            ('removed.xhtml', b'<html><body>REMOVED CHAPTER</body></html>')]
+            new_chapters = [('new-one.xhtml', b'<html><body>NEW ONE ' + b'expanded ' * 80 + b'</body></html>'),
+                            ('new-two.xhtml', b'<html><body>NEW TWO</body></html>')]
+            old_epub = epub_fixture(old_chapters)
+            new_epub = epub_fixture(new_chapters)
+            assert old_epub != new_epub and len(old_epub) != len(new_epub)
+            ebook_source = library / 'qa-book.epub'
+            ebook_source.write_bytes(old_epub)
+            ebook_metadata = {'synopsis': 'Keep EPUB synopsis', 'custom': {'edition': 7},
+                             'pages': ['unrelated-preserved-field']}
             assert len(converted) != len(replacement_converted)
             timestamp = int(time.time()) - 10
-            for path in [legacy_source, genuine_source]:
+            for path in [legacy_source, genuine_source, ebook_source]:
                 os.utime(path, (timestamp, timestamp))
             database = data / 'frayd.sqlite'
             with closing(sqlite3.connect(database)) as connection:
@@ -456,6 +500,9 @@ def main():
                     ('/data/library/Film.browser.mp4', len(converted), timestamp))
                 connection.execute("INSERT INTO identities(id,kind,key) VALUES(1,'device','qa-legacy-device')")
                 connection.execute('INSERT INTO progress(identity_id,media_id,position,updated_at) VALUES(1,2,42,12345)')
+                connection.execute("INSERT INTO media(id,kind,path,title,size_bytes,mtime_secs,meta_json) VALUES(3,'ebook',?,'Preserved EPUB title',?,?,?)",
+                    ('/data/library/qa-book.epub', len(old_epub), timestamp, json.dumps(ebook_metadata)))
+                connection.execute('INSERT INTO progress(identity_id,media_id,position,updated_at) VALUES(1,3,1,12346)')
                 connection.commit()
             database.chmod(0o666)
             before_legacy = legacy_fixture_snapshot(database)
@@ -488,7 +535,7 @@ def main():
                 assert after_legacy['progress'] == before_legacy['progress']
                 assert hashlib.sha256(legacy_source.read_bytes()).hexdigest() == legacy_hash
                 assert hashlib.sha256(genuine_source.read_bytes()).hexdigest() == genuine_hash
-                assert {path.name for path in library.iterdir()} == {'Film.mkv', 'Film.browser.mp4'}
+                assert {path.name for path in library.iterdir()} == {'Film.mkv', 'Film.browser.mp4', 'qa-book.epub'}
                 assert request('/api/stream/2') == replacement_converted
                 assert json.loads(request('/api/progress/2?identity=qa-legacy-device'))['position'] == 42
                 genuine_row = after_legacy['media'][1]
@@ -507,6 +554,57 @@ def main():
                 assert hashlib.sha256(legacy_source.read_bytes()).hexdigest() == legacy_hash
                 assert hashlib.sha256(genuine_source.read_bytes()).hexdigest() == genuine_hash
                 print('PASS: genuine legacy-reference metadata, device progress and exact source bytes persist after restart')
+                old_spine = [name for name, _ in old_chapters]
+                new_spine = [name for name, _ in new_chapters]
+                assert json.loads(request('/api/epub/3/spine')) == old_spine
+                assert request('/api/epub/3/chunk/0') == old_chapters[0][1]
+                assert request('/api/epub/3/chunk/2') == old_chapters[2][1]
+                warm_ebook = epub_fixture_snapshot(database)
+                assert warm_ebook['metadata'] == {**ebook_metadata, 'spine': old_spine}
+                assert warm_ebook['media']['id'] == 3
+                assert warm_ebook['media']['title'] == 'Preserved EPUB title'
+                assert warm_ebook['progress']['position'] == 1
+                request('/api/scan', {}, expected=202)
+                wait_for_scan_idle()
+                assert epub_fixture_snapshot(database) == warm_ebook
+                ebook_source.write_bytes(new_epub)
+                os.utime(ebook_source, (timestamp + 5, timestamp + 5))
+                ebook_hash = hashlib.sha256(new_epub).hexdigest()
+                print(f'PROBE: replaced EPUB media3 size {len(old_epub)}->{len(new_epub)}, mtime {timestamp}->{timestamp + 5}; warmed spine {old_spine} -> expected {new_spine}')
+                request('/api/scan', {}, expected=202)
+                wait_for_scan_idle()
+                invalidated_ebook = epub_fixture_snapshot(database)
+                expected_ebook = {
+                    'media': {**warm_ebook['media'], 'size_bytes': len(new_epub), 'mtime_secs': timestamp + 5},
+                    'metadata': ebook_metadata,
+                    'progress': warm_ebook['progress'],
+                }
+                if invalidated_ebook['metadata'].get('spine') == old_spine:
+                    request('/api/epub/3/chunk/0', expected=404)
+                    print('PROBE: stale SQLite spine retained and new EPUB chapter0 HTTP404 reproduced')
+                assert 'spine' not in invalidated_ebook['metadata'], 'EPUB rescan retained stale cached spine'
+                assert invalidated_ebook == expected_ebook
+                assert json.loads(request('/api/epub/3/spine')) == new_spine
+                assert request('/api/epub/3/chunk/0') == new_chapters[0][1]
+                assert request('/api/epub/3/chunk/1') == new_chapters[1][1]
+                request('/api/epub/3/chunk/2', expected=404)
+                refreshed_ebook = epub_fixture_snapshot(database)
+                assert refreshed_ebook == {**expected_ebook, 'metadata': {**ebook_metadata, 'spine': new_spine}}
+                assert json.loads(request('/api/progress/3?identity=qa-legacy-device')) == {'position': 1.0, 'updated_at': 12346}
+                assert hashlib.sha256(ebook_source.read_bytes()).hexdigest() == ebook_hash
+                assert hashlib.sha256(legacy_source.read_bytes()).hexdigest() == legacy_hash
+                assert hashlib.sha256(genuine_source.read_bytes()).hexdigest() == genuine_hash
+                assert {path.name for path in library.iterdir()} == {'Film.mkv', 'Film.browser.mp4', 'qa-book.epub'}
+                print('PASS: EPUB media3 old3->new2 renamed chapters; SQL spine invalidated then refreshed, exact new XHTML0/1 and removed chapter2 HTTP404; ID/title/progress/custom/pages/source hashes preserved')
+                compose('restart', 'app')
+                ready()
+                wait_for_scan_idle()
+                assert epub_fixture_snapshot(database) == refreshed_ebook
+                assert request('/api/epub/3/chunk/0') == new_chapters[0][1]
+                request('/api/epub/3/chunk/2', expected=404)
+                assert json.loads(request('/api/progress/3?identity=qa-legacy-device'))['position'] == 1
+                assert hashlib.sha256(ebook_source.read_bytes()).hexdigest() == ebook_hash
+                print('PASS: replaced EPUB metadata/cache, current chapters and device progress persist after restart')
 
     assert_project_removed(project)
     print(f'PASS: task-owned {project} containers, networks and volume removed')

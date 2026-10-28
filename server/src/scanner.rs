@@ -221,7 +221,7 @@ pub fn scan(db: &Connection, db_path: String, root: std::path::PathBuf, thumbs_d
     count
 }
 
-/// Update scan fingerprints and comic page names; clear converted playback only for known replacements.
+/// Update scan fingerprints and reader caches; clear converted playback only for known replacements.
 /// Preserve identity, user metadata, unchanged order and version-unqualified legacy playback.
 fn upsert_item(
     db: &Connection,
@@ -263,7 +263,9 @@ fn upsert_item(
                transcode_path = CASE WHEN media.mtime_secs IS NOT NULL AND media.size_bytes IS NOT NULL
                    THEN NULL ELSE media.transcode_path END,
                meta_json = CASE WHEN ?1 IN ('comic','manga') AND json_valid(media.meta_json)
-                   THEN json_remove(media.meta_json,'$.pages') ELSE media.meta_json END
+                   THEN json_remove(media.meta_json,'$.pages')
+                   WHEN ?1='ebook' AND json_valid(media.meta_json)
+                   THEN json_remove(media.meta_json,'$.spine') ELSE media.meta_json END
              WHERE media.mtime_secs IS NOT ?5 OR media.size_bytes IS NOT ?4",
             rusqlite::params![kind, path_str, title, meta.len() as i64, mtime],
         )

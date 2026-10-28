@@ -784,27 +784,8 @@ async fn epub_chunk(
     let Some(path) = media_path(&app, id).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let name = {
-        let db = app.db.lock().unwrap();
-        let meta: Option<String> = db
-            .query_row("SELECT meta_json FROM media WHERE id = ?1", [id], |r| r.get(0))
-            .ok()
-            .flatten();
-        let spine: Option<Vec<String>> = meta
-            .as_deref()
-            .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
-            .and_then(|v| v.get("spine").cloned())
-            .and_then(|p| serde_json::from_value(p).ok());
-        match spine {
-            Some(s) => s.get(n as usize).cloned(),
-            None => {
-                drop(db);
-                let db = app.db.lock().unwrap();
-                cache_spine(&db, id, std::path::Path::new(&path))
-                    .and_then(|s| s.get(n as usize).cloned())
-            }
-        }
-    };
+    let name=cache_spine(&app,id,&path).await
+        .and_then(|spine|usize::try_from(n).ok().and_then(|index|spine.get(index).cloned()));
     let Some(name) = name else { return StatusCode::NOT_FOUND.into_response() };
     match tokio::task::spawn_blocking(move || {
         epub::read_zip_entry(std::path::Path::new(&path), &name)
@@ -825,23 +806,35 @@ async fn epub_chunk(
     }
 }
 
-/// Compute + persist spine into meta_json.spine. Returns hrefs.
-fn cache_spine(db: &Connection, id: i64, path: &std::path::Path) -> Option<Vec<String>> {
-    let spine = epub::epub_spine(path)?;
-    let meta: Option<String> = db
-        .query_row("SELECT meta_json FROM media WHERE id = ?1", [id], |r| r.get(0))
-        .ok()
-        .flatten();
-    let mut v: serde_json::Value = meta
-        .as_deref()
-        .and_then(|m| serde_json::from_str(m).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    v["spine"] = serde_json::json!(spine);
-    let _ = db.execute(
-        "UPDATE media SET meta_json = ?1 WHERE id = ?2",
-        rusqlite::params![v.to_string(), id],
-    );
-    Some(spine)
+/// Reuse unchanged cached reading order or compute a missing spine outside the application DB mutex.
+async fn cache_spine(app: &Arc<App>, id: i64, path: &str) -> Option<Vec<String>> {
+    let version={
+        let db=app.db.lock().unwrap();
+        let (meta,mtime,size):(Option<String>,Option<i64>,Option<i64>)=db.query_row(
+            "SELECT meta_json,mtime_secs,size_bytes FROM media WHERE id=?1",[id],
+            |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).ok()?;
+        let cached=meta.and_then(|value|serde_json::from_str::<serde_json::Value>(&value).ok())
+            .and_then(|value|serde_json::from_value::<Vec<String>>(value["spine"].clone()).ok());
+        if let Some(spine)=cached {return Some(spine);}
+        (mtime,size)
+    };
+    let archive=PathBuf::from(path);
+    let spine=tokio::task::spawn_blocking(move ||epub::epub_spine(&archive)).await.ok()??;
+    let db=app.db.lock().unwrap();
+    publish_spine_cache(&db,id,path,version,spine)
+}
+
+/// Merge only a source-current spine, rejecting changed snapshots without replacing other metadata.
+/// Optional SQLite cache failures retain the computed reading result, preserving existing HTTP behavior.
+fn publish_spine_cache(db: &Connection, id: i64, path: &str,
+    version: (Option<i64>,Option<i64>), spine: Vec<String>) -> Option<Vec<String>> {
+    match db.execute("UPDATE media SET meta_json=json_set(COALESCE(meta_json,'{}'),'$.spine',json(?1))
+        WHERE id=?2 AND path=?3 AND mtime_secs IS ?4 AND size_bytes IS ?5",
+        rusqlite::params![serde_json::json!(&spine).to_string(),id,path,version.0,version.1]) {
+        Ok(1)=>Some(spine),
+        Ok(_)=>None,
+        Err(error)=>{tracing::warn!(%error,id,"EPUB spine cache write held");Some(spine)}
+    }
 }
 
 async fn media_path(app: &std::sync::Arc<App>, id: i64) -> Option<String> {
@@ -1343,6 +1336,119 @@ mod backend_regressions {
         Arc::new(App { db: Mutex::new(db), db_path: String::new(), library: None,
             scanning: std::sync::atomic::AtomicBool::new(false), auth_rl: auth::RateLimiter::new(300,10),
             party: Arc::new(party::Party::new()) })
+    }
+    /// Build an actual minimal EPUB with explicit OPF reading order and literal chapter payloads.
+    fn write_epub_fixture(path: &StdPath, chapters: &[(&str,&[u8])]) {
+        use std::io::Write;
+        let mut manifest=String::new();let mut spine=String::new();
+        for (index,(href,_)) in chapters.iter().enumerate() {
+            manifest.push_str(&format!("<item id=\"c{index}\" href=\"{href}\" media-type=\"application/xhtml+xml\"/>"));
+            spine.push_str(&format!("<itemref idref=\"c{index}\"/>"));
+        }
+        let opf=format!("<package><manifest>{manifest}</manifest><spine>{spine}</spine></package>");
+        let mut archive=zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        let options=zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name,bytes) in [("META-INF/container.xml",b"<container><rootfiles><rootfile full-path=\"book.opf\"/></rootfiles></container>".as_slice()),("book.opf",opf.as_bytes())].into_iter().chain(chapters.iter().copied()) {
+            archive.start_file(name,options).unwrap();archive.write_all(bytes).unwrap();
+        }
+        archive.finish().unwrap();
+    }
+    /// Replace a warmed EPUB and observe current chapter bytes after rescan without losing user state.
+    #[tokio::test]
+    async fn rescan_invalidates_replaced_epub_spine_and_lazy_reads_current_chapters() {
+        let root=std::env::temp_dir().join(format!("frayd-epub-refresh-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();let path=root.join("book.epub");
+        write_epub_fixture(&path,&[("old-one.xhtml",b"<p>Old one</p>"),("old-two.xhtml",b"<p>Old two</p>"),("old-three.xhtml",b"<p>Old three</p>")]);
+        let original=std::fs::metadata(&path).unwrap();let app=app_for(path.to_str().unwrap());
+        {
+            let db=app.db.lock().unwrap();
+            db.execute(r#"UPDATE media SET kind='ebook',mtime_secs=?1,size_bytes=?2,
+                meta_json=json_set(meta_json,'$.custom',json('{"nested":"keep"}')) WHERE id=1"#,
+                rusqlite::params![original.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64,original.len() as i64]).unwrap();
+            db.execute("UPDATE progress SET position=1 WHERE media_id=1",[]).unwrap();
+        }
+        let response=epub_chunk(State(app.clone()),Path((1,0))).await.into_response();
+        assert_eq!(response.status(),StatusCode::OK);
+        assert_eq!(axum::body::to_bytes(response.into_body(),8192).await.unwrap(),&b"<p>Old one</p>"[..]);
+        {
+            let db=app.db.lock().unwrap();
+            let before:String=db.query_row("SELECT meta_json FROM media WHERE id=1",[],|r|r.get(0)).unwrap();
+            assert_eq!(scanner::scan(&db,String::new(),root.clone(),None),0);
+            assert_eq!(db.query_row("SELECT meta_json FROM media WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),before);
+        }
+        write_epub_fixture(&path,&[("new-one.xhtml",b"<p>Replacement first chapter</p>"),("new-two.xhtml",b"<p>Replacement second chapter</p>")]);
+        assert_ne!(std::fs::metadata(&path).unwrap().len(),original.len());
+        std::fs::File::open(&path).unwrap().set_times(std::fs::FileTimes::new().set_modified(original.modified().unwrap())).unwrap();
+        let cache_after_scan={
+            let db=app.db.lock().unwrap();assert_eq!(scanner::scan(&db,String::new(),root.clone(),None),1);
+            db.query_row("SELECT json_type(meta_json,'$.spine') FROM media WHERE id=1",[],|r|r.get::<_,Option<String>>(0)).unwrap()
+        };
+        println!("EPUB_CACHE_AFTER_REPLACEMENT_SCAN={cache_after_scan:?}");
+        let response=epub_chunk(State(app.clone()),Path((1,0))).await.into_response();
+        assert_eq!(response.status(),StatusCode::OK,"replacement chunk still uses an old cached href");
+        assert_eq!(axum::body::to_bytes(response.into_body(),8192).await.unwrap(),&b"<p>Replacement first chapter</p>"[..]);
+        assert_eq!(cache_after_scan,None,"rescan did not clear the obsolete spine");
+        let response=epub_spine(State(app.clone()),Path(1)).await.into_response();
+        let names:Vec<String>=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),8192).await.unwrap()).unwrap();
+        assert_eq!(names,vec!["new-one.xhtml","new-two.xhtml"]);
+        let response=epub_chunk(State(app.clone()),Path((1,1))).await.into_response();
+        assert_eq!(axum::body::to_bytes(response.into_body(),8192).await.unwrap(),&b"<p>Replacement second chapter</p>"[..]);
+        assert_eq!(epub_chunk(State(app.clone()),Path((1,2))).await.into_response().status(),StatusCode::NOT_FOUND);
+        let db=app.db.lock().unwrap();let meta:String=db.query_row("SELECT meta_json FROM media WHERE id=1",[],|r|r.get(0)).unwrap();let meta:serde_json::Value=serde_json::from_str(&meta).unwrap();
+        assert_eq!(meta["spine"],serde_json::json!(names));assert_eq!(meta["synopsis"],"keep");assert_eq!(meta["custom"]["nested"],"keep");assert_eq!(meta["pages"],serde_json::json!(["À.png","Á.png","Â.png"]));
+        assert_eq!(db.query_row("SELECT id FROM media WHERE path=?1",[path.to_str().unwrap()],|r|r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(db.query_row("SELECT title FROM media WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),"Original");
+        assert_eq!(db.query_row("SELECT position FROM progress WHERE media_id=1",[],|r|r.get::<_,f64>(0)).unwrap(),1.0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    /// Preserve existing cached chunk order while the spine endpoint retains fresh-parse ordering.
+    #[tokio::test]
+    async fn unchanged_epub_chunk_cache_keeps_legacy_order() {
+        let path=concat!(env!("CARGO_MANIFEST_DIR"),"/tests/fixtures/stored.epub");let app=app_for(path);
+        app.db.lock().unwrap().execute(r#"UPDATE media SET kind='ebook',meta_json=json_set(meta_json,'$.spine',json('["two.xhtml","one.xhtml"]')) WHERE id=1"#,[]).unwrap();
+        let before:String=app.db.lock().unwrap().query_row("SELECT meta_json FROM media WHERE id=1",[],|r|r.get(0)).unwrap();
+        let response=epub_chunk(State(app.clone()),Path((1,0))).await.into_response();assert_eq!(response.status(),StatusCode::OK);
+        assert_eq!(axum::body::to_bytes(response.into_body(),8192).await.unwrap(),&b"<p>Chapter two</p>"[..]);
+        let response=epub_spine(State(app.clone()),Path(1)).await.into_response();
+        assert_eq!(serde_json::from_slice::<Vec<String>>(&axum::body::to_bytes(response.into_body(),8192).await.unwrap()).unwrap(),vec!["one.xhtml","two.xhtml"]);
+        assert_eq!(app.db.lock().unwrap().query_row("SELECT meta_json FROM media WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),before);
+    }
+    /// A failed archive read leaves metadata intact and preserves the existing 404 response.
+    #[tokio::test]
+    async fn unreadable_epub_does_not_publish_a_spine() {
+        let app=app_for("/does-not-exist.epub");let before:String=app.db.lock().unwrap().query_row("SELECT meta_json FROM media WHERE id=1",[],|r|r.get(0)).unwrap();
+        assert_eq!(epub_chunk(State(app.clone()),Path((1,0))).await.into_response().status(),StatusCode::NOT_FOUND);
+        assert_eq!(epub_spine(State(app.clone()),Path(1)).await.into_response().status(),StatusCode::NOT_FOUND);
+        assert_eq!(app.db.lock().unwrap().query_row("SELECT meta_json FROM media WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),before);
+    }
+    /// Optional cache-write refusal must not turn a successfully read chapter into a read failure.
+    #[tokio::test]
+    async fn epub_cache_write_failure_keeps_successful_chunk_response() {
+        let app=app_for(concat!(env!("CARGO_MANIFEST_DIR"),"/tests/fixtures/stored.epub"));
+        let before:String=app.db.lock().unwrap().query_row("SELECT meta_json FROM media WHERE id=1",[],|r|r.get(0)).unwrap();
+        app.db.lock().unwrap().execute_batch("CREATE TRIGGER reject_spine BEFORE UPDATE OF meta_json ON media BEGIN SELECT RAISE(FAIL,'fixture cache write refused'); END;").unwrap();
+        let response=epub_chunk(State(app.clone()),Path((1,0))).await.into_response();assert_eq!(response.status(),StatusCode::OK);
+        assert_eq!(axum::body::to_bytes(response.into_body(),8192).await.unwrap(),&b"<p>Chapter one</p>"[..]);
+        assert_eq!(app.db.lock().unwrap().query_row("SELECT meta_json FROM media WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),before);
+    }
+    /// Reject stale source snapshots while retaining newer metadata and the computed-read fallback contract.
+    #[test]
+    fn epub_spine_publication_checks_version_and_merges_only_spine() {
+        let app=app_for("fixture.epub");let db=app.db.lock().unwrap();
+        for (mtime,size) in [(11,100),(10,101)] {
+            db.execute("UPDATE media SET mtime_secs=?1,size_bytes=?2 WHERE id=1",rusqlite::params![mtime,size]).unwrap();
+            let before:String=db.query_row("SELECT meta_json FROM media WHERE id=1",[],|r|r.get(0)).unwrap();
+            assert_eq!(publish_spine_cache(&db,1,"fixture.epub",(Some(10),Some(100)),vec!["stale.xhtml".into()]),None);
+            assert_eq!(db.query_row("SELECT meta_json FROM media WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),before);
+        }
+        db.execute(r#"UPDATE media SET mtime_secs=10,size_bytes=100,
+            meta_json=json_set(meta_json,'$.custom',json('{"nested":"newer concurrent metadata"}')) WHERE id=1"#,[]).unwrap();
+        assert_eq!(publish_spine_cache(&db,1,"other.epub",(Some(10),Some(100)),vec!["wrong-path.xhtml".into()]),None);
+        assert_eq!(publish_spine_cache(&db,1,"fixture.epub",(Some(10),Some(100)),vec!["fresh.xhtml".into()]),Some(vec!["fresh.xhtml".into()]));
+        let meta:String=db.query_row("SELECT meta_json FROM media WHERE id=1",[],|r|r.get(0)).unwrap();let meta:serde_json::Value=serde_json::from_str(&meta).unwrap();
+        assert_eq!(meta["spine"],serde_json::json!(["fresh.xhtml"]));assert_eq!(meta["synopsis"],"keep");
+        assert_eq!(meta["custom"]["nested"],"newer concurrent metadata");assert_eq!(meta["pages"],serde_json::json!(["À.png","Á.png","Â.png"]));
+        assert_eq!(db.query_row("SELECT position FROM progress WHERE media_id=1",[],|r|r.get::<_,f64>(0)).unwrap(),7.0);
     }
     /// Known replacements must stream current source bytes while valid unchanged/unknown legacy playback survives.
     #[tokio::test]
