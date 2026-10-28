@@ -10,7 +10,7 @@ It does not authorize deployment or qualify arbitrary media, browsers or public 
 - Baseline application: `sha256:cd880c88f8c97dbebe771a3303455c714b3a03dde732cc8474634575b7f4cf58`, matching source `b852a7f87bc1ad9e3921d7b98202ccc2b719b70c`; prior accepted PR head `ccaa308e1395f0080e8c5b7de209f8ca043efb24` adds historical documentation.
 - First corrected runtime source: `407afbccb94697738025ae8c394d755814e79997`, committed before its image build. Application image: `sha256:958c9f9011cbeedec1d81433a8cae89efdc58bfbd990b2e33568f31b6b656b2d`. Its pinned build passes 45 Rust tests, Clippy and release compilation; observations below apply only to this first corrected image.
 - Proxy: `sha256:543d71e7db7b987f1e41dfb0a297efe5f020c141b2dbc39a859fd2473df7bbe2`.
-- Separate loopback fixture, fresh guest/device and disposable account, Chrome host and an independent in-app-browser guest for party checks. No production database or sessions were imported; only the identified free samples were copied.
+- Separate loopback fixture, fresh guest/device and disposable account, extension-browser host and an independent in-app-browser guest for party checks. No production database or sessions were imported; only the identified free samples were copied.
 - Exact copies of the five free samples were hash-checked before and after baseline testing; original live samples were not modified. The download receipts below are from 2026-10-28. Source URLs may change; these hashes identify the tested media bytes. Extract the MP4 from the movie ZIP; the comic ZIP is retained as a CBZ-compatible archive. Other samples are direct media files.
 
 ## Media provenance
@@ -37,10 +37,11 @@ included without a scanner suppression.
 
 The earlier 958-image passes below remain historical observations of that exact
 artifact; they are not presented as browser qualification of this later image.
-Actual latest-image browser acceptance is held for Chrome input recovery and
-a fresh script-payload binding. The full latest-image HTTP/storage integration and same-version stopped-volume recovery pass; these automated/storage results do not close the browser gates.
+At that checkpoint, browser acceptance was held for input recovery and
+a fresh script-payload binding. The later owner-correlated Vivaldi tab now responds;
+current-image payload binding and media rechecks remain required. The full latest-image HTTP/storage integration and same-version stopped-volume recovery pass; these automated/storage results do not close the browser gates.
 
-## Current automated qualification
+## Earlier automated qualification (9fe)
 
 Runtime source `c4cde98a36b781ea0a0f5f512b0d5001a3fbd2fc` builds app
 `sha256:9fe2f139cece83cd1151a416cb45fe8fd6e80b85bce1268cc26e002b9a276a44`
@@ -53,9 +54,9 @@ build reused the qualified 51-test Rust/Clippy/release stage with identical serv
 inputs and output binary; no fresh Rust execution is claimed for that cache hit.
 Nine real-DOM cases pass separately, as described below.
 
-The retained interactive fixture still runs the earlier 858 image. Latest-image
-manual media acceptance remains held until browser input recovers and the new
-image, loaded payload and actual media actions can be bound together. Earlier
+The retained interactive fixture still runs the earlier 858 image. Current-source
+manual media acceptance still requires a new image, loaded-payload binding and
+actual media actions. Browser control has now recovered as described below. Earlier
 958 observations, 858 backup recovery and these new automated results each retain
 their own source/image limits.
 
@@ -89,13 +90,19 @@ into a private boundary for guest library/media access.
 
 ## Limits and cleanup
 
-The owned fixture and two test tabs remain temporarily held for manual Chrome input
-recovery and the remaining oracles. Repeated mouse-input timeouts affected both
-127.0.0.1 and separate-storage localhost origins while accessibility reads worked.
-Input attempts stopped after the bounded failures. Cleanup is held until those
-checks finish; these temporary resources are separate from the live deployment. Browser observations do not establish physical audio
-output, full-duration playback, every codec/archive, external YouTube behavior,
-network latency/soak/reconnect behavior, public-hosting security or deployment.
+The owned fixture and test tabs remain available for current-source media checks.
+Earlier input attempts timed out while accessibility reads worked; those receipts
+remain historical control failures, not product results. The owner then opened a
+uniquely tagged test URL in Vivaldi. Its exact tab appeared in the extension
+provider and guest entry responded in 0.34 seconds. The provider's “Chrome” label
+was not evidence of an installed Google Chrome browser. This correlation restores
+control on the newly identified tab; it does not explain the earlier timeouts.
+
+The control recovery still used the older 858 image. Latest-source acceptance
+requires a qualified new image and freshly bound payload. These test resources
+remain separate from the live deployment. Browser observations do not establish
+physical audio output, full-duration playback, every codec/archive, external
+YouTube behavior, latency/soak/reconnect, public-hosting security or deployment.
 Same-version backup/restore has its separate bounded qualification in
 [Operations](../operations.md#backup-restore-and-upgrade-status).
 
@@ -165,10 +172,34 @@ lifecycle gap: stopping only the launcher leaves a descendant writing and
 recreating the profile. The runner now stops only its newly created process group
 with bounded TERM/KILL waits before one profile removal, and reports original
 runner errors separately from cleanup errors. The two lifecycle controls bring the Node total to 49; all nine
-real-DOM cases also pass locally. Full Chrome was unavailable locally; hosted
-confirmation remains required, and the original masked outcome is unknown.
+real-DOM cases also pass locally. Full Chrome was unavailable locally during that qualification. Hosted browser
+checks subsequently passed on `bf40d875`; the original masked outcome remains unknown.
 
 The controlled DNS fixture also binds only to its resolved container interface,
 instead of all interfaces. Its real DNS recovery test still passes against the
 same qualified images. No CodeQL suppression or dismissal was added; fresh hosted
 analysis must confirm the alert disposition.
+
+## Host echo and cleanup follow-up
+
+A full review of `bf40d875` found that the first host party state can overwrite a
+locally resumed video's source and position. The correction passes a host-only
+`preserveActiveVideo` option and recognizes the exact configured stream through
+the active video attribute, Plyr source child or loaded source. The guard precedes
+both ID and drift branches, including stale same-media IDs. Guest initial and
+subsequent synchronization retains the host's position and play/pause state.
+
+Red Node and actual-DOM controls reproduce a host resume of 203 seconds resetting
+to zero before and after metadata. The corrected source passes 60 Node tests and
+16 actual-DOM cases, including fresh/stale host IDs, guest synchronization,
+changed media and URL/precedence controls. Media events/transport remain synthetic
+in that harness; decoded playback and distinct-client timing still need the
+current-image media checks.
+
+The DNS fixture also bounds every cleanup command to five seconds and attempts
+all owned resources. It preserves an existing scenario failure when diagnostics,
+removal or inventory fail, while cleanup failure remains fatal after scenario
+success. Real fake-Docker hangs/errors reproduce the old masking behavior and
+pass the corrected controls; all 20 Python tests pass. Three accompanying AST
+command-injection diagnostics have separate static dispositions in the ledger;
+cleanup timeouts are not presented as a security mitigation.

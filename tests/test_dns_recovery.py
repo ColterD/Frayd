@@ -15,6 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON_IMAGE = 'python@sha256:1b668429b3511ab407d8e00648891631b0b1a4d7e15e3ca70f38ab5b91ad4ab4'
+CLEANUP_TIMEOUT = 5
 
 
 def docker(*args):
@@ -71,6 +72,39 @@ def wait_health(url, seconds):
             return time.monotonic() - started
         time.sleep(0.2)
     raise AssertionError(f'health remained unavailable for {seconds}s')
+
+
+def cleanup_fixture(project, names, failing):
+    """Bound every cleanup attempt and preserve an existing scenario failure."""
+    label = 'com.docker.compose.project=' + project
+    commands = [('diagnostic', ('logs', '--tail', '200', name)) for name in names[1:3]]
+    commands += [('remove', ('rm', '-f', name)) for name in names]
+    commands.append(('remove', ('network', 'rm', project)))
+    commands += [('inventory', (resource, 'ls', '-q', *(['-a'] if resource == 'container' else []),
+                                '--filter', f'label={label}'))
+                 for resource in ('container', 'network', 'volume')]
+    failures = []
+    for phase, args in commands:
+        try:
+            result = subprocess.run(['docker', *args], capture_output=True, text=True,
+                                    check=True, timeout=CLEANUP_TIMEOUT)
+        except (subprocess.SubprocessError, OSError) as error:
+            print(f'QA {phase} unavailable: {args[0]} {type(error).__name__}', file=sys.stderr)
+            if phase != 'diagnostic':
+                failures.append((phase, args[0], type(error).__name__))
+            continue
+        if phase == 'diagnostic':
+            lines = (result.stdout + result.stderr).splitlines()
+            selected = [line for line in lines[:-10] if 'could not be resolved' in line] + lines[-10:]
+            print(f'DIAGNOSTIC {args[-1]}:\n' + '\n'.join(selected), flush=True)
+        elif phase == 'inventory' and result.stdout.strip():
+            failures.append((args[0], result.stdout.strip()))
+    if failures:
+        print(f'QA cleanup failed: {failures}', file=sys.stderr)
+        if not failing:
+            raise AssertionError(f'QA cleanup failed: {failures}')
+    else:
+        print(f'PASS: task-owned {project} containers, networks and volumes removed', flush=True)
 
 
 def run_fixture(args):
@@ -136,26 +170,7 @@ def run_fixture(args):
             assert before == docker('inspect', '--format', '{{.Id}} {{.State.StartedAt}}', proxy)
             print(f'PASS: unchanged proxy recovered after SERVFAIL in {recovered:.2f}s; configSHA256={hashlib.sha256(Path(args.config).read_bytes()).hexdigest()}', flush=True)
         finally:
-            failing = sys.exc_info()[0] is not None
-            # Capture DNS replies and nginx upstream errors before removing fixture containers.
-            for name in (dns, proxy):
-                result = subprocess.run(['docker', 'logs', '--tail', '200', name], capture_output=True, text=True)
-                lines = (result.stdout + result.stderr).splitlines()
-                selected = [line for line in lines[:-10] if 'could not be resolved' in line] + lines[-10:]
-                print(f'DIAGNOSTIC {name}:\n' + '\n'.join(selected), flush=True)
-            for name in names:
-                subprocess.run(['docker', 'rm', '-f', name], capture_output=True)
-            subprocess.run(['docker', 'network', 'rm', project], capture_output=True)
-            clean = True
-            for resource in ('container', 'network', 'volume'):
-                remaining = docker(resource, 'ls', '-q', *(['-a'] if resource == 'container' else []), '--filter', f'label={label}')
-                if remaining:
-                    clean = False
-                    print(f'QA cleanup failed: {resource} {remaining}', file=sys.stderr)
-                    if not failing:
-                        raise AssertionError((resource, remaining))
-            if clean:
-                print(f'PASS: task-owned {project} containers, networks and volumes removed', flush=True)
+            cleanup_fixture(project, names, sys.exc_info()[0] is not None)
 
 
 def main():

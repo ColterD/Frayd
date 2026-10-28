@@ -21,6 +21,7 @@ function browser() {
         add: name => classes.add(name), remove: name => classes.delete(name),
         contains: name => classes.has(name),
       },
+      querySelector: () => null,
       setAttribute: (name, value) => attributes.set(name, value),
       getAttribute: name => attributes.get(name),
       addEventListener(name, callback, options) {
@@ -62,7 +63,7 @@ function browser() {
   };
   const sockets = [];
   const context = vm.createContext({
-    document, localStorage: {}, location: { hostname: 'test.invalid' },
+    document, localStorage: {}, URL, location: { hostname: 'test.invalid', origin: 'https://test.invalid' },
     console: { log() {}, warn() {} }, innerWidth: 1000, innerHeight: 800,
     fetch: async (url, options) => { requests.push({ url, options }); return response(url, options); },
     addEventListener: (name, fn) => listeners.set(name, fn),
@@ -554,6 +555,77 @@ test('highlight selection errors require the active opaque reader and use consta
   assert.deepEqual(b.requests, []);
 });
 
+
+for (const [isHost, metadataFirst, priorFollowId] of [
+  [true, true, null], [true, false, null], [false, true, null], [false, false, null],
+  [true, true, 9], [true, false, 9],
+]) {
+  test(`${isHost ? 'host' : 'guest'} first party state ${metadataFirst ? 'after' : 'before'} metadata with prior follow ID ${priorFollowId} preserves the role's video position`, async () => {
+    const b = browser();
+    b.respond(async () => ({ ok: true, json: async () => ({ position: 203 }) }));
+    b.run('LIBRARY = [{ id: 9, kind: "movie", title: "Movie" }]; openVideo(LIBRARY[0])');
+    await settle();
+    const media = b.nodes.get('#plyr-video');
+    // Plyr installs a source child; the video src property can stay empty.
+    media.querySelector = selector => selector === 'source' ? { src: '/api/stream/9' } : null;
+    media.src = '';
+    media.readyState = metadataFirst ? 1 : 0;
+    if (metadataFirst) b.run('plyr.duration = 634; plyr.emit("loadedmetadata")');
+    b.run(`partyFollowId = ${JSON.stringify(priorFollowId)}`);
+    vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), b.context);
+    b.nodes.get('#party-code-input').value = 'ABCD';
+    b.run('PartyUI.open()');
+    b.nodes.get('#pt-join').onclick();
+    b.sockets[0].onmessage({ data: JSON.stringify({ type: 'state', is_host: isHost,
+      state: { media_id: 9, title: 'Movie', queue: [], position: isHost ? 0 : 24,
+        playing: false, updated_at: Date.now() / 1000 } }) });
+    if (!metadataFirst) {
+      media.readyState = 1;
+      b.run('plyr.duration = 634; plyr.emit("loadedmetadata")');
+    }
+    await settle();
+    assert.equal(b.nodes.get('#plyr-video'), media);
+    assert.equal(media.currentTime, isHost ? 203 : 24);
+    assert.equal(media.paused, !isHost);
+    if (isHost) assert.equal(media.src, '');
+  });
+}
+
+for (const [name, src, child, currentSrc, preserve] of [
+  ['same-origin direct source', 'https://test.invalid/api/stream/9', '', '', true],
+  ['cross-origin suffix lookalike', 'https://other.invalid/api/stream/9', '', '', false],
+  ['direct source before matching child', '/api/stream/10', '/api/stream/9', '', false],
+  ['currentSrc fallback', '', '', 'https://test.invalid/api/stream/9', true],
+]) {
+  test(`host preservation checks the effective stream: ${name}`, () => {
+    const b = browser();
+    b.run('LIBRARY = [{ id: 9, kind: "movie" }]');
+    const media = b.nodes.get('#plyr-video');
+    media.src = src;
+    media.currentSrc = currentSrc;
+    media.querySelector = selector => selector === 'source' && child ? { src: child } : null;
+    media.currentTime = 203;
+    b.run('partyFollow(9, "Movie", 0, false, 0, { preserveActiveVideo: true })');
+    assert.equal(media.currentTime, preserve ? 203 : 0);
+    assert.equal(media.src, preserve ? src : '/api/stream/9');
+  });
+}
+
+test('host first party state still loads a different video', async () => {
+  const b = browser();
+  b.respond(async () => ({ ok: true, json: async () => ({ position: 203 }) }));
+  b.run('LIBRARY = [{ id: 9, kind: "movie" }, { id: 10, kind: "movie" }]; openVideo(LIBRARY[0])');
+  await settle();
+  b.run('plyr.duration = 634; plyr.emit("loadedmetadata")');
+  vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), b.context);
+  b.nodes.get('#party-code-input').value = 'ABCD';
+  b.run('PartyUI.open()');
+  b.nodes.get('#pt-join').onclick();
+  b.sockets[0].onmessage({ data: JSON.stringify({ type: 'state', is_host: true,
+    state: { media_id: 10, title: 'Next', queue: [], position: 90, playing: true, updated_at: Date.now() / 1000 } }) });
+  assert.equal(b.nodes.get('#plyr-video').src, '/api/stream/10');
+  assert.ok(b.run('plyr.currentTime') < 2);
+});
 
 async function hostParty(kind = 'music') {
   const b = browser();

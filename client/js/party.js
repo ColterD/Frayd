@@ -97,7 +97,7 @@ const PartyUI = (() => {
     const id = state?.media_id;
     if (id != null && id !== hostLoadedMedia && typeof window.partyFollow === 'function') {
       hostLoadedMedia = id;
-      window.partyFollow(id, state.title, 0, state.playing, state.updated_at);
+      window.partyFollow(id, state.title, 0, state.playing, state.updated_at, { preserveActiveVideo: true });
     }
   }
   let hostLoadedExt = null;

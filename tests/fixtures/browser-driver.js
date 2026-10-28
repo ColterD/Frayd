@@ -1,4 +1,4 @@
-/* global ebook, showChunk, LIBRARY, plyr, partyFollowId, partyPlaybackKind */
+/* global ebook, showChunk, LIBRARY, plyr, partyFollowId, partyPlaybackKind, openVideo, PartyUI */
 'use strict';
 (async () => {
   const cases = [];
@@ -154,6 +154,99 @@
     return { replacements: 2, activeEvents: ['play', 'pause', 'seek'], detachedSyntheticEvents,
       followerPositions: [12, 24], syntheticEventsOnly: true };
   });
+  // Keep real Plyr/source/DOM behavior; empty streams need controlled media timing.
+  const originalFetch = window.fetch;
+  const originalWebSocket = window.WebSocket;
+  const mediaPrototype = HTMLMediaElement.prototype;
+  const originalPlay = mediaPrototype.play;
+  const originalPause = mediaPrototype.pause;
+  const originalPaused = Object.getOwnPropertyDescriptor(mediaPrototype, 'paused');
+  const playback = new WeakMap();
+  mediaPrototype.play = function () {
+    playback.set(this, false);
+    this.dispatchEvent(new Event('play'));
+    return Promise.resolve();
+  };
+  mediaPrototype.pause = function () {
+    playback.set(this, true);
+    this.dispatchEvent(new Event('pause'));
+  };
+  Object.defineProperty(mediaPrototype, 'paused', { configurable: true,
+    get() { return playback.has(this) ? playback.get(this) : originalPaused.get.call(this); } });
+  window.fetch = (url, options) => /^\/api\/progress\/(10|11)\?/.test(String(url))
+    ? Promise.resolve(new Response(JSON.stringify({ position: 203 }), { headers: { 'Content-Type': 'application/json' } }))
+    : originalFetch(url, options);
+  let socket;
+  window.WebSocket = class {
+    constructor() { this.readyState = 1; this.sent = []; socket = this; }
+    send(data) { this.sent.push(JSON.parse(data)); }
+    close() { this.readyState = 3; }
+  };
+  async function firstPartyState({ id, isHost, metadataFirst, nextId = id, priorFollowId = null }) {
+    PartyUI.close();
+    delete window.partySend;
+    partyFollowId = priorFollowId;
+    const previous = plyr.media;
+    openVideo({ id, kind: 'movie', title: 'Resume fixture' });
+    await until(() => plyr.media !== previous, 'openVideo installs real Plyr source');
+    const media = plyr.media;
+    Object.defineProperty(media, 'duration', { configurable: true, value: 634 });
+    Object.defineProperty(media, 'readyState', { configurable: true, value: metadataFirst ? 1 : 0 });
+    const sourceBefore = { src: media.getAttribute('src'), child: media.querySelector('source')?.getAttribute('src') };
+    equal(sourceBefore, { src: null, child: `/api/stream/${id}` }, 'Plyr installs a source child without a video src attribute');
+    if (metadataFirst) {
+      media.dispatchEvent(new Event('loadedmetadata'));
+      equal(plyr.currentTime, 203, 'Saved resume applied before first party echo');
+    }
+    PartyUI.open();
+    document.getElementById('party-code-input').value = 'ABCD';
+    document.getElementById('pt-join').click();
+    const state = { media_id: nextId, title: 'Party fixture', queue: [], position: isHost ? 0 : 24,
+      playing: false, updated_at: Date.now() / 1000 };
+    socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: isHost, state }) });
+    if (!metadataFirst) {
+      Object.defineProperty(media, 'readyState', { configurable: true, value: 1 });
+      media.dispatchEvent(new Event('loadedmetadata'));
+    }
+    check(plyr.media === media, 'Party echo retains active Plyr media element');
+    const position = isHost && nextId === id ? 203 : isHost ? 0 : 24;
+    equal(plyr.currentTime, position, 'Role-correct first party position');
+    if (isHost && nextId === id) {
+      equal({ src: media.getAttribute('src'), child: media.querySelector('source')?.getAttribute('src') }, sourceBefore,
+        'Host echo preserves effective stream and source structure');
+      equal(media.paused, false, 'Host echo preserves local playback despite paused echo');
+    } else {
+      equal(media.paused, true, 'Guest or changed-media load follows paused party state');
+    }
+    if (!isHost) {
+      socket.onmessage({ data: JSON.stringify({ type: 'state', state: { ...state, position: 48,
+        playing: true, updated_at: Date.now() / 1000 } }) });
+      check(plyr.currentTime >= 48 && plyr.currentTime < 50, 'Guest same-media update follows host seek');
+      equal(media.paused, false, 'Guest same-media update follows host play');
+    }
+    PartyUI.close();
+    return { isHost, metadataFirst, priorFollowId, loadedMedia: id, partyMedia: nextId, firstPosition: position,
+      sourceBefore, sourceAfter: { src: media.getAttribute('src'), child: media.querySelector('source')?.getAttribute('src') },
+      actualVendoredPlyr: true, productionPartyStateHandler: true, syntheticMediaTimingAndTransport: true };
+  }
+  for (const metadataFirst of [false, true]) {
+    const id = metadataFirst ? 11 : 10;
+    for (const isHost of [true, false]) await run(
+      `${isHost ? 'host' : 'guest'} first party echo ${metadataFirst ? 'after' : 'before'} metadata uses correct resume authority`,
+      () => firstPartyState({ id, isHost, metadataFirst }));
+  }
+  for (const metadataFirst of [false, true]) {
+    const id = metadataFirst ? 11 : 10;
+    await run(`host with stale same-media follow ID ${metadataFirst ? 'after' : 'before'} metadata preserves saved resume`,
+      () => firstPartyState({ id, isHost: true, metadataFirst, priorFollowId: id }));
+  }
+  await run('host changed-media first state still loads the party stream',
+    () => firstPartyState({ id: 11, nextId: 10, isHost: true, metadataFirst: true }));
+  window.fetch = originalFetch;
+  window.WebSocket = originalWebSocket;
+  mediaPrototype.play = originalPlay;
+  mediaPrototype.pause = originalPause;
+  Object.defineProperty(mediaPrototype, 'paused', originalPaused);
   await api('result', { cases, errors, mediaDiagnostics, passed: cases.filter(item => item.status === 'PASS').length,
     failed: cases.filter(item => item.status === 'FAIL').length,
     limits: ['Synthetic media events do not prove decoded playback, codec support, or two-client synchronization.',
