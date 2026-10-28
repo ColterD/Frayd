@@ -13,7 +13,7 @@ with proxy `sha256:70c8658365d70d40979de2f191387b2e5e08bea22b44f960c0e77f751f67f
 The app script is `d676ea713c0975ea5a3236ea98e1bb6e98f11b9c4ab7823d6c1165a5dee29646`.
 All 31 build, 19 verification and 20 backend inputs match the tested commit.
 
-The current harness passes 92 Node tests, 20 Python tests and 25 real-DOM cases,
+The current harness passes 91 Node tests, 20 Python tests and 25 real-DOM cases,
 including five native H.264 decoding controls and parser-gated reader restoration.
 The normal build reuses the qualified 51-test Rust/Clippy/release stage after
 confirming identical backend inputs and output binary; it is not fresh Rust
@@ -38,25 +38,33 @@ and unsupported-selection checks were not repeated in this targeted run.
 The controlled parser gate proves the lost-message lifecycle class; the precise
 scheduling trigger of the earlier Vivaldi failure remains an inference.
 
-The sections below retain historical source/image observations and their original
-gates. They do not describe current acceptance unless explicitly bound to this
-checkpoint. The final [ordering and reader readiness](#deterministic-native-ordering-and-reader-readiness)
-section explains the current controlled regression evidence. Both `6810cc2` hosted builds failed (jobs `123020052092` and `123020014328`);
-both stopped before any browser case because the test-owned cache-control endpoint
-was unavailable. This is a harness startup failure, not a reproduced product
-regression. A diagnostic-only harness change retains the original failure and includes bounded,
-redacted owned-browser startup stderr in the failed receipt. Its failure control
-and current 25-case local browser run pass; the next hosted run must expose the
-missing startup evidence before a causal correction can be chosen. Actual-browser acceptance remains
-a separate gate. On verification head `f16897334b55e5d6c3da201a00791c9bd4855662`,
-[one complete hosted build](https://github.com/ColterD/Frayd/actions/runs/40747689066/job/123025739721)
-passed through browser, lint, Rust/Clippy, image and HTTP/storage/DNS steps. The
-paired job `123025771918` failed before any case at the same five-second startup
-deadline; bounded redacted stderr did not establish a fatal cause. A further diagnostic observes only owned port-file existence and process liveness
-for up to ten seconds after the original five-second failure. It retains the
-failed verdict and never navigates or opens the late endpoint. The late-file and
-never-file controls pass. This is partial hosted success, not a resolved
-intermittent failure. No merge or deployment is authorized.
+## Hosted browser startup budget
+
+The initial five-second discovery budget rejected a browser that later created
+its owned endpoint file at **8.719 seconds** on GitHub job `123031020202`.
+The diagnostic retained a failed verdict, observed only file existence and process
+liveness, and never opened that late endpoint. It did not establish a policy or
+DBus failure. Another matched run passed the browser cases.
+
+The corrected harness allows 15 seconds for discovery, keeps the overall 60-second
+guard, and still requires loopback endpoint validation and successful protocol
+setup before navigation. Bounded, redacted startup stderr remains available on
+failure. The temporary late-file observer is removed after establishing the
+insufficient startup budget. A controlled 8.7-second delay before launching the
+same real browser distinguishes the old and corrected discovery budgets.
+
+Earlier verification head `f16897334b55e5d6c3da201a00791c9bd4855662` had
+[one complete hosted pass](https://github.com/ColterD/Frayd/actions/runs/40747689066/job/123025739721)
+through browser, lint, Rust/Clippy, images and HTTP/storage/DNS integration, plus
+one startup failure before any browser case. That success does not erase the
+failure. The [PR checks](https://github.com/ColterD/Frayd/pull/2/checks) and current
+PR evidence identify the latest tested head and hosted outcome.
+
+The remaining sections retain historical source/image observations and their
+original gates. They do not qualify later artifacts. The final
+[ordering and reader readiness](#deterministic-native-ordering-and-reader-readiness)
+section records the controlled product regressions. No merge or deployment is
+authorized by these checks.
 
 ## Historical source and fixture boundaries
 
