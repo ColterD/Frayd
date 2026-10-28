@@ -214,7 +214,7 @@ pub fn scan(db: &Connection, db_path: String, root: std::path::PathBuf, thumbs_d
         }
         let path = entry.path();
         // skip our own transcode outputs (also purge any mistakenly-scanned rows)
-        if path.file_name().and_then(|f| f.to_str()).map(|f| f.ends_with(".browser.mp4")).unwrap_or(false) {
+        if path.file_name().and_then(|f| f.to_str()).map(|f| f.ends_with(".browser.mp4") || f.ends_with(".browser.tmp.mp4")).unwrap_or(false) {
             let _ = db.execute("DELETE FROM media WHERE path = ?1", [path.to_string_lossy().as_ref()]);
             continue;
         }
@@ -348,4 +348,86 @@ fn classify(p: &Path) -> Option<&'static str> {
         "opus" | "ogg" => "music",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Library(std::path::PathBuf);
+
+    impl Library {
+        fn new(names: &[&str]) -> Self {
+            let root = std::env::temp_dir().join(format!("frayd-scanner-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            for name in names {
+                std::fs::write(root.join(name), []).unwrap();
+            }
+            Self(root)
+        }
+    }
+
+    impl Drop for Library {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn scan_does_not_index_transcode_artifacts() {
+        let library = Library::new(&[
+            "Big Buck Bunny.browser.mp4",
+            "Big Buck Bunny.browser.tmp.mp4",
+            // Scanning a temporary output used to enqueue another conversion of it.
+            "Big Buck Bunny.browser.tmp.browser.tmp.mp4",
+            "Big Buck Bunny.browser.tmp.browser.mp4",
+        ]);
+        let db = open(":memory:");
+
+        assert_eq!(scan(&db, String::new(), library.0.clone(), None), 0);
+        let count: i64 = db.query_row("SELECT COUNT(*) FROM media", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn scan_purges_artifact_rows_and_preserves_sources_and_similar_names() {
+        let sources = [
+            "Big Buck Bunny.mkv",
+            "Big Buck Bunny.mp4",
+            "Big Buck Bunny.tmp.mp4",
+            "Big Buck Bunny.browser.mkv",
+            "Big Buck Bunny.browser.tmp.mkv",
+            "Big Buck Bunny.browser.tmp trailer.mp4",
+            "Big Buck Bunny.browser.tmp.mp4.mp4",
+        ];
+        let artifacts = ["Big Buck Bunny.browser.mp4", "Big Buck Bunny.browser.tmp.mp4"];
+        let names: Vec<&str> = sources.iter().chain(artifacts.iter()).copied().collect();
+        let library = Library::new(&names);
+        let db = open(":memory:");
+        for name in &names {
+            // Existing rows suppress unrelated metadata probes and background transcodes.
+            db.execute(
+                "INSERT INTO media (kind, path, title, mtime_secs, transcode_path)
+                 VALUES ('movie', ?1, ?2, ?3, 'already-converted')",
+                rusqlite::params![library.0.join(name).to_str().unwrap(), name, i64::MAX],
+            ).unwrap();
+        }
+        let original_ids: Vec<i64> = sources.iter().map(|name| {
+            db.query_row("SELECT id FROM media WHERE path = ?1",
+                [library.0.join(name).to_str().unwrap()], |row| row.get(0)).unwrap()
+        }).collect();
+
+        assert_eq!(scan(&db, String::new(), library.0.clone(), None), 0);
+        for (name, id) in sources.iter().zip(original_ids) {
+            let actual: i64 = db.query_row("SELECT id FROM media WHERE path = ?1",
+                [library.0.join(name).to_str().unwrap()], |row| row.get(0)).unwrap();
+            assert_eq!(actual, id, "source row changed: {name}");
+        }
+        let count: usize = db.query_row("SELECT COUNT(*) FROM media", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, sources.len());
+        for name in &names {
+            assert!(library.0.join(name).exists(), "scan removed file: {name}");
+        }
+        assert_eq!(scan(&db, String::new(), library.0.clone(), None), 0);
+    }
 }
