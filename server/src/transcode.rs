@@ -148,9 +148,10 @@ fn transcode_to_browser_mp4(src: &Path, tmp: &Path, out: &Path) -> Option<PathBu
 }
 
 /// Retire only this failed job's generated artifacts while retaining provenance on any uncertainty.
-/// Acquire the SQLite write lock before filesystem cleanup; a busy database leaves all state intact.
-fn discard_failed_job(db: &mut Connection, id: i64, src: &Path, tmp: &Path, out: &Path) -> bool {
+/// Acquire the SQLite write lock before cleanup; only the actual completed path authorizes final-file removal.
+fn discard_failed_job(db: &mut Connection, id: i64, src: &Path, tmp: &Path, out: &Path, completed: Option<&Path>) -> bool {
     let retired = (|| {
+        if completed.is_some_and(|path| path != out) { return None; }
         let job = tmp.parent()?;
         if out.parent() != Some(job) { return None; }
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).ok()?;
@@ -165,8 +166,14 @@ fn discard_failed_job(db: &mut Connection, id: i64, src: &Path, tmp: &Path, out:
         match std::fs::symlink_metadata(job) {
             Ok(metadata) => {
                 if !metadata.is_dir() || metadata.file_type().is_symlink() || job.canonicalize().ok()?.as_path() != job { return None; }
-                // A final output or an unknown child is not evidence of a failed job we may remove.
-                if std::fs::symlink_metadata(out).is_ok() { return None; }
+                if completed.is_some() {
+                    match std::fs::remove_file(out) {
+                        Ok(()) => (),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                        Err(_) => return None,
+                    }
+                } else if std::fs::symlink_metadata(out).is_ok() { return None; }
+                // Unknown children retain provenance; only an empty current-job directory is retired.
                 match std::fs::remove_file(tmp) {
                     Ok(()) => (),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
@@ -217,13 +224,16 @@ fn run_job(db_path: &str, media_id: i64, src: &Path, library: &Path) {
         tracing::warn!(media_id,"transcode held: cache or registry unavailable"); return;
     };
     let Some(completed) = transcode_to_browser_mp4(src,&tmp,&out) else {
-        discard_failed_job(&mut db,media_id,src,&tmp,&out);
+        discard_failed_job(&mut db,media_id,src,&tmp,&out,None);
         return;
     };
-    if let Err(error) = db.execute("UPDATE media SET transcode_path=?1 WHERE id=?2 AND path=?3",
+    match db.execute("UPDATE media SET transcode_path=?1 WHERE id=?2 AND path=?3",
         rusqlite::params![completed.to_string_lossy(),media_id,src.to_string_lossy()]) {
-        tracing::warn!(%error,media_id,"transcode completed but publication failed");
+        Ok(1) => return,
+        Ok(_) => tracing::warn!(media_id,"transcode publication held: source identity changed"),
+        Err(error) => tracing::warn!(%error,media_id,"transcode completed but publication failed"),
     }
+    discard_failed_job(&mut db,media_id,src,&tmp,&out,Some(&completed));
 }
 
 #[cfg(test)]
@@ -295,6 +305,35 @@ mod tests {
             .env("PATH",std::env::join_paths(paths).unwrap()).output().unwrap();
         assert!(output.status.success(),"isolated failed-job worker: {}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
     }
+    /// A completed file whose pointer cannot be published must not accumulate across retries.
+    #[test]
+    fn failed_publication_retires_unreferenced_current_job_outputs() {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(root)=std::env::var_os("FRAYD_TEST_PUBLICATION_ROOT") {
+            let root=PathBuf::from(root); let db_path=root.join("db.sqlite"); let src=root.join("library/film.mkv");
+            for _ in 0..2 { run_job(db_path.to_str().unwrap(),1,&src,&root.join("library")); }
+            let db=crate::store::connect(db_path.to_str().unwrap()).unwrap();
+            assert_eq!(db.query_row("SELECT COUNT(*) FROM transcode_artifacts",[],|r|r.get::<_,i64>(0)).unwrap(),0,"failed publication retained unused cache files");
+            assert_eq!(std::fs::read_dir(root.join("cache/1")).map(|entries|entries.count()).unwrap_or(0),0);
+            assert_eq!(db.query_row("SELECT transcode_path FROM media WHERE id=1",[],|r|r.get::<_,Option<String>>(0)).unwrap(),None);
+            assert_eq!(std::fs::read(src).unwrap(),b"original");
+            return;
+        }
+        let fixture=Fixture::new(); let src=fixture.source("film.mkv");
+        let db=crate::store::open(fixture.0.join("db.sqlite").to_str().unwrap()); insert(&db,1,&src);
+        db.execute_batch("CREATE TRIGGER fail_publication BEFORE UPDATE OF transcode_path ON media BEGIN SELECT RAISE(FAIL,'fixture publication refused'); END;").unwrap();drop(db);
+        let bin=fixture.0.join("bin");std::fs::create_dir(&bin).unwrap();
+        for (name,script) in [("ffprobe",b"#!/bin/sh\nprintf 'ac3\\n'\n".as_slice()),("ffmpeg",b"#!/bin/sh\nfor destination do :; done\nprintf 'converted fixture' > \"$destination\"\n".as_slice())] {
+            let executable=bin.join(name);std::fs::write(&executable,script).unwrap();
+            std::fs::set_permissions(executable,std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut paths=vec![bin];paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+        let output=Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","transcode::tests::failed_publication_retires_unreferenced_current_job_outputs","--nocapture"])
+            .env("FRAYD_TEST_PUBLICATION_ROOT",&fixture.0).env("FRAYD_TRANSCODES",fixture.0.join("cache"))
+            .env("PATH",std::env::join_paths(paths).unwrap()).output().unwrap();
+        assert!(output.status.success(),"isolated publication worker: {}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+    }
     /// A busy database must retain provenance and bytes until the write lock becomes available.
     #[test]
     fn failed_job_cleanup_holds_all_state_during_database_lock() {
@@ -304,11 +343,11 @@ mod tests {
         std::fs::write(&tmp,b"partial owned output").unwrap();
         let mut writer=crate::store::connect(path.to_str().unwrap()).unwrap();
         let lock=writer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
-        assert!(!discard_failed_job(&mut db,1,&src,&tmp,&out));
+        assert!(!discard_failed_job(&mut db,1,&src,&tmp,&out,None));
         assert_eq!(std::fs::read(&tmp).unwrap(),b"partial owned output");
         assert_eq!(db.query_row("SELECT COUNT(*) FROM transcode_artifacts",[],|r|r.get::<_,i64>(0)).unwrap(),2);
         drop(lock);
-        assert!(discard_failed_job(&mut db,1,&src,&tmp,&out));
+        assert!(discard_failed_job(&mut db,1,&src,&tmp,&out,None));
         assert!(!tmp.parent().unwrap().exists());
         assert_eq!(db.query_row("SELECT COUNT(*) FROM transcode_artifacts",[],|r|r.get::<_,i64>(0)).unwrap(),0);
     }
@@ -321,17 +360,23 @@ mod tests {
         let (tmp,out)=reserve_job(&mut db,&cache,&library,1,&src).unwrap();
         let (neighbor_tmp,neighbor_out)=reserve_job(&mut db,&cache,&library,1,&src).unwrap();
         std::fs::write(&tmp,b"partial").unwrap();std::fs::write(&neighbor_tmp,b"neighbor").unwrap();
-        assert!(discard_failed_job(&mut db,1,&src,&tmp,&out));
+        assert!(discard_failed_job(&mut db,1,&src,&tmp,&out,None));
         assert_eq!(std::fs::read(&neighbor_tmp).unwrap(),b"neighbor");
         assert_eq!(db.query_row("SELECT COUNT(*) FROM transcode_artifacts",[],|r|r.get::<_,i64>(0)).unwrap(),2);
         insert(&db,2,&neighbor_tmp);
-        assert!(!discard_failed_job(&mut db,1,&src,&neighbor_tmp,&neighbor_out));
+        assert!(!discard_failed_job(&mut db,1,&src,&neighbor_tmp,&neighbor_out,None));
         assert_eq!(std::fs::read(&neighbor_tmp).unwrap(),b"neighbor");
         db.execute("DELETE FROM media WHERE id=2",[]).unwrap();
         db.execute("UPDATE transcode_artifacts SET provenance='legacy_reference'",[]).unwrap();
-        assert!(!discard_failed_job(&mut db,1,&src,&neighbor_tmp,&neighbor_out));
+        assert!(!discard_failed_job(&mut db,1,&src,&neighbor_tmp,&neighbor_out,None));
         assert_eq!(std::fs::read(&neighbor_tmp).unwrap(),b"neighbor");
         assert_eq!(db.query_row("SELECT COUNT(*) FROM transcode_artifacts",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+        std::fs::rename(&neighbor_tmp,&neighbor_out).unwrap();
+        assert!(!discard_failed_job(&mut db,1,&src,&neighbor_tmp,&neighbor_out,Some(&neighbor_out)));
+        db.execute("UPDATE transcode_artifacts SET provenance='generated'",[]).unwrap();
+        insert(&db,2,&neighbor_out);
+        assert!(!discard_failed_job(&mut db,1,&src,&neighbor_tmp,&neighbor_out,Some(&neighbor_out)));
+        assert_eq!(std::fs::read(&neighbor_out).unwrap(),b"neighbor");
     }
     /// Protect same-stem sources from collisions and source-directory output writes.
     #[test]

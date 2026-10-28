@@ -505,23 +505,26 @@ async fn comic_page(
 }
 
 /// Share the existing page order between listing and content endpoints.
-/// Populate missing caches outside the DB lock, publishing only the cache field.
+/// Populate missing caches outside the DB lock, publishing only if the source fingerprint is unchanged.
 async fn comic_page_names(app: &Arc<App>, id: i64, path: &str) -> Option<Vec<String>> {
-    {
+    let (mtime,size) = {
         let db = app.db.lock().unwrap();
-        let meta: Option<String> = db.query_row("SELECT meta_json FROM media WHERE id=?1",[id],|r|r.get(0)).ok().flatten();
+        let (meta,mtime,size): (Option<String>,Option<i64>,Option<i64>) = db.query_row(
+            "SELECT meta_json,mtime_secs,size_bytes FROM media WHERE id=?1",[id],
+            |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).ok()?;
         let cached = meta.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
             .and_then(|v| serde_json::from_value::<Vec<String>>(v["pages"].clone()).ok());
         if let Some(names) = cached { return Some(names); }
-    }
+        (mtime,size)
+    };
     let archive = PathBuf::from(path);
     let pages = tokio::task::spawn_blocking(move || comic::comic_pages(&archive)).await.ok()??;
     let names: Vec<String> = pages.into_iter().map(|(name,_)| name).collect();
     let db = app.db.lock().unwrap();
-    // Patch only the cache field, preserving concurrent metadata changes.
+    // Patch only the cache field; a concurrent rescan must not receive a stale archive listing.
     let changed = db.execute("UPDATE media SET meta_json=json_set(COALESCE(meta_json,'{}'),
-        '$.pages',json(?1)) WHERE id=?2 AND path=?3",
-        rusqlite::params![serde_json::to_string(&names).ok()?,id,path]).ok()?;
+        '$.pages',json(?1)) WHERE id=?2 AND path=?3 AND mtime_secs IS ?4 AND size_bytes IS ?5",
+        rusqlite::params![serde_json::to_string(&names).ok()?,id,path,mtime,size]).ok()?;
     if changed != 1 { return None; }
     Some(names)
 }
@@ -1334,6 +1337,52 @@ mod backend_regressions {
         Arc::new(App { db: Mutex::new(db), db_path: String::new(), library: None,
             scanning: std::sync::atomic::AtomicBool::new(false), auth_rl: auth::RateLimiter::new(300,10),
             party: Arc::new(party::Party::new()) })
+    }
+    /// Write a small real CBZ whose image bytes and natural page order are explicit.
+    fn write_comic_fixture(path: &std::path::Path, pages: &[(&str,&[u8])]) {
+        use std::io::Write;
+        let mut archive=zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        for (name,bytes) in pages {
+            archive.start_file(*name,zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored)).unwrap();
+            archive.write_all(bytes).unwrap();
+        }
+        archive.finish().unwrap();
+    }
+    /// A changed archive must refresh both endpoints while unchanged cached order and user state survive.
+    #[tokio::test]
+    async fn rescan_refreshes_changed_comic_cache_without_replacing_identity_or_progress() {
+        let root=std::env::temp_dir().join(format!("frayd-comic-refresh-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap(); let path=root.join("book.cbz");
+        write_comic_fixture(&path,&[("page2.png",b"second original image"),("page10.png",b"tenth original image")]);
+        let original=std::fs::metadata(&path).unwrap(); let app=app_for(path.to_str().unwrap());
+        {
+            let db=app.db.lock().unwrap();
+            db.execute(r#"UPDATE media SET mtime_secs=?1,size_bytes=?2,meta_json=json_set(meta_json,'$.pages',json('["page10.png","page2.png"]')) WHERE id=1"#,
+                rusqlite::params![original.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64,original.len() as i64]).unwrap();
+            assert_eq!(scanner::scan(&db,String::new(),root.clone(),None),0);
+        }
+        let response=comic_pages(State(app.clone()),Path(1)).await.into_response();
+        let unchanged:Vec<String>=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),8192).await.unwrap()).unwrap();
+        assert_eq!(unchanged,vec!["page10.png","page2.png"]);
+        write_comic_fixture(&path,&[("page2.png",b"second original image"),("page5.png",b"new fifth image"),("page10.png",b"tenth original image")]);
+        std::fs::File::open(&path).unwrap().set_times(std::fs::FileTimes::new().set_modified(original.modified().unwrap())).unwrap();
+        {
+            let db=app.db.lock().unwrap();
+            scanner::scan(&db,String::new(),root.clone(),None);
+        }
+        let response=comic_pages(State(app.clone()),Path(1)).await.into_response();
+        assert_eq!(response.status(),StatusCode::OK);
+        let changed:Vec<String>=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),8192).await.unwrap()).unwrap();
+        assert_eq!(changed,vec!["page2.png","page5.png","page10.png"]);
+        let response=comic_page(State(app.clone()),Path((1,1))).await.into_response();
+        assert_eq!(response.status(),StatusCode::OK);
+        assert_eq!(axum::body::to_bytes(response.into_body(),8192).await.unwrap(),&b"new fifth image"[..]);
+        let db=app.db.lock().unwrap();
+        assert_eq!(db.query_row("SELECT id FROM media WHERE path=?1",[path.to_str().unwrap()],|r|r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(db.query_row("SELECT title FROM media WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),"Original");
+        assert_eq!(db.query_row("SELECT json_extract(meta_json,'$.synopsis') FROM media WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),"keep");
+        assert_eq!(db.query_row("SELECT position FROM progress WHERE media_id=1",[],|r|r.get::<_,f64>(0)).unwrap(),7.0);
+        std::fs::remove_dir_all(root).unwrap();
     }
     /// Protect cached UTF-8 names, physical page bytes, metadata, and saved progress together.
     #[tokio::test]

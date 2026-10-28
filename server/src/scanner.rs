@@ -221,7 +221,8 @@ pub fn scan(db: &Connection, db_path: String, root: std::path::PathBuf, thumbs_d
     count
 }
 
-/// Insert/update one media row (file or manga dir) + thumbs/transcode/meta work.
+/// Update source fingerprints and invalidate only comic page names when the source changes.
+/// Preserve identities, progress, unrelated metadata, and unchanged persisted page order.
 fn upsert_item(
     db: &Connection,
     db_path: String,
@@ -258,8 +259,10 @@ fn upsert_item(
             "INSERT INTO media (kind, path, title, size_bytes, mtime_secs)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(path) DO UPDATE SET
-               kind = ?1, mtime_secs = ?5, size_bytes = ?4
-             WHERE media.mtime_secs < ?5",
+               kind = ?1, mtime_secs = ?5, size_bytes = ?4,
+               meta_json = CASE WHEN ?1 IN ('comic','manga') AND json_valid(media.meta_json)
+                   THEN json_remove(media.meta_json,'$.pages') ELSE media.meta_json END
+             WHERE media.mtime_secs IS NOT ?5 OR media.size_bytes IS NOT ?4",
             rusqlite::params![kind, path_str, title, meta.len() as i64, mtime],
         )
         .unwrap_or(0);
@@ -371,6 +374,23 @@ mod tests {
         }
     }
 
+    /// Backdated and legacy-null fingerprints still invalidate only the changed comic cache field.
+    #[test]
+    fn changed_or_missing_comic_fingerprints_clear_only_page_names() {
+        let library=Library::new(&["book.cbz"]); let db=open(":memory:");
+        let path=library.0.join("book.cbz");
+        db.execute(r#"INSERT INTO media(id,kind,path,title,mtime_secs,size_bytes,meta_json)
+            VALUES(1,'comic',?1,'Original',?2,0,'{"pages":["old.png"],"synopsis":"keep"}')"#,
+            rusqlite::params![path.to_str().unwrap(),i64::MAX]).unwrap();
+        for legacy_null in [false,true] {
+            if legacy_null { db.execute(r#"UPDATE media SET mtime_secs=NULL,size_bytes=NULL,
+                meta_json=json_set(meta_json,'$.pages',json('["old.png"]')) WHERE id=1"#,[]).unwrap(); }
+            assert_eq!(scan(&db,String::new(),library.0.clone(),None),1);
+            assert_eq!(db.query_row("SELECT json_type(meta_json,'$.pages') FROM media WHERE id=1",[],|r|r.get::<_,Option<String>>(0)).unwrap(),None);
+            assert_eq!(db.query_row("SELECT json_extract(meta_json,'$.synopsis') FROM media WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),"keep");
+            assert_eq!(scan(&db,String::new(),library.0.clone(),None),0);
+        }
+    }
     /// Distinguish genuine exact-suffix sources from artifacts using ownership, never names.
     #[test]
     fn scan_preserves_genuine_browser_suffix_sources_and_progress() {
