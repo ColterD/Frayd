@@ -265,6 +265,9 @@ body.auth {
 #video-modal.on { display: flex; flex-direction: column; }
 #video-modal .modal-inner { position: relative; width: 100%; max-width: none; height: 100%; display: flex; align-items: center; justify-content: center; background: #000; }
 #video-modal video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+#video-modal #yt-party, #video-modal #yt-party iframe { width: 100%; height: 100%; border: 0; background: #000; }
+#video-modal.yt video { display: none; }
+#video-modal.yt #yt-party { display: block; }
 .vm-overlay {
   position: absolute; top: 0; left: 0; right: 0; z-index: 10;
   display: flex; justify-content: space-between; align-items: center;
