@@ -94,6 +94,7 @@ CREATE TABLE IF NOT EXISTS transcode_artifacts (
   owner_source_path TEXT NOT NULL,
   role TEXT NOT NULL CHECK(role IN ('temp','final')),
   provenance TEXT NOT NULL CHECK(provenance IN ('generated','legacy_reference')),
+  lifecycle TEXT NOT NULL DEFAULT 'unknown' CHECK(lifecycle IN ('unknown','pending','completed','retiring')),
   CHECK(path != owner_source_path)
 );
 CREATE INDEX IF NOT EXISTS idx_transcode_artifacts_owner ON transcode_artifacts(owner_media_id);

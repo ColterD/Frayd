@@ -186,6 +186,7 @@ pub fn scan(db: &Connection, db_path: String, root: std::path::PathBuf, thumbs_d
     if let Some(t) = thumbs_dir {
         let _ = std::fs::create_dir_all(t);
     }
+    crate::transcode::recover_pending_jobs(&db_path, &root);
     let owned = crate::transcode::reconcile_artifacts(db);
     let mut count = 0;
     let mut seen_manga_dirs: Vec<std::path::PathBuf> = Vec::new();
@@ -395,7 +396,7 @@ mod tests {
         }
         db.execute("UPDATE media SET transcode_path=?1 WHERE id=1",[library.0.join(names[1]).to_str().unwrap()]).unwrap();
         db.execute("UPDATE media SET transcode_path=?1 WHERE id=4",[library.0.join(names[4]).to_str().unwrap()]).unwrap();
-        db.execute("INSERT INTO transcode_artifacts VALUES(?1,1,?2,'temp','generated')",
+        db.execute("INSERT INTO transcode_artifacts(path,owner_media_id,owner_source_path,role,provenance) VALUES(?1,1,?2,'temp','generated')",
             rusqlite::params![library.0.join(names[2]).to_str().unwrap(),library.0.join(names[0]).to_str().unwrap()]).unwrap();
         db.execute_batch("INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture');
             INSERT INTO progress(identity_id,media_id,position) VALUES(1,2,42),(1,3,7);").unwrap();

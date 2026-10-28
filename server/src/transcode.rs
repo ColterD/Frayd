@@ -2,7 +2,8 @@
 use rusqlite::Connection;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::fs::{File, OpenOptions};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub static BUSY: AtomicBool = AtomicBool::new(false);
@@ -100,9 +101,22 @@ fn prepare_cache(cache: &Path, library: &Path) -> Option<PathBuf> {
     Some(canonical)
 }
 
+/// A fresh reservation capability binds publication to its exact output and recovery qualification.
+struct JobLease {
+    file: File,
+    completed: PathBuf,
+    reclaimable: bool,
+}
+
 /// Reserve a unique job namespace and persist both exact paths before launching ffmpeg.
 /// The cache must remain private: path checks reject existing redirects, not hostile writer races.
-fn reserve_job(db: &mut Connection, cache: &Path, library: &Path, id: i64, src: &Path) -> Option<(PathBuf,PathBuf)> {
+fn reserve_job(db: &mut Connection, cache: &Path, library: &Path, id: i64, src: &Path) -> Option<(PathBuf,PathBuf,JobLease)> {
+    reserve_job_with_recovery(db,cache,library,id,src,cfg!(target_os = "linux"))
+}
+
+/// Preserve conversion without granting recovery authority when the platform/filesystem lease is unqualified.
+fn reserve_job_with_recovery(db: &mut Connection, cache: &Path, library: &Path, id: i64, src: &Path,
+    qualify_recovery: bool) -> Option<(PathBuf,PathBuf,JobLease)> {
     let cache = prepare_cache(cache, library)?;
     let media = cache.join(id.to_string());
     match std::fs::create_dir(&media) {
@@ -122,78 +136,157 @@ fn reserve_job(db: &mut Connection, cache: &Path, library: &Path, id: i64, src: 
         if metadata.file_type().is_symlink() || !metadata.is_dir() { return None; }
         let canonical = job.canonicalize().ok()?;
         if canonical.parent() != Some(media.as_path()) || !canonical.starts_with(&cache) { return None; }
+        let lease = OpenOptions::new().create_new(true).read(true).write(true)
+            .open(canonical.join("lease")).ok()?;
+        let reclaimable=qualify_recovery && lease.try_lock().is_ok();
+        let lifecycle=if reclaimable {"pending"} else {"unknown"};
         let tmp = canonical.join("audio.tmp.mp4");
         let out = canonical.join("audio.mp4");
         let tx = db.transaction().ok()?;
         for (path,role) in [(&tmp,"temp"),(&out,"final")] {
-            let inserted = tx.execute("INSERT INTO transcode_artifacts(path,owner_media_id,owner_source_path,role,provenance)
-                SELECT ?1,id,path,?2,'generated' FROM media WHERE id=?3 AND path=?4",
-                rusqlite::params![path.to_str()?,role,id,src.to_str()?]).ok()?;
+            let inserted = tx.execute("INSERT INTO transcode_artifacts(path,owner_media_id,owner_source_path,role,provenance,lifecycle)
+                SELECT ?1,id,path,?2,'generated',?5 FROM media WHERE id=?3 AND path=?4",
+                rusqlite::params![path.to_str()?,role,id,src.to_str()?,lifecycle]).ok()?;
             if inserted != 1 { return None; }
         }
         tx.commit().ok()?;
-        Some((tmp,out))
+        Some((tmp,out.clone(),JobLease {file:lease,completed:out,reclaimable}))
     })();
-    if reserved.is_none() { let _ = std::fs::remove_dir(&job); }
+    if reserved.is_none() { let _ = std::fs::remove_file(job.join("lease")); let _ = std::fs::remove_dir(&job); }
     reserved
 }
 
 /// Convert only to paths already registered for this job. Never write beside the source.
-fn transcode_to_browser_mp4(src: &Path, tmp: &Path, out: &Path) -> Option<PathBuf> {
+fn transcode_to_browser_mp4(src: &Path, tmp: &Path, out: &Path, lease: &JobLease) -> Option<PathBuf> {
     let status = Command::new("ffmpeg").args([
-        "-n", "-i", src.to_str()?, "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy",
+        "-nostdin", "-n", "-i", src.to_str()?, "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy",
         "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-f", "mp4",
-    ]).arg(tmp).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().ok()?;
+    ]).arg(tmp).stdin(Stdio::from(lease.file.try_clone().ok()?)).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().ok()?;
     if !status.success() || !tmp.is_file() { return None; }
     std::fs::rename(tmp, out).ok()?;
     Some(out.to_path_buf())
 }
 
-/// Retire only this failed job's generated artifacts while retaining provenance on any uncertainty.
-/// Acquire the SQLite write lock before cleanup; only the actual completed path authorizes final-file removal.
+/// Validate fixed private job names and reject redirects or unregistered children before deletion.
+fn job_namespace(tmp: &Path, out: &Path, id: i64) -> Option<PathBuf> {
+    let job = tmp.parent()?;
+    if tmp.file_name()? != "audio.tmp.mp4" || out != job.join("audio.mp4")
+        || job.parent()?.file_name()?.to_str()? != id.to_string()
+        || uuid::Uuid::parse_str(job.file_name()?.to_str()?).is_err() { return None; }
+    for directory in [job.parent()?, job] {
+        match std::fs::symlink_metadata(directory) {
+            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+                if directory.canonicalize().ok()?.as_path() != directory { return None; }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && directory == job => (),
+            _ => return None,
+        }
+    }
+    if job.exists() {
+        for entry in std::fs::read_dir(job).ok()? {
+            let entry = entry.ok()?;
+            if !["audio.tmp.mp4", "audio.mp4", "lease"].contains(&entry.file_name().to_str()?)
+                || !entry.file_type().ok()?.is_file() { return None; }
+        }
+    }
+    Some(job.to_path_buf())
+}
+
+/// Check the exact consistent generated pair and all media references while holding a write transaction.
+fn job_state(db: &Connection, id: i64, src: &Path, tmp: &Path, out: &Path, allow_unknown: bool) -> Option<String> {
+    let rows = db.prepare("SELECT path,role,lifecycle FROM transcode_artifacts
+        WHERE owner_media_id=?1 AND owner_source_path=?2 AND provenance='generated'
+        AND path IN (?3,?4)").ok()?.query_map(rusqlite::params![id,src.to_str()?,tmp.to_str()?,out.to_str()?],
+        |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?))).ok()?
+        .collect::<rusqlite::Result<Vec<_>>>().ok()?;
+    if rows.len()!=2 || !rows.iter().any(|r| r.0==tmp.to_string_lossy() && r.1=="temp")
+        || !rows.iter().any(|r| r.0==out.to_string_lossy() && r.1=="final")
+        || rows[0].2!=rows[1].2 || (! ["pending","retiring"].contains(&rows[0].2.as_str())
+            && !(allow_unknown && rows[0].2=="unknown")) { return None; }
+    let owner: i64 = db.query_row("SELECT COUNT(*) FROM media WHERE id=?1 AND path=?2",
+        rusqlite::params![id,src.to_str()?],|row|row.get(0)).ok()?;
+    let references: i64 = db.query_row("SELECT COUNT(*) FROM media WHERE path IN (?1,?2)
+        OR transcode_path IN (?1,?2)",rusqlite::params![tmp.to_str()?,out.to_str()?],|row|row.get(0)).ok()?;
+    let prefix=format!("{}/",tmp.parent()?.to_str()?);
+    let upper=format!("{}0",tmp.parent()?.to_str()?);
+    let registered: i64 = db.query_row("SELECT COUNT(*) FROM transcode_artifacts WHERE path>=?1 AND path<?2",
+        rusqlite::params![prefix,upper],|row|row.get(0)).ok()?;
+    if owner!=1 || references!=0 || registered!=2 { return None; }
+    Some(rows[0].2.clone())
+}
+
+/// Retire a proven inactive/current finished worker under its lease; durable retiring survives filesystem/commit gaps.
+/// Unknown and completed pairs never grant cleanup authority, even when currently unreferenced.
 fn discard_failed_job(db: &mut Connection, id: i64, src: &Path, tmp: &Path, out: &Path, completed: Option<&Path>) -> bool {
     let retired = (|| {
         if completed.is_some_and(|path| path != out) { return None; }
-        let job = tmp.parent()?;
-        if out.parent() != Some(job) { return None; }
+        let job = job_namespace(tmp,out,id)?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).ok()?;
-        let owned: i64 = tx.query_row("SELECT COUNT(*) FROM transcode_artifacts
-            WHERE owner_media_id=?1 AND owner_source_path=?2 AND provenance='generated'
-            AND ((path=?3 AND role='temp') OR (path=?4 AND role='final'))",
-            rusqlite::params![id,src.to_str()?,tmp.to_str()?,out.to_str()?],|r|r.get(0)).ok()?;
-        if owned != 2 { return None; }
-        let referenced: i64 = tx.query_row("SELECT COUNT(*) FROM media WHERE path IN (?1,?2)
-            OR transcode_path IN (?1,?2)",rusqlite::params![tmp.to_str()?,out.to_str()?],|r|r.get(0)).ok()?;
-        if referenced != 0 { return None; }
-        match std::fs::symlink_metadata(job) {
-            Ok(metadata) => {
-                if !metadata.is_dir() || metadata.file_type().is_symlink() || job.canonicalize().ok()?.as_path() != job { return None; }
-                if completed.is_some() {
-                    match std::fs::remove_file(out) {
-                        Ok(()) => (),
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-                        Err(_) => return None,
-                    }
-                } else if std::fs::symlink_metadata(out).is_ok() { return None; }
-                // Unknown children retain provenance; only an empty current-job directory is retired.
-                match std::fs::remove_file(tmp) {
+        let state = job_state(&tx,id,src,tmp,out,false)?;
+        if !job.exists() && state!="retiring" { return None; }
+        if tx.execute("UPDATE transcode_artifacts SET lifecycle='retiring' WHERE path IN (?1,?2)",
+            rusqlite::params![tmp.to_str()?,out.to_str()?]).ok()?!=2 { return None; }
+        tx.commit().ok()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).ok()?;
+        if job_state(&tx,id,src,tmp,out,false)?.as_str()!="retiring" { return None; }
+        job_namespace(tmp,out,id)?;
+        if job.exists() {
+            for path in [tmp,out,&job.join("lease")] {
+                match std::fs::remove_file(path) {
                     Ok(()) => (),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                    Err(error) if error.kind()==std::io::ErrorKind::NotFound => (),
                     Err(_) => return None,
                 }
-                std::fs::remove_dir(job).ok()?;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-            Err(_) => return None,
+            std::fs::remove_dir(&job).ok()?;
         }
-        tx.execute("DELETE FROM transcode_artifacts WHERE owner_media_id=?1 AND owner_source_path=?2
-            AND provenance='generated' AND path IN (?3,?4)",
-            rusqlite::params![id,src.to_str()?,tmp.to_str()?,out.to_str()?]).ok()?;
+        if tx.execute("DELETE FROM transcode_artifacts WHERE path IN (?1,?2) AND lifecycle='retiring'",
+            rusqlite::params![tmp.to_str()?,out.to_str()?]).ok()?!=2 { return None; }
         tx.commit().ok()?;
         Some(())
     })();
     if retired.is_none() { tracing::warn!(id,"failed transcode cleanup held: ownership, references, filesystem or database unavailable"); }
     retired.is_some()
+}
+
+/// Recover only inactive known pending jobs on Linux; unsupported locks and historical unknown jobs retain provenance.
+/// Startup and explicit scans invoke this path again after a database timeout; no age or PID grants ownership.
+pub fn recover_pending_jobs(db_path: &str, library: &Path) {
+    if !cfg!(target_os = "linux") { return; }
+    let cache = std::env::var_os("FRAYD_TRANSCODES").map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(db_path).parent().unwrap_or(Path::new(".")).join("transcodes"));
+    if !cache.exists() { return; }
+    let Some(cache) = prepare_cache(&cache,library) else { return };
+    let Ok(mut db) = crate::store::connect(db_path) else { return };
+    let candidates = (|| {
+        db.prepare("SELECT owner_media_id,owner_source_path,path,lifecycle FROM transcode_artifacts
+            WHERE role='temp' AND provenance='generated' AND lifecycle IN ('pending','retiring')").ok()?
+            .query_map([],|row| Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?))).ok()?
+            .collect::<rusqlite::Result<Vec<_>>>().ok()
+    })().unwrap_or_default();
+    for (id,src,tmp,state) in candidates {
+        let tmp=PathBuf::from(tmp);
+        let Some(parent)=tmp.parent() else { continue };
+        let out=parent.join("audio.mp4");
+        let Some(job)=job_namespace(&tmp,&out,id) else { continue };
+        if job.parent().and_then(Path::parent)!=Some(cache.as_path()) { continue; }
+        if !job.exists() && state=="retiring" {
+            discard_failed_job(&mut db,id,Path::new(&src),&tmp,&out,None); continue;
+        }
+        let lease_path=job.join("lease");
+        // Retiring was committed only after proving no converter can still write. Its lease
+        // may have been unlinked just before a crash; a new lease serializes remaining cleanup.
+        let lease=match std::fs::symlink_metadata(&lease_path) {
+            Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() =>
+                OpenOptions::new().read(true).write(true).open(&lease_path),
+            Err(error) if error.kind()==std::io::ErrorKind::NotFound && state=="retiring" =>
+                OpenOptions::new().create_new(true).read(true).write(true).open(&lease_path),
+            _ => continue,
+        };
+        let Ok(lease)=lease else { continue };
+        if lease.try_lock().is_err() { continue; }
+        discard_failed_job(&mut db,id,Path::new(&src),&tmp,&out,None);
+    }
 }
 
 /// Queue one source; codec detection and all conversion work use a worker connection.
@@ -223,18 +316,25 @@ fn source_version(src: &Path) -> Option<(std::time::SystemTime,u64)> {
 /// Publish only the converted file/database snapshot, after acquiring the bounded SQLite write lock.
 /// Checking the actual source inside this transaction also covers time spent waiting for that lock.
 fn publish_completed_job(db: &mut Connection, id: i64, src: &Path, completed: &Path,
-    database_version: (Option<i64>,Option<i64>), file_version: (std::time::SystemTime,u64)) -> rusqlite::Result<bool> {
+    database_version: (Option<i64>,Option<i64>), file_version: (std::time::SystemTime,u64), lease: &JobLease) -> rusqlite::Result<bool> {
     let tx=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    if source_version(src)!=Some(file_version) { return Ok(false); }
+    if lease.completed!=completed || source_version(src)!=Some(file_version) { return Ok(false); }
+    let tmp=completed.parent().map(|job|job.join("audio.tmp.mp4")).ok_or(rusqlite::Error::InvalidQuery)?;
+    let expected=if lease.reclaimable {"pending"} else {"unknown"};
+    if job_state(&tx,id,src,&tmp,completed,!lease.reclaimable).as_deref()!=Some(expected) { return Ok(false); }
+    if tx.execute("UPDATE transcode_artifacts SET lifecycle='completed' WHERE path IN (?1,?2) AND lifecycle=?3",
+        rusqlite::params![tmp.to_string_lossy(),completed.to_string_lossy(),expected])?!=2 { return Ok(false); }
     let changed=tx.execute("UPDATE media SET transcode_path=?1 WHERE id=?2 AND path=?3
         AND mtime_secs IS ?4 AND size_bytes IS ?5 AND transcode_path IS NULL",
         rusqlite::params![completed.to_string_lossy(),id,src.to_string_lossy(),database_version.0,database_version.1])?;
+    if changed!=1 { return Ok(false); }
     tx.commit()?;
-    Ok(changed==1)
+    Ok(true)
 }
 
 /// Fail closed on database/cache/registry errors and persist the actual completed path.
 fn run_job(db_path: &str, media_id: i64, src: &Path, library: &Path) {
+    recover_pending_jobs(db_path,library);
     let Ok(mut db) = crate::store::connect(db_path) else { return };
     let Ok(database_version)=db.query_row("SELECT mtime_secs,size_bytes FROM media WHERE id=?1 AND path=?2 AND transcode_path IS NULL",
         rusqlite::params![media_id,src.to_string_lossy()],|row|Ok((row.get::<_,Option<i64>>(0)?,row.get::<_,Option<i64>>(1)?))) else { return };
@@ -247,14 +347,14 @@ fn run_job(db_path: &str, media_id: i64, src: &Path, library: &Path) {
     if !needs_transcode(&src.to_string_lossy()) { return; }
     let cache = std::env::var_os("FRAYD_TRANSCODES").map(PathBuf::from)
         .unwrap_or_else(|| Path::new(db_path).parent().unwrap_or(Path::new(".")).join("transcodes"));
-    let Some((tmp,out)) = reserve_job(&mut db,&cache,library,media_id,src) else {
+    let Some((tmp,out,lease)) = reserve_job(&mut db,&cache,library,media_id,src) else {
         tracing::warn!(media_id,"transcode held: cache or registry unavailable"); return;
     };
-    let Some(completed) = transcode_to_browser_mp4(src,&tmp,&out) else {
+    let Some(completed) = transcode_to_browser_mp4(src,&tmp,&out,&lease) else {
         discard_failed_job(&mut db,media_id,src,&tmp,&out,None);
         return;
     };
-    match publish_completed_job(&mut db,media_id,src,&completed,database_version,file_version) {
+    match publish_completed_job(&mut db,media_id,src,&completed,database_version,file_version,&lease) {
         Ok(true) => return,
         Ok(false) => tracing::warn!(media_id,"transcode publication held: source or database version changed"),
         Err(error) => tracing::warn!(%error,media_id,"transcode completed but publication failed"),
@@ -336,7 +436,7 @@ mod tests {
                 (3005,'movie','/legacy/genuine.mp4','legacy genuine source');
             INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture');
             INSERT INTO progress(identity_id,media_id,position) VALUES(1,3002,42);
-            INSERT INTO transcode_artifacts VALUES('/cache/retained-child.mp4',3003,'/cache/3/audio.tmp.mp4','final','generated');
+            INSERT INTO transcode_artifacts(path,owner_media_id,owner_source_path,role,provenance) VALUES('/cache/retained-child.mp4',3003,'/cache/3/audio.tmp.mp4','final','generated');
             UPDATE media SET transcode_path='/cache/4/audio.tmp.mp4' WHERE id=3000;
             UPDATE media SET transcode_path='/legacy/genuine.mp4' WHERE id=5;").unwrap();
         // Apply the migration over existing rows, then prove repeated initialization is idempotent.
@@ -507,12 +607,214 @@ mod tests {
             .env("PATH",std::env::join_paths(paths).unwrap()).output().unwrap();
         assert!(output.status.success(),"isolated publication worker: {}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
     }
+    /// Interrupted and write-timeout reservations need a reachable recovery pass after their workers exit.
+    #[test]
+    fn interrupted_and_timeout_reservations_recover_on_rescan() {
+        if let Some(root) = std::env::var_os("FRAYD_TEST_INTERRUPTED_RESERVATION_ROOT") {
+            let root = PathBuf::from(root);
+            let mut db = crate::store::connect(root.join("db.sqlite").to_str().unwrap()).unwrap();
+            let (tmp, _, _lease) = reserve_job(&mut db, &root.join("transcodes"), &root.join("library"), 1, &root.join("library/film.mkv")).unwrap();
+            std::fs::write(tmp, b"interrupted partial").unwrap();
+            std::fs::write(root.join("ready"), b"reserved").unwrap();
+            loop { std::thread::park(); }
+        }
+        let fixture = Fixture::new();
+        let db_path = fixture.0.join("db.sqlite");
+        let src = fixture.source("film.mkv");
+        let mut db = crate::store::open(db_path.to_str().unwrap());
+        insert(&db, 1, &src);
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "transcode::tests::interrupted_and_timeout_reservations_recover_on_rescan"])
+            .env("FRAYD_TEST_INTERRUPTED_RESERVATION_ROOT", &fixture.0)
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let ready = (0..500).any(|_| {
+            if fixture.0.join("ready").exists() { return true; }
+            std::thread::sleep(std::time::Duration::from_millis(5)); false
+        });
+        child.kill().unwrap(); let status = child.wait().unwrap();
+        assert!(ready && !status.success(), "worker did not reach its durable reservation before interruption");
+        let interrupted: String = db.query_row("SELECT path FROM transcode_artifacts WHERE role='temp'", [], |r| r.get(0)).unwrap();
+        let (tmp, out, lease) = reserve_job(&mut db, &fixture.0.join("transcodes"), &fixture.0.join("library"), 1, &src).unwrap();
+        std::fs::write(&tmp, b"timeout partial").unwrap();
+        let mut writer = crate::store::connect(db_path.to_str().unwrap()).unwrap();
+        let lock = writer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+        assert!(!discard_failed_job(&mut db, 1, &src, &tmp, &out, None));
+        drop(lock); drop(writer); drop(db);
+        assert_eq!(std::fs::read(&interrupted).unwrap(), b"interrupted partial");
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"timeout partial");
+        drop(lease);
+        // Reopen the database as a restarted application would, then use its real scan entry point.
+        let db = crate::store::connect(db_path.to_str().unwrap()).unwrap();
+        crate::scanner::scan(&db, db_path.to_string_lossy().into_owned(), fixture.0.join("library"), None);
+        let remaining = db.query_row("SELECT COUNT(*) FROM transcode_artifacts", [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(std::fs::read(&src).unwrap(), b"original");
+        assert_eq!(db.query_row("SELECT transcode_path FROM media WHERE id=1", [], |r| r.get::<_, Option<String>>(0)).unwrap(), None);
+        assert_eq!(remaining, 0, "rescan retained interrupted and DB-timeout reservations plus both partial files");
+        assert!(!Path::new(&interrupted).exists() && !tmp.exists());
+    }
+
+    /// An orphan converter inheriting stdin retains the OS lease until its own exit, across real recovery calls.
+    #[test]
+    fn orphan_converter_lease_blocks_recovery_until_converter_exit() {
+        if let Some(root)=std::env::var_os("FRAYD_TEST_ORPHAN_LEASE_ROOT") {
+            let root=PathBuf::from(root);
+            if std::env::var("FRAYD_TEST_ORPHAN_LEASE_MODE").unwrap()=="converter" {
+                std::fs::write(root.join("converter-ready"),b"ready").unwrap();
+                for _ in 0..500 {
+                    if root.join("converter-exit").exists() {return;}
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                panic!("fixture converter exit timed out");
+            }
+            let path=std::fs::read_to_string(root.join("lease-path")).unwrap();
+            let lease=OpenOptions::new().read(true).write(true).open(path).unwrap();lease.try_lock().unwrap();
+            let mut converter=Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","transcode::tests::orphan_converter_lease_blocks_recovery_until_converter_exit"])
+                .env("FRAYD_TEST_ORPHAN_LEASE_MODE","converter")
+                .stdin(Stdio::from(lease.try_clone().unwrap())).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+            assert!(converter.wait().unwrap().success());
+            return;
+        }
+        let fixture=Fixture::new();let path=fixture.0.join("db.sqlite");let src=fixture.source("film.mkv");
+        let mut db=crate::store::open(path.to_str().unwrap());insert(&db,1,&src);
+        let (tmp,out,lease)=reserve_job(&mut db,&fixture.0.join("transcodes"),&fixture.0.join("library"),1,&src).unwrap();
+        std::fs::write(&tmp,b"active converter partial").unwrap();
+        std::fs::write(fixture.0.join("lease-path"),tmp.parent().unwrap().join("lease").to_str().unwrap()).unwrap();drop(lease);
+        let mut worker=Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","transcode::tests::orphan_converter_lease_blocks_recovery_until_converter_exit"])
+            .env("FRAYD_TEST_ORPHAN_LEASE_ROOT",&fixture.0).env("FRAYD_TEST_ORPHAN_LEASE_MODE","worker")
+            .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let ready=(0..500).any(|_| {if fixture.0.join("converter-ready").exists(){return true;}std::thread::sleep(std::time::Duration::from_millis(5));false});
+        worker.kill().unwrap();worker.wait().unwrap();assert!(ready,"converter did not inherit its lease");
+        recover_pending_jobs(path.to_str().unwrap(),&fixture.0.join("library"));
+        assert_eq!(std::fs::read(&tmp).unwrap(),b"active converter partial");
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM transcode_artifacts",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+        std::fs::write(fixture.0.join("converter-exit"),b"exit").unwrap();
+        let probe=File::open(tmp.parent().unwrap().join("lease")).unwrap();
+        let released=(0..500).any(|_| {if probe.try_lock().is_ok(){return true;}std::thread::sleep(std::time::Duration::from_millis(5));false});
+        assert!(released,"converter did not release its inherited lease");drop(probe);
+        recover_pending_jobs(path.to_str().unwrap(),&fixture.0.join("library"));
+        assert!(!tmp.exists() && !out.exists() && !tmp.parent().unwrap().exists());
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM transcode_artifacts",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
+
+    /// Unqualified platforms keep conversion and fresh-token publication, but never gain automatic unknown-job cleanup.
+    #[test]
+    fn unqualified_recovery_preserves_conversion_and_retains_unknown_failures() {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(root)=std::env::var_os("FRAYD_TEST_UNQUALIFIED_ROOT") {
+            let root=PathBuf::from(root);let mode=std::env::var("FRAYD_TEST_UNQUALIFIED_MODE").unwrap();
+            let path=root.join("db.sqlite");let src=root.join("library/film.mkv");
+            let mut db=crate::store::open(path.to_str().unwrap());insert(&db,1,&src);
+            let (tmp,out,lease)=reserve_job_with_recovery(&mut db,&root.join("transcodes"),&root.join("library"),1,&src,false).unwrap();
+            assert!(!lease.reclaimable);
+            let converted=transcode_to_browser_mp4(&src,&tmp,&out,&lease);
+            assert_eq!(converted.is_some(),mode=="success");
+            let (other_tmp,other_out,other)=reserve_job_with_recovery(&mut db,&root.join("transcodes"),&root.join("library"),1,&src,false).unwrap();
+            assert!(!publish_completed_job(&mut db,1,&src,&out,(None,None),source_version(&src).unwrap(),&other).unwrap(),"reservation token authorized another job");
+            if mode=="success" {
+                assert!(publish_completed_job(&mut db,1,&src,&out,(None,None),source_version(&src).unwrap(),&lease).unwrap());
+                assert_eq!(std::fs::read(&out).unwrap(),b"synthetic converted bytes");
+            } else {
+                assert!(!discard_failed_job(&mut db,1,&src,&tmp,&out,None));
+                assert_eq!(std::fs::read(&tmp).unwrap(),b"synthetic converted bytes");
+            }
+            drop(lease);drop(other);recover_pending_jobs(path.to_str().unwrap(),&root.join("library"));
+            assert_eq!(db.query_row("SELECT COUNT(*) FROM transcode_artifacts",[],|r|r.get::<_,i64>(0)).unwrap(),4);
+            assert_eq!(db.query_row("SELECT COUNT(*) FROM transcode_artifacts WHERE lifecycle='unknown'",[],|r|r.get::<_,i64>(0)).unwrap(),if mode=="success"{2}else{4});
+            assert!(other_tmp.parent().unwrap().exists() && !other_out.exists());
+            assert_eq!(db.query_row("SELECT transcode_path IS NOT NULL FROM media WHERE id=1",[],|r|r.get::<_,bool>(0)).unwrap(),mode=="success");
+            return;
+        }
+        for mode in ["success","failure"] {
+            let fixture=Fixture::new();fixture.source("film.mkv");let bin=fixture.0.join("bin");std::fs::create_dir(&bin).unwrap();
+            let executable=bin.join("ffmpeg");
+            std::fs::write(&executable,b"#!/bin/sh\nfor destination do :; done\nprintf 'synthetic converted bytes' > \"$destination\"\n[ \"$FRAYD_TEST_UNQUALIFIED_MODE\" = success ]\n").unwrap();
+            std::fs::set_permissions(&executable,std::fs::Permissions::from_mode(0o755)).unwrap();
+            let result=Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","transcode::tests::unqualified_recovery_preserves_conversion_and_retains_unknown_failures","--nocapture"])
+                .env("FRAYD_TEST_UNQUALIFIED_ROOT",&fixture.0).env("FRAYD_TEST_UNQUALIFIED_MODE",mode).env("PATH",&bin).output().unwrap();
+            assert!(result.status.success(),"unqualified {mode}: {}{}",String::from_utf8_lossy(&result.stdout),String::from_utf8_lossy(&result.stderr));
+        }
+    }
+
+    /// Recovery retains active, historical, completed, referenced, redirected, and uncertain namespaces.
+    #[test]
+    fn recovery_retains_every_unqualified_job_and_retires_only_known_pending_pairs() {
+        use std::os::unix::fs::symlink;
+        for mode in ["active","unknown","completed","legacy","reference","extra","symlink","conflict","pending-missing","retiring-missing","retiring-unlinked-lease","pending"] {
+            let fixture=Fixture::new(); let path=fixture.0.join("db.sqlite");
+            let mut db=crate::store::open(path.to_str().unwrap());let src=fixture.source("film.mkv");insert(&db,1,&src);
+            let (tmp,out,lease)=reserve_job(&mut db,&fixture.0.join("transcodes"),&fixture.0.join("library"),1,&src).unwrap();
+            std::fs::write(&tmp,b"partial").unwrap();
+            if ["unknown","completed"].contains(&mode) {
+                db.execute("UPDATE transcode_artifacts SET lifecycle=?1",[mode]).unwrap();std::fs::write(&out,b"retained final").unwrap();
+            }
+            if mode=="legacy" { db.execute("UPDATE transcode_artifacts SET provenance='legacy_reference'",[]).unwrap(); }
+            if mode=="reference" {insert(&db,2,&tmp);db.execute_batch("INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture'); INSERT INTO progress(identity_id,media_id,position) VALUES(1,2,42);").unwrap();}
+            if mode=="extra" {std::fs::write(tmp.parent().unwrap().join("unregistered"),b"genuine").unwrap();}
+            if mode=="conflict" {let other=fixture.source("other.mkv");insert(&db,2,&other);db.execute("UPDATE transcode_artifacts SET owner_media_id=2 WHERE role='final'",[]).unwrap();}
+            if mode=="symlink" {let moved=fixture.0.join("moved");std::fs::rename(tmp.parent().unwrap(),&moved).unwrap();symlink(moved,tmp.parent().unwrap()).unwrap();}
+            if mode=="retiring-unlinked-lease" {
+                db.execute("UPDATE transcode_artifacts SET lifecycle='retiring'",[]).unwrap();
+                std::fs::remove_file(tmp.parent().unwrap().join("lease")).unwrap();
+            }
+            if mode.ends_with("-missing") {
+                if mode=="retiring-missing" {db.execute("UPDATE transcode_artifacts SET lifecycle='retiring'",[]).unwrap();}
+                std::fs::remove_dir_all(tmp.parent().unwrap()).unwrap();
+            }
+            let held=if mode=="active" {Some(lease)} else {drop(lease);None};
+            for _ in 0..2 {recover_pending_jobs(path.to_str().unwrap(),&fixture.0.join("library"));}
+            let retired=["pending","retiring-missing","retiring-unlinked-lease"].contains(&mode);
+            assert_eq!(db.query_row("SELECT COUNT(*) FROM transcode_artifacts",[],|r|r.get::<_,i64>(0)).unwrap(),if retired {0}else{2},"{mode}");
+            assert_eq!(std::fs::read(&src).unwrap(),b"original");
+            if !retired && !mode.ends_with("-missing") {assert_eq!(std::fs::read(&tmp).unwrap(),b"partial","{mode}");}
+            if ["unknown","completed"].contains(&mode) {assert_eq!(std::fs::read(&out).unwrap(),b"retained final");}
+            if mode=="reference" {assert_eq!(db.query_row("SELECT position FROM progress",[],|r|r.get::<_,f64>(0)).unwrap(),42.0);}
+            drop(held);
+        }
+    }
+
+    /// Completion and publication commit together; failed retirement can resume after its directory is gone.
+    #[test]
+    fn lifecycle_publication_is_atomic_and_retiring_commit_failures_remain_recoverable() {
+        for mode in ["published","publication-failure","publication-ignore","lifecycle-failure","lifecycle-ignore","retirement-failure","retirement-ignore"] {
+            let fixture=Fixture::new();let path=fixture.0.join("db.sqlite");let src=fixture.source("film.mkv");
+            let mut db=crate::store::open(path.to_str().unwrap());insert(&db,1,&src);
+            let (tmp,out,lease)=reserve_job(&mut db,&fixture.0.join("transcodes"),&fixture.0.join("library"),1,&src).unwrap();
+            std::fs::write(&out,b"completed bytes").unwrap();
+            if mode=="publication-failure" {db.execute_batch("CREATE TRIGGER reject_publication BEFORE UPDATE OF transcode_path ON media BEGIN SELECT RAISE(FAIL,'fixture refusal'); END;").unwrap();}
+            if mode=="lifecycle-failure" {db.execute_batch("CREATE TRIGGER reject_completion BEFORE UPDATE OF lifecycle ON transcode_artifacts WHEN NEW.lifecycle='completed' BEGIN SELECT RAISE(FAIL,'fixture refusal'); END;").unwrap();}
+            if mode=="publication-ignore" {db.execute_batch("CREATE TRIGGER reject_publication BEFORE UPDATE OF transcode_path ON media BEGIN SELECT RAISE(IGNORE); END;").unwrap();}
+            if mode=="lifecycle-ignore" {db.execute_batch("CREATE TRIGGER reject_completion BEFORE UPDATE OF lifecycle ON transcode_artifacts WHEN NEW.lifecycle='completed' AND OLD.role='final' BEGIN SELECT RAISE(IGNORE); END;").unwrap();}
+            if mode.starts_with("retirement-") {
+                let trigger=if mode=="retirement-ignore" {"CREATE TRIGGER reject_retirement BEFORE DELETE ON transcode_artifacts WHEN OLD.role='final' BEGIN SELECT RAISE(IGNORE); END;"}
+                    else {"CREATE TRIGGER reject_retirement BEFORE DELETE ON transcode_artifacts BEGIN SELECT RAISE(FAIL,'fixture refusal'); END;"};
+                db.execute_batch(trigger).unwrap();
+                assert!(!discard_failed_job(&mut db,1,&src,&tmp,&out,Some(&out)));
+                assert!(!tmp.parent().unwrap().exists());
+                assert_eq!(db.query_row("SELECT COUNT(*) FROM transcode_artifacts WHERE lifecycle='retiring'",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+                db.execute_batch("DROP TRIGGER reject_retirement;").unwrap();
+            } else {
+                let result=publish_completed_job(&mut db,1,&src,&out,(None,None),source_version(&src).unwrap(),&lease);
+                assert_eq!(result.unwrap_or(false),mode=="published");
+                assert_eq!(db.query_row("SELECT COUNT(*) FROM transcode_artifacts WHERE lifecycle='completed'",[],|r|r.get::<_,i64>(0)).unwrap(),if mode=="published"{2}else{0});
+                let pointer=db.query_row("SELECT transcode_path FROM media WHERE id=1",[],|r|r.get::<_,Option<String>>(0)).unwrap();
+                assert_eq!(pointer.is_some(),mode=="published");
+                if mode=="published" {db.execute("UPDATE media SET transcode_path=NULL WHERE id=1",[]).unwrap();}
+            }
+            drop(lease);recover_pending_jobs(path.to_str().unwrap(),&fixture.0.join("library"));
+            assert_eq!(db.query_row("SELECT COUNT(*) FROM transcode_artifacts",[],|r|r.get::<_,i64>(0)).unwrap(),if mode=="published"{2}else{0});
+            if mode=="published" {assert_eq!(std::fs::read(&out).unwrap(),b"completed bytes");}
+        }
+    }
+
     /// A busy database must retain provenance and bytes until the write lock becomes available.
     #[test]
     fn failed_job_cleanup_holds_all_state_during_database_lock() {
         let fixture=Fixture::new(); let path=fixture.0.join("db.sqlite");
         let mut db=crate::store::open(path.to_str().unwrap()); let src=fixture.source("film.mkv"); insert(&db,1,&src);
-        let (tmp,out)=reserve_job(&mut db,&fixture.0.join("cache"),&fixture.0.join("library"),1,&src).unwrap();
+        let (tmp,out,_lease)=reserve_job(&mut db,&fixture.0.join("cache"),&fixture.0.join("library"),1,&src).unwrap();
         std::fs::write(&tmp,b"partial owned output").unwrap();
         let mut writer=crate::store::connect(path.to_str().unwrap()).unwrap();
         let lock=writer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
@@ -530,8 +832,8 @@ mod tests {
         let fixture=Fixture::new(); let mut db=crate::store::open(":memory:");
         let src=fixture.source("film.mkv"); insert(&db,1,&src);
         let cache=fixture.0.join("cache"); let library=fixture.0.join("library");
-        let (tmp,out)=reserve_job(&mut db,&cache,&library,1,&src).unwrap();
-        let (neighbor_tmp,neighbor_out)=reserve_job(&mut db,&cache,&library,1,&src).unwrap();
+        let (tmp,out,_lease)=reserve_job(&mut db,&cache,&library,1,&src).unwrap();
+        let (neighbor_tmp,neighbor_out,_neighbor_lease)=reserve_job(&mut db,&cache,&library,1,&src).unwrap();
         std::fs::write(&tmp,b"partial").unwrap();std::fs::write(&neighbor_tmp,b"neighbor").unwrap();
         assert!(discard_failed_job(&mut db,1,&src,&tmp,&out,None));
         assert_eq!(std::fs::read(&neighbor_tmp).unwrap(),b"neighbor");
@@ -589,8 +891,8 @@ mod tests {
     fn failed_conversion_does_not_publish_or_touch_originals() {
         let fixture=Fixture::new(); let mut db=crate::store::open(":memory:");
         let src=fixture.source("invalid.mkv"); insert(&db,1,&src);
-        let (tmp,out)=reserve_job(&mut db,&fixture.0.join("cache"),&fixture.0.join("library"),1,&src).unwrap();
-        assert!(transcode_to_browser_mp4(&src,&tmp,&out).is_none());
+        let (tmp,out,_lease)=reserve_job(&mut db,&fixture.0.join("cache"),&fixture.0.join("library"),1,&src).unwrap();
+        assert!(transcode_to_browser_mp4(&src,&tmp,&out,&_lease).is_none());
         assert!(!out.exists()); assert!(!tmp.exists()); assert_eq!(std::fs::read(&src).unwrap(),b"original");
         assert_eq!(db.query_row("SELECT transcode_path FROM media",[],|r|r.get::<_,Option<String>>(0)).unwrap(),None);
     }
@@ -603,7 +905,7 @@ mod tests {
         for (index,name) in names.iter().enumerate() {
             let path=fixture.0.join(name); if index==0 { std::fs::write(&path,b"owned").unwrap(); }
             insert(&db,index as i64+2,&path);
-            db.execute("INSERT INTO transcode_artifacts VALUES(?1,1,?2,'temp','generated')",rusqlite::params![path.to_str().unwrap(),src.to_str().unwrap()]).unwrap();
+            db.execute("INSERT INTO transcode_artifacts(path,owner_media_id,owner_source_path,role,provenance) VALUES(?1,1,?2,'temp','generated')",rusqlite::params![path.to_str().unwrap(),src.to_str().unwrap()]).unwrap();
         }
         db.execute_batch("INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture');
             INSERT INTO progress(identity_id,media_id,position) VALUES(1,4,42);
