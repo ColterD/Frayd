@@ -260,6 +260,89 @@ mod tests {
     fn insert(db: &Connection,id:i64,path:&Path) {
         db.execute("INSERT INTO media(id,kind,path,title) VALUES(?1,'movie',?2,'fixture')",rusqlite::params![id,path.to_str().unwrap()]).unwrap();
     }
+    const ARTIFACT_PLAN_QUERIES: [&str; 4] = [
+        r#"INSERT OR IGNORE INTO transcode_artifacts
+        (path,owner_media_id,owner_source_path,role,provenance)
+        SELECT transcode_path,id,path,'final','legacy_reference' FROM media m
+        WHERE transcode_path IS NOT NULL AND transcode_path != path
+        AND (SELECT COUNT(*) FROM media x WHERE x.transcode_path=m.transcode_path)=1;"#,
+        r#"SELECT COUNT(*) FROM transcode_artifacts a LEFT JOIN media m
+        ON m.id=a.owner_media_id WHERE m.path IS NULL OR m.path != a.owner_source_path
+        OR EXISTS (SELECT 1 FROM media other WHERE other.transcode_path=a.path AND other.id != a.owner_media_id)"#,
+        r#"SELECT a.path FROM transcode_artifacts a JOIN media m
+        ON m.id=a.owner_media_id AND m.path=a.owner_source_path WHERE a.path != m.path
+        AND NOT EXISTS (SELECT 1 FROM media other WHERE other.transcode_path=a.path AND other.id != m.id)"#,
+        r#"DELETE FROM media WHERE path=?1
+            AND EXISTS (SELECT 1 FROM transcode_artifacts a WHERE a.path=media.path AND a.provenance='generated')
+            AND NOT EXISTS (SELECT 1 FROM progress WHERE media_id=media.id)
+            AND NOT EXISTS (SELECT 1 FROM annotations WHERE media_id=media.id)
+            AND NOT EXISTS (SELECT 1 FROM tracks WHERE media_id=media.id)
+            AND NOT EXISTS (SELECT 1 FROM playlist_items WHERE media_id=media.id)
+            AND NOT EXISTS (SELECT 1 FROM transcode_artifacts WHERE owner_media_id=media.id)"#,
+    ];
+
+    /// Observe bundled SQLite planning for the exact production reconciliation statements.
+    fn artifact_query_plan(db: &Connection, sql: &str, path: Option<&str>) -> Vec<String> {
+        let mut statement=db.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        statement.query_map(rusqlite::params_from_iter(path),|row|row.get(3)).unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>().unwrap()
+    }
+
+    /// Keep correlated lookups indexed at realistic cardinality while retaining protected media identities.
+    #[test]
+    fn reconciliation_uses_indexed_lookups_and_preserves_referenced_rows_at_scale() {
+        let db=crate::store::open(":memory:");
+        // Model an existing populated database that predates both additive indexes.
+        db.execute_batch("DROP INDEX IF EXISTS idx_media_transcode_path; DROP INDEX IF EXISTS idx_transcode_artifacts_owner;").unwrap();
+        db.execute_batch("WITH RECURSIVE ids(id) AS (SELECT 1 UNION ALL SELECT id+1 FROM ids WHERE id<3000)
+            INSERT INTO media(id,kind,path,title,transcode_path)
+            SELECT id,'movie','/source/'||id||'.mkv','fixture','/cache/'||id||'/audio.mp4' FROM ids;
+            INSERT INTO transcode_artifacts(path,owner_media_id,owner_source_path,role,provenance)
+            SELECT '/cache/'||id||'/audio.tmp.mp4',id,path,'temp','generated' FROM media;
+            INSERT INTO transcode_artifacts(path,owner_media_id,owner_source_path,role,provenance)
+            SELECT transcode_path,id,path,'final','generated' FROM media;
+            INSERT INTO media(id,kind,path,title) VALUES
+                (3001,'movie','/cache/1/audio.tmp.mp4','unreferenced'),
+                (3002,'movie','/cache/2/audio.tmp.mp4','saved progress'),
+                (3003,'movie','/cache/3/audio.tmp.mp4','owns another artifact'),
+                (3004,'movie','/cache/4/audio.tmp.mp4','conflicting playback reference'),
+                (3005,'movie','/legacy/genuine.mp4','legacy genuine source');
+            INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture');
+            INSERT INTO progress(identity_id,media_id,position) VALUES(1,3002,42);
+            INSERT INTO transcode_artifacts VALUES('/cache/retained-child.mp4',3003,'/cache/3/audio.tmp.mp4','final','generated');
+            UPDATE media SET transcode_path='/cache/4/audio.tmp.mp4' WHERE id=3000;
+            UPDATE media SET transcode_path='/legacy/genuine.mp4' WHERE id=5;").unwrap();
+        // Apply the migration over existing rows, then prove repeated initialization is idempotent.
+        for _ in 0..2 { db.execute_batch(include_str!("../schema.sql")).unwrap(); }
+        let counts=db.query_row("SELECT (SELECT COUNT(*) FROM media WHERE transcode_path IS NOT NULL),
+            (SELECT COUNT(*) FROM media),(SELECT COUNT(*) FROM transcode_artifacts),(SELECT COUNT(*) FROM progress)",[],
+            |row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?))).unwrap();
+        assert_eq!(counts,(3000,3005,6001,1));
+        println!("SQLite {} fixture converted/media/artifacts/progress={counts:?}",
+            db.query_row("SELECT sqlite_version()",[],|row|row.get::<_,String>(0)).unwrap());
+        let plans=ARTIFACT_PLAN_QUERIES.iter().enumerate().map(|(index,sql)| {
+            let plan=artifact_query_plan(&db,sql,if index==3 {Some("/cache/1/audio.tmp.mp4")} else {None});
+            println!("PLAN {} SQL={} DETAILS={plan:?}",["backfill","conflicts","ownership","cleanup"][index],sql);
+            plan
+        }).collect::<Vec<_>>();
+        for (index,alias,column) in [(0,"x","transcode_path"),(1,"other","transcode_path"),
+            (2,"other","transcode_path"),(3,"transcode_artifacts","owner_media_id")] {
+            assert!(plans[index].iter().any(|line|line.contains(&format!("SEARCH {alias} USING"))
+                && line.contains(&format!("({column}=?)"))),"unindexed correlated lookup: {:?}",plans[index]);
+        }
+        assert_eq!(db.execute(ARTIFACT_PLAN_QUERIES[0],[]).unwrap(),1);
+        assert_eq!(db.query_row(ARTIFACT_PLAN_QUERIES[1],[],|row|row.get::<_,i64>(0)).unwrap(),1);
+        let ownership_count=db.prepare(ARTIFACT_PLAN_QUERIES[2]).unwrap().query_map([],|row|row.get::<_,String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap().len();
+        assert_eq!(ownership_count,6001);
+        assert_eq!(db.execute(ARTIFACT_PLAN_QUERIES[3],["/cache/1/audio.tmp.mp4"]).unwrap(),1);
+        for _ in 0..2 { assert_eq!(reconcile_artifacts(&db).len(),6001); }
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM media",[],|row|row.get::<_,i64>(0)).unwrap(),3004);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM transcode_artifacts",[],|row|row.get::<_,i64>(0)).unwrap(),6002);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM media WHERE id BETWEEN 3002 AND 3005",[],|row|row.get::<_,i64>(0)).unwrap(),4);
+        assert_eq!(db.query_row("SELECT position FROM progress WHERE media_id=3002",[],|row|row.get::<_,f64>(0)).unwrap(),42.0);
+        println!("RESULTS backfill_inserted=1 conflicts=1 owned_paths=6001 cleanup_removed=1 final_media=3004 final_artifacts=6002 protected_media=4 progress=42 repeated_reconciliation=2");
+    }
+
     /// Reject preexisting namespace objects before any outside write or ownership publication.
     #[test]
     fn media_namespace_symlinks_and_files_cannot_redirect_job_reservation() {

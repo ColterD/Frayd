@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS media (
 );
 CREATE INDEX IF NOT EXISTS idx_media_kind ON media(kind);
 CREATE INDEX IF NOT EXISTS idx_media_title ON media(title);
+CREATE INDEX IF NOT EXISTS idx_media_transcode_path ON media(transcode_path);
 
 CREATE TABLE IF NOT EXISTS identities (
   id INTEGER PRIMARY KEY,
@@ -95,3 +96,4 @@ CREATE TABLE IF NOT EXISTS transcode_artifacts (
   provenance TEXT NOT NULL CHECK(provenance IN ('generated','legacy_reference')),
   CHECK(path != owner_source_path)
 );
+CREATE INDEX IF NOT EXISTS idx_transcode_artifacts_owner ON transcode_artifacts(owner_media_id);
