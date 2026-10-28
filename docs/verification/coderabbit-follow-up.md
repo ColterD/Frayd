@@ -1,11 +1,11 @@
 # CodeRabbit follow-up verification
 
 Updated 2026-10-28 UTC for [fork draft PR #2](https://github.com/ColterD/Frayd/pull/2).
-This ledger accounts for **25 CodeRabbit issue/diagnostic entries**: the original
+This ledger accounts for **26 CodeRabbit issue/diagnostic entries**: the original
 12, two initial PR #2 documentation comments, two subsequent cleanup findings,
 one outside-diff cache finding, one unverified wording diagnostic and the final
 full-review index finding, the later count-consistency comment and three final
-documentation/harness comments, proxy-command alignment and the later legacy refresh finding. Summary-only
+documentation/harness comments, proxy-command alignment, the later legacy refresh finding and exact image provenance. Summary-only
 risks and GitHub CodeQL alerts are recorded separately, not added to that count.
 PR #2 remains draft and unmerged. No deployment is qualified or authorized here.
 
@@ -21,6 +21,7 @@ PR #2 remains draft and unmerged. No deployment is qualified or authorized here.
 | Whole-PR review on `5451980` | [5678577205](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5678577205), head `54519804a27f5139b7ee54c10b604e898af355d9`, batch 1/1, 24 selected files and one SVG excluded. Three Minor documentation/harness issues; zero outside-diff items, nitpicks or tool diagnostics. Coverage 100%, 54 functions across 12 files, ten unsupported skips. |
 | Whole-PR review on `23ba22e` | [5678783997](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5678783997), batch 1/1, one Minor proxy-command alignment; zero outside-diff items, nitpicks or tool diagnostics. Coverage 100%, 56 functions across 12 files, ten unsupported skips. All four preceding review threads were marked addressed and resolved. |
 | Whole-PR review on `9a22ad2` | [5678944739](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5678944739), batch 1/1, one Minor legacy-reference scanner exclusion; zero outside-diff items, nitpicks or tool diagnostics. Coverage 100%, 56 functions across 12 files, ten unsupported skips. The prior proxy-command thread was addressed and resolved. |
+| Whole-PR review on `a634a5f` | [5679275186](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5679275186), batch 1/1, one Minor image-provenance documentation request; zero outside-diff items, nitpicks or tool diagnostics. Coverage 100%, 58 functions across 12 files, ten unsupported skips. Legacy-refresh runtime thread addressed and resolved. |
 | Upstream synchronization | Upstream `kattiest/Frayd` commit `540b87acea05304c767a151d47456fceaaf7b29a` merged into fork main at `49de065f3fb0875425f5467b87ae161b43d7914e`, and into the PR branch at `fafad69434a5893cb1d1dbbcbdf56d87f0aab05b`. |
 | Security patch already on fork main | PR-branch patch `b840753a9cabb680b94733ae7a58b6b303619d17` was cherry-picked to fork main as `2789f37e55148e0ee69e7bba6bb5ee30b5f49225`. This fixes the original four EPUB-message sender-boundary findings in source; all four default-branch alerts now report fixed, not dismissed. It does not merge PR #2. |
 | Combined foundation | Implementation `6af4c15` and ancestry-only merge `a6af5f5` include upstream synchronization, hygiene, cache/publication corrections and explicit ingestion trust. Fork main received the narrow ingestion patch at `a7a6dabccce971992d1ed47b00ef66f74811e6e7`. The pre-index app image below passes 28 Rust tests and full runtime qualification; the latest index follow-up passes 29 Rust tests, Clippy and release build. Post-index image/review results are recorded in the PR body; browser evidence stays tied to the unchanged client hash. |
@@ -77,6 +78,8 @@ qualification. A resolved review thread and a passing check are separate evidenc
 | [DOC-PROXY-CMD](https://github.com/ColterD/Frayd/pull/2#discussion_r4397657061) | Minor, documentation | The proxy build used the neutral tag but the following nginx configuration check retained the old tag. | Both commands now use `frayd-proxy-qa:local`; the exact documented build/configuration-check sequence is verified separately. No runtime source changes. |
 
 | [LEGACY-REFRESH](https://github.com/ColterD/Frayd/pull/2#discussion_r4397774540) | Minor | A legacy conversion reference can suppress scanning a separately indexed genuine file at the referenced path. Keeping the database row is insufficient: replacement size, thumbnails and conversion eligibility must refresh. | Baseline actual scan retained stale size 8 instead of 41 bytes. A provenance-aware ownership predicate now permits indexed legacy targets to refresh; the focused regression preserves ID/progress/metadata, generated-artifact exclusions and unindexed legacy compatibility. All 33 Rust tests, Clippy and release pass; fixed-image real-media runtime refresh and restart persistence pass. |
+
+| [DOC-IMAGE-PROVENANCE](https://github.com/ColterD/Frayd/pull/2#discussion_r4398020230) | Minor, documentation | The legacy-refresh red/green section used short image IDs without source-commit bindings. | Full immutable image digests and verified source-commit bindings are recorded in that section; local receipts distinguish build-time working trees from their later commits. |
 
 The latest full review selected 24 files and excluded one deleted SVG. The earlier
 `3b7a5f5` review selected five files and skipped `tests/test_integration.py` as
@@ -464,3 +467,29 @@ the corrected harness tears down the initial scenario before switching storage.
 Repeated baseline and fixed runs complete with zero owned resources remaining.
 The same integration command runs in CI; final-head CI and full review remain
 acceptance gates.
+
+### Exact artifacts for the legacy-refresh comparison
+
+Both runs use the integration harness at source commit
+`a634a5f4e8c29bca28b854d3ae128fd9039ce660` and the same immutable proxy
+`sha256:543d71e7db7b987f1e41dfb0a297efe5f020c141b2dbc39a859fd2473df7bbe2`.
+These are locally retained QA images; the identifiers do not claim registry publication.
+
+| Run | Full application image digest | Matching source commit | Observed result |
+|---|---|---|---|
+| Baseline | `sha256:a19b1132c02e958e498f1cff4611c07ee55198c1ac5c3707acb5c7d02287abe3` | `54519804a27f5139b7ee54c10b604e898af355d9` | Exit 1: stored size 11,833 versus actual 31,526 after rescan. |
+| Fixed | `sha256:7d77ce2ccd7967fad3625bb8fa172d6378152607bcb4992e2649934cc0097a5a` | `a634a5f4e8c29bca28b854d3ae128fd9039ce660` | Exit 0: stored size 31,526, refreshed mtime, preserved IDs/progress/source bytes and successful restart persistence. |
+
+All 31 image inputs in each retained build manifest were verified against the
+corresponding Git commit objects. The baseline was built from frozen working-tree
+inputs while checkout HEAD was `b2a850443f400748e25fc2f3a46661075eb9e0e4`;
+those inputs subsequently landed in the matching `5451980` commit above. The fixed
+image likewise used frozen inputs while HEAD was `9a22ad2`, subsequently committed
+as `a634a5f`. Neither build-time HEAD alone is the image source attribution.
+The fixed backend manifest is
+`25eb54aca0e82de95484872e0f14e940c9904036f849ffee83dda860b9b1f4b3`;
+the baseline backend manifest is
+`90652fcf1c56beace518ce9140ae809dd176310598c437e1c9514c5da525e8e2`.
+Local receipts retain commands, build manifests, runtime logs, exact fixture
+observations and cleanup checks; the full digest/source/result bindings above
+make this public ledger independent of the local receipt paths.
