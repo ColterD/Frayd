@@ -6,13 +6,16 @@ import http.client
 import http.server
 import importlib.util
 import io
+import fcntl
 import json
 import os
 import secrets
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -121,6 +124,73 @@ class WebSocketIdentityWireTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
 
 
+class DockerTimeoutTests(unittest.TestCase):
+    """Prove control/lifecycle/media budgets and timeout descendant ownership."""
+
+    def test_operation_budgets_and_unknown_operations(self):
+        cases = [
+            (('inspect', 'owned'), ('metadata', 20)),
+            (('container', 'ls', '-a'), ('metadata', 20)),
+            (('network', 'inspect', 'owned'), ('metadata', 20)),
+            (('volume', 'ls'), ('metadata', 20)),
+            (('compose', '-p', 'owned', '-f', '-', 'config'), ('metadata', 20)),
+            (('compose', '-p', 'owned', '-f', '-', 'up', '--wait', '--wait-timeout', '90'), ('compose-up', 120)),
+            (('compose', '-f', '-', 'restart', 'app'), ('lifecycle', 60)),
+            (('compose', '-f', '-', 'down', '--volumes'), ('cleanup', 60)),
+            (('exec', '-i', 'owned', 'sh', '-c', 'cat'), ('exec', 30)),
+            (('exec', 'owned', 'ffmpeg', '-v', 'error'), ('media-conversion', 120)),
+            (('exec', 'owned', '/usr/bin/ffprobe', '-v', 'error'), ('exec', 30)),
+        ]
+        for arguments, expected in cases:
+            with self.subTest(operation=expected[0]):
+                self.assertEqual(integration.docker_timeout(arguments), expected)
+        for arguments in [(), ('unknown',), ('build', '.'), ('compose', '-f', '-', 'unknown')]:
+            with self.assertRaises(ValueError):
+                integration.docker_timeout(arguments)
+
+    def test_timeout_override_is_finite_and_diagnostics_are_public(self):
+        for timeout in [0, -1, float('inf'), float('nan')]:
+            with self.subTest(timeout=timeout), self.assertRaises(ValueError):
+                integration.docker('inspect', 'owned', timeout=timeout)
+
+    def test_actual_timeout_stops_child_after_cli_parent_exits(self):
+        # Model a Docker CLI that leaves a Compose plugin holding its captured pipes.
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            lease = root / 'lease'
+            ready = root / 'ready'
+            group = root / 'group'
+            child = ('import fcntl,pathlib,sys,time; '
+                     'handle=open(sys.argv[1], "w"); fcntl.flock(handle,fcntl.LOCK_EX); '
+                     'pathlib.Path(sys.argv[2]).write_text("ready"); time.sleep(60)')
+            executable = root / 'docker'
+            executable.write_text(f'#!{sys.executable}\nimport os,pathlib,subprocess,sys\n'
+                                  f'pathlib.Path({str(group)!r}).write_text(str(os.getpgrp()))\n'
+                                  f'subprocess.Popen([sys.executable,"-c",{child!r},{str(lease)!r},{str(ready)!r}])\n'
+                                  'print("private stdout"); print("private stderr",file=sys.stderr)\n')
+            executable.chmod(0o755)
+            output = io.StringIO()
+            started = time.monotonic()
+            try:
+                with (patch.dict(os.environ, {'PATH': folder}), contextlib.redirect_stderr(output),
+                      self.assertRaises(subprocess.TimeoutExpired) as caught):
+                    integration.docker('inspect', 'private-argv', input=b'private stdin', timeout=1)
+                self.assertLess(time.monotonic() - started, 4)
+                self.assertTrue(ready.exists(), 'Owned child actually started and held its lease')
+                with lease.open('a') as handle:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertEqual(caught.exception.cmd, ['docker', 'metadata'])
+                self.assertIsNone(caught.exception.output)
+                self.assertIsNone(caught.exception.stderr)
+                self.assertNotIn('private', str(caught.exception) + output.getvalue())
+            finally:
+                if group.exists():
+                    try:
+                        os.killpg(int(group.read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+
 class DockerFailureTests(unittest.TestCase):
     """Keep diagnostics useful and preserve the first nonzero failure."""
 
@@ -131,11 +201,11 @@ class DockerFailureTests(unittest.TestCase):
                 error = subprocess.CalledProcessError(17, ['docker', 'build'], output=b'private output', stderr=stderr)
                 output = io.StringIO()
                 with (
-                    patch.object(integration.subprocess, 'run', side_effect=error),
+                    patch.object(integration, 'run_docker', side_effect=error),
                     contextlib.redirect_stderr(output),
                     self.assertRaises(subprocess.CalledProcessError) as caught,
                 ):
-                    integration.docker('build', input=b'private input')
+                    integration.docker('inspect', 'owned', input=b'private input')
                 self.assertIs(caught.exception, error)
                 self.assertEqual(caught.exception.returncode, 17)
                 self.assertEqual(output.getvalue(), 'build failed\n')
@@ -154,7 +224,7 @@ class DockerFailureTests(unittest.TestCase):
                 contextlib.redirect_stderr(output),
                 self.assertRaises(subprocess.CalledProcessError) as caught,
             ):
-                integration.docker('synthetic-command', input=b'private stdin')
+                integration.docker('inspect', 'owned', input=b'private stdin')
             self.assertEqual(caught.exception.returncode, 23)
             self.assertEqual(output.getvalue(), 'synthetic Docker failure\n')
 
@@ -162,7 +232,8 @@ class DockerFailureTests(unittest.TestCase):
         """A cleanup failure cannot replace the original nonzero Docker status."""
         original = subprocess.CalledProcessError(17, ['docker', 'build'])
         failures = (subprocess.CalledProcessError(19, ['docker', 'compose', 'down']),
-                    OSError('synthetic Docker unavailable'))
+                    OSError('synthetic Docker unavailable'),
+                    subprocess.TimeoutExpired(['docker', 'cleanup'], 60))
         for cleanup in failures:
             with (
                 self.subTest(cleanup_type=type(cleanup).__name__),

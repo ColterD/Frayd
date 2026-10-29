@@ -362,36 +362,42 @@ $('#add-media').onclick = async () => {
   try {
     const r = await fetch('/api/scan', { method: 'POST', headers: authHeaders() });
     if (generation !== accountGeneration) return;
-    if (r.status === 202) {
-      toast('Scanning library…');
-      // poll status until idle, then refresh library
+    if (r.status === 202 || r.status === 409) {
+      toast(r.status === 409 ? 'Scan already running — monitoring progress…' : 'Scanning library…');
+      let pending = false;
+      let failures = 0;
+      // Keep at most one request active; allow three consecutive failures before manual retry.
       const poll = setInterval(async () => {
+        if (generation !== accountGeneration) { clearInterval(poll); return; }
+        if (pending) return;
+        pending = true;
         try {
-        if (generation !== accountGeneration) { clearInterval(poll); return; }
-        const response = await fetch('/api/scan/status');
-        if (response.ok === false) throw new Error('Status unavailable');
-        const { scanning } = await response.json();
-        if (generation !== accountGeneration) { clearInterval(poll); return; }
-        if (scanning) return;
-        clearInterval(poll);
-        const before = LIBRARY.length;
-        await loadLibrary();
-        if (generation !== accountGeneration) return;
-        toast(LIBRARY.length > before ? `Scan complete — ${LIBRARY.length - before} new item(s)` : 'Scan complete');
-        btn.disabled = false;
-        btn.innerHTML = ADD_BTN_HTML;
-        } catch {
+          const response = await fetch('/api/scan/status');
+          if (response.ok === false) throw new Error('Status unavailable');
+          const { scanning } = await response.json();
+          if (generation !== accountGeneration) { clearInterval(poll); return; }
+          if (scanning) { failures = 0; return; }
+          const before = LIBRARY.length;
+          await loadLibrary();
           clearInterval(poll);
           if (generation !== accountGeneration) return;
+          toast(LIBRARY.length > before ? `Scan complete — ${LIBRARY.length - before} new item(s)` : 'Scan complete');
           btn.disabled = false;
           btn.innerHTML = ADD_BTN_HTML;
-          toast('Scan status unavailable', true);
+        } catch {
+          if (generation !== accountGeneration) { clearInterval(poll); return; }
+          if (++failures < 3) {
+            if (failures === 1) toast('Scan status unavailable — retrying…', true);
+            return;
+          }
+          clearInterval(poll);
+          btn.disabled = false;
+          btn.innerHTML = ADD_BTN_HTML;
+          toast('Scan status unavailable — click Scan to retry monitoring', true);
+        } finally {
+          pending = false;
         }
       }, 1500);
-    } else if (r.status === 409) {
-      toast('Scan already running', true);
-      btn.disabled = false;
-      btn.innerHTML = ADD_BTN_HTML;
     } else if (r.status === 501) {
       toast('No library folder configured — set it in settings', true);
       btn.disabled = false;

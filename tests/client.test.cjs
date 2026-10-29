@@ -1416,3 +1416,76 @@ for (const phase of ['start', 'status', 'library']) {
     });
   }
 }
+
+for (const failure of ['network', 'http', 'json']) {
+  test(`toolbar scan retries one ${failure} status failure then refreshes on completion`, async () => {
+    const b = browser();
+    let statusCalls = 0;
+    b.respond(async url => {
+      if (url === '/api/scan/status') {
+        if (++statusCalls === 1) {
+          if (failure === 'network') throw Error('temporary network failure');
+          return { ok: failure !== 'http', json: async () => { throw Error('temporary invalid response'); } };
+        }
+        return { ok: true, json: async () => ({ scanning: false }) };
+      }
+      return { status: 202, ok: true, json: async () => [] };
+    });
+    const button = b.nodes.get('#add-media');
+    await button.onclick();
+    const poll = [...b.intervals.values()][0];
+    await poll();
+    assert.equal(b.intervals.size, 1);
+    assert.equal(button.disabled, true);
+    await poll();
+    assert.equal(statusCalls, 2);
+    assert.equal(b.requests.filter(r => r.url === '/api/library').length, 1);
+    assert.equal(button.disabled, false);
+    assert.equal(b.intervals.size, 0);
+  });
+}
+
+test('toolbar scan bounds consecutive failures and retry reattaches to a busy scan', async () => {
+  const b = browser();
+  b.respond(async url => {
+    if (url === '/api/scan/status') throw Error('offline');
+    return { status: 202 };
+  });
+  const button = b.nodes.get('#add-media');
+  await button.onclick();
+  const poll = [...b.intervals.values()][0];
+  for (let attempt = 0; attempt < 3; ++attempt) await poll();
+  assert.equal(b.intervals.size, 0);
+  assert.equal(button.disabled, false);
+  assert.equal(b.requests.filter(r => r.url === '/api/scan/status').length, 3);
+  const notices = b.context.document.body.children.map(node => node.children[0]?.innerHTML || '').join(' ');
+  assert.match(notices, /retry/i);
+  b.respond(async url => ({ status: url === '/api/scan' ? 409 : 200, ok: true, json: async () => url === '/api/scan/status' ? { scanning: false } : [] }));
+  await button.onclick();
+  assert.equal(button.disabled, true);
+  assert.equal(b.intervals.size, 1);
+  await [...b.intervals.values()][0]();
+  assert.equal(b.requests.filter(r => r.url === '/api/library').length, 1);
+  assert.equal(button.disabled, false);
+  assert.equal(b.intervals.size, 0);
+});
+
+test('toolbar scan never overlaps pending status or completion refresh requests', async () => {
+  const b = browser();
+  let release;
+  b.respond(url => url === '/api/scan' ? Promise.resolve({ status: 202 }) : new Promise(resolve => { release = resolve; }));
+  await b.nodes.get('#add-media').onclick();
+  const poll = [...b.intervals.values()][0];
+  const pending = poll();
+  const duplicate = poll();
+  assert.equal(b.requests.filter(r => r.url === '/api/scan/status').length, 1);
+  await duplicate;
+  release({ ok: true, json: async () => ({ scanning: false }) });
+  await new Promise(resolve => setImmediate(resolve));
+  await poll();
+  assert.equal(b.requests.filter(r => r.url === '/api/library').length, 1);
+  assert.equal(b.requests.filter(r => r.url === '/api/scan/status').length, 1);
+  release({ ok: true, json: async () => [] });
+  await pending;
+  assert.equal(b.intervals.size, 0);
+});

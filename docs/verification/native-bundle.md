@@ -15,6 +15,7 @@ scripts/native/package.sh /absolute/new/output x86_64-unknown-linux-gnu \
   /absolute/server/target/release/frayd-native
 # Verify the adjacent archive checksum; extract into a new private directory.
 # Preserve manifest modes even under umask 077:
+mkdir -m 700 /absolute/new/extraction-directory
 tar -xpzf /absolute/package.tar.gz -C /absolute/new/extraction-directory
 # Run from the extracted bundle:
 ./install.sh --prefix /absolute/new/prefix --data-dir /absolute/new/data

@@ -140,7 +140,77 @@ async function isolatedResponsiveCase(width) {
       throw error;
     } finally { document.getElementById('pb-close').click(); disposeSettings(); }
 }
-async function freshResponsiveDocument(width) {
+async function isolatedToolbarRetryCase(mode) {
+  const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+  function check(value, message) { if (!value) throw new Error(message); }
+  async function until(predicate, label, budget = 4000) {
+    const deadline = Date.now() + budget;
+    while (!predicate()) { check(Date.now() < deadline, 'Timed out: ' + label); await delay(20); }
+  }
+  await until(() => account?.isAdmin && LIBRARY.length > 0, 'fresh modeled account resumes');
+  const previousFetch = window.fetch;
+  let statusReads = 0, libraryReads = 0;
+  const postStatuses = [], clicks = [];
+  let releaseLibrary;
+  const reply = value => new Response(JSON.stringify(value), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  const button = document.getElementById('add-media');
+  const originalMarkup = button.innerHTML;
+  button.addEventListener('click', event => clicks.push(event.isTrusted));
+  const initialLibrary = LIBRARY;
+  window.fetch = async (url, options = {}) => {
+    if (url === '/api/scan') {
+      const status = postStatuses.length ? 409 : 202;
+      postStatuses.push(status);
+      return new Response(null, { status });
+    }
+    if (url === '/api/scan/status') {
+      statusReads++;
+      if (statusReads <= (mode === 'transient' ? 1 : 3)) throw Error('Owned transient status transport failure');
+      return reply({ scanning: false });
+    }
+    if (url === '/api/library') {
+      libraryReads++;
+      if (mode === 'transient') return new Promise(resolve => { releaseLibrary = () => resolve(reply(initialLibrary)); });
+      return reply(initialLibrary);
+    }
+    return previousFetch(url, options);
+  };
+  async function trustedClick() {
+    button.scrollIntoView({ block: 'center' });
+    const r = button.getBoundingClientRect();
+    const point = { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    check(document.elementFromPoint(point.x, point.y) === button || button.contains(document.elementFromPoint(point.x, point.y)), 'Production toolbar accepts pointer hit');
+    const response = await previousFetch('/__fixture/click', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(point) });
+    check(response.ok && clicks.at(-1) === true, 'Production scan receives trusted browser click');
+  }
+  try {
+    await trustedClick();
+    if (mode === 'transient') {
+      await until(() => statusReads === 1, 'first failure delivered');
+      check(button.disabled && button.textContent === 'Scanning…', 'Transient failure keeps monitoring active');
+      check(document.getElementById('toast-host').textContent.includes('retrying'), 'Transient failure reports automatic retry');
+      await until(() => releaseLibrary, 'next idle status starts refresh');
+      await delay(1650);
+      check(statusReads === 2 && libraryReads === 1 && button.disabled, 'No overlapping polls while library refresh is pending beyond1500ms');
+      releaseLibrary();
+    } else {
+      // Three real1500ms intervals require4500ms;6500ms is scoped to this criterion only.
+      await until(() => !button.disabled, 'three failures restore retry control', 6500);
+      check(statusReads === 3 && libraryReads === 0, 'Exactly three failures stop without refreshing');
+      check(button.innerHTML === originalMarkup && document.getElementById('toast-host').textContent.includes('click Scan to retry monitoring'), 'Manual retry is truthful and available');
+      await trustedClick();
+      check(button.disabled && document.getElementById('toast-host').textContent.includes('monitoring progress'), 'POST409 reattaches monitoring');
+    }
+    await until(() => !button.disabled, 'valid idle status completes monitoring');
+    check(libraryReads === 1 && button.innerHTML === originalMarkup, 'Successful current-account completion refreshes once and restores control');
+    check(document.getElementById('toast-host').textContent.includes('Scan complete'), 'Completion feedback published');
+    check(postStatuses.join(',') === (mode === 'transient' ? '202' : '202,409'), 'Expected scan admission statuses');
+    return { mode, freshDocument: true, trustedClicks: clicks, postStatuses, statusReads, libraryReads,
+      realIntervalMs: 1500, noOverlapDuringHeldRefresh: mode === 'transient', toolbarRestored: true,
+      accountName: account.name, modeledAPI: true, actualDOMAndTimers: true };
+  } finally { if (releaseLibrary) releaseLibrary(); window.fetch = previousFetch; }
+}
+async function freshResponsiveDocument(width, toolbarRetryMode = null) {
   const viewport = await fetch('/__fixture/viewport', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ width }) });
   if (!viewport.ok) throw Error('Owned viewport control failed');
   const frame = document.createElement('iframe');
@@ -156,7 +226,7 @@ async function freshResponsiveDocument(width) {
       };
       window.addEventListener('message', receive);
     });
-    frame.src = '/__fixture/responsive?width=' + width;
+    frame.src = toolbarRetryMode ? '/__fixture/toolbar-retry?width=' + width + '&mode=' + toolbarRetryMode : '/__fixture/responsive?width=' + width;
     document.body.appendChild(frame);
     const packet = await result;
     if (packet.status !== 'PASS' || packet.errors.length) {
@@ -193,6 +263,16 @@ async function freshResponsiveDocument(width) {
     });
     check(response.ok, `Fixture ${path}: ${response.status}`);
     return response.json();
+  }
+  if (window.__toolbarRetryMode) {
+    const width = window.__responsiveFixture.width;
+    try {
+      const observed = await isolatedToolbarRetryCase(window.__toolbarRetryMode);
+      parent.postMessage({ type: 'responsive-case-result', width, status: 'PASS', observed, errors }, location.origin);
+    } catch (error) {
+      parent.postMessage({ type: 'responsive-case-result', width, status: 'FAIL', error: error.stack, errors }, location.origin);
+    }
+    return;
   }
   if (window.__responsiveFixture) {
     const width = window.__responsiveFixture.width;
@@ -1130,6 +1210,8 @@ async function freshResponsiveDocument(width) {
     responder = defaultResponder;
     return { actualEnterAppTransition: true, staleLibraryReads: 0, staleFeedback: false, staleToolbarMutation: false, modeledAccountAndAPI: true, realPollingTimer: true, logoutReloadCoveredSeparately: true };
   });
+  await run('fresh toolbar transient status failure retries without overlapping refresh', () => freshResponsiveDocument(1440, 'transient'));
+  await run('fresh toolbar three status failures allow trusted POST409 monitoring reattach', () => freshResponsiveDocument(1440, 'reattach'));
   await run('actual settings DOM scopes seven kind permissions and authoritative locked roots', async () => {
     responder = defaultResponder;
     await openSettings();

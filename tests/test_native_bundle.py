@@ -15,6 +15,7 @@ import tarfile
 import tempfile
 import time
 import unittest
+from unittest import mock
 import urllib.request
 import zipfile
 
@@ -133,12 +134,34 @@ class NativeOwnership(unittest.TestCase):
         lease = self.base / 'timeout child lease'
         ready = self.base / 'timeout child ready'
         group_record = self.base / 'timeout owned group'
-        child = "import fcntl,pathlib,sys,time; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); pathlib.Path(sys.argv[2]).write_text('ready'); time.sleep(60)"
+        child = "import fcntl,pathlib,sys,time; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); time.sleep(2); pathlib.Path(sys.argv[2]).write_text('ready'); time.sleep(60)"
         driver = "import os,pathlib,subprocess,sys,time; pathlib.Path(sys.argv[1]).write_text(str(os.getpgrp())); subprocess.Popen([sys.executable,'-c',sys.argv[2],sys.argv[3],sys.argv[4]]); time.sleep(60)"
+        original_communicate = subprocess.Popen.communicate
+        awaiting_readiness = True
+
+        def communicate_after_ready(process, input_data=None, timeout=None):
+            nonlocal awaiting_readiness
+            if awaiting_readiness:
+                # Patch only this test's first communicate call. run_bounded has
+                # already recorded its process, so readiness failure still enters
+                # its normal owned-group cleanup without changing the runner API.
+                awaiting_readiness = False
+                deadline = time.monotonic() + 10
+                while not ready.exists():
+                    self.assertIsNone(process.poll(), 'fixture exited before readiness')
+                    self.assertLess(time.monotonic(), deadline, 'fixture readiness timed out')
+                    time.sleep(0.02)
+                with lease.open('r+') as handle:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return original_communicate(process, input_data, timeout=timeout)
+
         try:
-            with self.assertRaises(subprocess.TimeoutExpired):
-                run_bounded([sys.executable, '-c', driver, str(group_record), child, str(lease), str(ready)], timeout=1, capture_output=True, text=True)
-            self.assertTrue(ready.exists(), 'owned descendant must have acquired its lease before timeout')
+            with mock.patch.object(subprocess.Popen, 'communicate', communicate_after_ready):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    run_bounded([sys.executable, '-c', driver, str(group_record), child, str(lease), str(ready)], timeout=1, capture_output=True, text=True)
+            self.assertFalse(awaiting_readiness)
+            self.assertTrue(ready.exists(), 'descendant was ready before the cleanup timer')
             with lease.open('r+') as handle:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         finally:

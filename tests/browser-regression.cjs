@@ -61,6 +61,7 @@ function responsivePreload(width) {
     if (path.startsWith('/api/progress/')) return reply(null);
     if (path === '/api/progress') return reply(null, 204);
     if (path === '/api/scan') return reply(null, 409);
+    if (path === '/api/scan/status') return reply({ scanning: false });
     if (path === '/api/admin/perms') return reply([]);
     if (path === '/api/admin/settings') return reply({ library_paths: [], library_locked: false, server_version: 'fixture' });
     throw new Error('Unknown responsive API fixture request: ' + path);
@@ -454,12 +455,14 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
       }
       if (path === '/__fixture/viewport' && request.method === 'POST') return json(await cacheSession.viewport(JSON.parse(input).width));
       if (path === '/__fixture/click' && request.method === 'POST') { const point = JSON.parse(input); return json(await cacheSession.click(point.x, point.y)); }
-      if (path === '/__fixture/responsive') {
+      if (path === '/__fixture/responsive' || path === '/__fixture/toolbar-retry') {
         const width = Number(new URL(request.url, 'http://fixture.invalid').searchParams.get('width'));
         if (![320, 768, 1024, 1440].includes(width)) return json({}, 400);
+        const mode = path === '/__fixture/toolbar-retry' ? new URL(request.url, 'http://fixture.invalid').searchParams.get('mode') : null;
+        if (mode !== null && !['transient', 'reattach'].includes(mode)) return json({}, 400);
         const source = readFileSync(join(root, 'client/index.html'), 'utf8');
         response.writeHead(200, { 'Content-Type': 'text/html' });
-        return response.end(source.replace('<head>', '<head><base href="/"><script>(' + responsivePreload.toString() + ')(' + width + ')</script>')
+        return response.end(source.replace('<head>', '<head><base href="/"><script>(' + responsivePreload.toString() + ')(' + width + ');window.__toolbarRetryMode=' + JSON.stringify(mode) + '</script>')
           .replace('<script src="js/app.js?v=5"></script>', '<script>Plyr.defaults.iconUrl="/vendor/plyr/plyr.svg";</script><script src="js/app.js?v=5"></script>')
           .replace('</body>', '<script src="/__fixture/browser-driver.js"></script></body>'));
       }
@@ -621,7 +624,7 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
       cacheControl = cacheSession.receipt;
       return result;
     })(), exited, timedOut]);
-    const expectedCases = responsiveDiagnosticOnly ? 1 : 47;
+    const expectedCases = responsiveDiagnosticOnly ? 1 : 49;
     const complete = observed.cases.length === expectedCases
       && new Set(observed.cases.map(item => item.name)).size === expectedCases
       && observed.cases.every(item => item.status === 'PASS')

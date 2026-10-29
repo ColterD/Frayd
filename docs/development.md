@@ -12,7 +12,7 @@ Install a current Rust toolchain, Clippy and a C compiler. On Linux, the Rust te
 cargo test --locked
 cargo clippy --locked --all-targets
 cargo build --locked --release
-FRAYD_LIBRARY=/absolute/path/to/your/media cargo run --locked
+FRAYD_BIND=127.0.0.1 FRAYD_LIBRARY=/absolute/path/to/your/media cargo run --locked
 ```
 
 Use a disposable media directory for development. Native runs have no Compose network isolation. Set `FRAYD_BIND=127.0.0.1` for loopback access. The default port is 8484; the default database is `frayd.db` under the build-time server source directory. Thumbnails and conversions default beside the database. Configure `FRAYD_DB`, `FRAYD_THUMBS` and `FRAYD_TRANSCODES` for disposable writable data, separate from any read-only source library; set `FRAYD_CLIENT_DIR` to the intended client assets. Raw `cargo run` retains its compile-time database default: moving a bare server binary does not qualify relocation. The packaged launcher supplies explicit private data/client paths and loopback binding, and verifies ownership before start/removal. `default-run = "frayd-server"` preserves `cargo run` after adding the `frayd-native` helper binary; the helper adds no Cargo dependency. See [configuration and storage](operations.md#configuration-and-storage) for environment overrides and cache caveats. Native media tools such as `ffmpeg`/`ffprobe` must be available separately; the Docker image supplies those tools.

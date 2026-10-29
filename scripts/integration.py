@@ -4,8 +4,10 @@ import base64
 import hashlib
 import io
 import json
+import math
 import os
 import secrets
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -23,10 +25,81 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 base = ''
 
-def docker(*args, **kwargs):
-    """Run Docker, exposing only its captured stderr when a command fails."""
+def docker_timeout(args):
+    """Budget only the finite operations this disposable image-only runner uses."""
+    if not args:
+        raise ValueError('Missing Docker operation')
+    command = args[0]
+    if command == 'compose':
+        index = 1
+        while index < len(args) and args[index] in ('-p', '-f'):
+            index += 2
+        command = args[index] if index < len(args) else ''
+        if command in ('config', 'ps', 'port'):
+            return 'metadata', 20
+        if command == 'up':
+            # Existing --wait-timeout90 plus bounded CLI/setup overhead; no builds.
+            return 'compose-up', 120
+        if command == 'down':
+            return 'cleanup', 60
+        if command in ('restart', 'stop', 'rm'):
+            return 'lifecycle', 60
+    elif command in ('inspect', 'logs'):
+        return 'metadata', 20
+    elif command in ('container', 'network', 'volume') and len(args) > 1 and args[1] in ('ls', 'inspect'):
+        return 'metadata', 20
+    elif command == 'exec':
+        index = 1
+        while index < len(args) and args[index] == '-i':
+            index += 1
+        executable = args[index + 1] if index + 1 < len(args) else ''
+        if executable in ('ffmpeg', '/usr/bin/ffmpeg'):
+            # Owned two-second synthetic encodes; intentionally longer than control calls.
+            return 'media-conversion', 120
+        if executable:
+            return 'exec', 30
+    raise ValueError('Unsupported Docker operation; assign an explicit operation budget')
+
+
+def run_docker(args, operation, timeout, **options):
+    """Own CLI/plugin descendants and never expose private timeout argv or output."""
+    input_data = options.pop('input', None)
+    process = subprocess.Popen(['docker', *args], cwd=ROOT, start_new_session=True,
+                               shell=False, stdin=subprocess.PIPE if input_data is not None else None,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, **options)
     try:
-        return subprocess.run(['docker', *args], cwd=ROOT, check=True, capture_output=True, **kwargs)
+        stdout, stderr = process.communicate(input_data, timeout=timeout)
+    except BaseException as error:
+        # The CLI may already have exited while its Compose plugin still owns pipes.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            # Drain only in memory: inherited pipes close when killed plugin children exit.
+            process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            error.add_note('Docker local process cleanup exceeded10s')
+        finally:
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+        if isinstance(error, subprocess.TimeoutExpired):
+            raise subprocess.TimeoutExpired(['docker', operation], timeout) from None
+        raise
+    result = subprocess.CompletedProcess(['docker', operation], process.returncode, stdout, stderr)
+    result.check_returncode()
+    return result
+
+
+def docker(*args, **kwargs):
+    """Run an explicitly budgeted operation; only ordinary failures expose stderr."""
+    operation, budget = docker_timeout(args)
+    timeout = kwargs.pop('timeout', budget)
+    if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError('Docker operation timeout must be finite and positive')
+    try:
+        return run_docker(args, operation, timeout, **kwargs)
     except subprocess.CalledProcessError as error:
         diagnostic = error.stderr or b''
         if isinstance(diagnostic, bytes):
