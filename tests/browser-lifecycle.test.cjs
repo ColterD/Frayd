@@ -9,7 +9,7 @@ const { once, EventEmitter } = require('node:events');
 const { setTimeout: delay } = require('node:timers/promises');
 const { test } = require('node:test');
 const vm = require('node:vm');
-const { stopBrowserGroup } = require('./browser-regression.cjs');
+const { stopBrowserGroup, withLocalPlyrIcons } = require('./browser-regression.cjs');
 const executable = join(__dirname, 'fixtures/browser-child-writer.cjs');
 
 test('interception diagnostics preserve fatal errors and safely correlate retired frames without copying payloads', async () => {
@@ -784,5 +784,26 @@ test('installer poll observer keeps its own deadline and retires timers, observe
     polling.dispose();
     polling.dispose();
     assert.equal(removed, 1, 'Every completion/failure/disposal path closes its exact frame once');
+  }
+});
+
+
+test('local Plyr adapter preserves the sole app script tag across cache versions', () => {
+  for (const suffix of ['', '?v=5', '?v=9']) {
+    const tag = '<script src="js/app.js' + suffix + '"></script>';
+    const input = '<body>' + tag + '</body>';
+    const output = withLocalPlyrIcons(input);
+    assert.equal(output.endsWith(tag + '</body>'), true, 'Original app tag and cache query stay byte-identical');
+    assert.equal(output.split(tag).length - 1, 1);
+    assert.equal(output.split('Plyr.defaults.iconUrl').length - 1, 1);
+    assert.ok(output.indexOf('Plyr.defaults.iconUrl') < output.indexOf(tag));
+    assert.match(output, /iconUrl="\/vendor\/plyr\/plyr\.svg"/);
+  }
+});
+
+test('local Plyr adapter fails immediately for absent or duplicate app scripts', () => {
+  const tag = '<script src="js/app.js?v=9"></script>';
+  for (const input of ['<body></body>', '<body>' + tag + tag + '</body>']) {
+    assert.throws(() => withLocalPlyrIcons(input), /exactly one production app script/);
   }
 });

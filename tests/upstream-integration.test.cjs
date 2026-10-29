@@ -214,7 +214,7 @@ test('late progress does not paint detached or superseded cards; row sorting is 
 test('production library rendering assigns book portraits and retains music/video landscapes', async () => {
   const b=browser();
   b.respond(async()=>({ok:true,json:async()=>null}));
-  b.run('account={isAdmin:true}; LIBRARY=["movie","music","audiobook","ebook","comic","manga"].map((kind,id)=>({id:id+1,title:kind,kind,author:"Author"})); filtering=false');
+  b.run('account={isAdmin:true}; LIBRARY=["movie","music","audiobook","ebook","comic","manga"].map((kind,id)=>({id:id+1,title:kind,kind,author:"Author"})); filtering=false; authorDrill.music={author:"Author"}; authorDrill.ebook={author:"Author"}; authorDrill.audiobook={author:"Author"}');
   await b.run('renderRows(LIBRARY)');
   const cards=[];
   const visit=node=>{if(node.className?.startsWith('media-card ')) cards.push(node);for(const child of node.children||[])visit(child);};

@@ -42,6 +42,9 @@ async function isolatedResponsiveCase(width) {
     try {
       await until(() => account?.isAdmin && LIBRARY.length === items.length, 'fresh document authenticates with private fixture model');
       check(!document.getElementById('party-modal').classList.contains('on') && !document.getElementById('playerbar').classList.contains('on'), 'Fresh document starts with clean party/player state');
+      authorDrill.music = { author: 'Fixture artist' };
+      authorDrill.ebook = { author: 'Fixture author' };
+      authorDrill.audiobook = { author: 'Fixture author' };
       await filterKind('all', '');
       const actualCards = [...document.querySelectorAll('#main .media-card')];
       const portraitItems = items.filter(item => ['ebook', 'comic', 'manga', 'audiobook'].includes(item.kind));
@@ -1541,6 +1544,71 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     check(!document.querySelector('#main').textContent.includes('Continue watching'), 'Filtered view has no stale continue row');
     const retainedLibrary = LIBRARY, retainedKind = activeKind, retainedQuery = activeQuery;
     const priorMovieSort = rowSort.get('Movies');
+    const retainedShowsDrill = showsDrill;
+    const retainedAuthorDrill = { ...authorDrill };
+    const tvAndAuthorItems = [
+      { id: 9, kind: 'episode', title: '日本語.Show.S01E02', series: 'Unicode show' },
+      { id: 10, kind: 'episode', title: 'Unicode 1x01', series: 'Unicode show' },
+      { id: 60, kind: 'episode', title: 'Unicode bonus', series: 'Unicode show' },
+      { id: 61, kind: 'movie', title: 'Unicode movie' },
+      { id: 62, kind: 'music', title: 'Loose song', author: 'Mixed artist' },
+      { id: 63, kind: 'music', title: 'Album song', author: 'Mixed artist', series: 'Named album' },
+      { id: 64, kind: 'ebook', title: 'Series book', author: 'Book author', series: 'Named books' },
+      { id: 65, kind: 'audiobook', title: 'Loose audiobook', author: 'Audio author' },
+    ];
+    let tvSearchMode = 'success';
+    responder = async (url, options) => {
+      const parsed = new URL(url, location.origin);
+      if (parsed.pathname === '/api/library') {
+        const query = parsed.searchParams.get('q');
+        if (query && tvSearchMode === 'network') throw Error('Owned TV search transport failure');
+        if (query && tvSearchMode === 'http') return reply(null, 500);
+        return reply(query ? tvAndAuthorItems.filter(item => item.title.toLowerCase().includes(query.toLowerCase())) : tvAndAuthorItems);
+      }
+      if (url.startsWith('/api/progress/')) return reply(null);
+      return defaultResponder(url, options);
+    };
+    LIBRARY = tvAndAuthorItems;
+    showsDrill = null;
+    const tvNav = document.querySelector('#sidebar [data-kind="show"]');
+    check(tvNav, 'Upstream TV navigation exists');
+    tvNav.focus(); await key('Enter');
+    await until(() => activeKind === 'episode' && document.querySelector('#main .show-grid'), 'trusted TV navigation reaches canonical episode shelf');
+    const byTitle = title => [...document.querySelectorAll('#main .media-card')].find(node => node.querySelector('.title')?.textContent === title);
+    byTitle('Unicode show').click();
+    await until(() => showsDrill === 'Unicode show' && byTitle('Unicode 1x01'), 'TV folder opens episode cards');
+    equal([...document.querySelectorAll('#main .series-head h4')].map(node => node.textContent), ['Season 1', 'Other episodes'], 'Known and unknown seasons have truthful labels');
+    equal([...document.querySelectorAll('#main .media-card .title')].map(node => node.textContent), ['Unicode 1x01', '日本語.Show.S01E02', 'Unicode bonus'], 'Episode ordering uses parsed numbers');
+    byTitle('Unicode 1x01').click();
+    await until(() => document.getElementById('video-modal').classList.contains('on') && (plyr.media.src || plyr.media.querySelector('source')?.src || '').endsWith('/api/stream/10'), 'Episode card dispatches to real vendored video player');
+    document.getElementById('vm-back').click();
+    await loadLibrary(); await delay(0);
+    equal(showsDrill, 'Unicode show', 'Library refresh retains the selected series');
+    for (const mode of ['success', 'http', 'network']) {
+      tvSearchMode = mode;
+      activeKind = 'show';
+      await serverSearch('Unicode'); await delay(0);
+      equal(activeKind, 'episode', 'TV search normalizes its navigation alias');
+      check(!byTitle('Unicode movie'), 'TV search and failure fallback exclude matching movies');
+      check(byTitle('Unicode 1x01'), 'TV search and failure fallback preserve matching episode cards');
+    }
+    tvSearchMode = 'success';
+    await serverSearch(''); await delay(0);
+    document.querySelector('#sidebar [data-kind="music"]').click(); await delay(0);
+    byTitle('Mixed artist').click(); await delay(0);
+    check(byTitle('Loose song') && byTitle('Named album'), 'Mixed author retains loose song beside album folder');
+    byTitle('Named album').click(); await delay(0);
+    check(byTitle('Album song') && !byTitle('Loose song'), 'Album drill shows its own songs');
+    document.querySelectorAll('#main .back-row')[1].click(); await delay(0);
+    check(byTitle('Loose song') && byTitle('Named album'), 'Author back restores loose items and album');
+    document.querySelector('#sidebar [data-kind="ebook"]').click(); await delay(0);
+    byTitle('Book author').click(); await delay(0); byTitle('Named books').click(); await delay(0);
+    check(byTitle('Series book')?.classList.contains('portrait'), 'All-series ebook author retains actual portrait card');
+    document.querySelector('#sidebar [data-kind="audiobook"]').click(); await delay(0);
+    byTitle('Audio author').click(); await delay(0);
+    check(byTitle('Loose audiobook')?.classList.contains('portrait'), 'All-loose audiobook author retains actual portrait card');
+    const tvAuthorWorkflows = { trustedTVNavigation: true, canonicalEpisodeSearch: ['success', 'http', 'network'], refreshRetainsSeries: true,
+      episodeVideoDispatch: true, unknownSeasonLabel: 'Other episodes', mixedArtistLooseAndAlbum: true, ebookAllSeries: true, audiobookAllLoose: true, actualDOM: true, modeledAPI: true };
     const progressGets = [];
     const positions = new Map([[60, 20], [61, 80], [62, 99], [63, 0]]);
     LIBRARY = [
@@ -1549,6 +1617,9 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       { id: 62, kind: 'music', title: 'Progress song', duration_secs: 100 },
       { id: 63, kind: 'ebook', title: 'Progress book' },
     ];
+    showsDrill = 'Unknown series';
+    authorDrill.music = { author: 'Unknown' };
+    authorDrill.ebook = { author: 'Unknown' };
     responder = async (url, options) => {
       if (url.startsWith('/api/progress/')) {
         const id = Number(new URL(url, location.origin).pathname.split('/').at(-1));
@@ -1585,9 +1656,11 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     check([...document.querySelectorAll('#main .progress-strip')].every(strip => strip.style.display === 'none'), 'Failed progress leaves every regular bar hidden');
     responder = defaultResponder;
     LIBRARY = retainedLibrary;
+    showsDrill = retainedShowsDrill;
+    Object.assign(authorDrill, retainedAuthorDrill);
     if (priorMovieSort === undefined) rowSort.delete('Movies'); else rowSort.set('Movies', priorMovieSort);
     await filterKind(retainedKind, retainedQuery);
-    return { deletedId: +deletedId, libraryIds: LIBRARY.map(i => i.id), activeKind, sort, detachedProgressIgnored: true, modeledAPI: true,
+    return { deletedId: +deletedId, libraryIds: LIBRARY.map(i => i.id), activeKind, sort, detachedProgressIgnored: true, modeledAPI: true, tvAuthorWorkflows,
       progressReadReuse: { libraryItems: 4, initialGets, sortAdditionalGets: 0, nextRenderGets: 4, freshResumeAdditionalGets: 1, failedRenderGets: failedGets.length,
         continuationOrder: ['Progress episode', 'Progress movie'], actualDOM: true, modeledProgressAPI: true } };
   });

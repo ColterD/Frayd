@@ -334,7 +334,7 @@ fn upsert_item(
 }
 
 /// Refresh source fingerprints through the existing guarded path, or atomically change only a stale kind.
-/// Known unchanged fingerprints permit no cache, duration, metadata, lease or converter work on reclassification.
+/// Known unchanged fingerprints permit only kind changes and NULL episode-series backfill, without media work.
 fn upsert_item_with_roots(db: &Connection, db_path: String, path: &Path, kind: &str, thumbs_dir: Option<&Path>, roots: &[std::path::PathBuf]) -> usize {
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
@@ -357,14 +357,24 @@ fn upsert_item_with_roots(db: &Connection, db_path: String, path: &Path, kind: &
         let existing=tx.query_row("SELECT kind,mtime_secs,size_bytes FROM media WHERE path=?1",[&path_str],
             |row|Ok((row.get::<_,String>(0)?,row.get::<_,Option<i64>>(1)?,row.get::<_,Option<i64>>(2)?))).optional()?;
         let is_new=existing.is_none();
-        let kind_only=existing.as_ref().is_some_and(|(old_kind,old_mtime,old_size)|
-            old_kind!=kind && *old_mtime==Some(mtime) && *old_size==Some(meta.len() as i64));
-        if kind_only {
-            let changed=tx.execute("UPDATE media SET kind=?1 WHERE path=?2 AND kind IS NOT ?1
-                AND mtime_secs IS ?3 AND size_bytes IS ?4",rusqlite::params![kind,path_str,mtime,meta.len() as i64])?;
-            if changed!=1 {return Err(rusqlite::Error::InvalidQuery);}
+        let unchanged=existing.as_ref().is_some_and(|(_,old_mtime,old_size)|
+            *old_mtime==Some(mtime) && *old_size==Some(meta.len() as i64));
+        let kind_only=unchanged && existing.as_ref().is_some_and(|(old_kind,_,_)|old_kind!=kind);
+        if kind_only || (unchanged && kind=="episode") {
+            let changed=if kind_only {
+                let changed=tx.execute("UPDATE media SET kind=?1 WHERE path=?2 AND kind IS NOT ?1
+                    AND mtime_secs IS ?3 AND size_bytes IS ?4",rusqlite::params![kind,path_str,mtime,meta.len() as i64])?;
+                if changed!=1 {return Err(rusqlite::Error::InvalidQuery);}
+                changed
+            } else {0};
+            let backfilled=if kind=="episode" {
+                if let Some(show)=episode_series(path,roots) {
+                    tx.execute("UPDATE media SET series=?1 WHERE path=?2 AND kind='episode' AND series IS NULL
+                        AND mtime_secs IS ?3 AND size_bytes IS ?4",rusqlite::params![show,path_str,mtime,meta.len() as i64])?
+                } else {0}
+            } else {0};
             tx.commit()?;
-            return Ok((changed,false,true));
+            return Ok((changed.max(backfilled),false,true));
         }
         // Capture the exact prior pointer only when both fingerprint components were known.
         let prior:Option<(i64,String)>=tx.query_row("SELECT id,transcode_path FROM media WHERE path=?1
@@ -401,7 +411,7 @@ fn upsert_item_with_roots(db: &Connection, db_path: String, path: &Path, kind: &
         Err(error)=>{tracing::warn!(%error,"scan refresh held: source and artifact state retained");return 0;}
     };
 
-    // Classification policy changes do not grant source-version or cache mutation authority.
+    // Classification/NULL-series backfills grant no probing, conversion, source-version or cache authority.
     if kind_only {return updated;}
 
     // metadata + thumbnails: for new items
@@ -410,14 +420,10 @@ fn upsert_item_with_roots(db: &Connection, db_path: String, path: &Path, kind: &
         let path_pb = path.to_path_buf();
         let ProbeMetadata { duration: dur, title: title_tag, synopsis, author: tag_author, series: tag_series } =
             ffprobe_metadata(&path_str).unwrap_or_default();
-        // Tags take precedence over filename heuristics independently for author and series.
-        let (author, series) = match (tag_author, tag_series) {
-            (Some(a), Some(s)) => (Some(a), Some(s)),
-            (a, s) => {
-                let (fa, fs) = filename_author_series(&title);
-                (a.or(fa), s.or(fs))
-            }
-        };
+        // Episode tags win over show-name inference; audio retains its existing filename heuristics.
+        let (filename_author,filename_series)=filename_author_series(&title);
+        let author=tag_author.or(filename_author);
+        let series=tag_series.or_else(|| if kind=="episode" {episode_series(path,roots)}else{filename_series});
         let _ = db.execute(
             "UPDATE media SET duration_secs = ?1,
                title = CASE WHEN ?2 != '' THEN ?2 ELSE title END,
@@ -486,6 +492,67 @@ fn upsert_item_with_roots(db: &Connection, db_path: String, path: &Path, kind: &
     updated
 }
 
+/// Locate a complete S1E02, 1x02 or Season 1 Episode 2 token, with bounded numeric widths.
+/// ASCII normalization preserves Unicode byte offsets; alphanumeric prefixes/suffixes cannot form tokens.
+fn episode_marker(title: &str) -> Option<usize> {
+    fn after_number(text: &str, maximum: usize) -> Option<&str> {
+        let count = text.bytes().take_while(u8::is_ascii_digit).count();
+        if count == 0 || count > maximum { None } else { Some(&text[count..]) }
+    }
+    fn after_space(text: &str) -> Option<&str> {
+        let rest = text.trim_start();
+        if rest.len() == text.len() { None } else { Some(rest) }
+    }
+    let lower = title.to_ascii_lowercase();
+    for (start, character) in lower.char_indices() {
+        if character != 's' && !character.is_ascii_digit() { continue; }
+        if lower[..start].chars().next_back().is_some_and(char::is_alphanumeric) { continue; }
+        let remainder = (|| {
+            let tail = &lower[start..];
+            if let Some(rest) = tail.strip_prefix("season") {
+                let rest = after_space(rest)?;
+                let rest = after_number(rest, 2)?;
+                let rest = after_space(rest)?.strip_prefix("episode")?;
+                after_number(after_space(rest)?, 3)
+            } else if let Some(rest) = tail.strip_prefix('s') {
+                let rest = after_number(rest, 2)?.strip_prefix('e')?;
+                after_number(rest, 3)
+            } else {
+                let rest = after_number(tail, 2)?.strip_prefix('x')?;
+                after_number(rest, 3)
+            }
+        })();
+        if remainder.is_some_and(|rest| !rest.chars().next().is_some_and(char::is_alphanumeric)) {
+            return Some(start);
+        }
+    }
+    None
+}
+
+/// Normalize release-name separators without changing Unicode show names or internal hyphens.
+fn episode_series_name(name: &str) -> Option<String> {
+    let name = name.replace(['.', '_'], " ");
+    let name = name.trim_matches(|c: char| c.is_whitespace() || c == '-')
+        .split_whitespace().collect::<Vec<_>>().join(" ");
+    if name.is_empty() { None } else { Some(name) }
+}
+
+/// Prefer the filename prefix, then at most two admitted parents, skipping a numbered Season folder.
+fn episode_series(path: &Path, roots: &[std::path::PathBuf]) -> Option<String> {
+    let title = path.file_stem()?.to_str()?;
+    if let Some(name) = episode_marker(title).and_then(|start| episode_series_name(&title[..start])) {
+        return Some(name);
+    }
+    for directory in path.parent()?.ancestors().take(2) {
+        if !roots.iter().any(|root| directory.starts_with(root)) { break; }
+        let name = episode_series_name(directory.file_name()?.to_str()?)?;
+        if name.to_ascii_lowercase().strip_prefix("season").is_some_and(|suffix|
+            !suffix.trim().is_empty() && suffix.trim().bytes().all(|b| b.is_ascii_digit())) { continue; }
+        return Some(name);
+    }
+    None
+}
+
 /// Preserve upstream standalone-path test classification with the six-ancestor context limit.
 /// Scans use classify_with_root so hints cannot escape their selected library boundary.
 #[cfg(test)]
@@ -527,7 +594,10 @@ fn classify_with_root(p:&Path,library_root:Option<&Path>) -> Option<&'static str
         }
         "epub"=>"ebook",
         "cbz"|"cbr"=>"comic",
-        "mkv"|"mp4"|"webm"=>"movie",
+        "mkv"|"mp4"|"webm"=>{
+            let stem=p.file_stem().and_then(|name|name.to_str()).unwrap_or("");
+            if episode_marker(stem).is_some() {"episode"}else{"movie"}
+        },
         _=>return None,
     })
 }
@@ -574,6 +644,119 @@ mod tests {
         assert_eq!(classify(&p("/media/stuff/Book 01 - Chapter 3.mp3")), Some("audiobook"));
         // plain title defaults to music
         assert_eq!(classify(&p("/media/stuff/delain-virtue-and-vice.mp3")), Some("music"));
+    }
+
+    /// Episode markers must be bounded tokens and apply only to supported video containers.
+    #[test]
+    fn upstream_dd8_episode_tokens_and_video_only_classification() {
+        for (stem,expected) in [
+            ("Show S01E02","episode"),("SHOW.S1E002","episode"),("日本語.Show.S12E123","episode"),
+            ("Show 1x02","episode"),("SHOW.12X123","episode"),("Show Season 1 Episode 2","episode"),
+            ("Show SEASON\t12 EPISODE 123","episode"),("Show S00E01","episode"),
+            ("Film 1920x1080","movie"),("Film1920x1080","movie"),("MyS01E02title","movie"),
+            ("S001E02","movie"),("S01E1234","movie"),("Show S01 E02","movie"),("Season1Episode2","movie"),
+            ("日本語S01E02","movie"),("Show 123x02","movie"),("Show S01E02日本語","movie"),
+        ] {
+            for extension in ["mkv","mp4","webm","MP4"] {
+                assert_eq!(classify(&p(format!("/media/{stem}.{extension}"))),Some(expected),"{stem}.{extension}");
+            }
+            assert_eq!(classify(&p(format!("/media/{stem}.mp3"))),Some("music"));
+            assert_eq!(classify(&p(format!("/media/{stem}.epub"))),Some("ebook"));
+        }
+    }
+
+    /// Reclassification and NULL-only show backfills retain all other rows and bytes without media work.
+    #[cfg(unix)]
+    #[test]
+    fn upstream_dd8_episode_rescan_backfills_series_without_media_work() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::env::var_os("FRAYD_TEST_EPISODE_CHILD").is_none() {
+            let fixture=Library::new(&[]);let bin=fixture.0.join("bin");std::fs::create_dir(&bin).unwrap();
+            for name in ["ffprobe","ffmpeg"] {
+                let tool=bin.join(name);std::fs::write(&tool,"#!/bin/sh\nprintf 'probe\\n' >> \"$FRAYD_TEST_EPISODE_PROBES\"\nexit 1\n").unwrap();
+                std::fs::set_permissions(tool,std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let result=Command::new(std::env::current_exe().unwrap()).args(["--exact","scanner::tests::upstream_dd8_episode_rescan_backfills_series_without_media_work","--nocapture"])
+                .env("FRAYD_TEST_EPISODE_CHILD","1").env("FRAYD_TEST_EPISODE_PROBES",fixture.0.join("probes")).env("PATH",bin)
+                .env_remove("FRAYD_TRANSCODES").env_remove("FRAYD_THUMBS").output().unwrap();
+            print!("{}{}",String::from_utf8_lossy(&result.stdout),String::from_utf8_lossy(&result.stderr));
+            assert!(result.status.success(),"episode backfill oracle failed: {}",result.status);return;
+        }
+        let fixture=Library::new(&[]);let library=fixture.0.join("library");std::fs::create_dir(&library).unwrap();
+        let database=fixture.0.join("db.sqlite");let db=open(database.to_str().unwrap());
+        let thumbs=fixture.0.join("thumbs");std::fs::create_dir(&thumbs).unwrap();
+        let job=fixture.0.join("transcodes/41").join(uuid::Uuid::new_v4().to_string());std::fs::create_dir_all(&job).unwrap();
+        let output=job.join("audio.mp4");let temporary=job.join("audio.tmp.mp4");let lease=job.join("lease");
+        let cases=[(41,"First.Show.S01E02.mp4","movie",None,"First Show"),(42,"Second_Show.1x02.webm","episode",None,"Second Show"),(43,"Third.Show.Season 1 Episode 2.mkv","episode",Some("Owner show"),"Owner show"),(44,"Fourth.Show.S1E02.mp4","movie",Some(""),"")];
+        let mut files=vec![output.clone(),temporary.clone(),lease.clone()];
+        for file in &files {std::fs::write(file,b"retained artifact").unwrap();}
+        for (id,name,kind,series,_) in cases {
+            let source=library.join(name);std::fs::write(&source,b"retained source").unwrap();let meta=std::fs::metadata(&source).unwrap();
+            let thumbnail=thumbs.join(format!("{id}.jpg"));std::fs::write(&thumbnail,b"retained thumbnail").unwrap();files.extend([source.clone(),thumbnail.clone()]);
+            db.execute("INSERT INTO media(id,kind,path,title,series,author,duration_secs,size_bytes,mtime_secs,meta_json,thumb_path,transcode_path) VALUES(?1,?2,?3,'Embedded title',?4,'Owner author',73,?5,?6,?7,?8,?9)",
+                rusqlite::params![id,kind,source.to_str().unwrap(),series,meta.len() as i64,meta.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64,r#"{"pages":["keep"],"spine":["keep"],"synopsis":"owner"}"#,thumbnail.to_str().unwrap(),if id==41 {output.to_str()}else{None}]).unwrap();
+        }
+        db.execute_batch("INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture');INSERT INTO progress(identity_id,media_id,position) VALUES(1,41,12),(1,42,23),(1,43,34),(1,44,45);").unwrap();
+        for (file,role) in [(&temporary,"temp"),(&output,"final")] {
+            db.execute("INSERT INTO transcode_artifacts(path,owner_media_id,owner_source_path,role,provenance,lifecycle) VALUES(?1,41,?2,?3,'generated','completed')",rusqlite::params![file.to_str().unwrap(),library.join(cases[0].1).to_str().unwrap(),role]).unwrap();
+        }
+        let snapshot=||cases.map(|(id,_,_,_,_)| {let mut row:serde_json::Value=serde_json::from_str(&audio_row_snapshot(&db,id)).unwrap();row.as_object_mut().unwrap().remove("series");row});
+        let before=snapshot();
+        let artifacts=||db.query_row("SELECT json_group_array(json_object('path',path,'owner',owner_media_id,'source',owner_source_path,'role',role,'provenance',provenance,'lifecycle',lifecycle)) FROM transcode_artifacts",[],|r|r.get::<_,String>(0)).unwrap();let artifacts_before=artifacts();
+        let bytes:Vec<_>=files.iter().map(|file|(std::fs::read(file).unwrap(),std::fs::metadata(file).unwrap().modified().unwrap())).collect();
+        for expected in [3,0] {
+            assert_eq!(scan(&db,database.to_string_lossy().into_owned(),library.clone(),Some(&thumbs)),expected);
+            for (id,_,_,_,show) in cases {
+                assert_eq!(db.query_row("SELECT kind,series FROM media WHERE id=?1",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).unwrap(),("episode".into(),show.into()));
+            }
+            assert_eq!(snapshot(),before);assert_eq!(artifacts(),artifacts_before);
+            assert_eq!(db.query_row("SELECT group_concat(position) FROM (SELECT position FROM progress ORDER BY media_id)",[],|r|r.get::<_,String>(0)).unwrap(),"12.0,23.0,34.0,45.0");
+            for (file,(data,modified)) in files.iter().zip(&bytes) {assert_eq!(&std::fs::read(file).unwrap(),data);assert_eq!(std::fs::metadata(file).unwrap().modified().unwrap(),*modified);}
+            assert!(!crate::transcode::BUSY.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(!std::path::PathBuf::from(std::env::var_os("FRAYD_TEST_EPISODE_PROBES").unwrap()).exists(),"episode metadata-only scan invoked a media tool");
+        }
+        db.execute_batch("UPDATE media SET kind='movie',series=NULL WHERE id=41;CREATE TRIGGER reject_show BEFORE UPDATE OF series ON media WHEN OLD.id=41 BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
+        assert_eq!(upsert_item(&db,database.to_string_lossy().into_owned(),&library.join(cases[0].1),"episode",Some(&thumbs),&library),0);
+        assert_eq!(db.query_row("SELECT kind,series FROM media WHERE id=41",[],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?))).unwrap(),("movie".into(),None));
+        assert_eq!(snapshot(),before);assert_eq!(artifacts(),artifacts_before);
+        assert!(!std::path::PathBuf::from(std::env::var_os("FRAYD_TEST_EPISODE_PROBES").unwrap()).exists(),"failed backfill invoked a media tool");
+        println!("episode_first_scan=3 idempotent_scan=0 source_versions_ids_progress_metadata_cache_artifacts_retained=true media_probes=0 series_failure_rolls_back_kind=true");
+    }
+
+    /// A real newly scanned episode uses one JSON probe; tags beat filename/parent show inference.
+    #[cfg(unix)]
+    #[test]
+    fn upstream_dd8_new_episode_scan_retains_one_probe_and_series_precedence() {
+        if std::env::var_os("FRAYD_TEST_NEW_EPISODE_CHILD").is_none() {
+            let result=Command::new(std::env::current_exe().unwrap()).args(["--exact","scanner::tests::upstream_dd8_new_episode_scan_retains_one_probe_and_series_precedence","--nocapture"])
+                .env("FRAYD_TEST_NEW_EPISODE_CHILD","1").env_remove("FRAYD_TRANSCODES").env_remove("FRAYD_THUMBS").output().unwrap();
+            print!("{}{}",String::from_utf8_lossy(&result.stdout),String::from_utf8_lossy(&result.stderr));
+            assert!(result.status.success(),"new episode scan oracle failed: {}",result.status);return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let fixture=Library::new(&[]);let library=fixture.0.join("library");std::fs::create_dir(&library).unwrap();
+        let original_path=std::env::var_os("PATH").unwrap();
+        let real_probe=std::env::split_paths(&original_path).map(|directory|directory.join("ffprobe")).find(|candidate|candidate.is_file()).unwrap().canonicalize().unwrap();
+        let bin=fixture.0.join("bin");std::fs::create_dir(&bin).unwrap();let count=fixture.0.join("count");
+        let wrapper=bin.join("ffprobe");std::fs::write(&wrapper,"#!/bin/sh\nprintf 'probe\\n' >> \"$FRAYD_TEST_NEW_EPISODE_COUNT\"\nexec \"$FRAYD_TEST_NEW_EPISODE_PROBE\" \"$@\"\n").unwrap();
+        std::fs::set_permissions(wrapper,std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("FRAYD_TEST_NEW_EPISODE_COUNT",&count);std::env::set_var("FRAYD_TEST_NEW_EPISODE_PROBE",real_probe);
+        std::env::set_var("PATH",std::env::join_paths([bin].into_iter().chain(std::env::split_paths(&original_path))).unwrap());
+        crate::transcode::BUSY.store(true,std::sync::atomic::Ordering::SeqCst);
+        let database=fixture.0.join("db.sqlite");let db=open(database.to_str().unwrap());
+        for (relative,tagged,title,show) in [("Visible.Show.S01E02.mp4",true,"Embedded title hides episode marker","Tag Show"),("Fallback.Show.1x02.mp4",false,"Fallback.Show.1x02","Fallback Show"),("Parent.Show/Season 1/S1E002.mp4",false,"S1E002","Parent Show")] {
+            let source=library.join(relative);std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            let mut generate=Command::new("ffmpeg");generate.args(["-v","error","-nostdin","-f","lavfi","-i","color=c=black:s=16x16:r=10","-t","0.2","-c:v","mpeg4","-threads","1","-an"]);
+            if tagged {generate.args(["-metadata","album=Tag Show","-metadata","title=Embedded title hides episode marker"]);}
+            assert!(generate.arg(&source).output().unwrap().status.success());
+            std::fs::write(&count,[]).unwrap();
+            assert_eq!(scan(&db,database.to_string_lossy().into_owned(),library.clone(),None),1);
+            assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(),1);
+            assert_eq!(db.query_row("SELECT kind,title,series,duration_secs FROM media WHERE path=?1",[source.to_str().unwrap()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,f64>(3)?))).unwrap(),("episode".into(),title.into(),show.into(),0.2));
+            assert_eq!(scan(&db,database.to_string_lossy().into_owned(),library.clone(),None),0);
+            assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(),1);
+            println!("real_episode={relative} probes=1 kind=episode title={title:?} series={show:?} duration=0.2 unchanged_reprobe=false");
+        }
     }
 
     /// One structured probe persists decoded tags and retains filename fallbacks on unusable output.

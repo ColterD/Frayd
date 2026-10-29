@@ -2137,12 +2137,15 @@ test('an obsolete boot resume cannot cover a newly entered account with sign-in'
 test('episode renders as video, appears in library rows and opens the video player', async () => {
   const b = browser();
   b.respond(async () => ({ ok: true, json: async () => null }));
-  b.run('LIBRARY = [{ id: 12, kind: "episode", title: "Episode" }]; filtering = true');
+  b.run('LIBRARY = [{ id: 12, kind: "episode", title: "Episode", series: "Fixture show" }]; filtering = true');
   await b.run('renderRows(LIBRARY)');
   assert.match(b.nodes.get('#hero').innerHTML, /▶ Play/);
   const section = b.nodes.get('#main').children.at(-1);
-  assert.match(section.children[0].innerHTML, /Episodes/);
-  const card = section.children[1].children[0];
+  assert.match(section.children[0].innerHTML, /TV Shows/);
+  b.nodes.get('#main').children.length = 0;
+  await section.children[1].children[0].onclick();
+  const detail = b.nodes.get('#main').children.at(-1);
+  const card = detail.children.find(node => node.className === 'cards').children[0];
   assert.match(card.innerHTML, /src="\/api\/thumb\/12"/);
   card.onclick();
   await settle();
@@ -2197,7 +2200,8 @@ function progressRenderFixture() {
     { id: 2, kind: 'episode', title: 'Episode', duration_secs: 100 },
     { id: 3, kind: 'music', title: 'Song', duration_secs: 100 },
     { id: 4, kind: 'ebook', title: 'Book' }
-  ]; filtering = false;`);
+  ]; filtering = false; showsDrill = 'Unknown series';
+  authorDrill.music = { author: 'Unknown' }; authorDrill.ebook = { author: 'Unknown' };`);
   const positions = new Map([[1, 20], [2, 80], [3, 99], [4, 0]]);
   b.respond(async url => ({ ok: true, json: async () => new URL(url, 'https://fixture.invalid').pathname === '/api/library' ? b.run('LIBRARY') : ({ position: positions.get(Number(new URL(url, 'https://fixture.invalid').pathname.split('/').at(-1))) }) }));
   return { b, positions, reads: () => b.requests.filter(request => request.url.startsWith('/api/progress/')) };
@@ -2371,5 +2375,187 @@ for (const completionOrder of [[0, 1], [1, 0]]) {
     await ignored;
     assert.equal(b.run('accountGeneration'), owner);
     assert.equal(b.run('account.name'), 'Latest fixture');
+  });
+}
+
+test('TV season tokens match the scanner grammar and reject embedded dimensions', () => {
+  const b = browser();
+  for (const [title, expected] of [
+    ['Show S01E02', [1, 2]], ['SHOW.S1E002', [1, 2]], ['日本語.Show.S12E123', [12, 123]],
+    ['Show 1x02', [1, 2]], ['SHOW.12X123', [12, 123]], ['Show Season 1 Episode 2', [1, 2]],
+    ['Show SEASON\t12 EPISODE 123', [12, 123]], ['Show S00E01', [0, 1]],
+    ['Film 1920x1080', null], ['Film1920x1080', null], ['MyS01E02title', null],
+    ['S001E02', null], ['S01E1234', null], ['Show S01 E02', null], ['Season1Episode2', null],
+    ['日本語S01E02', null], ['Show 123x02', null], ['Show S01E02日本語', null],
+  ]) {
+    const actual = b.run(`episodeNumbers(${JSON.stringify(title)})`);
+    assert.equal(JSON.stringify(actual), JSON.stringify(expected), title);
+  }
+});
+
+for (const searchResult of ['success', 'http-failure', 'network-failure']) {
+  test(`TV show alias retains episode filtering through ${searchResult} search and library refresh`, async () => {
+    const b = browser();
+    const library = [{ id: 60, kind: 'episode', title: 'Owned S01E02', series: 'Owned show' }, { id: 61, kind: 'movie', title: 'Owned movie' }];
+    b.context.tvFixture = library;
+    b.respond(async url => {
+      const parsed = new URL(url, 'https://fixture.invalid');
+      if (parsed.pathname !== '/api/library') return { ok: true, json: async () => null };
+      if (parsed.searchParams.has('q') && searchResult === 'network-failure') throw new Error('owned search failure');
+      return { ok: !(parsed.searchParams.has('q') && searchResult === 'http-failure'), json: async () => library };
+    });
+    b.run('LIBRARY = tvFixture');
+    await b.run('filterKind("show", "Owned")');
+    assert.equal(b.run('activeKind'), 'episode');
+    assert.equal(b.run('activeQuery'), 'Owned');
+    b.nodes.get('#main').children.length = 0;
+    b.run('activeKind = "show"');
+    await b.run('serverSearch("Owned")');
+    await settle();
+    const rows = b.nodes.get('#main').children;
+    assert.equal(rows.length, 1, 'TV search never renders matching movies');
+    assert.match(rows[0].children[0].innerHTML, /TV Shows/);
+    b.nodes.get('#main').children.length = 0;
+    await b.run('loadLibrary()'); await settle();
+    assert.equal(b.run('activeKind'), 'episode');
+    assert.equal(b.run('activeQuery'), 'Owned');
+    assert.equal(b.nodes.get('#main').children.length, 1);
+    assert.equal(b.run('searchGeneration > 0'), true);
+  });
+}
+
+test('TV series drill sorts parsed episodes, labels unknown episodes and preserves deletion scope', async () => {
+  const b = browser();
+  b.respond(async url => ({ ok: true, status: 204, json: async () => new URL(url, 'https://fixture.invalid').pathname === '/api/library' ? b.run('LIBRARY') : null }));
+  b.context.confirm = () => true;
+  b.run(`LIBRARY = [
+    { id: 60, kind: 'episode', title: 'Show S01E02', series: 'Show' },
+    { id: 61, kind: 'episode', title: 'Show 1x01', series: 'Show' },
+    { id: 62, kind: 'episode', title: 'Show unknown cut', series: 'Show' },
+    { id: 63, kind: 'episode', title: 'Other S02E01', series: 'Other' },
+    { id: 64, kind: 'movie', title: 'Show movie' }
+  ]`);
+  await b.run('filterKind("show", "Show")');
+  const shelf = b.nodes.get('#main').children.at(-1);
+  assert.match(shelf.children[1].children[0].innerHTML, /3 episodes/);
+  b.nodes.get('#main').children.length = 0;
+  await shelf.children[1].children[0].onclick();
+  const detail = b.nodes.get('#main').children.at(-1);
+  assert.equal(b.run('showsDrill'), 'Show');
+  assert.deepEqual(detail.children.filter(node => node.className === 'cards').flatMap(node => node.children.map(card => card.title)), ['Show 1x01', 'Show S01E02', 'Show unknown cut']);
+  assert.ok(detail.children.some(node => node.innerHTML.includes('Other episodes')));
+  const firstCard = detail.children.find(node => node.className === 'cards').children[0];
+  const beforeOpen = b.requests.filter(request => request.url.startsWith('/api/progress/61?')).length;
+  firstCard.onclick(); await settle();
+  assert.equal(b.requests.filter(request => request.url.startsWith('/api/progress/61?')).length, beforeOpen + 1, 'Episode playback fetches fresh progress outside its render');
+  assert.equal(b.nodes.get('#plyr-video').src, '/api/stream/61');
+  b.nodes.get('#main').children.length = 0;
+  await b.run('loadLibrary()'); await settle();
+  assert.equal(b.run('showsDrill'), 'Show');
+  assert.equal(b.run('activeQuery'), 'Show');
+  b.nodes.get('#main').children.length = 0;
+  await b.run('deleteMedia(LIBRARY.find(item => item.id === 60))'); await settle();
+  assert.equal(b.run('activeKind'), 'episode');
+  assert.equal(b.run('activeQuery'), 'Show');
+  assert.equal(b.run('showsDrill'), 'Show');
+  assert.equal(b.run('LIBRARY.some(item => item.id === 60)'), false);
+  const remaining = b.nodes.get('#main').children.at(-1);
+  b.nodes.get('#main').children.length = 0;
+  await remaining.children[0].onclick();
+  assert.equal(b.run('showsDrill'), null);
+  assert.equal(b.run('activeKind'), 'episode');
+  assert.equal(b.run('activeQuery'), 'Show');
+});
+
+for (const kind of ['music', 'ebook', 'audiobook']) {
+  for (const layout of ['loose', 'series', 'mixed']) {
+    test(`${kind} author drill retains ${layout} items and navigates named series`, async () => {
+      const b = browser();
+      b.respond(async () => ({ ok: true, json: async () => null }));
+      const items = [
+        ...(layout !== 'series' ? [{ id: 60, title: 'Loose item', kind, author: 'Author' }] : []),
+        ...(layout !== 'loose' ? [{ id: 61, title: 'Series item', kind, author: 'Author', series: 'Named series' }] : []),
+      ];
+      b.context.authorItemsFixture = items;
+      b.run('LIBRARY = authorItemsFixture');
+      await b.run(`filterKind(${JSON.stringify(kind)}, "")`);
+      const shelf = b.nodes.get('#main').children.at(-1);
+      b.nodes.get('#main').children.length = 0;
+      await shelf.children[0].children[0].onclick();
+      let detail = b.nodes.get('#main').children.at(-1);
+      assert.equal(b.run(`authorDrill[${JSON.stringify(kind)}].author`), 'Author');
+      const nodes = detail.children.flatMap(node => node.children);
+      const loose = nodes.find(node => node.title === 'Loose item — Author');
+      assert.equal(Boolean(loose), layout !== 'series');
+      if (layout !== 'loose') {
+        const folder = nodes.find(node => node.innerHTML.includes('Named series'));
+        assert.ok(folder);
+        b.nodes.get('#main').children.length = 0;
+        await folder.onclick();
+        detail = b.nodes.get('#main').children.at(-1);
+        const cards = detail.children.at(-1).children;
+        assert.deepEqual(cards.map(card => card.title), ['Series item — Author']);
+        b.nodes.get('#main').children.length = 0;
+        await detail.children[1].onclick();
+        assert.equal(b.run(`authorDrill[${JSON.stringify(kind)}].series`), undefined);
+      }
+    });
+  }
+}
+
+
+test('TV pending search cannot render a retired account series', async () => {
+  const b = browser();
+  await settle();
+  b.run('activeKind = "show"; IDENTITY = "old-TV-fixture"');
+  let release;
+  b.respond(() => new Promise(resolve => { release = resolve; }));
+  const pending = b.run('serverSearch("TV")');
+  b.run('++accountGeneration; IDENTITY = "new-TV-fixture"');
+  b.nodes.get('#main').innerHTML = 'new account view';
+  release({ ok: true, json: async () => [{ id: 60, kind: 'episode', title: 'TV S01E02', series: 'Old TV' }] });
+  await pending; await settle();
+  assert.equal(b.nodes.get('#main').innerHTML, 'new account view');
+  assert.equal(b.nodes.get('#main').children.length, 0);
+});
+
+for (const scenario of ['closed-abort', 'superseded-abort', 'superseded-notallowed', 'paused-abort', 'current-notallowed', 'current-notsupported', 'current-abort', 'undefined-play']) {
+  test(`video play completion ${scenario} respects ownership and keeps current errors visible`, async () => {
+    const b = browser();
+    await settle();
+    b.respond(async () => ({ ok: true, json: async () => null }));
+    let reject;
+    const ownedPlay = new Promise((resolve, fail) => { reject = fail; });
+    let calls = 0;
+    b.context.ownedPlayBoundary = () => {
+      calls++;
+      b.run('plyr.media.paused = false');
+      if (scenario === 'undefined-play') return undefined;
+      return calls === 1 ? ownedPlay : Promise.resolve();
+    };
+    b.run('plyr.play = ownedPlayBoundary; openVideo({ id: 20, kind: "episode", title: "Owned episode" })');
+    await settle();
+    assert.equal(calls, 1, 'Production openVideo calls the exact controlled play boundary');
+    if (scenario === 'closed-abort') b.nodes.get('#vm-back').onclick();
+    if (scenario.startsWith('superseded-')) { b.run('openVideo({ id: 21, kind: "episode", title: "Current replacement" })'); await settle(); }
+    if (scenario === 'paused-abort') b.run('plyr.pause()');
+    if (scenario === 'current-notallowed') b.run('plyr.media.paused = true');
+    if (scenario !== 'undefined-play') {
+      const error = new Error('Owned fixture playback failure');
+      error.name = scenario.endsWith('notallowed') ? 'NotAllowedError' : scenario === 'current-notsupported' ? 'NotSupportedError' : 'AbortError';
+      reject(error);
+    }
+    await settle(); await settle(); // Any unhandled rejection from ownedPlay fails this Node test.
+    const currentFailure = scenario.startsWith('current-');
+    const notices = b.context.document.body.children.flatMap(node => node.children);
+    assert.equal(notices.length, currentFailure ? 1 : 0);
+    if (currentFailure) {
+      assert.equal(notices[0].className, 'toast toast-err');
+      assert.match(notices[0].innerHTML, /playback/i);
+      assert.equal(b.nodes.get('#video-modal').classList.contains('on'), true);
+      assert.equal(b.run('videoItem.id'), 20);
+    }
+    if (scenario.startsWith('superseded-')) assert.equal(b.run('videoItem.id'), 21);
+    if (scenario === 'closed-abort') assert.equal(b.nodes.get('#video-modal').classList.contains('on'), false);
   });
 }

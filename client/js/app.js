@@ -539,7 +539,9 @@ document.querySelectorAll('.nav-item').forEach(btn => {
     document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     filtering = btn.dataset.kind !== 'all';
-    filterKind(btn.dataset.kind);
+    if (btn.dataset.kind !== 'show') showsDrill = null;
+    if (authorDrill[btn.dataset.kind]) authorDrill[btn.dataset.kind] = null;
+    return filterKind(btn.dataset.kind);
   };
 });
 let searchTimer;
@@ -553,6 +555,7 @@ $('#search input').addEventListener('input', (e) => {
  * @param {string} q
  */
 async function serverSearch(q) {
+  activeKind = libraryKind(activeKind);
   activeQuery = q;
   filtering = activeKind !== 'all' || !!q;
   const generation = ++searchGeneration;
@@ -608,6 +611,11 @@ async function loadLibrary() {
   filterKind(activeKind, activeQuery);
 }
 
+/** Map the UI's TV shelf alias to the stored media kind. */
+function libraryKind(kind) {
+  return kind === 'show' ? 'episode' : kind || 'all';
+}
+
 /**
  * Apply the selected kind and text filter to the current library and render its rows.
  * @param {string} kind
@@ -616,7 +624,7 @@ async function loadLibrary() {
  */
 function filterKind(kind, query = activeQuery) {
   ++searchGeneration;
-  activeKind = kind || 'all';
+  activeKind = libraryKind(kind);
   activeQuery = query || '';
   filtering = activeKind !== 'all' || !!activeQuery;
   let items = LIBRARY;
@@ -762,6 +770,67 @@ async function continueRow(snapshot = LIBRARY, generation = renderGeneration, pr
   return wrap;
 }
 
+// TV shelf state is separate from the canonical episode navigation kind.
+let showsDrill = null;
+
+/** Parse only bounded scanner-supported episode tokens; unknown titles remain ungrouped. */
+function episodeNumbers(title) {
+  const match = String(title || '').match(/(?:^|[^\p{L}\p{N}])(?:s([0-9]{1,2})e([0-9]{1,3})|([0-9]{1,2})x([0-9]{1,3})|season\s+([0-9]{1,2})\s+episode\s+([0-9]{1,3}))(?=$|[^\p{L}\p{N}])/iu);
+  if (!match) return null;
+  return [Number(match[1] ?? match[3] ?? match[5]), Number(match[2] ?? match[4] ?? match[6])];
+}
+
+/** Render series folders or the selected series using this render's progress reader. */
+function groupedByShow(items, progressFor = resumeFor) {
+  if (showsDrill) return showDetail(showsDrill, items.filter(item => (item.series || 'Unknown series') === showsDrill), progressFor);
+  const wrap = el('section');
+  wrap.appendChild(el('div', 'row-head', '<h3>TV Shows</h3>'));
+  const bySeries = new Map();
+  items.forEach(item => {
+    const name = item.series || 'Unknown series';
+    if (!bySeries.has(name)) bySeries.set(name, []);
+    bySeries.get(name).push(item);
+  });
+  const grid = el('div', 'cards show-grid');
+  for (const [show, episodes] of bySeries) {
+    const folder = el('div', 'media-card landscape');
+    folder.innerHTML = `
+      <img class="thumb" loading="lazy" src="/api/thumb/${episodes[0].id}" alt=""
+           onerror="this.outerHTML='<div class=&quot;thumb-fallback&quot;>${esc(show[0] || '?')}</div>'">
+      <div class="card-body"><div class="title">${esc(show)}</div>
+        <div class="sub">${episodes.length} episode${episodes.length === 1 ? '' : 's'}</div></div>`;
+    folder.onclick = () => { showsDrill = show; return filterKind('show'); };
+    grid.appendChild(folder);
+  }
+  wrap.appendChild(grid);
+  return wrap;
+}
+
+/** Group known season numbers and retain unparseable titles in a truthful final bucket. */
+function showDetail(show, episodes, progressFor = resumeFor) {
+  const wrap = el('section');
+  const back = el('button', 'link back-row', '← All shows');
+  back.onclick = () => { showsDrill = null; return filterKind('show'); };
+  wrap.append(back, el('div', 'row-head', `<h3>${esc(show)}</h3>`));
+  const seasons = new Map();
+  episodes.forEach(item => {
+    const season = episodeNumbers(item.title)?.[0] ?? null;
+    if (!seasons.has(season)) seasons.set(season, []);
+    seasons.get(season).push(item);
+  });
+  const order = [...seasons.keys()].sort((a, b) => a === null ? 1 : b === null ? -1 : a - b);
+  for (const season of order) {
+    wrap.appendChild(el('div', 'row-head series-head', `<h4>${season === null ? 'Other episodes' : 'Season ' + season}</h4>`));
+    const cards = el('div', 'cards');
+    const entries = seasons.get(season).slice().sort((a, b) =>
+      (episodeNumbers(a.title)?.[1] ?? 0) - (episodeNumbers(b.title)?.[1] ?? 0)
+      || (a.title || '').localeCompare(b.title || '', undefined, { numeric: true }));
+    entries.forEach(item => cards.appendChild(card(item, progressFor)));
+    wrap.appendChild(cards);
+  }
+  return wrap;
+}
+
 /**
  * Render hero and grouped library rows; discard asynchronous continuation work after a newer render.
  * @param {Object[]} items
@@ -798,7 +867,9 @@ async function renderRows(items) {
     const kindItems = byKind[kind];
     if (!kindItems?.length) continue;
     // books/audio: author → series → books grouping
-    if (kind === 'audiobook' || kind === 'ebook' || kind === 'music') {
+    if (kind === 'episode') {
+      main.appendChild(groupedByShow(kindItems, progressFor));
+    } else if (kind === 'audiobook' || kind === 'ebook' || kind === 'music') {
       main.appendChild(groupedByAuthor(kind, kindItems, progressFor));
     } else {
       main.appendChild(section(kind[0].toUpperCase() + kind.slice(1) + 's', kindItems, progressFor));
@@ -817,33 +888,70 @@ async function renderRows(items) {
   }
 }
 
-// author → series → books: one section per author, sub-rows per series
-/**
- * Group media cards by author and then series within one kind.
- * @param {string} kind
- * @param {Object[]} items
- * @param {function(number): Promise<Object|null>} [progressFor=resumeFor]
- * @returns {HTMLElement}
- */
+// Folder drill state is independent for each author-based media module.
+const authorDrill = { audiobook: null, ebook: null, music: null };
+
+/** Render authors, named series and loose items without dropping either path. */
 function groupedByAuthor(kind, items, progressFor = resumeFor) {
   const label = kind[0].toUpperCase() + kind.slice(1) + 's';
   const wrap = el('section');
-  const byAuthor = {};
-  items.forEach(i => (byAuthor[i.author || 'Unknown'] ||= []).push(i));
-  for (const [author, authorItems] of Object.entries(byAuthor)) {
-    const head = el('div', 'row-head', `<h3>${esc(label)} — ${esc(author)}</h3>`);
-    wrap.appendChild(head);
-    const bySeries = {};
-    authorItems.forEach(i => (bySeries[i.series || ''] ||= []).push(i));
-    for (const [series, seriesItems] of Object.entries(bySeries)) {
-      if (series) {
-        const sh = el('div', 'row-head series-head', `<h4>${esc(series)}</h4>`);
-        wrap.appendChild(sh);
-      }
-      const cards = el('div', 'cards');
-      seriesItems.forEach(it => cards.appendChild(card(it, progressFor)));
-      wrap.appendChild(cards);
+  const drill = authorDrill[kind];
+  if (!drill) {
+    const authors = new Map();
+    items.forEach(item => {
+      const name = item.author || 'Unknown';
+      if (!authors.has(name)) authors.set(name, []);
+      authors.get(name).push(item);
+    });
+    const grid = el('div', 'cards');
+    for (const [author, entries] of authors) {
+      const folder = el('div', 'media-card landscape');
+      folder.innerHTML = `<div class="thumb-fallback folder-fallback">${esc(author[0] || '?')}</div>
+        <div class="card-body"><div class="title">${esc(author)}</div>
+          <div class="sub">${entries.length} item${entries.length === 1 ? '' : 's'}</div></div>`;
+      folder.onclick = () => { authorDrill[kind] = { author }; return filterKind(kind); };
+      grid.appendChild(folder);
     }
+    wrap.appendChild(grid);
+    return wrap;
+  }
+  const authorItems = items.filter(item => (item.author || 'Unknown') === drill.author);
+  const back = el('button', 'link back-row', `← All ${label.toLowerCase()}`);
+  back.onclick = () => { authorDrill[kind] = null; return filterKind(kind); };
+  wrap.appendChild(back);
+  if (drill.series) {
+    const up = el('button', 'link back-row', `← ${drill.author}`);
+    up.onclick = () => { authorDrill[kind] = { author: drill.author }; return filterKind(kind); };
+    wrap.append(up, el('div', 'row-head', `<h3>${esc(drill.series)}</h3>`));
+    const cards = el('div', 'cards');
+    authorItems.filter(item => item.series === drill.series).forEach(item => cards.appendChild(card(item, progressFor)));
+    wrap.appendChild(cards);
+    return wrap;
+  }
+  wrap.appendChild(el('div', 'row-head', `<h3>${esc(drill.author)}</h3>`));
+  const bySeries = new Map();
+  authorItems.filter(item => item.series).forEach(item => {
+    if (!bySeries.has(item.series)) bySeries.set(item.series, []);
+    bySeries.get(item.series).push(item);
+  });
+  if (bySeries.size) {
+    const grid = el('div', 'cards');
+    for (const [series, entries] of bySeries) {
+      const folder = el('div', 'media-card landscape');
+      folder.innerHTML = `<div class="thumb-fallback folder-fallback">${esc(series[0])}</div>
+        <div class="card-body"><div class="title">${esc(series)}</div>
+          <div class="sub">${entries.length} item${entries.length === 1 ? '' : 's'}</div></div>`;
+      folder.onclick = () => { authorDrill[kind] = { author: drill.author, series }; return filterKind(kind); };
+      grid.appendChild(folder);
+    }
+    wrap.appendChild(grid);
+  }
+  const loose = authorItems.filter(item => !item.series);
+  if (loose.length) {
+    if (bySeries.size) wrap.appendChild(el('div', 'row-head series-head', '<h4>Other items</h4>'));
+    const cards = el('div', 'cards');
+    loose.forEach(item => cards.appendChild(card(item, progressFor)));
+    wrap.appendChild(cards);
   }
   return wrap;
 }
@@ -1864,7 +1972,12 @@ function openVideo(it) {
         window.partySend({ type: 'load', media_id: it.id, title: it.title, position: plyr.currentTime });
       }
     }, { once: true });
-    plyr.play();
+    plyr.play()?.catch(error => {
+      const current = videoItem === it && generation === videoOpenGeneration
+        && ownsNativeLoad(media, 'video', it.id, nativeGeneration) && $('#video-modal').classList.contains('on');
+      if (error?.name === 'AbortError' && (!current || media.paused)) return;
+      if (current) toast('Unable to start video playback', true);
+    });
   });
   trackProgress(plyr, it);
   startChromeAutoHide();
