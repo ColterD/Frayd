@@ -253,10 +253,83 @@ async function isolatedResponsiveCase(width) {
       const enter = await key('Enter'); const space = await key(' ');
       check(enter.dialogs.length === 1 && space.dialogs.length === 1 && LIBRARY.length === before, 'Native cancellation retains cards at this viewport');
       check(!document.getElementById('video-modal').classList.contains('on'), 'Delete keys do not open playback');
+      measured.modalHeaders = [];
+      async function headerAtHeights(selector, titleId, expectedTitle, native = false) {
+        try {
+          for (const height of width === 320 ? [1000, 568] : width === 768 ? [1000, 600] : [1000]) {
+            await api('viewport', { width, height });
+            await until(() => innerHeight === height, 'header viewport settles');
+            const header = document.querySelector(selector), title = document.getElementById(titleId);
+            const bounds = rect(header), titleBounds = rect(title);
+            equal(title.textContent, expectedTitle, 'Modal retains complete title text');
+            check(bounds.left >= -1 && bounds.right <= innerWidth + 1 && bounds.top >= -1 && bounds.bottom <= innerHeight + 1, 'Modal header stays in viewport');
+            const controls = [...header.querySelectorAll('button,input')];
+            const controlRects = controls.map(control => {
+              const bounds = rect(control), hit = document.elementFromPoint(bounds.left + bounds.width / 2, bounds.top + bounds.height / 2);
+              check(bounds.width > 0 && contains(rect(header), bounds) && (hit === control || control.contains(hit)), 'Every modal header action has an unobstructed hit target');
+              if (!control.disabled) { control.focus(); check(document.activeElement === control, 'Enabled header action accepts focus'); }
+              if (native) check(bounds.width === 44 && bounds.height === 44, 'Native header action preserves44px hit area');
+              return { id: control.id, disabled: control.disabled, bounds };
+            });
+            if (native) {
+              check(contains(bounds, titleBounds) && bounds.height <= 76, 'Native title fits a bounded one-line overlay');
+            } else {
+              // Inline reader titles can span lines; inspect painted fragments, not their union.
+              const range = document.createRange(); range.selectNodeContents(title);
+              for (const fragment of range.getClientRects()) {
+                check(fragment.left >= -1 && fragment.right <= innerWidth + 1 && fragment.top >= bounds.top - 1 && fragment.bottom <= bounds.bottom + 1, 'Reader title fragment fits header');
+                check(controlRects.every(control => fragment.right <= control.bounds.left + 1 || fragment.left >= control.bounds.right - 1 || fragment.bottom <= control.bounds.top + 1 || fragment.top >= control.bounds.bottom - 1), 'Reader title paint does not overlap actions');
+              }
+            }
+            measured.modalHeaders.push({ width, height, selector, title: title.textContent, titleBounds, bounds, controls: controlRects });
+          }
+        } finally {
+          await api('viewport', { width, height: 1000 });
+          await until(() => innerHeight === 1000, 'header viewport restores');
+        }
+      }
+      const previousReaderFetch = window.fetch;
+      let releaseHeaderProgress;
+      const headerReply = value => new Response(JSON.stringify(value), { headers: { 'Content-Type': 'application/json' } });
+      window.fetch = (url, options = {}) => {
+        const path = new URL(String(url), location.origin).pathname;
+        if (path === '/api/comic/90/pages') return Promise.resolve(headerReply(['0', '1']));
+        if (path === '/api/epub/7/spine') return Promise.resolve(headerReply(['one.xhtml']));
+        if (path === '/api/epub/7/toc' || path === '/api/annotations/7') return Promise.resolve(headerReply([]));
+        if (path === '/api/progress/90' || path === '/api/progress/7') return new Promise(resolve => { releaseHeaderProgress = () => resolve(headerReply(null)); });
+        if (path === '/api/epub/7/chunk/0') return Promise.resolve(new Response('<html><head></head><body><p>Owned reader header fixture</p></body></html>', { headers: { 'Content-Type': 'text/html' } }));
+        return previousReaderFetch(url, options);
+      };
+      try {
+        const comicTitle = 'Wilhelm Busch - Max und Moritz';
+        await openComic({ id: 90, kind: 'comic', title: comicTitle });
+        await until(() => releaseHeaderProgress, 'comic header restore reaches held progress');
+        check(comic.page === null && document.getElementById('cm-pageinfo').textContent === 'Loading…', 'Comic header uses actual pending state');
+        await headerAtHeights('#comic-modal .comic-head', 'cm-title', comicTitle);
+        releaseHeaderProgress(); releaseHeaderProgress = null;
+        await until(() => comic.page === 0, 'comic header restore completes');
+        await headerAtHeights('#comic-modal .comic-head', 'cm-title', comicTitle);
+        document.getElementById('cm-close').click();
+        const ebookTitle = 'Robert Louis Stevenson - Dr Jekyll and Mr Hyde';
+        await openEbook({ id: 7, kind: 'ebook', title: ebookTitle });
+        await until(() => releaseHeaderProgress, 'ebook header restore reaches held progress');
+        check(ebook.chunk === null && document.getElementById('em-pageinfo').textContent === 'Loading…', 'EPUB header uses actual pending state');
+        await headerAtHeights('#ebook-modal .comic-head', 'em-title', ebookTitle);
+        releaseHeaderProgress(); releaseHeaderProgress = null;
+        await until(() => ebook.document?.ready, 'real sandboxed chapter establishes header ready state');
+        await headerAtHeights('#ebook-modal .comic-head', 'em-title', ebookTitle);
+      } finally {
+        releaseHeaderProgress?.();
+        document.getElementById('cm-close').click(); document.getElementById('em-close').click();
+        window.fetch = previousReaderFetch;
+      }
       // Real production openVideo and decoder; only media/API bytes are fixtures.
       plyr.muted = true;
-      openVideo({ id: 21, kind: 'movie', title: 'Responsive native layout' });
+      const nativeTitle = 'Duck and Cover - http://www.archive.org/details/DuckandC1951';
+      openVideo({ id: 21, kind: 'movie', title: nativeTitle });
       await until(() => plyr.media.readyState === 4 && plyr.media.getVideoPlaybackQuality().totalVideoFrames > 0, 'responsive native video decodes');
+      document.querySelector('.vm-overlay').classList.remove('hidden');
+      await headerAtHeights('.vm-overlay', 'vm-title', nativeTitle, true);
       plyr.toggleControls(true);
       const wrapper = document.querySelector('#video-modal .plyr');
       const nativeControls = document.querySelector('.plyr__controls');
@@ -268,6 +341,7 @@ async function isolatedResponsiveCase(width) {
       // Model only the external-provider layout state; no YouTube playback claim.
       const modal = document.getElementById('video-modal'), external = document.getElementById('yt-party');
       modal.classList.add('yt');
+      await headerAtHeights('.vm-overlay', 'vm-title', nativeTitle, true);
       measured.youtubeLayoutModel = { wrapper: rect(wrapper), placeholder: rect(external) };
       check(rect(wrapper).width === 0 && rect(nativeControls).width === 0, 'YouTube mode hides native wrapper and controls');
       check(rect(external).width === innerWidth && rect(external).height === innerHeight, 'External placeholder fills viewport');
@@ -278,7 +352,7 @@ async function isolatedResponsiveCase(width) {
         modal.classList.remove('yt');
         check(rect(iframe).width === 0 && rect(wrapper).width === innerWidth, 'Returning native mode hides external iframe and restores Plyr');
       } finally { iframe.replaceWith(external); modal.classList.remove('yt'); document.getElementById('vm-back').click(); }
-      return { viewport: { width: innerWidth, height: innerHeight }, sizes, grids, ratios, layoutGeometry: { login: measured.loginGeometry, authFlow: measured.authFlowGeometry, settings: measured.settingsGeometry, party: measured.partyGeometry, hero: measured.heroGeometry, native: measured.videoGeometry, youtubeModel: measured.youtubeLayoutModel }, navigationLabels: nav.map(n => n.textContent.trim()), adminAndPlayerControlsReachable: true, realMediaControl: true, audioPauseUi: measured.audioPauseUi, deletionCancellation: true, nativeDiagnostics: fixture, overflowInventory: measured.overflowInventory };
+      return { viewport: { width: innerWidth, height: innerHeight }, sizes, grids, ratios, layoutGeometry: { login: measured.loginGeometry, authFlow: measured.authFlowGeometry, settings: measured.settingsGeometry, party: measured.partyGeometry, modalHeaders: measured.modalHeaders, hero: measured.heroGeometry, native: measured.videoGeometry, youtubeModel: measured.youtubeLayoutModel }, navigationLabels: nav.map(n => n.textContent.trim()), adminAndPlayerControlsReachable: true, realMediaControl: true, audioPauseUi: measured.audioPauseUi, deletionCancellation: true, nativeDiagnostics: fixture, overflowInventory: measured.overflowInventory };
     } catch (error) {
       error.observed = { ...measured, audio: { readyState: pbAudio.readyState, paused: pbAudio.paused,
         duration: pbAudio.duration, currentTime: pbAudio.currentTime, mediaError: pbAudio.error?.code || null }, nativeDiagnostics: fixture };
