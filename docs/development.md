@@ -6,7 +6,7 @@ Use an isolated checkout of the exact commit being qualified and disposable data
 
 ## Native server
 
-Install a current Rust toolchain, Clippy and a C compiler. Keep `client/` beside `server/`: the server embeds that source path at build time. From `server/`:
+Install a current Rust toolchain, Clippy and a C compiler. On Linux, the Rust tests also require `ffmpeg` and `ffprobe` on `PATH` for the real replacement-duration oracle. The Docker build stage supplies both tools before running tests. Keep `client/` beside `server/`: the server embeds that source path at build time. From `server/`:
 
 ```sh
 cargo test --locked

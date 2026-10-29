@@ -1,5 +1,7 @@
 FROM rust:bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8 AS build
 WORKDIR /app/server
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 COPY server/ ./
 ENV CARGO_BUILD_JOBS=2
 RUN rustup component add clippy && cargo test --locked && cargo clippy --locked --all-targets && cargo build --locked --release
