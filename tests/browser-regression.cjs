@@ -122,7 +122,7 @@ function installerPreload() {
 }
 /**
  * Resolve an existing BROWSER_BIN or PATH browser without installing or downloading
- * software. Version probing and launch failures remain visible to the caller.
+ * software. Identity comes from the owned browser protocol after launch.
  */
 function browserPath() {
   if (process.env.BROWSER_BIN) return realpathSync(process.env.BROWSER_BIN);
@@ -374,6 +374,12 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser, diagno
       socket.addEventListener('open', resolve, { once: true });
       socket.addEventListener('error', () => reject(new Error('Owned browser cache protocol failed to open')), { once: true });
     }), 'Owned browser cache protocol open timed out', openBudget);
+    const identity = await rpc('Browser.getVersion');
+    if (typeof identity.product !== 'string' || !identity.product.trim()
+      || typeof identity.revision !== 'string' || !identity.revision.trim()) {
+      throw new Error('Invalid owned browser identity response');
+    }
+    Object.assign(receipt, { browserVersion: identity.product, browserRevision: identity.revision });
     await rpc('Page.enable');
     // Intercept before navigation: no request can reach an operator loopback service.
     await rpc('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
@@ -653,7 +659,7 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
       capturedAt: new Date().toISOString(),
       repository: 'ColterD/Frayd',
       head: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8', timeout: 10000 }).trim(),
-      executable, browserVersion: execFileSync(executable, ['--version'], { encoding: 'utf8', timeout: 10000 }).trim(),
+      executable,
       executableSha256: hash(executable), nodeVersion: process.version,
       files: Object.fromEntries([...productionFiles, ...harnessFiles].map(file => [file, hash(join(root, file))])),
       browserClaim: 'Observed executable identity only; browser is supplied by BROWSER_BIN or PATH, not an immutable dependency.',
@@ -685,6 +691,8 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
     await bounded(Promise.race([(async () => {
       cacheSession = await cacheSetup({ profile, fixtureUrl: url, browser, diagnostics: startupDiagnostics, budgetMs: startupBudgetMs });
       cacheControl = cacheSession.receipt;
+      provenance.browserVersion = cacheControl.browserVersion;
+      provenance.browserRevision = cacheControl.browserRevision;
     })(), exited]), `Browser startup exceeded ${startupBudgetMs} milliseconds`, startupBudgetMs);
     recordPhase('cases');
     const observed = await bounded(Promise.race([result, exited]),

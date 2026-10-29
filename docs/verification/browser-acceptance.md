@@ -586,3 +586,9 @@ passes remain bound to their recorded image. The rebuilt `5926` reader passes
 the three actual Vivaldi reopen cycles described above. Current two-client party
 smoke remains held by browser detachment. The controlled lost-listener class is
 proven; the precise trigger of the earlier live observation remains an inference.
+
+## bd2cd36 SVG cover and reader acceptance
+
+The disposable app at `bd2cd36ee3c8fbd0683cfe9c2793116bcf889543` fixes a natural EPUB cover wrapped in SVG: the earlier image-only rule left its 693×1194.72 box taller than the reader. Both image formats now share the height/width cap. Actual 320/768/1440-pixel screenshots show the complete cover with no vertical clipping. The owner fixture retains bookmark 2.333 at page 2/4 and one highlight; TOC navigation and resize to page 4/9 then back to 2/4 pass. Three-profile readability from the earlier checkpoint is separate from this exact bookmark oracle.
+
+The client layer was derived from the immutable `e7bee5f` app, with exact archived client bytes; app ID `676b945632fd0d5547b3dee6586849a3f214840223fe5aec42bacce2dfbc435d`, proxy ID `fc94053ebcdf71cdc8d2dfc097c7808ac1a0fad9547194668423b6db9de89887`. The server binary remains byte-identical (`57fa33a4d1b480edd742b676bfd67ac0dfe0d5f6d17669978c02b6501c32ec1e`); this is no new backend build. Actual guest sign-out/re-entry and muted audio footer controls also pass at desktop/phone widths. Final hosted checks and live upgrade preservation remain separate gates.

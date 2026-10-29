@@ -41,7 +41,7 @@ test('interception diagnostics preserve fatal errors and safely correlate retire
               data: 'diagnostic-payload-must-not-leak' } });
             return;
           }
-          this.receive({ id: command.id, result: {} });
+          this.receive({ id: command.id, result: command.method === 'Browser.getVersion' ? { product: 'OwnedChrome/1', revision: 'owned-revision', protocolVersion: '1.3' } : {} });
           if (command.method === 'Page.navigate') {
             this.receive({ method: 'Page.frameNavigated', params: { frame: { id: 'owned-frame', loaderId: 'owned-loader' } } });
             this.receive({ method: 'Fetch.requestPaused', params: { requestId: 'owned-interception', networkId: 'owned-network',
@@ -61,6 +61,8 @@ test('interception diagnostics preserve fatal errors and safely correlate retire
     const browser = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
     const session = await configure({ profile: '/owned/profile', fixtureUrl: 'http://127.0.0.1:8080/', browser });
     try {
+      assert.equal(session.receipt.browserVersion, 'OwnedChrome/1');
+      assert.equal(session.receipt.browserRevision, 'owned-revision');
       await delay(0);
       assert.equal(session.receipt.protocolErrors.length, exactCancellation ? 0 : 1, 'Only exact correlated cancellation retires; every other error stays fatal');
       assert.equal(session.receipt.canceledInterceptions.length, exactCancellation ? 1 : 0);
@@ -828,5 +830,44 @@ test('local Plyr adapter fails immediately for absent or duplicate app scripts',
   const tag = '<script src="js/app.js?v=9"></script>';
   for (const input of ['<body></body>', '<body>' + tag + tag + '</body>']) {
     assert.throws(() => withLocalPlyrIcons(input), /exactly one production app script/);
+  }
+});
+
+test('runner obtains identity from its owned session without a separate hanging version process', { timeout: 15000 }, async () => {
+  const fixtureDirectory = mkdtempSync(join(tmpdir(), 'frayd-owned-identity-'));
+  const browserScript = join(fixtureDirectory, 'browser.cjs');
+  const versionMarker = join(fixtureDirectory, 'version-invoked');
+  writeFileSync(browserScript, `#!/usr/bin/env node
+if (process.argv.includes('--version')) {
+  require('node:fs').writeFileSync(${JSON.stringify(versionMarker)}, 'unexpected separate version process');
+  setInterval(() => {}, 1000);
+} else { require(${JSON.stringify(executable)}); }
+`, { mode: 0o700 });
+  const invocation = spawn(process.execPath, ['-e', `
+    require(${JSON.stringify(resolve(__dirname, 'browser-regression.cjs'))}).main({
+      evidenceDirectory: ${JSON.stringify(join(fixtureDirectory, 'result'))},
+      async cacheSetup() {
+        return { receipt: { browserVersion: 'OwnedChrome/1', browserRevision: 'owned-revision' }, async close() {} };
+      }
+    });
+  `], { env: { ...process.env, BROWSER_BIN: browserScript, FRAYD_CHILD_FIXTURE_EARLY_EXIT: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let stdout = '';
+  let stderr = '';
+  invocation.stdout.on('data', bytes => { stdout += bytes; });
+  invocation.stderr.on('data', bytes => { stderr += bytes; });
+  try {
+    const [code] = await once(invocation, 'exit');
+    assert.equal(code, 1, stderr);
+    const result = JSON.parse(stdout);
+    assert.match(result.runnerError, /Browser exited before result: 7\/null; original browser exit sentinel/);
+    assert.equal(existsSync(versionMarker), false, 'No extra browser process runs for provenance');
+    assert.equal(result.provenance.browserVersion, 'OwnedChrome/1');
+    assert.equal(result.provenance.browserRevision, 'owned-revision');
+    assert.equal(result.timeBudgets.casesMs, 60000);
+    assert.equal(Object.values(result.cleanup).every(Boolean), true);
+    assert.deepEqual(result.cleanupErrors, []);
+  } finally {
+    if (invocation.exitCode === null) invocation.kill('SIGKILL');
+    rmSync(fixtureDirectory, { recursive: true, force: true });
   }
 });

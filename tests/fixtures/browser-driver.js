@@ -933,9 +933,10 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     const publishChapter = publishEbookDocument;
     const chapterErrors = [];
     const errorWrites = [];
-    // Observe the real sandboxed error paragraph after load; keep its production markup intact.
+    // Observe actual visible layout after load; a newly attached frame may load before its first layout.
+    // The existing parent deadline still rejects a paragraph that never becomes visible.
     publishEbookDocument = html => publishChapter(html + (html.includes('Failed to load chapter.')
-      ? '<script>addEventListener("load",()=>{const p=document.querySelector("p"),r=p.getBoundingClientRect();parent.postMessage({type:"chapter-error-proof",text:p.textContent,width:r.width,height:r.height},"*")});<\/script>' : ''));
+      ? '<script>addEventListener("load",()=>{const p=document.querySelector("p");let initialGeometry,samples=0;function measure(){const r=p.getBoundingClientRect();initialGeometry??={width:r.width,height:r.height};samples++;if(!(r.width>0&&r.height>0)){requestAnimationFrame(measure);return;}parent.postMessage({type:"chapter-error-proof",text:p.textContent,width:r.width,height:r.height,initialGeometry,samples},"*");}measure();});<\/script>' : ''));
     try {
       for (const [status, body] of [[404, ''], [500, 'Owned rejected body'], [200, ''], [200, 'Missing head']]) {
         window.fetch = (url, options) => {
@@ -956,12 +957,12 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
         await showChunk(1, { frac: 0.75 });
         const error = await observed;
         equal(error.text, 'Failed to load chapter.', 'Sandboxed chapter error paragraph actually renders');
-        check(error.width > 0 && error.height > 0 && readerFrame().getBoundingClientRect().height > 0, 'Error paragraph and its frame have visible geometry');
+        check(error.width > 0 && error.height > 0 && readerFrame().getBoundingClientRect().height > 0, 'Error paragraph and its frame have visible geometry: ' + JSON.stringify({ error, frame: readerFrame().getBoundingClientRect().toJSON(), modal: getComputedStyle(document.getElementById('ebook-modal')).display, app: getComputedStyle(document.getElementById('app')).display }));
         check(readerFrame() !== previous, 'Chapter error uses a fresh published frame');
         equal(document.getElementById('em-pageinfo').textContent, 'Chapter unavailable', 'Error does not retain Loading status');
         equal(ebook.lastFrac, 0.75, 'Error preserves requested bookmark fraction');
         equal(errorWrites, [], 'Chapter error cannot autosave a false zero position');
-        chapterErrors.push({ status, emptyBody: !body, text: error.text, width: error.width, height: error.height });
+        chapterErrors.push({ status, emptyBody: !body, text: error.text, width: error.width, height: error.height, initialGeometry: error.initialGeometry, samples: error.samples });
       }
     } finally { window.fetch = errorFetch; publishEbookDocument = publishChapter; }
     const saved = [{ kind: 'highlight', spine_idx: 0, cfi: 'char:7:6', text: 'target', color: 'yellow' }];
