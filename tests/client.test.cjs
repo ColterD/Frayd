@@ -2076,3 +2076,43 @@ test('own video echo preserves the pending local resume gate until its saved64 l
     [{ type: 'load', media_id: 10, title: 'Next', position: 64 }]);
   assert.equal(b.run('videoLoadPending'), false);
 });
+
+test('host audio zero echo preserves106 through progress tick and native pause saves', async t => {
+  const { b, socket, clock } = await hostedNativeBrowser('audio');
+  b.respond(async () => ({ ok: true, json: async () => ({ position: 106 }) }));
+  const audio = b.nodes.get('#pb-audio');
+  audio.readyState = 1;
+  b.run('playAudio(LIBRARY[1])');
+  await settle();
+  assert.equal(audio.currentTime, 106);
+  assert.equal(audio.paused, false);
+  assert.equal(b.run('hasNativeStream(pbAudio, 10)'), true);
+  const tick = b.intervals.get(b.run('progressTimer'));
+  assert.equal(typeof tick, 'function');
+  b.requests.length = 0;
+  socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: true,
+    state: { media_id: 10, title: 'Own zero echo', queue: [], position: 0,
+      playing: true, updated_at: b.run('Date.now()/1000') } }) });
+  await settle();
+  const positionAfterEcho = audio.currentTime;
+  clock.milliseconds += 1000;
+  tick();
+  await settle();
+  const tickPositions = progress(b);
+  const beforePause = b.requests.length;
+  audio.pause();
+  await settle();
+  const pausePosts = b.requests.slice(beforePause).filter(request => request.url === '/api/progress')
+    .map(request => JSON.parse(request.options.body));
+  const posts = b.requests.filter(request => request.url === '/api/progress')
+    .map(request => JSON.parse(request.options.body));
+  t.diagnostic(JSON.stringify({ positionAfterEcho, tickPositions, pausePositions: pausePosts.map(post => post.position),
+    savedMediaIds: posts.map(post => post.media_id), allPositions: posts.map(post => post.position) }));
+  assert.deepEqual(tickPositions, [106], 'The active interval must actually save the preserved resume position');
+  assert.deepEqual(pausePosts.map(post => post.position), [106], 'The native pause must actually save that same position');
+  assert.equal(posts.every(post => post.media_id === 10 && post.position >= 106), true,
+    'Every post-echo save belongs to the current media and none rewinds below resume');
+  assert.equal(positionAfterEcho, 106);
+  assert.equal(audio.currentTime, 106);
+  assert.equal(audio.paused, true);
+});
