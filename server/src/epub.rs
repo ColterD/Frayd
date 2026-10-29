@@ -170,7 +170,7 @@ pub fn epub_toc(path: &Path) -> Option<Vec<(String, usize)>> {
         // navPoint: <navLabel><text>Title</text></navLabel><content src="..."/>
         for np in text.split("<navPoint").skip(1) {
             let title = between(np, "<text>", "</text>")
-                .map(|t| t.trim().to_string())
+                .and_then(|title| toc_title_text(&title))
                 .unwrap_or_default();
             let src = match attr(np,"src") {Some(src)=>src,None=>continue};
             let Some(full)=resolve_href(&toc_full,&src) else {continue;};
@@ -185,7 +185,7 @@ pub fn epub_toc(path: &Path) -> Option<Vec<(String, usize)>> {
         for a in text.split("<a ").skip(1) {
             let href = match attr(a, "href") { Some(h) => h, None => continue };
             let title = between(a, ">", "</a>")
-                .map(|t| t.trim().to_string())
+                .and_then(|title| toc_title_text(&title))
                 .unwrap_or_default();
             let Some(full)=resolve_href(&toc_full,&href) else {continue;};
             if !title.is_empty() {
@@ -202,6 +202,42 @@ pub fn epub_toc(path: &Path) -> Option<Vec<(String, usize)>> {
 pub fn read_zip_entry(path: &Path, name: &str) -> Option<Vec<u8>> {
     let mut zip=zip::ZipArchive::new(std::fs::File::open(path).ok()?).ok()?;
     read_entry(&mut zip,name,BINARY_LIMIT).ok().flatten()
+}
+
+/// Collect bounded XML character data without turning decoded text back into markup.
+/// Only predefined and numeric references resolve; DTD/custom entities never expand.
+fn toc_title_text(markup: &str) -> Option<String> {
+    use quick_xml::events::Event;
+    if markup.len() as u64 > METADATA_LIMIT { return None; }
+    let mut reader = quick_xml::Reader::from_str(markup);
+    reader.config_mut().check_end_names = true;
+    let mut depth = 0usize;
+    let mut title = String::new();
+    for _ in 0..XML_EVENT_LIMIT {
+        match reader.read_event().ok()? {
+            Event::Start(_) => {
+                depth += 1;
+                if depth > XML_DEPTH_LIMIT { return None; }
+            }
+            Event::Empty(_) => {
+                if depth >= XML_DEPTH_LIMIT { return None; }
+            }
+            Event::End(_) => { depth = depth.checked_sub(1)?; }
+            Event::Text(text) => title.push_str(&text.xml10_content()),
+            Event::CData(text) => title.push_str(&text.xml10_content()),
+            Event::GeneralRef(reference) => {
+                if let Some(character) = reference.resolve_char_ref().ok()? {
+                    title.push(character);
+                } else {
+                    title.push_str(quick_xml::escape::resolve_predefined_entity(reference.as_ref())?);
+                }
+            }
+            Event::DocType(_) | Event::Decl(_) => return None,
+            Event::Eof => return if depth == 0 { Some(title.trim().to_string()) } else { None },
+            _ => (),
+        }
+    }
+    None
 }
 
 fn attr(s: &str, name: &str) -> Option<String> {
@@ -225,6 +261,16 @@ fn between(s: &str, open: &str, close: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn toc_title_text_rejects_resource_overflow_and_entity_declarations() {
+        assert_eq!(toc_title_text("&amp;lt;safe&amp;gt;"), Some("&lt;safe&gt;".into()));
+        assert_eq!(toc_title_text("<!DOCTYPE span [<!ENTITY custom 'expanded'>]><span>&custom;</span>"), None);
+        assert_eq!(toc_title_text(&"x".repeat(METADATA_LIMIT as usize + 1)), None);
+        let deep = format!("{}{}", "<span>".repeat(XML_DEPTH_LIMIT + 1), "</span>".repeat(XML_DEPTH_LIMIT + 1));
+        assert_eq!(toc_title_text(&deep), None);
+        assert_eq!(toc_title_text(&"<br/>".repeat(XML_EVENT_LIMIT)), None);
+    }
 
     #[test]
     fn package_spine_preserves_order_skips_missing_and_keeps_first_duplicate() {

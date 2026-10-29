@@ -136,3 +136,31 @@ fn epub_boundary_exact_cached_names_keep_literal_percent_without_double_decoding
     assert_eq!(epub::read_zip_entry(&path,"literal%20name.xhtml").unwrap(),b"literal percent chapter");
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn epub_toc_labels_decode_entities_and_collect_only_xml_text() {
+    let container = "<container><rootfile full-path=\"OPS/book.opf\"/></container>";
+    for format in ["ncx", "nav"] {
+        for (label, expected) in [
+            ("Q&amp;A", Some("Q&A")),
+            ("<span>One</span>", Some("One")),
+            (" <span title=\"1 > 0\">One</span><!-- ignored --><em> &amp; 二</em> <![CDATA[<b>&amp;</b>]]> &#x1F4D6; &lt;safe&gt; ", Some("One & 二 <b>&amp;</b> 📖 <safe>")),
+            ("left <span>middle</span>  right", Some("left middle  right")),
+            ("&unknown;", None),
+            ("<span>unclosed", None),
+        ] {
+            let properties = if format == "ncx" { "media-type=\"application/x-dtbncx+xml\"" } else { "properties=\"nav\"" };
+            let opf = format!("<package><manifest><item id=\"first\" href=\"first.xhtml\"/><item id=\"chapter\" href=\"chap%20one&amp;two.xhtml\"/><item id=\"toc\" href=\"toc.{format}\" {properties}/></manifest><spine><itemref idref=\"first\"/><itemref idref=\"chapter\"/></spine></package>");
+            let toc = if format == "ncx" {
+                format!("<ncx><navPoint><navLabel><text>{label}</text></navLabel><content src=\"chap%20one&amp;two.xhtml#part\"/></navPoint></ncx>")
+            } else {
+                format!("<html><nav><a href=\"chap%20one&amp;two.xhtml#part\">{label}</a></nav></html>")
+            };
+            let toc_path = format!("OPS/toc.{format}");
+            let path = boundary_archive(&[("META-INF/container.xml", container, 0), ("OPS/book.opf", &opf, 0), (&toc_path, &toc, 0)]);
+            let actual = epub::epub_toc(&path);
+            std::fs::remove_file(path).unwrap();
+            assert_eq!(actual, expected.map(|title| vec![(title.to_string(), 1)]), "{format}: {label}");
+        }
+    }
+}
