@@ -233,6 +233,7 @@ struct LibraryItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     synopsis: Option<String>,
     series: Option<String>,
+    artwork_version: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1089,43 +1090,13 @@ async fn remove_user(
 fn cleanup_owned_thumbnail(db: &mut Connection, thumbs: &StdPath, roots: &[PathBuf], id:i64,
     source:&str, thumbnail:Option<&str>) -> Result<(),String> {
     let Some(thumbnail)=thumbnail else {return Ok(());};
-    let saved=StdPath::new(thumbnail);
-    let basename=saved.file_name().ok_or("thumbnail has no basename")?;
-    if basename != std::ffi::OsStr::new(&format!("{id}.jpg")) && !scanner::generated_thumbnail_name(id,saved) {
-        return Err("thumbnail name does not prove media ownership".into());
+    let tx=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|error|error.to_string())?;
+    // The deleted row is no longer in the reference query, so retain its original source explicitly.
+    if StdPath::new(source).canonicalize().ok().is_some_and(|source| StdPath::new(thumbnail).canonicalize().ok().as_ref()==Some(&source)) {
+        return Err("thumbnail is the original source".into());
     }
-    let expected=thumbs.join(basename);
-    let metadata=match std::fs::symlink_metadata(&expected) {
-        Ok(metadata)=>metadata,
-        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(()),
-        Err(error)=>return Err(error.to_string()),
-    };
-    if !metadata.is_file() || metadata.file_type().is_symlink() {return Err("thumbnail is not an owned regular file".into());}
-    let directory=thumbs.canonicalize().map_err(|e|e.to_string())?;
-    let owned=expected.canonicalize().map_err(|e|e.to_string())?;
-    let saved_metadata=std::fs::symlink_metadata(saved).map_err(|e|e.to_string())?;
-    if saved_metadata.file_type().is_symlink() || !saved_metadata.is_file()
-        || owned!=directory.join(basename) || saved.canonicalize().map_err(|e|e.to_string())?!=owned {
-        return Err("thumbnail path does not prove configured cache ownership".into());
-    }
-    if StdPath::new(source).canonicalize().ok().as_ref()==Some(&owned) {return Err("thumbnail is the original source".into());}
-    for root in roots {
-        let canonical=root.canonicalize().map_err(|e|e.to_string())?;
-        if owned.starts_with(canonical) {return Err("thumbnail overlaps a configured library".into());}
-    }
-    let tx=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
-    {
-        let mut statement=tx.prepare("SELECT path FROM media UNION ALL SELECT thumb_path FROM media WHERE thumb_path IS NOT NULL
-            UNION ALL SELECT transcode_path FROM media WHERE transcode_path IS NOT NULL
-            UNION ALL SELECT path FROM transcode_artifacts UNION ALL SELECT owner_source_path FROM transcode_artifacts").map_err(|e|e.to_string())?;
-        let paths=statement.query_map([],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?;
-        for path in paths {
-            let path=path.map_err(|e|e.to_string())?;
-            if StdPath::new(&path).canonicalize().ok().as_ref()==Some(&owned) {return Err("thumbnail still has a database reference".into());}
-        }
-    }
-    std::fs::remove_file(&owned).map_err(|e|e.to_string())?;
-    tx.commit().map_err(|e|e.to_string())
+    scanner::retire_thumbnail(&tx,id,thumbnail,thumbs,roots)?;
+    tx.commit().map_err(|error|error.to_string())
 }
 
 /// Delete only an unreferenced media row after rechecking admin and converter admission in a write transaction.
@@ -1200,7 +1171,7 @@ async fn library_handler(
     let filter = q.get("q").map(|s| format!("%{}%", s.replace(['%', '_'], "")));
     let sql = format!(
         "SELECT id, kind, title, author, duration_secs,
-                json_extract(meta_json, '$.synopsis'), series, created_at
+                json_extract(meta_json, '$.synopsis'), series, created_at, thumb_path
          FROM media
          WHERE (?1 IS NULL OR title LIKE ?1 OR author LIKE ?1
                 OR json_extract(meta_json, '$.synopsis') LIKE ?1){}
@@ -1219,12 +1190,20 @@ async fn library_handler(
                 synopsis: r.get(5)?,
                 series: r.get(6)?,
                 created_at: r.get(7)?,
+                artwork_version: artwork_version(r.get(0)?, r.get::<_,Option<String>>(8)?.as_deref()),
             })
         })
         .unwrap()
         .filter_map(Result::ok)
         .collect();
     Json(items)
+}
+
+/// Expose persisted artwork availability as an opaque version, never an operator filesystem path.
+fn artwork_version(id: i64, saved: Option<&str>) -> Option<String> {
+    let path=StdPath::new(saved?);
+    let name=path.file_name()?.to_str()?;
+    if name == format!("{id}.jpg") || scanner::generated_thumbnail_name(id,path) {Some(name.to_string())}else{None}
 }
 
 /// Stream the indexed conversion or source using the existing single-range file service.
@@ -2492,10 +2471,48 @@ mod integration_regressions {
     #[tokio::test]
     async fn artwork_media_delete_retires_current_uuid_and_retains_original_and_legacy() {
         let (root,app)=fixture();seed_media(&root,&app);
+        let legacy=root.join("thumbs/1.jpg");std::fs::write(&legacy,b"legacy thumbnail").unwrap();
         let generated=root.join("thumbs").join(format!("1-{}.jpg",uuid::Uuid::new_v4()));std::fs::write(&generated,b"generated artwork").unwrap();
         app.db.lock().unwrap().execute("UPDATE media SET thumb_path=?1 WHERE id=1",[generated.to_string_lossy()]).unwrap();
         assert_eq!(media(&app,1).await,StatusCode::NO_CONTENT);
-        assert!(!generated.exists());assert_eq!(std::fs::read(root.join("thumbs/1.jpg")).unwrap(),b"thumbnail");
+        assert!(!generated.exists());assert_eq!(std::fs::read(owned_thumb(&root)).unwrap(),b"thumbnail");assert_eq!(std::fs::read(legacy).unwrap(),b"legacy thumbnail");
+        assert_eq!(std::fs::read(root.join("library/source.cbz")).unwrap(),b"original");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn artwork_api_library_and_search_expose_only_opaque_versions() {
+        let (root,app)=fixture();
+        let versions=[Some(format!("1-{}.jpg",uuid::Uuid::new_v4())),Some("2.jpg".into()),Some(format!("3-{}.jpg",uuid::Uuid::new_v4())),Some(format!("4-{}.jpg",uuid::Uuid::new_v4())),None,None,None];
+        {
+            let db=app.db.lock().unwrap();
+            for (index,kind) in ["ebook","comic","episode","music","audiobook","manga","movie"].iter().enumerate() {
+                let saved=if index==5 {Some("/operator/private/cache/unknown.jpg".into())}else if index==6 {Some(format!("/operator/private/cache/9-{}.jpg",uuid::Uuid::new_v4()))}else{versions[index].as_ref().map(|version|format!("/operator/private/cache/{version}"))};
+                db.execute("INSERT INTO media(id,kind,path,title,thumb_path) VALUES(?1,?2,?3,?4,?5)",rusqlite::params![index as i64+1,kind,format!("/operator/private/source/{index}"),if index<4 {format!("Cover {kind}")}else{format!("Absent {kind}")},saved]).unwrap();
+            }
+            db.execute("UPDATE user_perms SET allowed_kinds='[\"ebook\",\"music\"]' WHERE identity_id=2",[]).unwrap();
+        }
+        let session=auth::create_session(&app.db.lock().unwrap(),2).unwrap();
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
+        let router=Router::new().route("/api/library",get(library_handler)).with_state(app);
+        let server=tokio::spawn(async move {axum::serve(listener,router).await.unwrap();});
+        for (query,restricted,expected) in [("",false,7),("?q=Cover",false,4),("?q=Cover",true,2)] {
+            let url=format!("http://{address}/api/library{query}");let token=session.clone();
+            let body=tokio::task::spawn_blocking(move || {let request=ureq::get(&url);let request=if restricted {request.set("Authorization",&format!("Bearer {token}"))}else{request};request.call().unwrap().into_string().unwrap()}).await.unwrap();
+            assert!(!body.contains("/operator/") && !body.contains("thumb_path"),"operator paths must remain internal");
+            let items:Vec<serde_json::Value>=serde_json::from_str(&body).unwrap();assert_eq!(items.len(),expected);
+            for item in items {let id=item["id"].as_u64().unwrap() as usize;assert!(item.get("artwork_version").is_some(),"availability field absent for id={id}");assert_eq!(item["artwork_version"],serde_json::json!(versions[id-1]));if restricted {assert!(matches!(item["kind"].as_str(),Some("ebook"|"music")));}}
+        }
+        server.abort();std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn artwork_api_delete_retains_selected_legacy_thumbnail() {
+        let (root,app)=fixture();seed_media(&root,&app);
+        let legacy=root.join("thumbs/1.jpg");std::fs::rename(owned_thumb(&root),&legacy).unwrap();
+        app.db.lock().unwrap().execute("UPDATE media SET thumb_path=?1 WHERE id=1",[legacy.to_string_lossy()]).unwrap();
+        assert_eq!(media(&app,1).await,StatusCode::NO_CONTENT);
+        assert_eq!(std::fs::read(legacy).unwrap(),b"thumbnail");
         assert_eq!(std::fs::read(root.join("library/source.cbz")).unwrap(),b"original");
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2508,9 +2525,10 @@ mod integration_regressions {
     async fn user(app:&Arc<App>,id:i64)->StatusCode {remove_user(State(app.clone()),axum::http::HeaderMap::new(),query(),Path(id)).await}
     /// Exercise validated permission writes through the production transaction path.
     async fn permission(app:&Arc<App>,value:serde_json::Value)->StatusCode {set_perm(State(app.clone()),axum::http::HeaderMap::new(),query(),Json(value)).await}
-    /// Bind one indexed source and its distinct configured id.jpg thumbnail for byte-preservation oracles.
+    fn owned_thumb(root:&StdPath) -> PathBuf {root.join("thumbs/1-11111111-1111-4111-8111-111111111111.jpg")}
+    /// Bind one indexed source and its qualified generated thumbnail for ownership and preservation oracles.
     fn seed_media(root:&StdPath,app:&Arc<App>) {
-        let source=root.join("library/source.cbz");let thumb=root.join("thumbs/1.jpg");
+        let source=root.join("library/source.cbz");let thumb=owned_thumb(root);
         std::fs::write(&source,b"original").unwrap();std::fs::write(&thumb,b"thumbnail").unwrap();
         app.db.lock().unwrap().execute("INSERT INTO media(id,kind,path,title,thumb_path) VALUES(1,'comic',?1,'fixture',?2)",rusqlite::params![source.to_str().unwrap(),thumb.to_str().unwrap()]).unwrap();
     }
@@ -2520,7 +2538,7 @@ mod integration_regressions {
         let (root,app)=fixture();seed_media(&root,&app);
         app.db.lock().unwrap().execute_batch("INSERT INTO progress(identity_id,media_id,position) VALUES(2,1,42);").unwrap();
         assert_eq!(media(&app,1).await,StatusCode::CONFLICT);
-        assert_eq!(std::fs::read(root.join("thumbs/1.jpg")).unwrap(),b"thumbnail");
+        assert_eq!(std::fs::read(owned_thumb(&root)).unwrap(),b"thumbnail");
         assert_eq!(std::fs::read(root.join("library/source.cbz")).unwrap(),b"original");
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2590,7 +2608,7 @@ mod integration_regressions {
                 }
             }
             let before=table_counts(&app);assert_eq!(media(&app,1).await,StatusCode::CONFLICT,"reference {reference}");assert_eq!(table_counts(&app),before);
-            assert_eq!(std::fs::read(root.join("thumbs/1.jpg")).unwrap(),b"thumbnail");assert_eq!(std::fs::read(root.join("library/source.cbz")).unwrap(),b"original");
+            assert_eq!(std::fs::read(owned_thumb(&root)).unwrap(),b"thumbnail");assert_eq!(std::fs::read(root.join("library/source.cbz")).unwrap(),b"original");
             std::fs::remove_dir_all(root).unwrap();
         }
     }
@@ -2601,14 +2619,14 @@ mod integration_regressions {
             let (root,app)=fixture();seed_media(&root,&app);
             if failure {app.db.lock().unwrap().execute_batch("CREATE TRIGGER reject_media BEFORE DELETE ON media BEGIN SELECT RAISE(ABORT,'fixture'); END").unwrap();}
             assert_eq!(media(&app,1).await,if failure {StatusCode::INTERNAL_SERVER_ERROR}else{StatusCode::NO_CONTENT});
-            assert_eq!(root.join("thumbs/1.jpg").exists(),failure);
+            assert_eq!(owned_thumb(&root).exists(),failure);
             assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM media",[],|r|r.get::<_,i64>(0)).unwrap(),if failure {1}else{0});
             assert_eq!(std::fs::read(root.join("library/source.cbz")).unwrap(),b"original");
             if !failure {assert_eq!(media(&app,1).await,StatusCode::NOT_FOUND);}
             else {
                 app.db.lock().unwrap().execute_batch("DROP TRIGGER reject_media;CREATE TRIGGER reject_media BEFORE DELETE ON media BEGIN SELECT RAISE(IGNORE); END").unwrap();
                 assert_eq!(media(&app,1).await,StatusCode::INTERNAL_SERVER_ERROR);
-                assert_eq!(std::fs::read(root.join("thumbs/1.jpg")).unwrap(),b"thumbnail");
+                assert_eq!(std::fs::read(owned_thumb(&root)).unwrap(),b"thumbnail");
             }
             std::fs::remove_dir_all(root).unwrap();
         }
@@ -2620,28 +2638,28 @@ mod integration_regressions {
             let (root,app)=fixture();seed_media(&root,&app);
             match refusal {
                 "shared"|"alias-shared"=>{
-                    let mut path=root.join("thumbs/1.jpg");
+                    let mut path=owned_thumb(&root);
                     #[cfg(unix)] if refusal=="alias-shared" {std::os::unix::fs::symlink(&path,root.join("alias.jpg")).unwrap();path=root.join("alias.jpg");}
                     app.db.lock().unwrap().execute("INSERT INTO media(id,kind,path,title,thumb_path) VALUES(2,'comic','/synthetic-other','other',?1)",[path.to_str().unwrap()]).unwrap();
                 }
                 "artifact-shared"=>{
                     let db=app.db.lock().unwrap();db.execute_batch("INSERT INTO media(id,kind,path,title) VALUES(2,'movie','/synthetic-other','other')").unwrap();
-                    db.execute("INSERT INTO transcode_artifacts VALUES(?1,2,'/synthetic-other','final','generated','completed')",[root.join("thumbs/1.jpg").to_str().unwrap()]).unwrap();
+                    db.execute("INSERT INTO transcode_artifacts VALUES(?1,2,'/synthetic-other','final','generated','completed')",[owned_thumb(&root).to_str().unwrap()]).unwrap();
                 }
                 "symlink"=>{
-                    #[cfg(unix)] {std::fs::remove_file(root.join("thumbs/1.jpg")).unwrap();std::fs::write(root.join("outside.jpg"),b"thumbnail").unwrap();std::os::unix::fs::symlink(root.join("outside.jpg"),root.join("thumbs/1.jpg")).unwrap();}
+                    #[cfg(unix)] {std::fs::remove_file(owned_thumb(&root)).unwrap();std::fs::write(root.join("outside.jpg"),b"thumbnail").unwrap();std::os::unix::fs::symlink(root.join("outside.jpg"),owned_thumb(&root)).unwrap();}
                 }
                 "unowned"=>{app.db.lock().unwrap().execute("UPDATE media SET thumb_path=NULL WHERE id=1",[]).unwrap();}
-                "missing-saved"=>{app.db.lock().unwrap().execute("UPDATE media SET thumb_path=?1 WHERE id=1",[root.join("missing.jpg").to_str().unwrap()]).unwrap();}
+                "missing-saved"=>{app.db.lock().unwrap().execute("UPDATE media SET thumb_path=?1 WHERE id=1",[root.join("thumbs/1-22222222-2222-4222-8222-222222222222.jpg").to_str().unwrap()]).unwrap();}
                 "library-b"=>app.library.write().unwrap().roots.push(root.join("thumbs")),
                 "unavailable-root"=>app.library.write().unwrap().roots.push(root.join("missing-root")),
-                "source"=>{app.db.lock().unwrap().execute("UPDATE media SET path=?1 WHERE id=1",[root.join("thumbs/1.jpg").to_str().unwrap()]).unwrap();}
+                "source"=>{app.db.lock().unwrap().execute("UPDATE media SET path=?1 WHERE id=1",[owned_thumb(&root).to_str().unwrap()]).unwrap();}
                 "scan-active"=>app.scanning.store(true,std::sync::atomic::Ordering::SeqCst),
                 _=>unreachable!(),
             }
             assert_eq!(media(&app,1).await,StatusCode::NO_CONTENT,"refusal {refusal}");
             assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM media WHERE id=1",[],|r|r.get::<_,i64>(0)).unwrap(),0);
-            assert_eq!(std::fs::read(root.join("thumbs/1.jpg")).unwrap(),b"thumbnail");assert_eq!(std::fs::read(root.join("library/source.cbz")).unwrap(),b"original");
+            assert_eq!(std::fs::read(owned_thumb(&root)).unwrap(),b"thumbnail");assert_eq!(std::fs::read(root.join("library/source.cbz")).unwrap(),b"original");
             std::fs::remove_dir_all(root).unwrap();
         }
     }
@@ -2663,7 +2681,7 @@ mod integration_regressions {
         for table in ["media","albums","tracks","transcode_artifacts"] {assert_eq!(db.query_row(&format!("SELECT COUNT(*) FROM {table}"),[],|r|r.get::<_,i64>(0)).unwrap(),1);}
         assert_eq!(db.query_row("SELECT position FROM progress WHERE identity_id=3",[],|r|r.get::<_,f64>(0)).unwrap(),73.0);
         assert_eq!(db.query_row("SELECT note FROM annotations WHERE identity_id=3",[],|r|r.get::<_,String>(0)).unwrap(),"other-note");        }
-        assert_eq!(std::fs::read(root.join("library/source.cbz")).unwrap(),b"original");assert_eq!(std::fs::read(root.join("thumbs/1.jpg")).unwrap(),b"thumbnail");
+        assert_eq!(std::fs::read(root.join("library/source.cbz")).unwrap(),b"original");assert_eq!(std::fs::read(owned_thumb(&root)).unwrap(),b"thumbnail");
         assert_eq!(user(&app,2).await,StatusCode::NOT_FOUND);assert_eq!(user(&app,1).await,StatusCode::CONFLICT);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2712,7 +2730,7 @@ mod integration_regressions {
             assert_eq!(done_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap(),StatusCode::FORBIDDEN);worker.join().unwrap();
             assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM identities WHERE id=2",[],|r|r.get::<_,i64>(0)).unwrap(),1);
             assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM media WHERE id=1",[],|r|r.get::<_,i64>(0)).unwrap(),1);
-            assert_eq!(std::fs::read(root.join("thumbs/1.jpg")).unwrap(),b"thumbnail");
+            assert_eq!(std::fs::read(owned_thumb(&root)).unwrap(),b"thumbnail");
             std::fs::remove_dir_all(root).unwrap();
         }
     }
@@ -2729,7 +2747,7 @@ mod integration_regressions {
         ready_rx.recv().unwrap();std::thread::sleep(std::time::Duration::from_millis(30));assert!(done_rx.try_recv().is_err());
         transcode::BUSY.store(true,std::sync::atomic::Ordering::SeqCst);drop(admission);
         assert_eq!(done_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap(),StatusCode::CONFLICT);worker.join().unwrap();
-        assert_eq!(std::fs::read(root.join("thumbs/1.jpg")).unwrap(),b"thumbnail");assert_eq!(std::fs::read(root.join("library/source.cbz")).unwrap(),b"original");
+        assert_eq!(std::fs::read(owned_thumb(&root)).unwrap(),b"thumbnail");assert_eq!(std::fs::read(root.join("library/source.cbz")).unwrap(),b"original");
         std::fs::remove_dir_all(root).unwrap();
     }
     /// Decode the creation status/code/proof in memory for admission tests; do not record private proof values.
@@ -2795,7 +2813,7 @@ mod integration_regressions {
         assert_eq!(delete_media(State(app.clone()),headers.clone(),empty(),Path(1)).await,StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(remove_user(State(app.clone()),headers.clone(),empty(),Path(2)).await,StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(set_perm(State(app.clone()),headers,empty(),Json(serde_json::json!({"identity_id":2,"allowed_kinds":null}))).await,StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(std::fs::read(root.join("thumbs/1.jpg")).unwrap(),b"thumbnail");assert_eq!(std::fs::read(root.join("library/source.cbz")).unwrap(),b"original");
+        assert_eq!(std::fs::read(owned_thumb(&root)).unwrap(),b"thumbnail");assert_eq!(std::fs::read(root.join("library/source.cbz")).unwrap(),b"original");
         std::fs::remove_dir_all(root).unwrap();
     }
     #[tokio::test]

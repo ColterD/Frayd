@@ -119,13 +119,13 @@ test('reader single-page, final-page, empty search and geometry reports remain a
   assert.equal(b.requests.length, 2);
 });
 
-test('ready restores resume and saved marks once, and rejects stale generations on the same WindowProxy', async () => {
+test('ready restores resume and saved marks once, and rejects stale generations on the current WindowProxy', async () => {
   const b = reader();
   const posted = [];
-  b.nodes.get('#em-frame').contentWindow.postMessage = data => posted.push(data);
   b.respond(async () => ({ text: async () => '<html><head></head><body>Hello</body></html>' }));
   b.run('ebook.annots = [{ kind: "highlight", spine_idx: 1, cfi: "char:0:5", color: "yellow" }]');
   await b.run('showChunk(1, { frac: 0.75 })');
+  b.nodes.get('#em-frame').contentWindow.postMessage = data => posted.push(data);
   const generation = b.run('ebook.document.generation');
   assert.deepEqual(posted, []);
   b.send({ type: 'reader-ready', generation: generation - 1 });
@@ -140,6 +140,7 @@ test('ready restores resume and saved marks once, and rejects stale generations 
   b.send({ type: 'reader-ready', generation });
   assert.equal(posted.length, 2);
   await b.run('showChunk(1, { atEnd: true })');
+  b.nodes.get('#em-frame').contentWindow.postMessage = data => posted.push(data);
   b.send({ type: 'reader-ready', generation });
   b.send({ ...highlight, generation });
   assert.equal(posted.length, 2);
@@ -191,3 +192,36 @@ test('closed or superseded book opening cannot publish its late TOC and resume',
   assert.equal(b.requests.some(request => request.url.includes('/chunk/') || request.url.includes('/progress/9')), false);
   assert.equal(b.nodes.get('#em-frame').srcdoc, '');
 });
+
+for (const failure of [false, true]) {
+  test(`chapter ${failure ? 'error' : 'body'} publishes a fresh configured frame and rejects the retired window`, async () => {
+    const b = reader();
+    const retired = b.nodes.get('#em-frame');
+    const attributes = ['id', 'sandbox', 'title', 'referrerpolicy'];
+    retired.setAttribute('title', 'Reader');
+    retired.setAttribute('referrerpolicy', 'no-referrer');
+    b.respond(async () => {
+      if (failure) throw new Error('Owned chapter failure');
+      return { text: async () => '<html><head></head><body>Published chapter</body></html>' };
+    });
+    await b.run('showChunk(1, { frac: 0.75 })');
+    const current = b.nodes.get('#em-frame');
+    assert.notEqual(current, retired);
+    assert.notEqual(current.contentWindow, retired.contentWindow);
+    for (const name of attributes) assert.equal(current.getAttribute(name), retired.getAttribute(name));
+    assert.equal(retired.replacementAtPublication.srcdoc, current.srcdoc);
+    assert.match(current.srcdoc, failure ? /Failed to load chapter/ : /Published chapter/);
+    const generation = b.run('ebook.document.generation');
+    for (const data of [{ type: 'reader-ready' }, highlight, { type: 'page', page: 2, pages: 4 }, { type: 'chapter', dir: 1 }]) {
+      b.send({ ...data, generation }, { source: retired.contentWindow });
+    }
+    assert.equal(b.run('ebook.document.ready'), false);
+    assert.equal(b.run('ebook.chunk'), 1);
+    assert.equal(b.requests.length, 1);
+    assert.equal(b.nodes.get('#em-pageinfo').textContent, '');
+    // A queued reset on the removed node cannot overwrite the published body.
+    retired.srcdoc = '';
+    retired.src = 'about:blank';
+    assert.match(current.srcdoc, failure ? /Failed to load chapter/ : /Published chapter/);
+  });
+}

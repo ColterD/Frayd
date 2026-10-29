@@ -27,6 +27,69 @@ integration = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(integration)
 
 
+class ThumbnailOracleTests(unittest.TestCase):
+    """Reject false artwork ownership before the destructive HTTP oracle runs."""
+
+    def test_exact_database_selected_uuid_jpeg_and_unrelated_siblings(self):
+        """Capture only the selected regular JPEG while retaining unrelated artwork."""
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            thumbs = data / 'thumbs'
+            thumbs.mkdir()
+            name = '7-12345678-1234-4234-8234-123456789abc.jpg'
+            selected = thumbs / name
+            jpeg = b'\xff\xd8\xffowned JPEG fixture\xff\xd9'
+            selected.write_bytes(jpeg)
+            legacy = thumbs / '7.jpg'
+            legacy.write_bytes(b'legacy retained')
+            unknown = thumbs / 'unknown.jpg'
+            unknown.write_bytes(b'unknown retained')
+            self.assertEqual(integration.qualified_thumbnail(data, 7, '/data/thumbs/' + name),
+                             (selected, jpeg))
+            self.assertEqual(legacy.read_bytes(), b'legacy retained')
+            self.assertEqual(unknown.read_bytes(), b'unknown retained')
+
+    def test_invalid_database_paths_and_artifacts_cannot_pass(self):
+        """Missing bytes, aliases, wrong ownership and non-JPEG bytes fail closed."""
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            thumbs = data / 'thumbs'
+            thumbs.mkdir()
+            name = '7-12345678-1234-4234-8234-123456789abc.jpg'
+            saved = '/data/thumbs/' + name
+            selected = thumbs / name
+            selected.write_bytes(b'\xff\xd8\xffowned JPEG fixture\xff\xd9')
+            invalid = [None, '', '/data/thumbs/7.jpg', saved.replace('7-', '8-', 1),
+                       saved.upper(), saved.replace('789abc', '789ABC'), saved.replace('789abc', '789abz'),
+                       saved.replace('/thumbs/', '/other/'), saved.replace('/thumbs/', '/thumbs/../thumbs/'),
+                       saved.replace('/thumbs/', '//thumbs/'), saved + '.jpg',
+                       saved.replace('12345678-1234-4234-8234-', '12345678123442348234')]
+            for path in invalid:
+                with self.subTest(path=path), self.assertRaises((AssertionError, ValueError)):
+                    integration.qualified_thumbnail(data, 7, path)
+            for content in (b'', b'PNG bytes', b'\xff\xd8\xfftruncated', b'wrong header\xff\xd9'):
+                selected.write_bytes(content)
+                with self.subTest(content=content), self.assertRaises(AssertionError):
+                    integration.qualified_thumbnail(data, 7, saved)
+            selected.unlink()
+            with self.assertRaises(AssertionError):
+                integration.qualified_thumbnail(data, 7, saved)
+            outside = data / 'outside.jpg'
+            outside.write_bytes(b'\xff\xd8\xffoutside JPEG fixture\xff\xd9')
+            selected.symlink_to(outside)
+            with self.assertRaises(AssertionError):
+                integration.qualified_thumbnail(data, 7, saved)
+            selected.unlink()
+            selected.mkdir()
+            with self.assertRaises(AssertionError):
+                integration.qualified_thumbnail(data, 7, saved)
+            selected.rmdir()
+            thumbs.rmdir()
+            thumbs.symlink_to(data, target_is_directory=True)
+            with self.assertRaises(AssertionError):
+                integration.qualified_thumbnail(data, 7, saved)
+
+
 class CurlHttpTests(unittest.TestCase):
     """Execute the credential-safe curl -i adapter against an owned HTTP server."""
 

@@ -59,7 +59,7 @@ pub(crate) fn generated_thumbnail_name(id: i64, path: &Path) -> bool {
 }
 
 /// Retire one exact generated file only when no source, playback, or thumbnail still references it.
-fn retire_thumbnail(db: &Connection, id: i64, saved: &str, thumbs: &Path, roots: &[std::path::PathBuf]) -> Result<(), String> {
+pub(crate) fn retire_thumbnail(db: &Connection, id: i64, saved: &str, thumbs: &Path, roots: &[std::path::PathBuf]) -> Result<(), String> {
     let path = Path::new(saved);
     if !generated_thumbnail_name(id, path) { return Ok(()); }
     let metadata = match std::fs::symlink_metadata(path) {

@@ -24,6 +24,16 @@ function browser({ now, storage = {}, initialResponse } = {}) {
       querySelector: () => null,
       setAttribute: (name, value) => attributes.set(name, value),
       getAttribute: name => attributes.get(name),
+      cloneNode() {
+        const clone = element();
+        for (const [name, value] of attributes) clone.setAttribute(name, value);
+        clone.contentWindow = { postMessage() {} };
+        return clone;
+      },
+      replaceWith(replacement) {
+        this.replacementAtPublication = { node: replacement, srcdoc: replacement.srcdoc };
+        nodes.set('#' + this.getAttribute('id'), replacement);
+      },
       addEventListener(name, callback, options) {
         const handlers = events.get(name) || [];
         handlers.push({ callback, once: options?.once });

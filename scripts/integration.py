@@ -354,6 +354,25 @@ def assert_project_removed(project):
         assert not remaining, (resource, project, remaining)
 
 
+def qualified_thumbnail(data, media_id, saved):
+    """Capture the exact DB-selected UUID JPEG inside the owned fixture thumbnail mount."""
+    assert isinstance(saved, str), 'thumbnail publication missing'
+    name = Path(saved).name
+    assert saved == '/data/thumbs/' + name, 'thumbnail outside exact fixture namespace'
+    prefix = f'{media_id}-'
+    assert name.startswith(prefix) and name.endswith('.jpg'), 'thumbnail ownership mismatch'
+    token = name[len(prefix):-4]
+    assert str(uuid.UUID(token)) == token, 'thumbnail UUID is not canonical'
+    thumbs = data / 'thumbs'
+    thumbnail = thumbs / name
+    assert not thumbs.is_symlink() and thumbs.is_dir(), 'thumbnail directory redirected'
+    assert not thumbnail.is_symlink() and thumbnail.is_file(), 'thumbnail is not a regular file'
+    assert thumbnail.resolve().parent == thumbs.resolve(), 'thumbnail escaped owned directory'
+    content = thumbnail.read_bytes()
+    assert content.startswith(b'\xff\xd8\xff') and content.endswith(b'\xff\xd9'), 'thumbnail is not JPEG'
+    return thumbnail, content
+
+
 def upstream_contract_qualification(args):
     """Run fresh two-root/admin/queued-ingest HTTP paths on the caller-qualified image."""
     global base
@@ -554,19 +573,30 @@ def upstream_contract_qualification(args):
             assert sql('SELECT cfi FROM annotations WHERE identity_id=10002') == [('other',)]
             sql('DELETE FROM annotations WHERE media_id=?', (media_id,))
             sql('DELETE FROM progress WHERE media_id=?', (media_id,))
-            thumbnail = data / 'thumbs' / f'{media_id}.jpg'
-            thumbnail_bytes = thumbnail.read_bytes()
+            saved_thumbnail = sql('SELECT thumb_path FROM media WHERE id=?', (media_id,))[0][0]
+            thumbnail, thumbnail_bytes = qualified_thumbnail(data, media_id, saved_thumbnail)
+            retained_artwork = {data / 'thumbs' / f'{media_id}.jpg': b'owned legacy artwork sentinel',
+                                data / 'thumbs' / 'unknown.jpg': b'owned unknown artwork sentinel'}
+            for path, content in retained_artwork.items():
+                with path.open('xb') as artifact:
+                    artifact.write(content)
             sql("CREATE TRIGGER qa_media_failure BEFORE DELETE ON media BEGIN SELECT RAISE(ABORT,'owned QA'); END")
             curl_request(f'/api/media/{media_id}', token=token, method='DELETE', expected=500)
-            assert sql('SELECT path FROM media WHERE id=?', (media_id,)) == [('/roots/a/first.cbz',)]
-            assert (roots / 'a/first.cbz').read_bytes() == source_bytes
+            assert sql('SELECT path,thumb_path FROM media WHERE id=?', (media_id,)) == [('/roots/a/first.cbz', saved_thumbnail)]
+            for source in (roots / 'a/first.cbz', roots / 'b/second.cbz'):
+                assert source.read_bytes() == source_bytes
             assert thumbnail.read_bytes() == thumbnail_bytes
+            for path, content in retained_artwork.items():
+                assert path.read_bytes() == content
             sql('DROP TRIGGER qa_media_failure')
             curl_request(f'/api/media/{media_id}', token=token, method='DELETE', expected=204)
             assert sql('SELECT id FROM media WHERE id=?', (media_id,)) == []
+            assert not thumbnail.exists() and not thumbnail.is_symlink(), 'selected UUID thumbnail was not removed'
             for source in (roots / 'a/first.cbz', roots / 'b/second.cbz'):
                 assert source.read_bytes() == source_bytes
-            print('PASS upstream-admin: explicit-null permission clear, self409, user DB500 rollback and target-only cleanup, media refs/busy409/admin403/missing404/DB500/success204; original sources preserved')
+            for path, content in retained_artwork.items():
+                assert path.read_bytes() == content
+            print('PASS upstream-admin: explicit-null permission clear, self409, user DB500 rollback and target-only cleanup, media refs/busy409/admin403/missing404/DB500/success204; DB-selected UUID JPEG path/bytes preserved on rollback and removed after commit; original sources and legacy/unknown artwork preserved')
             # An already configured removable/NAS root becoming unavailable must not
             # destroy HTTP/admin access or turn the stored snapshot into an empty list.
             # New writes still use the strict missing-path400 oracle above.

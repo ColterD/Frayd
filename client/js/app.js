@@ -712,10 +712,9 @@ function card(it, progressFor = resumeFor) {
 function artwork(item, portrait = false, memberOnly = false) {
   const symbol = ['movie', 'episode'].includes(item.kind) ? '▶' : item.kind === 'music' ? '♪' : item.kind === 'audiobook' ? '🎙' : ['comic', 'manga'].includes(item.kind) ? '📄' : '📖';
   const fallback = `<div class="thumb-fallback${portrait ? ' portrait' : ''}">${symbol}</div>`;
-  if (!item.thumb_path && (memberOnly || !['movie', 'episode'].includes(item.kind))) return fallback;
-  const basename = typeof item.thumb_path === 'string' ? item.thumb_path.split(/[\\/]/).pop() : '';
-  const version = basename ? '?v=' + encodeURIComponent(basename) : '';
-  return `<img class="thumb" loading="lazy" src="/api/thumb/${item.id}${version}" alt="${esc(memberOnly ? 'Artwork from ' + item.title : '')}"
+  const version = typeof item.artwork_version === 'string' ? item.artwork_version : '';
+  if (!version) return fallback;
+  return `<img class="thumb" loading="lazy" src="/api/thumb/${item.id}?v=${encodeURIComponent(version)}" alt="${esc(memberOnly ? 'Artwork from ' + item.title : '')}"
     onerror="this.outerHTML='${fallback.replaceAll('"', '&quot;')}'">`;
 }
 
@@ -757,7 +756,7 @@ function section(kind, items, progressFor = resumeFor) {
 function mediaFolder(name, items, kind, label, open) {
   const folder = el('div', 'media-card landscape');
   folder.title = name;
-  const member = items.find(item => item.thumb_path);
+  const member = items.find(item => typeof item.artwork_version === 'string' && item.artwork_version);
   folder.innerHTML = `${artwork(member || {kind}, false, true)}
     <div class="card-body"><div class="title">${esc(name)}</div>
       <div class="sub">${label} · ${items.length} ${kind === 'episode' ? 'episode' : 'item'}${items.length === 1 ? '' : 's'}</div></div>`;
@@ -1119,6 +1118,14 @@ async function openEbook(it) {
   });
 }
 
+/** Publish only a fully configured, detached frame so an old reset cannot replace this document. */
+function publishEbookDocument(html) {
+  const previous = $('#em-frame');
+  const frame = previous.cloneNode(false);
+  frame.srcdoc = html;
+  previous.replaceWith(frame);
+}
+
 /**
  * Load and paginate an EPUB chapter in a sandboxed frame; stale book/document generations cannot publish it.
  * @param {number} n
@@ -1346,10 +1353,10 @@ async function showChunk(n, opts = {}) {
     readerDocument.items = inject;
     readerDocument.want = ebook.pendingCol === Infinity ? 'end' : ebook.pendingCol;
     ebook.pendingCol = 0;
-    $('#em-frame').srcdoc = html;
+    publishEbookDocument(html);
   } catch {
     if (!isCurrent()) return;
-    $('#em-frame').srcdoc = '<p style="font-family:sans-serif;color:#333">Failed to load chapter.</p>';
+    publishEbookDocument('<p style="font-family:sans-serif;color:#333">Failed to load chapter.</p>');
   }
 }
 

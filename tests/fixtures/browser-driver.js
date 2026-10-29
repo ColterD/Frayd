@@ -610,10 +610,11 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     packet.mediaDiagnostics.push(...mediaDiagnostics);
     return api('result', packet);
   }
-  const frame = document.getElementById('em-frame');
+  const readerFrame = () => document.getElementById('em-frame');
   let sequence = 0;
   function probe(action = 'inspect', details = {}) {
     return new Promise((resolve, reject) => {
+      const frame = readerFrame();
       const id = ++sequence;
       const timeout = setTimeout(() => { window.removeEventListener('message', receive); reject(new Error('Probe timeout')); }, 4000);
       function receive(event) {
@@ -629,8 +630,8 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     });
   }
   async function load() {
-    const loaded = new Promise(resolve => frame.addEventListener('load', resolve, { once: true }));
     await showChunk(0);
+    const loaded = new Promise(resolve => readerFrame().addEventListener('load', resolve, { once: true }));
     await loaded;
     await until(() => ebook?.document?.ready, 'current reader ready');
     equal((await probe()).opaqueOrigin, 'null', 'Reader must have opaque sandbox origin');
@@ -658,7 +659,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     document.getElementById('ebook-modal').classList.add('on');
     await load();
     if (search) {
-      frame.contentWindow.postMessage({ type: 'search', query: search }, '*');
+      readerFrame().contentWindow.postMessage({ type: 'search', query: search }, '*');
       await until(async () => (await probe()).searchMarks.length > 0, 'production search mark');
     }
     const before = (await probe()).marks;
@@ -841,8 +842,18 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     await api('configure', { body: '<p id="target">prefix target suffix</p>', annotations: saved, parserGate: true });
     ebook = { it: { id: 7 }, spine: ['one.xhtml', 'two.xhtml'], chunk: 0, annots: saved };
     document.getElementById('ebook-modal').classList.add('on');
-    const loaded = new Promise(resolve => frame.addEventListener('load', resolve, { once: true }));
+    const retiredFrame = readerFrame();
+    const retiredWindow = retiredFrame.contentWindow;
     await showChunk(0, { frac: 0.5 });
+    check(readerFrame() !== retiredFrame && !retiredFrame.isConnected, 'Chapter replaces the previous frame');
+    check(readerFrame().contentWindow !== retiredWindow, 'Published chapter owns a fresh WindowProxy');
+    equal(readerFrame().getAttribute('sandbox'), retiredFrame.getAttribute('sandbox'), 'Publication preserves sandbox');
+    check(readerFrame().srcdoc.includes('prefix target suffix'), 'Full chapter is configured at publication');
+    // Deliver the retired source with the CURRENT generation: source validation must reject it.
+    window.dispatchEvent(new MessageEvent('message', { origin: 'null', source: retiredWindow,
+      data: { type: 'reader-ready', generation: ebook.document.generation } }));
+    check(!ebook.document.ready, 'Retired window cannot mark the current chapter ready');
+    const loaded = new Promise(resolve => readerFrame().addEventListener('load', resolve, { once: true }));
     await until(async () => (await api('parser-state')).held, 'parser blocked before generated listener');
     await delay(240); // Negative control: the old one-shot 100 ms restore expires here.
     await api('release-parser', {});
@@ -852,7 +863,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     equal(observed.marks, ['target'], 'Saved mark restored after actual listener readiness');
     equal((await api('state')).posts, [], 'Restore requires no new annotation POST');
     const retiredGeneration = ebook.document.generation;
-    frame.contentWindow.postMessage({ type: 'inject-hl', generation: retiredGeneration,
+    readerFrame().contentWindow.postMessage({ type: 'inject-hl', generation: retiredGeneration,
       items: [{ off: 7, len: 6, color: 'yellow' }] }, '*');
     equal((await probe()).marks, ['target'], 'Repeated restore does not nest marks');
     document.getElementById('em-close').click();
@@ -867,10 +878,17 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     await showChunk(0);
     await until(() => ebook.document.ready, 'first TOC chapter ready');
     equal((await probe()).marks, ['target'], 'TOC revisit restores exactly once');
-    // The opaque WindowProxy remains the same across these documents.
+    // Also reject a retired generation sent by the current opaque WindowProxy.
     await probe('ready', { generation: reopenedGeneration });
     equal((await probe()).marks, ['target'], 'Stale ready cannot duplicate current marks');
-    return { marks: observed.marks, parserHeldBeyondOldTimer: true, posts: 0,
+    const beforeResize = readerFrame();
+    const resizeFraction = ebook.lastFrac;
+    window.dispatchEvent(new Event('resize'));
+    await until(() => readerFrame() !== beforeResize && ebook.document.ready, 'resize publishes a fresh ready chapter');
+    equal(ebook.lastFrac, resizeFraction, 'Resize preserves the reported position');
+    equal((await probe()).marks, ['target'], 'Resize restores saved marks');
+    return { freshFrame: true, retiredWindowRejected: true, resizeReady: true,
+      marks: observed.marks, parserHeldBeyondOldTimer: true, posts: 0,
       reopen: true, tocRevisit: true, duplicateRestoreIdempotent: true, staleReadyIgnored: true };
   });
   await run('plain text save, 201 paint, reload and duplicate', () => highlight({
@@ -1919,18 +1937,18 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     const retainedShowsDrill = showsDrill;
     const retainedAuthorDrill = { ...authorDrill };
     const tvAndAuthorItems = [
-      { id: 9, kind: 'episode', title: '日本語.Show.S01E02', series: 'Unicode show', created_at: 30, thumb_path: '/fixture/9.png' },
+      { id: 9, kind: 'episode', title: '日本語.Show.S01E02', series: 'Unicode show', created_at: 30, artwork_version: '9.png' },
       { id: 10, kind: 'episode', title: 'Unicode 1x01', series: 'Unicode show', created_at: 10 },
       { id: 60, kind: 'episode', title: 'Unicode bonus', series: 'Unicode show' },
-      { id: 61, kind: 'movie', title: 'Unicode movie' },
+      { id: 61, kind: 'movie', title: 'Unicode movie', artwork_version: '61.png' },
       { id: 62, kind: 'music', title: 'Loose song', author: 'Mixed artist' },
-      { id: 63, kind: 'music', title: 'Album song', author: 'Mixed artist', series: 'Named album', thumb_path: '/fixture/63.png' },
-      { id: 64, kind: 'ebook', title: 'Series book', author: 'Book author', series: 'Named books', thumb_path: '/fixture/64.png' },
-      { id: 65, kind: 'audiobook', title: 'Loose audiobook', author: 'Audio author', thumb_path: '/fixture/65.png' },
+      { id: 63, kind: 'music', title: 'Album song', author: 'Mixed artist', series: 'Named album', artwork_version: '63.png' },
+      { id: 64, kind: 'ebook', title: 'Series book', author: 'Book author', series: 'Named books', artwork_version: '64.png' },
+      { id: 65, kind: 'audiobook', title: 'Loose audiobook', author: 'Audio author', artwork_version: '65.png' },
       { id: 66, kind: 'music', title: 'Second song', author: 'Second artist', created_at: 20 },
       { id: 67, kind: 'episode', title: 'Second S01E01', series: 'Second show', created_at: 20 },
-      { id: 68, kind: 'comic', title: 'Covered comic', thumb_path: '/fixture/68.png' },
-      { id: 69, kind: 'manga', title: 'Covered manga', thumb_path: '/fixture/69.png' },
+      { id: 68, kind: 'comic', title: 'Covered comic', artwork_version: '68.png' },
+      { id: 69, kind: 'manga', title: 'Covered manga', artwork_version: '69.png' },
     ];
     let tvSearchMode = 'success';
     responder = async (url, options) => {

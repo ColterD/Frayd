@@ -380,6 +380,7 @@ test('highlight waits for creation and retains saved state for chapter revisit w
   b.respond(async () => ({ text: async () => '<html><head></head><body>Hello world</body></html>' }));
   await b.run('showChunk(0)');
   await b.run('showChunk(1)');
+  b.nodes.get('#em-frame').contentWindow.postMessage = data => posted.push(data);
   assert.equal(posted.length, 1);
   b.message({ type: 'reader-ready' });
   assert.equal(posted.length, 3);
@@ -2150,7 +2151,7 @@ test('an obsolete boot resume cannot cover a newly entered account with sign-in'
 test('episode renders as video, appears in library rows and opens the video player', async () => {
   const b = browser();
   b.respond(async () => ({ ok: true, json: async () => null }));
-  b.run('LIBRARY = [{ id: 12, kind: "episode", title: "Episode", series: "Fixture show" }]; filtering = true');
+  b.run('LIBRARY = [{ id: 12, kind: "episode", title: "Episode", series: "Fixture show", artwork_version: "12-cover.jpg" }]; filtering = true');
   await b.run('renderRows(LIBRARY)');
   assert.match(b.nodes.get('#hero').innerHTML, /▶ Play/);
   const section = b.nodes.get('#main').children.at(-1);
@@ -2159,7 +2160,7 @@ test('episode renders as video, appears in library rows and opens the video play
   await section.children[1].children[0].onclick();
   const detail = b.nodes.get('#main').children.at(-1);
   const card = detail.children.find(node => node.className === 'cards').children[0];
-  assert.match(card.innerHTML, /src="\/api\/thumb\/12"/);
+  assert.match(card.innerHTML, /src="\/api\/thumb\/12\?v=12-cover.jpg"/);
   card.onclick();
   await settle();
   assert.equal(b.nodes.get('#comic-modal').classList.contains('on'), false);
@@ -2952,34 +2953,48 @@ test('folder dates use member extremes with stable ties and preserve input and d
   assert.deepEqual(titles(b.run(`groupedByAuthor('music',authorItems)`)), ['A','B','C']);
 });
 
-test('available artwork renders for every media kind and folders choose a member with artwork', () => {
+test('API artwork versions render every kind and version replacement without cache paths', () => {
   const b = browser();
+  const imageUrl = html => new URL(html.match(/src="([^"]+)"/)[1], 'https://fixture.invalid');
   for (const kind of ['movie','episode','music','audiobook','ebook','comic','manga']) {
-    const withCover = b.run(`card({id:42,kind:'${kind}',title:'Covered',thumb_path:'/cache/42.jpg'})`);
-    assert.match(withCover.innerHTML, /src="\/api\/thumb\/42\?v=42.jpg"/);
-    assert.doesNotMatch(withCover.innerHTML, /src="\/cache/);
-    if (!['movie','episode'].includes(kind)) {
-      const noCover = b.run(`card({id:43,kind:'${kind}',title:'Uncovered'})`);
+    const withCover = b.run(`card({id:42,kind:'${kind}',title:'Covered',artwork_version:'42-550e8400-e29b-41d4-a716-446655440000.jpg'})`);
+    const first = imageUrl(withCover.innerHTML);
+    assert.equal(first.pathname, '/api/thumb/42');
+    assert.equal(first.searchParams.get('v'), '42-550e8400-e29b-41d4-a716-446655440000.jpg');
+    const replacement = imageUrl(b.run(`card({id:42,kind:'${kind}',title:'Covered',artwork_version:'42-550e8400-e29b-41d4-a716-446655440001.jpg'})`).innerHTML);
+    assert.equal(first.pathname, replacement.pathname);
+    assert.notEqual(first.href, replacement.href, 'A replacement version changes the cache key for the same media ID');
+    for (const missing of [undefined, null, '', true]) {
+      b.context.artworkDtoFixture = {id:43,kind,title:'Uncovered',artwork_version:missing};
+      const noCover = b.run('card(artworkDtoFixture)');
       assert.doesNotMatch(noCover.innerHTML, /<img/);
       assert.match(noCover.innerHTML, /thumb-fallback/);
     }
   }
-  const shelf = b.run(`groupedByAuthor('music', [{id:1,title:'Uncovered',author:'Artist'}, {id:2,title:'Covered song',author:'Artist',thumb_path:'/cache/2.jpg'}])`);
-  assert.match(shelf.children[1].children[0].innerHTML, /src="\/api\/thumb\/2\?v=2.jpg"/);
+  const shelf = b.run(`groupedByAuthor('music', [{id:1,kind:'music',title:'Uncovered',author:'Artist'}, {id:2,kind:'music',title:'Covered song',author:'Artist',artwork_version:'2-cover.jpg'}])`);
+  assert.equal(imageUrl(shelf.children[1].children[0].innerHTML).searchParams.get('v'), '2-cover.jpg');
   assert.match(shelf.children[1].children[0].innerHTML, /Artwork from Covered song/);
-  const imageUrl = html => new URL(html.match(/src="([^"]+)"/)[1], 'https://fixture.invalid');
-  const first = imageUrl(b.run(`card({id:42,kind:'music',title:'Track',thumb_path:'/operator/cache/42-old cover.jpg'})`).innerHTML);
-  const replacement = imageUrl(b.run(`card({id:42,kind:'music',title:'Track',thumb_path:'/operator/cache/42-new-cover.jpg'})`).innerHTML);
-  assert.equal(first.pathname, replacement.pathname);
-  assert.equal(first.searchParams.get('v'), '42-old cover.jpg');
-  assert.equal(replacement.searchParams.get('v'), '42-new-cover.jpg');
-  assert.notEqual(first.href, replacement.href, 'Replacing a cover changes its browser cache key without changing media identity');
-  assert.doesNotMatch(first.href, /operator|cache/);
-  assert.match(first.search, /old%20cover/);
-  const noPath = imageUrl(b.run(`card({id:42,kind:'movie',title:'Video',thumb_path: true})`).innerHTML);
-  assert.equal(noPath.search, '', 'Nonstring metadata cannot become a version or disclose a path');
-  const folderReplacement = b.run(`groupedByAuthor('music', [{id:2,kind:'music',title:'Track',author:'Artist',thumb_path:'/operator/cache/2-replacement.jpg'}])`);
-  assert.equal(imageUrl(folderReplacement.children[1].children[0].innerHTML).searchParams.get('v'), '2-replacement.jpg');
+  const encoded = imageUrl(b.run(`card({id:42,kind:'music',title:'Track',artwork_version:'cover version #1.jpg'})`).innerHTML);
+  assert.equal(encoded.searchParams.get('v'), 'cover version #1.jpg');
+  assert.match(encoded.search, /cover%20version%20%231.jpg/);
+});
+
+test('library refresh uses replacement artwork versions from the actual DTO in author folders', async () => {
+  const b = browser();
+  let artworkVersion = '42-initial.jpg';
+  b.respond(async url => ({ok:true,json:async () => url.startsWith('/api/library')
+    ? [{id:42,kind:'music',title:'Track',author:'Artist',artwork_version:artworkVersion}]
+    : null}));
+  await b.run('loadLibrary()');
+  await settle();
+  const folderHtml = () => b.nodes.get('#main').children.at(-1).children[1].children[0].innerHTML;
+  assert.match(folderHtml(), /src="\/api\/thumb\/42\?v=42-initial.jpg"/);
+  artworkVersion = '42-replacement.jpg';
+  b.nodes.get('#main').children.length = 0; // Boundary double does not parse innerHTML clearing.
+  await b.run('loadLibrary()');
+  await settle();
+  assert.match(folderHtml(), /src="\/api\/thumb\/42\?v=42-replacement.jpg"/);
+  assert.doesNotMatch(folderHtml(), /42-initial/);
 });
 
 
