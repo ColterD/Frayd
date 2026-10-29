@@ -66,8 +66,12 @@ holds subsequent start/removal even after the child exits. Inspect and resolve
 that exact installation manually; PID reuse is never treated as permission to
 kill a process. Keep foreground supervision alive until its server exits.
 Removal verifies every remaining owned entry and rejects modified or extra files
-before deleting anything. It removes only recorded unchanged payload and empty
-owned directories. Data, original environment/configuration/database files,
+before deleting anything. Missing or moved data and missing or malformed data markers
+do not block program removal: the private prefix receipt and unchanged payload
+authorize it, while recorded data path redirects and overlap still fail closed.
+Start continues to require the exact valid data marker. Removal neither recreates
+the data location nor reads or deletes data contents. It removes only recorded
+unchanged payload and empty owned directories. Data, original environment/configuration/database files,
 libraries, source checkouts and shared Rust installations are never removed.
 The private prefix protects against other Unix users; this is not a sandbox
 against concurrent malicious code running as the same account or filesystem

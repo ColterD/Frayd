@@ -446,10 +446,12 @@ mod native {
         }
         Ok(receipt)
     }
-    /// Reconstruct removal/start authority from prefix, payload and data receipts.
+    /// Reconstruct program ownership from the private prefix and recorded payload.
+    /// Validate the recorded data location without reading its contents or marker;
+    /// data may be absent during removal, but redirects and overlap remain refused.
     /// Reject changed/unowned files, invalid locks and any active or uncertain child
     /// marker without mutation. Only removal retry may tolerate missing payload.
-    fn load_install(prefix: &Path, allow_missing: bool) -> Result<Receipt> {
+    fn load_prefix(prefix: &Path, allow_missing: bool) -> Result<Receipt> {
         safe_path(prefix)?;
         private_owned_dir(prefix)?;
         let record = entry(&prefix.join(RECEIPT), RECEIPT)?;
@@ -465,9 +467,9 @@ mod native {
         {
             return reject("invalid prefix/data receipt");
         }
-        let data = data_receipt(&receipt.data)?;
-        if data.id != receipt.data_id {
-            return reject("data ownership mismatch");
+        safe_path(&receipt.data)?;
+        if !disjoint(prefix, &prospective_library_path(&receipt.data)?) {
+            return reject("resolved prefix/data overlap");
         }
         verify_tree(
             prefix,
@@ -486,6 +488,16 @@ mod native {
             return reject("invalid lifecycle lock");
         }
         Ok(receipt)
+    }
+    /// Require the exact data identity before launch; this grants no removal authority.
+    /// Missing or invalid data remains a launch refusal even when program ownership
+    /// alone would permit uninstall. No directory or marker is created here.
+    fn validate_start_data(receipt: &Receipt) -> Result<()> {
+        let data = data_receipt(&receipt.data)?;
+        if data.id != receipt.data_id {
+            return reject("data ownership mismatch");
+        }
+        Ok(())
     }
     /// Obtain explicit consent through --yes or an affirmative stdin response.
     /// Return false for decline/EOF without persistent effects; callers must not
@@ -680,10 +692,11 @@ mod native {
     /// SIGINT/SIGTERM terminates and reaps only the owned Child handle; a crash or
     /// SIGKILL leaves its uncertainty marker to block later start/removal safely.
     fn start(prefix: &Path, port: u16) -> Result<()> {
-        let receipt = load_install(prefix, false)?;
+        let receipt = load_prefix(prefix, false)?;
+        validate_start_data(&receipt)?;
         let _lock = locked(prefix)?;
         // Revalidate under the lifecycle lock, including orphan markers.
-        load_install(prefix, false)?;
+        validate_start_data(&load_prefix(prefix, false)?)?;
         for found in WalkDir::new(&receipt.data).follow_links(false) {
             let found = found?;
             if found.file_type().is_symlink()
@@ -759,7 +772,7 @@ mod native {
     /// and remove directories only when empty. Preserve all data; retain or restore
     /// receipt metadata on cleanup failure when the filesystem permits recovery.
     fn uninstall(prefix: &Path, yes: bool) -> Result<()> {
-        let receipt = load_install(prefix, true)?;
+        let receipt = load_prefix(prefix, true)?;
         removal_parent_writable(prefix)?;
         if !confirm(
             yes,
@@ -768,7 +781,7 @@ mod native {
             return Ok(());
         }
         let _lock = locked(prefix)?;
-        load_install(prefix, true)?;
+        load_prefix(prefix, true)?;
         for item in receipt
             .manifest
             .entries

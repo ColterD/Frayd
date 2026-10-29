@@ -251,6 +251,66 @@ class NativeOwnership(unittest.TestCase):
         self.install('--yes')
         self.run_helper('uninstall', '--yes')
 
+    def test_removal_without_data_authority_preserves_all_remaining_data(self):
+        for state in ['moved directory', 'deleted directory', 'missing marker', 'malformed marker']:
+            with self.subTest(state=state):
+                self.prefix = self.base / ('installed ' + state)
+                self.data = self.base / ('data ' + state)
+                self.install('--yes')
+                (self.data / 'frayd.db').write_bytes(b'NONSECRET preserved database')
+                marker = self.data / '.frayd-data.json'
+                if state == 'moved directory':
+                    self.data.rename(self.base / 'moved data')
+                elif state == 'deleted directory':
+                    marker.unlink()
+                    (self.data / 'frayd.db').unlink()
+                    self.data.rmdir()
+                elif state == 'missing marker':
+                    marker.unlink()
+                else:
+                    marker.write_bytes(b'NONSECRET malformed marker')
+                before = self.snapshot()
+                self.run_helper('start', code=2)
+                self.assertEqual(self.snapshot(), before)
+                self.run_helper('uninstall', '--yes')
+                self.assertFalse(self.prefix.exists())
+                remaining = [item for item in before if not (item[0] == self.prefix.name or item[0].startswith(self.prefix.name + '/'))]
+                self.assertEqual(self.snapshot(), remaining)
+                self.assertEqual(self.data.exists(), state in ['missing marker', 'malformed marker'])
+
+    def test_missing_data_marker_does_not_weaken_removal_guards(self):
+        for guard in ['modified payload', 'unknown payload', 'uncertain child', 'data alias overlap']:
+            with self.subTest(guard=guard):
+                self.prefix = self.base / ('installed ' + guard)
+                self.data = self.base / ('data ' + guard)
+                self.install('--yes')
+                marker = self.data / '.frayd-data.json'
+                marker.unlink()
+                if guard == 'modified payload':
+                    target = self.prefix / 'client/index.html'
+                    original = target.read_bytes()
+                    target.write_bytes(b'changed')
+                elif guard == 'unknown payload':
+                    target = self.prefix / 'unknown'
+                    target.write_bytes(b'unknown')
+                elif guard == 'uncertain child':
+                    target = self.prefix / '.frayd-child.json'
+                    target.write_bytes(b'uncertain')
+                else:
+                    self.data.rmdir()
+                    self.data.symlink_to(self.prefix, target_is_directory=True)
+                before = self.snapshot()
+                self.run_helper('start', code=2)
+                self.run_helper('uninstall', '--yes', code=2)
+                self.assertEqual(self.snapshot(), before)
+                if guard == 'modified payload':
+                    target.write_bytes(original)
+                elif guard == 'data alias overlap':
+                    self.data.unlink()
+                else:
+                    target.unlink()
+                self.run_helper('uninstall', '--yes')
+
     def test_missing_absolute_library_keeps_installed_lifecycle_available(self):
         self.install('--yes')
         sentinel = self.data / 'frayd.db'
