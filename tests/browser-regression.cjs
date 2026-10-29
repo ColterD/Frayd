@@ -183,10 +183,10 @@ async function bounded(promise, message, milliseconds = 3000) {
  * its cache before navigation. Retry transient HTTP readiness only; unexpected targets
  * or debugger ownership fail closed. Keep the protocol open until caller teardown.
  */
-async function configureOwnedBrowserCache({ profile, fixtureUrl, browser, diagnostics = {} }) {
+async function configureOwnedBrowserCache({ profile, fixtureUrl, browser, diagnostics = {}, budgetMs = 30000 }) {
   const startedAt = Date.now();
-  const deadline = startedAt + 15000;
-  Object.assign(diagnostics, { budgetMs: 15000, phase: 'port-file', attempts: 0, transientFailures: 0, emptyLists: 0 });
+  const deadline = startedAt + budgetMs;
+  Object.assign(diagnostics, { budgetMs, phase: 'port-file', attempts: 0, transientFailures: 0, emptyLists: 0 });
   function phase(name) { diagnostics.phase = name; diagnostics.elapsedMs = Date.now() - startedAt; }
   /**
    * Return time left on the single startup deadline; advancing to another phase or
@@ -212,6 +212,7 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser, diagno
     }
     await delay(20);
   }
+  diagnostics.portReadyElapsedMs = Date.now() - startedAt;
   phase('http-discovery');
   let pages;
   const browserExited = new AbortController();
@@ -411,14 +412,17 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser, diagno
  * profile. Record original and cleanup failures separately; remove the profile only
  * after confirmed group shutdown, retaining it when shutdown cannot be established.
  */
-async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, cacheSetup = configureOwnedBrowserCache, responsiveDiagnosticOnly = false, resultFilename = 'result.json' } = {}) {
+async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, cacheSetup = configureOwnedBrowserCache, responsiveDiagnosticOnly = false, resultFilename = 'result.json', startupBudgetMs = 30000, caseBudgetMs = 60000 } = {}) {
   if (!/^[a-zA-Z0-9-]+\.json$/.test(resultFilename)) throw new Error('Evidence result filename must be a simple JSON basename');
   if (Number(process.versions.node.split('.')[0]) < 22 || typeof WebSocket !== 'function') {
     throw new Error('Browser regressions require Node.js 22+ with the global WebSocket API');
   }
+  if (!Number.isInteger(startupBudgetMs) || startupBudgetMs < 1 || startupBudgetMs > 30000
+    || !Number.isInteger(caseBudgetMs) || caseBudgetMs < 1 || caseBudgetMs > 60000) {
+    throw new Error('Phase budgets must be positive milliseconds within startup30s and cases60s');
+  }
   let browser;
   let profile;
-  let timer;
   let pendingAnnotation;
   let parserGate = false;
   let parserResponse;
@@ -435,6 +439,10 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
   let cacheControl;
   let cacheSession;
   const startupDiagnostics = {};
+  let phaseStartedAt;
+  const phaseTimeline = [];
+  function recordPhase(phase) { phaseTimeline.push({ phase, elapsedMs: Date.now() - phaseStartedAt }); }
+  let caseProgress = { completed: 0, passed: 0, failed: 0, blocked: 0, currentCase: null };
   const cleanupErrors = [];
   let browserGroupStopped = false;
   let resolveResult;
@@ -537,6 +545,18 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
         pendingAnnotation = null;
         return json({ ok: true });
       }
+      if (path === '/__fixture/progress' && request.method === 'POST') {
+        const { completed, passed, failed, blocked, currentCase } = JSON.parse(input);
+        const counts = [completed, passed, failed, blocked];
+        if (!counts.every(value => Number.isInteger(value) && value >= 0 && value <= 49)
+          || passed + failed + blocked !== completed
+          || !(currentCase === null || currentCase === completed + 1 && currentCase <= 49)) return json({}, 400);
+        // Requests may arrive out of order; progress never supplies terminal case evidence.
+        if (completed > caseProgress.completed || completed === caseProgress.completed && currentCase !== null) {
+          caseProgress = { completed, passed, failed, blocked, currentCase, elapsedMs: Date.now() - phaseStartedAt };
+        }
+        return json({ ok: true });
+      }
       if (path === '/__fixture/result' && request.method === 'POST') {
         json({ ok: true });
         resolveResult(JSON.parse(input));
@@ -626,6 +646,8 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
     profile = mkdtempSync(join(tmpdir(), 'frayd-browser-regression-'));
     const url = `http://127.0.0.1:${server.address().port}/`;
     const ownedCacheControl = cacheSetup === configureOwnedBrowserCache;
+    phaseStartedAt = Date.now();
+    recordPhase('startup');
     browser = spawn(executable, ['--headless', '--no-sandbox', '--disable-gpu', '--mute-audio', '--disable-background-networking',
       '--disable-component-update', '--disable-sync', '--no-first-run', '--no-default-browser-check',
       '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1', '--disable-features=MediaRouter',
@@ -642,12 +664,15 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
       browser.once('error', reject);
       browser.once('exit', (code, signal) => reject(new Error(`Browser exited before result: ${code}/${signal}; ${logs}`)));
     });
-    const timedOut = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`Browser regression exceeded 60 seconds; ${logs}`)), 60000); });
-    const observed = await Promise.race([(async () => {
-      cacheSession = await cacheSetup({ profile, fixtureUrl: url, browser, diagnostics: startupDiagnostics });
+    // Startup includes cache configuration and the navigation acknowledgement. Only
+    // then does the unchanged case budget begin; neither phase resets on retries.
+    await bounded(Promise.race([(async () => {
+      cacheSession = await cacheSetup({ profile, fixtureUrl: url, browser, diagnostics: startupDiagnostics, budgetMs: startupBudgetMs });
       cacheControl = cacheSession.receipt;
-      return result;
-    })(), exited, timedOut]);
+    })(), exited]), `Browser startup exceeded ${startupBudgetMs} milliseconds`, startupBudgetMs);
+    recordPhase('cases');
+    const observed = await bounded(Promise.race([result, exited]),
+      `Browser regression cases exceeded ${caseBudgetMs} milliseconds`, caseBudgetMs);
     const expectedCases = responsiveDiagnosticOnly ? 1 : 49;
     const complete = observed.cases.length === expectedCases
       && new Set(observed.cases.map(item => item.name)).size === expectedCases
@@ -665,7 +690,7 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
   } catch (error) {
     runError = error;
   } finally {
-    clearTimeout(timer);
+    if (phaseStartedAt !== undefined) recordPhase('cleanup');
     releaseMedia('runner-cleanup');
     // Keep interception active through group death; detaching it while a browser is
     // alive can release paused requests to operator services.
@@ -692,6 +717,10 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
   }
   output.cacheControl = cacheControl;
   output.startupDiagnostics = startupDiagnostics;
+  if (phaseStartedAt !== undefined) recordPhase('finished');
+  output.timeBudgets = { startupMs: startupBudgetMs, casesMs: caseBudgetMs };
+  output.phaseTimeline = phaseTimeline;
+  output.caseProgress = caseProgress;
   output.mediaGate = { held: Boolean(heldMedia), pending: pendingMedia, events: mediaGateEvents };
   output.cleanupErrors = cleanupErrors;
   output.cleanup = { browserExited: !browser?.pid || browser.exitCode !== null || browser.signalCode !== null,

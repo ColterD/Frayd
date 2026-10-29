@@ -328,9 +328,21 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     await until(() => ebook?.document?.ready, 'current reader ready');
     equal((await probe()).opaqueOrigin, 'null', 'Reader must have opaque sandbox origin');
   }
+  function reportProgress(currentCase) {
+    // Fixed numeric fields only: no case payloads, URLs, headers or errors.
+    // Never await diagnostics or change the production polling cadence.
+    fetch('/__fixture/progress', { method: 'POST', keepalive: true,
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+        completed: cases.length, passed: cases.filter(item => item.status === 'PASS').length,
+        failed: cases.filter(item => item.status === 'FAIL').length,
+        blocked: cases.filter(item => item.status === 'BLOCKED').length, currentCase,
+      }) }).catch(() => {});
+  }
   async function run(name, fn) {
+    reportProgress(cases.length + 1);
     try { cases.push({ name, status: 'PASS', observed: await fn() }); }
     catch (error) { cases.push({ name, status: error.code === 'NATIVE_CODEC_UNAVAILABLE' ? 'BLOCKED' : 'FAIL', error: error.stack, ...(error.observed ? { observed: error.observed } : {}) }); }
+    reportProgress(null);
   }
   async function highlight({ body, start, end, text, offset, search, saved = [] }) {
     await api('configure', { body, annotations: saved });
@@ -1524,6 +1536,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       'Fresh owned headless browser and loopback fixture only; physical output and owner deployment are untested.'] };
   // Leave a real pending interval to prove production logout disposes it.
   pollSettings(settingsGeneration, 'scan', document.createElement('button'));
+  reportProgress(cases.length + 1); // The final case crosses a document reload.
   sessionStorage.setItem('frayd-qa-logout', JSON.stringify(packet));
   document.getElementById('logout').click();
   return;

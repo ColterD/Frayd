@@ -266,7 +266,7 @@ setInterval(() => {}, 1000);
 `, { mode: 0o700 });
   const runner = resolve(__dirname, 'browser-regression.cjs');
   const invocation = spawn(process.execPath, ['-e', `
-    require(${JSON.stringify(runner)}).main({ evidenceDirectory: ${JSON.stringify(resultDirectory)} })
+    require(${JSON.stringify(runner)}).main({ evidenceDirectory: ${JSON.stringify(resultDirectory)}, startupBudgetMs: 200 })
       .catch(error => { console.error(error.stack); process.exitCode = 1; });
   `], { env: { ...process.env, BROWSER_BIN: browserScript }, stdio: ['ignore', 'pipe', 'pipe'] });
   let stdout = '';
@@ -277,7 +277,7 @@ setInterval(() => {}, 1000);
     const [code] = await once(invocation, 'exit');
     assert.equal(code, 1, stderr);
     const result = JSON.parse(stdout);
-    assert.match(result.runnerError, /Owned browser did not expose its cache-control endpoint/);
+    assert.match(result.runnerError, /Owned browser did not expose its cache-control endpoint|Browser startup exceeded 200 milliseconds/);
     assert.equal(result.cases.length, 0);
     assert.equal(result.complete, false);
     assert.equal(result.cacheControl, undefined);
@@ -309,7 +309,7 @@ test('cache discovery waits for a complete valid port and stops on exit or deadl
       existsSync: () => true,
       readFileSync: () => ['', '12', '12partial\n/unused', '70000\n/unused', '32123\n/unused'][Math.min(reads++, 4)],
       async delay() {
-        now += scenario === 'deadline' ? 15000 : 20;
+        now += scenario === 'deadline' ? 30000 : 20;
         if (scenario === 'exit') browser.exitCode = 7;
       },
       async fetch(url) { fetched.push(url); throw new Error('valid discovery reached'); },
@@ -351,7 +351,7 @@ test('browser setup shares its remaining startup budget across port and HTTP dis
       AbortSignal: { timeout(milliseconds) { httpBudget = milliseconds; return {}; }, any() { return {}; } },
       async fetch() {
         if (!expireAfterHttp) throw new Error('HTTP boundary reached');
-        now = 15001;
+        now = 30001;
         return { ok: true, json: async () => [{ type: 'page', url: 'about:blank', webSocketDebuggerUrl: 'ws://127.0.0.1:32123/devtools/page/owned-test' }] };
       },
       WebSocket: class { constructor() { throw new Error('Expired startup opened a protocol connection'); } },
@@ -418,11 +418,11 @@ test('unresponsive owned discovery stops at the shared deadline or browser exit 
     });
     const startedAt = Date.now();
     try {
-      await assert.rejects(configure({ profile, fixtureUrl: 'unused', browser }),
+      await assert.rejects(configure({ profile, fixtureUrl: 'unused', browser, budgetMs: 200 }),
         scenario === 'deadline' ? /startup deadline exceeded/ : /exited before cache setup/);
       const elapsed = Date.now() - startedAt;
       assert.equal(requested, true, 'The real owned HTTP endpoint received discovery');
-      if (scenario === 'deadline') assert.ok(elapsed >= 14000 && elapsed < 18000, `Shared deadline elapsed ${elapsed}ms`);
+      if (scenario === 'deadline') assert.ok(elapsed >= 180 && elapsed < 1500, `Shared deadline elapsed ${elapsed}ms`);
       else assert.ok(elapsed < 3000, `Browser exit must abort the pending request: ${elapsed}ms`);
       assert.equal(browser.listenerCount('exit'), 0);
     } finally {
@@ -437,7 +437,7 @@ test('unresponsive owned discovery stops at the shared deadline or browser exit 
 });
 
 
-test('owned discovery retries a stalled HTTP attempt within the unchanged shared startup budget', { timeout: 8000 }, async () => {
+test('owned discovery retries a stalled HTTP attempt within the shared startup budget', { timeout: 8000 }, async () => {
   const source = readFileSync(join(__dirname, 'browser-regression.cjs'), 'utf8');
   const setupSource = source.slice(source.indexOf('async function bounded('), source.indexOf('async function main('));
   for (const scenario of ['headers', 'body']) {
@@ -469,7 +469,7 @@ test('owned discovery retries a stalled HTTP attempt within the unchanged shared
       assert.equal(attempts, 2);
       assert.equal(diagnostics.attempts, 2);
       assert.equal(diagnostics.transientFailures, 1);
-      assert.equal(diagnostics.budgetMs, 15000);
+      assert.equal(diagnostics.budgetMs, 30000);
       assert.equal(diagnostics.phase, 'socket-open');
       assert.doesNotMatch(JSON.stringify(diagnostics), /127\.0\.0\.1|devtools|unused/);
       assert.ok(Date.now() - startedAt < 2000, 'A stalled attempt must leave time for subsequent readiness probes');
@@ -538,4 +538,57 @@ setInterval(() => {}, 1000);
     if (invocation.exitCode === null) invocation.kill('SIGKILL');
     rmSync(fixtureDirectory, { recursive: true, force: true });
   }
+});
+
+
+test('startup and cases have separate finite budgets and preserve partial progress on failure', { timeout: 8000 }, async () => {
+  const fixtureDirectory = mkdtempSync(join(tmpdir(), 'frayd-phase-budgets-'));
+  const browserScript = join(fixtureDirectory, 'browser.cjs');
+  writeFileSync(browserScript, `#!/usr/bin/env node
+if (process.argv.includes('--version')) { console.log('Owned phase-budget fixture'); process.exit(0); }
+setInterval(() => {}, 1000);
+`, { mode: 0o700 });
+  const runner = resolve(__dirname, 'browser-regression.cjs');
+  try {
+    for (const scenario of ['slow-success', 'startup-timeout', 'case-timeout']) {
+      const invocation = spawn(process.execPath, ['-e', `
+        require(${JSON.stringify(runner)}).main({ evidenceDirectory: ${JSON.stringify(fixtureDirectory)},
+          startupBudgetMs: 600, caseBudgetMs: 900,
+          async cacheSetup({ fixtureUrl }) {
+            if (${JSON.stringify(scenario)} === 'startup-timeout') return new Promise(() => {});
+            await new Promise(resolve => setTimeout(resolve, 400));
+            await fetch(fixtureUrl + '__fixture/progress', { method: 'POST', body: JSON.stringify({
+              completed: 1, passed: 1, failed: 0, blocked: 0, currentCase: 2 }) });
+            if (${JSON.stringify(scenario)} === 'slow-success') setTimeout(() => {
+              fetch(fixtureUrl + '__fixture/result', { method: 'POST', body: JSON.stringify({
+                cases: Array.from({ length: 49 }, (_, n) => ({ name: 'controlled ' + n, status: 'PASS' })),
+                passed: 49, failed: 0, errors: [] }) }).catch(() => {});
+            }, 650);
+            return { receipt: { injectedTestDouble: true }, close: async () => {} };
+          }
+        }).catch(error => { console.error(error.stack); process.exitCode = 1; });
+      `], { env: { ...process.env, BROWSER_BIN: browserScript }, stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '', stderr = '';
+      invocation.stdout.on('data', bytes => { stdout += bytes; });
+      invocation.stderr.on('data', bytes => { stderr += bytes; });
+      const [code] = await once(invocation, 'exit');
+      const result = JSON.parse(stdout);
+      assert.equal(code, scenario === 'slow-success' ? 0 : 1, stderr);
+      assert.equal(result.complete, scenario === 'slow-success');
+      assert.deepEqual(result.timeBudgets, { startupMs: 600, casesMs: 900 });
+      assert.deepEqual(result.phaseTimeline.map(item => item.phase), scenario === 'startup-timeout'
+        ? ['startup', 'cleanup', 'finished'] : ['startup', 'cases', 'cleanup', 'finished']);
+      assert.equal(Object.values(result.cleanup).every(Boolean), true);
+      assert.deepEqual(result.cleanupErrors, []);
+      if (scenario === 'slow-success') {
+        assert.ok(result.phaseTimeline[2].elapsedMs > 900, 'Combined work exceeds the case budget yet passes');
+        assert.equal(result.cases.length, 49);
+      } else {
+        assert.match(result.runnerError, scenario === 'startup-timeout' ? /startup exceeded 600 milliseconds/ : /cases exceeded 900 milliseconds/);
+        assert.equal(result.cases.length, 0, 'Progress never substitutes for terminal case evidence');
+        assert.equal(result.caseProgress.completed, scenario === 'case-timeout' ? 1 : 0);
+        assert.equal(result.caseProgress.currentCase, scenario === 'case-timeout' ? 2 : null);
+      }
+    }
+  } finally { rmSync(fixtureDirectory, { recursive: true, force: true }); }
 });
