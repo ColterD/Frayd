@@ -37,7 +37,7 @@ function responsivePreload(width) {
   const originalFetch = window.fetch.bind(window);
   const fixture = window.__responsiveFixture = { width, progressResponses: [], mediaEvents: [], cardClicks: [], requests: [] };
   fixture.items = [
-    ...Array.from({ length: 6 }, (_, n) => ({ id: 60 + n, kind: 'movie', title: n ? `Movie ${n}` : 'Long media title '.repeat(12), created_at: n })),
+    ...Array.from({ length: 6 }, (_, n) => ({ id: 60 + n, kind: 'movie', title: n ? `Movie ${n}` : 'Date With Your Family, A - http://www.archive.org/details/DateWith1950', author: n ? '' : 'UnbrokenAuthor'.repeat(15), created_at: n })),
     ...Array.from({ length: 8 }, (_, n) => ({ id: 23 + n, kind: 'music', title: n ? `Audio ${n}` : 'Long player title '.repeat(8), author: 'Fixture artist', created_at: n })),
     ...['ebook', 'comic', 'manga', 'audiobook'].flatMap((kind, k) => Array.from({ length: 8 }, (_, n) => ({
       id: 70 + k * 10 + n, kind, title: `${kind} book ${n}`, author: 'Fixture author', created_at: n,

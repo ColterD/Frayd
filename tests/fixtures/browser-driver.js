@@ -42,10 +42,36 @@ async function isolatedResponsiveCase(width) {
     try {
       await until(() => account?.isAdmin && LIBRARY.length === items.length, 'fresh document authenticates with private fixture model');
       check(!document.getElementById('party-modal').classList.contains('on') && !document.getElementById('playerbar').classList.contains('on'), 'Fresh document starts with clean party/player state');
+      // Measure existing production form nodes; only signed-out visibility is modeled.
+      const login = document.getElementById('login'), app = document.getElementById('app');
+      const loginStyle = login.getAttribute('style'), appClass = app.className, bodyClass = document.body.className;
+      const rect = node => { const r = node.getBoundingClientRect(); return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height }; };
+      const contains = (outer, inner) => inner.left >= outer.left - 1 && inner.right <= outer.right + 1 && inner.top >= outer.top - 1 && inner.bottom <= outer.bottom + 1;
+      try {
+        app.classList.remove('on'); login.style.display = 'block'; document.body.classList.add('auth');
+        const card = rect(document.querySelector('.auth-card'));
+        measured.loginGeometry = ['email', 'password', 'pw-toggle'].map(id => ({ id, ...rect(document.getElementById(id)) }));
+        check(document.documentElement.scrollWidth <= innerWidth + 1, 'Sign-in document fits viewport without hiding overflow');
+        measured.loginGeometry.forEach(field => check(field.width > 0 && contains(card, field), 'Sign-in input/reveal fits auth card: ' + field.id));
+        const reveal = document.getElementById('pw-toggle'), r = rect(reveal);
+        check(reveal.contains(document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2)), 'Password reveal accepts pointer hit');
+      } finally {
+        if (loginStyle === null) login.removeAttribute('style'); else login.setAttribute('style', loginStyle);
+        app.className = appClass; document.body.className = bodyClass;
+      }
       authorDrill.music = { author: 'Fixture artist' };
       authorDrill.ebook = { author: 'Fixture author' };
       authorDrill.audiobook = { author: 'Fixture author' };
       await filterKind('all', '');
+      const hero = document.getElementById('hero'), heroRect = rect(hero);
+      check(hero.style.display === 'block', 'Actual renderHero retains its production inline block display');
+      const title = hero.querySelector('h2'), copy = hero.querySelector('.hero-copy'), tags = [...hero.querySelectorAll('.tag')];
+      measured.heroGeometry = { hero: heroRect, title: rect(title), copy: rect(copy), tags: tags.map(rect), play: rect(hero.querySelector('.btn-play')) };
+      for (const node of [title, copy, ...tags, hero.querySelector('.btn-play')]) {
+        check(contains(heroRect, rect(node)), 'Hero text/tag/button fits growing hero bounds');
+        if (node !== copy) check(node.scrollWidth <= node.clientWidth + 1, 'Hero text wraps without horizontal clipping');
+      }
+      check(Math.max(...tags.map(node => rect(node).bottom)) <= rect(copy).top, 'Wrapped tags do not overlap hero copy');
       const actualCards = [...document.querySelectorAll('#main .media-card')];
       const portraitItems = items.filter(item => ['ebook', 'comic', 'manga', 'audiobook'].includes(item.kind));
       for (const item of portraitItems) {
@@ -141,7 +167,32 @@ async function isolatedResponsiveCase(width) {
       const enter = await key('Enter'); const space = await key(' ');
       check(enter.dialogs.length === 1 && space.dialogs.length === 1 && LIBRARY.length === before, 'Native cancellation retains cards at this viewport');
       check(!document.getElementById('video-modal').classList.contains('on'), 'Delete keys do not open playback');
-      return { viewport: { width: innerWidth, height: innerHeight }, sizes, grids, ratios, navigationLabels: nav.map(n => n.textContent.trim()), adminAndPlayerControlsReachable: true, realMediaControl: true, audioPauseUi: measured.audioPauseUi, deletionCancellation: true, nativeDiagnostics: fixture, overflowInventory: measured.overflowInventory };
+      // Real production openVideo and decoder; only media/API bytes are fixtures.
+      plyr.muted = true;
+      openVideo({ id: 21, kind: 'movie', title: 'Responsive native layout' });
+      await until(() => plyr.media.readyState === 4 && plyr.media.getVideoPlaybackQuality().totalVideoFrames > 0, 'responsive native video decodes');
+      plyr.toggleControls(true);
+      const wrapper = document.querySelector('#video-modal .plyr');
+      const nativeControls = document.querySelector('.plyr__controls');
+      await until(() => contains(rect(wrapper), rect(nativeControls)), 'revealed native controls settle inside wrapper');
+      measured.videoGeometry = { wrapper: rect(wrapper), controls: rect(nativeControls), decodedFrames: plyr.media.getVideoPlaybackQuality().totalVideoFrames };
+      check(rect(wrapper).width === innerWidth && rect(wrapper).height === innerHeight, 'Native Plyr fills viewport');
+      check(getComputedStyle(document.getElementById('yt-party')).display === 'none', 'Native mode hides inactive external surface');
+      reachable(document.querySelector('.plyr__controls [data-plyr="play"]'));
+      // Model only the external-provider layout state; no YouTube playback claim.
+      const modal = document.getElementById('video-modal'), external = document.getElementById('yt-party');
+      modal.classList.add('yt');
+      measured.youtubeLayoutModel = { wrapper: rect(wrapper), placeholder: rect(external) };
+      check(rect(wrapper).width === 0 && rect(nativeControls).width === 0, 'YouTube mode hides native wrapper and controls');
+      check(rect(external).width === innerWidth && rect(external).height === innerHeight, 'External placeholder fills viewport');
+      const iframe = document.createElement('iframe'); iframe.id = 'yt-party'; iframe.title = 'Modeled YouTube surface';
+      external.replaceWith(iframe);
+      try {
+        check(rect(iframe).width === innerWidth && rect(iframe).height === innerHeight, 'YouTube replacement iframe fills viewport');
+        modal.classList.remove('yt');
+        check(rect(iframe).width === 0 && rect(wrapper).width === innerWidth, 'Returning native mode hides external iframe and restores Plyr');
+      } finally { iframe.replaceWith(external); modal.classList.remove('yt'); document.getElementById('vm-back').click(); }
+      return { viewport: { width: innerWidth, height: innerHeight }, sizes, grids, ratios, layoutGeometry: { login: measured.loginGeometry, hero: measured.heroGeometry, native: measured.videoGeometry, youtubeModel: measured.youtubeLayoutModel }, navigationLabels: nav.map(n => n.textContent.trim()), adminAndPlayerControlsReachable: true, realMediaControl: true, audioPauseUi: measured.audioPauseUi, deletionCancellation: true, nativeDiagnostics: fixture, overflowInventory: measured.overflowInventory };
     } catch (error) {
       error.observed = { ...measured, audio: { readyState: pbAudio.readyState, paused: pbAudio.paused,
         duration: pbAudio.duration, currentTime: pbAudio.currentTime, mediaError: pbAudio.error?.code || null }, nativeDiagnostics: fixture };
