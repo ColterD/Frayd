@@ -66,6 +66,10 @@ async function isolatedResponsiveCase(width) {
           check(brandRect.top >= 0 && brandRect.bottom <= cardRect.top && cardRect.bottom <= footerRect.top, 'Authentication brand, form and guest footer never overlap at short height');
           check(document.documentElement.scrollWidth <= innerWidth + 1, 'Short authentication document stays within viewport width');
           const controls = [...login.querySelectorAll('input,button,a')];
+          measured.authFlowGeometry.controlOrder = controls.map(control => control.id || control.getAttribute('type'));
+          equal(measured.authFlowGeometry.controlOrder, ['email', 'password', 'pw-toggle', 'submit', 'guest'], 'Authentication offers exactly its five implemented controls');
+          check(controls[0].type === 'email' && controls[0].required && controls[1].type === 'password' && controls[1].required, 'Native sign-in field validation remains enabled');
+          check(controls[3].type === 'submit' && controls[3].form === document.getElementById('login-form'), 'Sign in retains native form submission');
           for (const control of controls) {
             control.scrollIntoView({ block: 'center', inline: 'nearest' });
             control.focus();
@@ -82,11 +86,15 @@ async function isolatedResponsiveCase(width) {
             }
             measured.authFlowGeometry.controls.push({ id: control.id || control.textContent.trim(), bounds, scrollY });
           }
-          const guest = document.getElementById('guest');
-          controls[controls.indexOf(guest) - 1].focus();
-          await key('Tab');
-          check(document.activeElement === guest, 'Native Tab reaches guest link after social controls');
-          check(height === 1000 || measured.authFlowGeometry.controls.some(control => control.scrollY > 0), 'Short sign-in page scrolls to controls below fold');
+          controls[0].focus();
+          for (const control of controls.slice(1)) {
+            await key('Tab');
+            check(document.activeElement === control, 'Native Tab follows the supported sign-in control order');
+          }
+          measured.authFlowGeometry.tabOrderVerified = true;
+          measured.authFlowGeometry.needsScroll = document.documentElement.scrollHeight > innerHeight + 1;
+          if (measured.authFlowGeometry.needsScroll) check(measured.authFlowGeometry.controls.some(control => control.scrollY > 0), 'Overflowing sign-in content remains reachable by natural scrolling');
+          else check(footerRect.bottom <= innerHeight + 1, 'Compact sign-in content fits without requiring artificial scrolling');
         } finally {
           await api('viewport', { width, height: 1000 });
           await until(() => innerHeight === 1000, 'original viewport height restored');
@@ -190,6 +198,7 @@ async function isolatedResponsiveCase(width) {
       reachable(document.querySelector('#search input'));
       reachable(document.getElementById('add-media')); document.getElementById('add-media').click();
       await until(() => !document.getElementById('add-media').disabled, 'Visible scan control handles modeled busy response');
+      equal([...document.querySelectorAll('#topbar button')].map(button => button.id), ['party-btn', 'add-media'], 'Main toolbar offers implemented Party and Scan controls');
       reachable(document.getElementById('party-btn')); document.getElementById('party-btn').click();
       check(document.getElementById('party-modal').classList.contains('on'), 'Visible party control opens panel');
       const originalSocket = window.WebSocket;
