@@ -499,15 +499,16 @@ async fn thumb(
             .ok()
     };
     let Some(path) = path else { return StatusCode::NO_CONTENT.into_response() };
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => (
-            [(header::CONTENT_TYPE, thumbnail_mime(&bytes)),
-             (header::CACHE_CONTROL, "no-cache")],
-            bytes,
-        )
-            .into_response(),
-        Err(_) => StatusCode::NO_CONTENT.into_response(),
-    }
+    use tokio::io::{AsyncReadExt,AsyncSeekExt};
+    let Ok(mut file)=tokio::fs::File::open(&path).await else {return StatusCode::NO_CONTENT.into_response();};
+    let Ok(metadata)=file.metadata().await else {return StatusCode::NO_CONTENT.into_response();};
+    if !metadata.is_file() {return StatusCode::NO_CONTENT.into_response();}
+    let mut signature=Vec::new();
+    if (&mut file).take(12).read_to_end(&mut signature).await.is_err()
+        || file.seek(std::io::SeekFrom::Start(0)).await.is_err() {return StatusCode::NO_CONTENT.into_response();}
+    let stream=tokio_util::io::ReaderStream::with_capacity(file,64*1024);
+    ([(header::CONTENT_TYPE,thumbnail_mime(&signature)),(header::CACHE_CONTROL,"no-cache"),
+      (header::CONTENT_LENGTH,&metadata.len().to_string())],axum::body::Body::from_stream(stream)).into_response()
 }
 
 /// GET /api/comic/:id/pages → ["p001.jpg", ...] natural-sorted.
@@ -1661,12 +1662,28 @@ mod backend_regressions {
         app.db.lock().unwrap().execute("UPDATE media SET kind='ebook',thumb_path=?1 WHERE id=1",[image.to_string_lossy()]).unwrap();
         let response=thumb(State(app.clone()),Path(1)).await.into_response();
         assert_eq!(response.status(),StatusCode::OK);assert_eq!(response.headers()[header::CONTENT_TYPE],"image/png");assert_eq!(response.headers()[header::CACHE_CONTROL],"no-cache");
+        assert_eq!(axum::body::to_bytes(response.into_body(),1024).await.unwrap().as_ref(),b"\x89PNG\r\n\x1a\nlegacy");
         let replacement=directory.join("new.jpg");std::fs::write(&replacement,[0xff,0xd8,0xff,0xd9]).unwrap();
         app.db.lock().unwrap().execute("UPDATE media SET thumb_path=?1 WHERE id=1",[replacement.to_string_lossy()]).unwrap();
         let response=thumb(State(app.clone()),Path(1)).await.into_response();assert_eq!(response.headers()[header::CONTENT_TYPE],"image/jpeg");
+        assert_eq!(axum::body::to_bytes(response.into_body(),1024).await.unwrap().as_ref(),&[0xff,0xd8,0xff,0xd9]);
         app.db.lock().unwrap().execute("UPDATE media SET thumb_path=NULL WHERE id=1",[]).unwrap();
         assert_eq!(thumb(State(app),Path(1)).await.into_response().status(),StatusCode::NO_CONTENT);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn epub_boundary_cached_legacy_thumbnail_streams_bounded_frames() {
+        use futures::StreamExt;
+        let directory=std::env::temp_dir().join(format!("frayd-thumb-stream-{}",uuid::Uuid::new_v4()));std::fs::create_dir(&directory).unwrap();
+        let image=directory.join("1.jpg");let mut file=std::fs::File::create(&image).unwrap();
+        std::io::Write::write_all(&mut file,b"\x89PNG\r\n\x1a\nlegacy").unwrap();file.set_len(8*1024*1024).unwrap();
+        let app=app_for("fixture.epub");app.db.lock().unwrap().execute("UPDATE media SET thumb_path=?1 WHERE id=1",[image.to_string_lossy()]).unwrap();
+        let response=thumb(State(app.clone()),Path(1)).await.into_response();assert_eq!(response.status(),StatusCode::OK);assert_eq!(response.headers()[header::CONTENT_TYPE],"image/png");
+        let mut chunks=response.into_body().into_data_stream();let first=chunks.next().await.unwrap().unwrap();assert!(first.len()<=64*1024,"legacy artwork first body frame buffered {} bytes",first.len());println!("legacy_thumbnail_bytes=8388608 first_body_frame_bytes={} frame_limit_bytes=65536",first.len());drop(chunks);
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();let router=Router::new().route("/api/thumb/:id",get(thumb)).with_state(app);let server=tokio::spawn(async move{axum::serve(listener,router).await.unwrap();});
+        let head=tokio::task::spawn_blocking(move||{let response=ureq::head(&format!("http://{address}/api/thumb/1")).call().unwrap();(response.status(),response.header("Content-Length").unwrap().to_string(),response.header("Content-Type").unwrap().to_string())}).await.unwrap();
+        assert_eq!(head,(200,(8*1024*1024).to_string(),"image/png".into()));server.abort();std::fs::remove_dir_all(directory).unwrap();
     }
 
     /// Isolate legacy metadata and saved progress without using an operator database.

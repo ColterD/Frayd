@@ -634,7 +634,7 @@ function filterKind(kind, query = activeQuery) {
   if (activeKind !== 'all') items = items.filter(i => i.kind === activeKind);
   if (activeQuery) {
     const q = activeQuery.toLowerCase();
-    items = items.filter(i => (i.title || '').toLowerCase().includes(q) || (i.author || '').toLowerCase().includes(q));
+    items = items.filter(i => (i.title || '').toLowerCase().includes(q) || (i.author || '').toLowerCase().includes(q) || (i.synopsis || '').toLowerCase().includes(q));
   }
   return renderRows(items);
 }
@@ -1146,7 +1146,10 @@ async function showChunk(n, opts = {}) {
   const chunkUrl = ebook.spine[ebook.chunk]; // zip-relative path
   const base = chunkUrl.includes('/') ? chunkUrl.slice(0, chunkUrl.lastIndexOf('/') + 1) : '';
   try {
-    let html = await (await fetch(`/api/epub/${ebook.it.id}/chunk/${ebook.chunk}`)).text();
+    const response = await fetch(`/api/epub/${ebook.it.id}/chunk/${ebook.chunk}`);
+    if (!response.ok) throw new Error('Chapter unavailable');
+    let html = await response.text();
+    if (!/<\/head>/i.test(html)) throw new Error('Invalid chapter');
     if (!isCurrent()) return;
     const PW = ebookPageW(), PAD = 28; // page margin; column gap must be 2*PAD (see stride below)
     const FRAME_H = Math.round((document.getElementById('em-frame')?.clientHeight || window.innerHeight * 0.78) / window.innerHeight * 100);
@@ -1166,7 +1169,7 @@ async function showChunk(n, opts = {}) {
           height:${FRAME_H}vh;width:${PW}px;padding:${PAD}px;
           margin:0;box-sizing:border-box;font-family:Georgia,serif;
           text-align:justify;overflow-wrap:break-word}
-        img{max-width:100%}
+        img{max-width:100%;max-height:calc(${FRAME_H}vh - ${2 * PAD}px);object-fit:contain}
       </style>
       <script>
         const generation = ${readerDocument.generation};
@@ -1374,6 +1377,7 @@ async function showChunk(n, opts = {}) {
   } catch {
     if (!isCurrent()) return;
     publishEbookDocument('<p style="font-family:sans-serif;color:#333">Failed to load chapter.</p>');
+    $('#em-pageinfo').textContent = 'Chapter unavailable';
   }
 }
 

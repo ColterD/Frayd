@@ -92,7 +92,7 @@ test('missing or replaced frame cannot authorize an old sender', () => {
 
 test('reader chapter reports preserve both directions and enforce spine boundaries', async () => {
   const b = reader();
-  b.respond(async () => ({ text: async () => '<html><head></head><body>Chapter</body></html>' }));
+  b.respond(async () => ({ ok: true, text: async () => '<html><head></head><body>Chapter</body></html>' }));
   b.send({ type: 'chapter', dir: 1 });
   await new Promise(setImmediate);
   assert.equal(b.run('ebook.chunk'), 2);
@@ -122,7 +122,7 @@ test('reader single-page, final-page, empty search and geometry reports remain a
 test('ready restores resume and saved marks once, and rejects stale generations on the current WindowProxy', async () => {
   const b = reader();
   const posted = [];
-  b.respond(async () => ({ text: async () => '<html><head></head><body>Hello</body></html>' }));
+  b.respond(async () => ({ ok: true, text: async () => '<html><head></head><body>Hello</body></html>' }));
   b.run('ebook.annots = [{ kind: "highlight", spine_idx: 1, cfi: "char:0:5", color: "yellow" }]');
   await b.run('showChunk(1, { frac: 0.75 })');
   b.nodes.get('#em-frame').contentWindow.postMessage = data => posted.push(data);
@@ -158,15 +158,15 @@ test('late chapter fetch cannot replace the latest chapter or a closed reader', 
   b.respond(() => new Promise(resolve => finish.push(resolve)));
   const old = b.run('showChunk(0)');
   const current = b.run('showChunk(2)');
-  finish[1]({ text: async () => '<html><head></head><body>Current</body></html>' });
+  finish[1]({ ok: true, text: async () => '<html><head></head><body>Current</body></html>' });
   await current;
   const html = b.nodes.get('#em-frame').srcdoc;
-  finish[0]({ text: async () => '<html><head></head><body>Retired</body></html>' });
+  finish[0]({ ok: true, text: async () => '<html><head></head><body>Retired</body></html>' });
   await old;
   assert.equal(b.nodes.get('#em-frame').srcdoc, html);
   const closed = b.run('showChunk(1)');
   b.nodes.get('#em-close').onclick();
-  finish[2]({ text: async () => '<html><head></head><body>Closed</body></html>' });
+  finish[2]({ ok: true, text: async () => '<html><head></head><body>Closed</body></html>' });
   await closed;
   assert.equal(b.nodes.get('#em-frame').srcdoc, '');
 });
@@ -202,7 +202,7 @@ for (const failure of [false, true]) {
     retired.setAttribute('referrerpolicy', 'no-referrer');
     b.respond(async () => {
       if (failure) throw new Error('Owned chapter failure');
-      return { text: async () => '<html><head></head><body>Published chapter</body></html>' };
+      return { ok: true, text: async () => '<html><head></head><body>Published chapter</body></html>' };
     });
     await b.run('showChunk(1, { frac: 0.75 })');
     const current = b.nodes.get('#em-frame');
@@ -218,7 +218,7 @@ for (const failure of [false, true]) {
     assert.equal(b.run('ebook.document.ready'), false);
     assert.equal(b.run('ebook.chunk'), 1);
     assert.equal(b.requests.length, 1);
-    assert.equal(b.nodes.get('#em-pageinfo').textContent, '');
+    assert.equal(b.nodes.get('#em-pageinfo').textContent, failure ? 'Chapter unavailable' : '');
     // A queued reset on the removed node cannot overwrite the published body.
     retired.srcdoc = '';
     retired.src = 'about:blank';
@@ -230,7 +230,7 @@ async function paginationDocument({ visible = false, pages = 4, layoutPending = 
   const vm = require('node:vm');
   const b = reader();
   b.run('ebook.spine.push("d"); ebook.chunk = 2');
-  b.respond(async () => ({ text: async () => '<html><head></head><body>Saved chapter</body></html>' }));
+  b.respond(async () => ({ ok: true, text: async () => '<html><head></head><body>Saved chapter</body></html>' }));
   await b.run('showChunk(2, { frac: 1 / 3 })');
   const script = b.nodes.get('#em-frame').srcdoc.match(/<script>([\s\S]*?)<\/script>/)[1];
   const events = new Map(), renders = [];
@@ -294,4 +294,57 @@ test('visible viewport waits for a render before its first resume can overwrite 
   await reader.render();
   assert.equal(reader.b.nodes.get('#em-pageinfo').textContent, '3 · p2/4');
   assert.equal(reader.b.run('ebook.lastFrac'), 1 / 3);
+});
+
+for (const [status, body] of [[404, ''], [500, 'Owned server rejection'], [200, ''], [200, 'Plain chapter without a head']]) {
+  test(`chapter response ${status} ${body ? 'text' : 'empty'} publishes a current error without losing the requested fraction`, async () => {
+    const b = reader();
+    const response = new Response(body, { status });
+    b.respond(async () => response);
+    b.nodes.get('#em-pageinfo').textContent = 'Loading…';
+    const previous = b.nodes.get('#em-frame');
+    await b.run('showChunk(1, { frac: 0.75 })');
+    assert.notEqual(b.nodes.get('#em-frame'), previous);
+    assert.match(b.nodes.get('#em-frame').srcdoc, /Failed to load chapter/);
+    assert.equal(b.nodes.get('#em-pageinfo').textContent, 'Chapter unavailable');
+    assert.equal(b.run('ebook.lastFrac'), 0.75);
+    assert.equal(b.run('ebook.document.ready'), false);
+    assert.equal(b.requests.filter(request => request.options?.method === 'POST').length, 0);
+    assert.equal(response.bodyUsed, status === 200, 'Rejected HTTP body is not read or rendered');
+  });
+}
+
+for (const status of [404, 500]) {
+  test(`late HTTP ${status} cannot erase a newer ready chapter or overwrite its bookmark`, async () => {
+    const b = reader();
+    let release;
+    b.respond(() => new Promise(resolve => { release = resolve; }));
+    const stale = b.run('showChunk(0)');
+    b.respond(async () => new Response('<html><head></head><body>Current ready chapter</body></html>'));
+    await b.run('showChunk(2, { frac: 0.75 })');
+    b.send({ type: 'reader-ready' });
+    b.send({ type: 'page', page: 4, pages: 5 });
+    const current = b.nodes.get('#em-frame');
+    const html = current.srcdoc;
+    release(new Response('Retired error', { status }));
+    await stale;
+    assert.equal(b.nodes.get('#em-frame'), current);
+    assert.equal(current.srcdoc, html);
+    assert.equal(b.nodes.get('#em-pageinfo').textContent, '3 · p4/5');
+    assert.equal(b.run('ebook.lastFrac'), 0.75);
+    assert.deepEqual(b.requests.filter(request => request.options?.method === 'POST').map(request => JSON.parse(request.options.body).position), [2.75]);
+  });
+}
+
+test('HTTP 200 chapter with a head publishes its bridge and awaits the normal ready handshake', async () => {
+  const b = reader();
+  b.respond(async () => new Response('<html><head></head><body>Valid chapter</body></html>'));
+  await b.run('showChunk(1, { frac: 0.75 })');
+  assert.match(b.nodes.get('#em-frame').srcdoc, /reader-ready/);
+  assert.match(b.nodes.get('#em-frame').srcdoc, /Valid chapter/);
+  assert.equal(b.run('ebook.document.ready'), false);
+  b.send({ type: 'reader-ready' });
+  b.send({ type: 'page', page: 4, pages: 5 });
+  assert.equal(b.nodes.get('#em-pageinfo').textContent, '2 · p4/5');
+  assert.equal(b.run('ebook.lastFrac'), 0.75);
 });

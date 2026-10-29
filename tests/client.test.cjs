@@ -30,7 +30,7 @@ test('closing before any page report saves a finite chapter position', () => {
 
 test('changing chapters resets the previous fractional position before layout reports', async () => {
   const b = browser();
-  b.respond(async () => ({ text: async () => '<html><head></head><body>Chapter</body></html>' }));
+  b.respond(async () => ({ ok: true, text: async () => '<html><head></head><body>Chapter</body></html>' }));
   b.run('ebook = { it: { id: 7 }, chunk: 0, spine: ["a", "b"], document: { generation: 1, ready: true } }');
   b.page(3, 5);
   await b.run('showChunk(1)');
@@ -49,13 +49,13 @@ test('closing while the next chapter fetch is pending saves the new chapter posi
   const loading = b.run('showChunk(1)');
   b.nodes.get('#em-close').onclick();
   assert.deepEqual(progress(b), [0.5, 1]);
-  finishFetch({ text: async () => '<html><head></head><body>Chapter</body></html>' });
+  finishFetch({ ok: true, text: async () => '<html><head></head><body>Chapter</body></html>' });
   await loading;
 });
 
 test('closing a resumed chapter before layout preserves the requested fraction', async () => {
   const b = browser();
-  b.respond(async () => ({ text: async () => '<html><head></head><body>Chapter</body></html>' }));
+  b.respond(async () => ({ ok: true, text: async () => '<html><head></head><body>Chapter</body></html>' }));
   b.run('ebook = { it: { id: 7 }, chunk: 0, spine: ["a", "b"], document: { generation: 1, ready: true } }');
   await b.run('showChunk(1, { frac: 0.75 })');
   b.nodes.get('#em-close').onclick();
@@ -377,7 +377,7 @@ test('highlight waits for creation and retains saved state for chapter revisit w
   assert.equal(b.nodes.get('#em-searchinfo').textContent, 'Highlight saved');
   assert.equal(b.run('ebook.annots.length'), 1);
   assert.equal(posted.length, 1);
-  b.respond(async () => ({ text: async () => '<html><head></head><body>Hello world</body></html>' }));
+  b.respond(async () => ({ ok: true, text: async () => '<html><head></head><body>Hello world</body></html>' }));
   await b.run('showChunk(0)');
   await b.run('showChunk(1)');
   b.nodes.get('#em-frame').contentWindow.postMessage = data => posted.push(data);
@@ -440,7 +440,7 @@ test('pending highlight completion keeps captured book and chapter without touch
 
 async function generatedSelection(options = {}) {
   const { b } = highlightReader();
-  b.respond(async () => ({ text: async () => '<html><head></head><body>prefix Hello world</body></html>' }));
+  b.respond(async () => ({ ok: true, text: async () => '<html><head></head><body>prefix Hello world</body></html>' }));
   await b.run('showChunk(1)');
   b.message({ type: 'reader-ready' });
   const generatedHtml = b.nodes.get('#em-frame').srcdoc;
@@ -3011,3 +3011,36 @@ test('a retired category sort control cannot fetch progress for a replacement id
   assert.equal(reads().length, before);
   assert.equal(b.nodes.get('#main').innerHTML, 'replacement account view');
 });
+
+for (const kind of ['episode', 'music', 'ebook', 'audiobook']) {
+  test(`synopsis-only ${kind} search survives folder navigation without extra library requests`, async () => {
+    const b = browser();
+    const match = { id: 41, kind, title: 'Unrelated title', author: 'Author', series: 'Collection', synopsis: 'A NeBuLa adventure' };
+    const nonmatch = { id: 42, kind, title: 'Different title', author: 'Author', series: 'Collection', synopsis: 'Nothing matches here' };
+    b.context.scopedLibraryFixture = [match, nonmatch];
+    b.run(`LIBRARY = scopedLibraryFixture; activeKind = '${kind}'; IDENTITY = 'scoped-search-owner'`);
+    b.respond(async url => ({ok:true,json:async () => url.startsWith('/api/library?q=') ? [match] : null}));
+    await b.run('serverSearch("NEBULA")');
+    await settle();
+    const shelf = b.nodes.get('#main').children.at(-1);
+    assert.match(shelf.children[1].children[0].innerHTML, kind === 'episode' ? /Collection/ : /Author/);
+    b.nodes.get('#main').children.length = 0;
+    await shelf.children[1].children[0].onclick();
+    await settle();
+    let detail = b.nodes.get('#main').children.at(-1);
+    if (kind !== 'episode') {
+      const seriesGrid = detail.children.find(node => node.className === 'cards');
+      assert.ok(seriesGrid, 'Synopsis-only result must retain its author series folder');
+      const series = seriesGrid.children[0];
+      b.nodes.get('#main').children.length = 0;
+      await series.onclick();
+      await settle();
+      detail = b.nodes.get('#main').children.at(-1);
+    }
+    const cards = detail.children.filter(node => node.className === 'cards').flatMap(node => node.children);
+    assert.deepEqual(cards.map(card => card.title), ['Unrelated title — Author']);
+    assert.equal(b.requests.filter(request => request.url.startsWith('/api/library')).length, 1);
+    assert.equal(b.run('LIBRARY === scopedLibraryFixture'), true, 'Filtering retains the already identity-scoped library');
+    assert.equal(b.run('activeQuery'), 'NEBULA');
+  });
+}

@@ -188,6 +188,9 @@ async function isolatedResponsiveCase(width) {
         await api('viewport', { width, height: 568 });
         await until(() => innerHeight === 568, 'short active-audio viewport settles');
         try {
+          const metadata = { title: 'Long song title '.repeat(12), author: 'Long artist credit '.repeat(18), album: 'Long album title '.repeat(12) };
+          playAudio({ ...music, title: metadata.title + ' — ' + metadata.album, author: metadata.author, series: metadata.album });
+          await until(() => !localAudioLoad.pendingResume && pbAudio.readyState >= 2 && !pbAudio.paused, 'long-metadata native audio starts');
           const main = document.getElementById('main');
           const lastCard = [...main.querySelectorAll('.media-card')].at(-1);
           const title = lastCard.querySelector('.title');
@@ -199,11 +202,15 @@ async function isolatedResponsiveCase(width) {
             const hit = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
             return { box, hit: hit?.id || hit?.className || hit?.tagName, reachable: hit === node || node.contains(hit) };
           };
-          measured.shortAudioFooter = { viewport: { width: innerWidth, height: innerHeight }, main: rect(main),
+          measured.shortAudioFooter = { metadata, subtitle: { text: document.getElementById('pb-sub').textContent, bounds: rect(document.getElementById('pb-sub')) }, viewport: { width: innerWidth, height: innerHeight }, main: rect(main),
             paddingBottom: getComputedStyle(main).paddingBottom, maxScroll: main.scrollTop, documentScroll: scrollY, documentHeight: document.documentElement.scrollHeight, card: rect(lastCard),
             title: pointHit(title), bar: rect(bar), audioControls: ['pb-play', 'pb-close'].map(id => ({id, ...pointHit(document.getElementById(id))})) };
           check(rect(lastCard).bottom <= rect(bar).top, 'Last library card clears the active wrapped player at maximum scroll');
           check(measured.shortAudioFooter.title.reachable, 'Last library card title center accepts a pointer hit above the player');
+          equal(document.getElementById('pb-sub').textContent, metadata.author, 'Full artist text remains in accessible DOM despite visual ellipsis');
+          equal(document.getElementById('pb-title').textContent, metadata.title + ' — ' + metadata.album, 'Full title and album remain in DOM');
+          const subtitleStyle = getComputedStyle(document.getElementById('pb-sub'));
+          check(subtitleStyle.whiteSpace === 'nowrap' && subtitleStyle.textOverflow === 'ellipsis', 'Artist metadata remains a single ellipsized line');
           let trustedTitleClick = false;
           title.addEventListener('click', event => { trustedTitleClick = event.isTrusted; event.stopImmediatePropagation(); }, { capture: true, once: true });
           const titleBox = rect(title);
@@ -216,6 +223,20 @@ async function isolatedResponsiveCase(width) {
           measured.shortAudioFooter.centeredCard = pointHit(lastCard);
           check(measured.shortAudioFooter.centeredCard.reachable, 'Last library card center is reachable by scrolling');
           equal([...bar.querySelectorAll('button')].map(button => button.id), ['pb-play', 'pb-close'], 'Default audio player retains exactly its two implemented buttons');
+          let trustedPlay = false, trustedClose = false;
+          const playButton = document.getElementById('pb-play'), closeButton = document.getElementById('pb-close');
+          playButton.addEventListener('click', event => { trustedPlay = event.isTrusted; }, { once: true });
+          const playBounds = rect(playButton), closeBounds = rect(closeButton);
+          await api('click', { x: playBounds.left + playBounds.width / 2, y: playBounds.top + playBounds.height / 2 });
+          await until(() => pbAudio.paused && playButton.textContent === '▶', 'Long-metadata player pauses through trusted control click');
+          await api('click', { x: playBounds.left + playBounds.width / 2, y: playBounds.top + playBounds.height / 2 });
+          await until(() => !pbAudio.paused, 'Long-metadata player resumes through trusted control click');
+          closeButton.addEventListener('click', event => { trustedClose = event.isTrusted; }, { once: true });
+          await api('click', { x: closeBounds.left + closeBounds.width / 2, y: closeBounds.top + closeBounds.height / 2 });
+          check(!bar.classList.contains('on') && pbAudio.paused && trustedPlay && trustedClose, 'Both implemented controls work with long artist, album and title');
+          measured.shortAudioFooter.controlClicks = { trustedPlay, trustedClose, pausedAndResumed: true, closed: true };
+          playAudio(music);
+          await until(() => !localAudioLoad.pendingResume && pbAudio.readyState >= 2 && !pbAudio.paused, 'Native audio restores after long-metadata control checks');
           await filterKind('episode', '');
           equal(scrollY, 0, 'Category filtering resets document scroll');
           window.scrollTo(0, document.documentElement.scrollHeight);
@@ -880,6 +901,69 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       equal(ebook.lastFrac, 0, 'Visible single-page chapter legitimately publishes zero fraction');
       equal(paginationWrites, [2 + 1 / 3, 2], 'Valid single-page autosave remains accepted');
     } finally { window.fetch = chapterFetch; }
+    const tallCoverSource = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="500" height="862" viewBox="0 0 500 862"><rect width="500" height="862" fill="#f5e4b9"/><rect x="10" y="10" width="480" height="842" fill="none" stroke="#46342a" stroke-width="20"/><text x="250" y="100" text-anchor="middle" font-size="40">COVER TOP</text><text x="250" y="800" text-anchor="middle" font-size="40">COVER BOTTOM</text></svg>');
+    const coverBody = '<img id="owned-tall-cover" style="width:100%" alt="Owned tall cover: top and bottom must remain visible" src="' + tallCoverSource + '"><script>' +
+      'addEventListener("message",async event=>{if(event.source!==parent||event.data?.type!=="cover-fit-probe")return;' +
+      'const image=document.getElementById("owned-tall-cover");await image.decode();const rect=image.getBoundingClientRect(),body=document.body.getBoundingClientRect(),style=getComputedStyle(document.body);' +
+      'parent.postMessage({type:"cover-fit-result",naturalWidth:image.naturalWidth,naturalHeight:image.naturalHeight,alt:image.alt,' +
+      'image:{top:rect.top,bottom:rect.bottom,width:rect.width,height:rect.height},content:{top:body.top+parseFloat(style.paddingTop),bottom:body.bottom-parseFloat(style.paddingBottom)},viewport:innerHeight},"*")});<\/script>';
+    await api('configure', { body: coverBody, annotations: [] });
+    ebook = { it: { id: 7 }, spine: ['cover.xhtml', 'chapter.xhtml'], chunk: 0, annots: [] };
+    await showChunk(0, { frac: 1 / 3 });
+    await until(() => ebook.document.ready, 'decoded tall cover reader ready');
+    const coverFit = await new Promise((resolve, reject) => {
+      const frameWindow = readerFrame().contentWindow;
+      const timer = setTimeout(() => { window.removeEventListener('message', receive); reject(new Error('Tall cover geometry probe timed out')); }, 4000);
+      function receive(event) {
+        if (event.source !== frameWindow || event.origin !== 'null' || event.data?.type !== 'cover-fit-result') return;
+        clearTimeout(timer); window.removeEventListener('message', receive); resolve(event.data);
+      }
+      window.addEventListener('message', receive);
+      frameWindow.postMessage({ type: 'cover-fit-probe' }, '*');
+    });
+    equal([coverFit.naturalWidth, coverFit.naturalHeight], [500, 862], 'Tall fixture image really decodes at its intrinsic dimensions');
+    check(coverFit.image.top >= coverFit.content.top - 1 && coverFit.image.bottom <= coverFit.content.bottom + 1,
+      'Decoded tall cover fits inside the actual padded reader content: ' + JSON.stringify(coverFit));
+    equal(coverFit.alt, 'Owned tall cover: top and bottom must remain visible', 'Cover alternative text remains intact');
+    equal(document.getElementById('em-pageinfo').textContent, '1 · p1/1', 'Fitted cover occupies one actual page');
+    equal(ebook.lastFrac, 0, 'Visible cover single-page position legitimately saves zero fraction');
+    ebookFlip(-1); await probe();
+    equal(ebook.chunk, 0, 'Previous at the cover remains within the first spine entry');
+    const errorFetch = window.fetch;
+    const publishChapter = publishEbookDocument;
+    const chapterErrors = [];
+    const errorWrites = [];
+    // Observe the real sandboxed error paragraph after load; keep its production markup intact.
+    publishEbookDocument = html => publishChapter(html + (html.includes('Failed to load chapter.')
+      ? '<script>addEventListener("load",()=>{const p=document.querySelector("p"),r=p.getBoundingClientRect();parent.postMessage({type:"chapter-error-proof",text:p.textContent,width:r.width,height:r.height},"*")});<\/script>' : ''));
+    try {
+      for (const [status, body] of [[404, ''], [500, 'Owned rejected body'], [200, ''], [200, 'Missing head']]) {
+        window.fetch = (url, options) => {
+          if (url === '/api/epub/7/chunk/1') return Promise.resolve(new Response(body, { status }));
+          if (url === '/api/progress' && options?.method === 'POST') errorWrites.push(JSON.parse(options.body).position);
+          return errorFetch(url, options);
+        };
+        document.getElementById('em-pageinfo').textContent = 'Loading…';
+        const previous = readerFrame();
+        const observed = new Promise((resolve, reject) => {
+          const timer = setTimeout(() => { window.removeEventListener('message', receive); reject(new Error('Chapter error render probe timed out')); }, 4000);
+          function receive(event) {
+            if (event.source !== readerFrame().contentWindow || event.origin !== 'null' || event.data?.type !== 'chapter-error-proof') return;
+            clearTimeout(timer); window.removeEventListener('message', receive); resolve(event.data);
+          }
+          window.addEventListener('message', receive);
+        });
+        await showChunk(1, { frac: 0.75 });
+        const error = await observed;
+        equal(error.text, 'Failed to load chapter.', 'Sandboxed chapter error paragraph actually renders');
+        check(error.width > 0 && error.height > 0 && readerFrame().getBoundingClientRect().height > 0, 'Error paragraph and its frame have visible geometry');
+        check(readerFrame() !== previous, 'Chapter error uses a fresh published frame');
+        equal(document.getElementById('em-pageinfo').textContent, 'Chapter unavailable', 'Error does not retain Loading status');
+        equal(ebook.lastFrac, 0.75, 'Error preserves requested bookmark fraction');
+        equal(errorWrites, [], 'Chapter error cannot autosave a false zero position');
+        chapterErrors.push({ status, emptyBody: !body, text: error.text, width: error.width, height: error.height });
+      }
+    } finally { window.fetch = errorFetch; publishEbookDocument = publishChapter; }
     const saved = [{ kind: 'highlight', spine_idx: 0, cfi: 'char:7:6', text: 'target', color: 'yellow' }];
     await api('configure', { body: '<p id="target">prefix target suffix</p>', annotations: saved, parserGate: true });
     ebook = { it: { id: 7 }, spine: ['one.xhtml', 'two.xhtml'], chunk: 0, annots: saved };
@@ -929,7 +1013,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     await until(() => readerFrame() !== beforeResize && ebook.document.ready, 'resize publishes a fresh ready chapter');
     equal(ebook.lastFrac, resizeFraction, 'Resize preserves the reported position');
     equal((await probe()).marks, ['target'], 'Resize restores saved marks');
-    return { initialPagination: { hiddenAutosaves: 0, autosavePositions: paginationWrites, visibleSinglePage: true },
+    return { chapterErrors, errorWrites, coverFit, initialPagination: { hiddenAutosaves: 0, autosavePositions: paginationWrites, visibleSinglePage: true },
       freshFrame: true, retiredWindowRejected: true, resizeReady: true,
       marks: observed.marks, parserHeldBeyondOldTimer: true, posts: 0,
       reopen: true, tocRevisit: true, duplicateRestoreIdempotent: true, staleReadyIgnored: true };
@@ -1985,13 +2069,13 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     const retainedAuthorDrill = { ...authorDrill };
     const tvAndAuthorItems = [
       { id: 9, kind: 'episode', title: '日本語.Show.S01E02', series: 'Unicode show', created_at: 30, artwork_version: '9.png' },
-      { id: 10, kind: 'episode', title: 'Unicode 1x01', series: 'Unicode show', created_at: 10 },
+      { id: 10, kind: 'episode', title: 'Unicode 1x01', synopsis: 'A NeBuLa adventure', series: 'Unicode show', created_at: 10 },
       { id: 60, kind: 'episode', title: 'Unicode bonus', series: 'Unicode show' },
       { id: 61, kind: 'movie', title: 'Unicode movie', artwork_version: '61.png' },
       { id: 62, kind: 'music', title: 'Loose song', author: 'Mixed artist' },
-      { id: 63, kind: 'music', title: 'Album song', author: 'Mixed artist', series: 'Named album', artwork_version: '63.png' },
-      { id: 64, kind: 'ebook', title: 'Series book', author: 'Book author', series: 'Named books', artwork_version: '64.png' },
-      { id: 65, kind: 'audiobook', title: 'Loose audiobook', author: 'Audio author', artwork_version: '65.png' },
+      { id: 63, kind: 'music', title: 'Album song', synopsis: 'A NeBuLa adventure', author: 'Mixed artist', series: 'Named album', artwork_version: '63.png' },
+      { id: 64, kind: 'ebook', title: 'Series book', synopsis: 'A NeBuLa adventure', author: 'Book author', series: 'Named books', artwork_version: '64.png' },
+      { id: 65, kind: 'audiobook', title: 'Loose audiobook', synopsis: 'A NeBuLa adventure', author: 'Audio author', artwork_version: '65.png' },
       { id: 66, kind: 'music', title: 'Second song', author: 'Second artist', created_at: 20 },
       { id: 67, kind: 'episode', title: 'Second S01E01', series: 'Second show', created_at: 20 },
       { id: 68, kind: 'comic', title: 'Covered comic', artwork_version: '68.png' },
@@ -2004,7 +2088,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
         const query = parsed.searchParams.get('q');
         if (query && tvSearchMode === 'network') throw Error('Owned TV search transport failure');
         if (query && tvSearchMode === 'http') return reply(null, 500);
-        return reply(query ? tvAndAuthorItems.filter(item => item.title.toLowerCase().includes(query.toLowerCase())) : tvAndAuthorItems);
+        return reply(query ? tvAndAuthorItems.filter(item => [item.title, item.author, item.synopsis].some(value => (value || '').toLowerCase().includes(query.toLowerCase()))) : tvAndAuthorItems);
       }
       if (url.startsWith('/api/progress/')) return reply(null);
       return defaultResponder(url, options);
@@ -2026,8 +2110,20 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       button.click();
       equal(button.textContent, 'Newest first', 'Second toggle returns to newest');
     }
+    // Deliberately place the real cards beyond the lazy-loading distance.
+    const lazySpacer = el('div'); lazySpacer.style.height = '8000px';
+    document.getElementById('main').prepend(lazySpacer);
     const dashboardImages = [...document.querySelectorAll('#main > section img.thumb')];
-    await until(() => dashboardImages.length === 7 && dashboardImages.every(img => img.complete && img.naturalWidth > 0), 'All seven categories load available thumbnail API artwork');
+    equal(dashboardImages.length, 7, 'All seven categories expose available artwork');
+    const albumImage = categoryShelves[2].querySelector('img.thumb');
+    const lazyArtwork = { before: { top: albumImage.getBoundingClientRect().top, loading: albumImage.loading, complete: albumImage.complete, naturalWidth: albumImage.naturalWidth }, decoded: [] };
+    check(lazyArtwork.before.top > innerHeight + 2000 && lazyArtwork.before.loading === 'lazy', 'Album image starts beyond the viewport lazy-loading distance');
+    for (const img of dashboardImages) {
+      img.closest('.media-card').scrollIntoView({ block: 'center', inline: 'nearest' });
+      await until(() => img.complete && img.naturalWidth > 0, 'Visible category artwork decodes through thumbnail API');
+      lazyArtwork.decoded.push({ src: img.getAttribute('src'), naturalWidth: img.naturalWidth });
+    }
+    lazySpacer.remove();
     const tvShelf = categoryShelves[1];
     equal([...tvShelf.querySelectorAll('.title')].map(node => node.textContent), ['Unicode show', 'Second show'], 'TV folders start by maximum member date');
     tvShelf.querySelector('button').click();
@@ -2072,8 +2168,22 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     document.querySelector('#sidebar [data-kind="audiobook"]').click(); await delay(0);
     byTitle('Audio author').click(); await delay(0);
     check(byTitle('Loose audiobook')?.classList.contains('portrait'), 'All-loose audiobook author retains actual portrait card');
+    for (const [kind, author, series, title] of [
+      ['episode', null, 'Unicode show', 'Unicode 1x01'],
+      ['music', 'Mixed artist', 'Named album', 'Album song'],
+      ['ebook', 'Book author', 'Named books', 'Series book'],
+      ['audiobook', 'Audio author', null, 'Loose audiobook'],
+    ]) {
+      showsDrill = null; Object.keys(authorDrill).forEach(key => { authorDrill[key] = null; });
+      activeKind = kind;
+      await serverSearch('NEBULA'); await delay(0);
+      byTitle(author || series).click(); await delay(0);
+      if (author && series) { byTitle(series).click(); await delay(0); }
+      check(byTitle(title), 'Synopsis-only result survives folder navigation for ' + kind);
+      equal([...document.querySelectorAll('#main .media-card .title')].map(node => node.textContent), [title], 'Unmatched siblings remain excluded');
+    }
     const tvAuthorWorkflows = { trustedTVNavigation: true, canonicalEpisodeSearch: ['success', 'http', 'network'], refreshRetainsSeries: true,
-      episodeVideoDispatch: true, unknownSeasonLabel: 'Other episodes', mixedArtistLooseAndAlbum: true, ebookAllSeries: true, audiobookAllLoose: true, actualDOM: true, modeledAPI: true };
+      episodeVideoDispatch: true, lazyArtwork, synopsisFolderSearch: ['episode', 'music', 'ebook', 'audiobook'], unknownSeasonLabel: 'Other episodes', mixedArtistLooseAndAlbum: true, ebookAllSeries: true, audiobookAllLoose: true, actualDOM: true, modeledAPI: true };
     const progressGets = [];
     const positions = new Map([[60, 20], [61, 80], [62, 99], [63, 0]]);
     LIBRARY = [

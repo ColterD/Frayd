@@ -9,11 +9,12 @@ use walkdir::WalkDir;
 fn extract_thumb(src: &Path, kind: &str, media_id: i64, thumbs: &Path) -> Result<Option<String>, String> {
     use std::io::Write;
     let bytes = if matches!(kind, "comic" | "manga" | "ebook") {
-        let cover = if kind == "ebook" { crate::epub::epub_cover(src) } else { None };
-        let cover = cover.or_else(|| {
+        let cover = if kind == "ebook" {
+            crate::epub::epub_cover(src)
+        } else {
             crate::comic::comic_pages(src)
                 .and_then(|pages| pages.first().and_then(|page| crate::comic::read_zip_entry(src, &page.0)))
-        });
+        };
         let Some(cover) = cover else { return Ok(None); };
         let mut child = Command::new("ffmpeg")
             .args(["-v", "error", "-i", "pipe:0", "-frames:v", "1", "-vf", "scale=480:-2", "-q:v", "4", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"])
@@ -683,6 +684,38 @@ mod tests {
             assert_eq!(std::fs::read(&owned).unwrap(),b"retained bytes","{guard}");
         }
         println!("retirement_negative_guards=8 retained_source_playback_artifacts_symlinks_outside_cache=true");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn epub_boundary_scanner_rejection_never_invokes_ffmpeg_or_publishes_artwork() {
+        use std::io::{Read,Write};
+        use std::os::unix::fs::PermissionsExt;
+        if std::env::var_os("FRAYD_TEST_EPUB_BOUNDARY_CHILD").is_none() {
+            let output=Command::new(std::env::current_exe().unwrap()).args(["--exact","scanner::tests::epub_boundary_scanner_rejection_never_invokes_ffmpeg_or_publishes_artwork","--nocapture"]).env("FRAYD_TEST_EPUB_BOUNDARY_CHILD","1").output().unwrap();
+            assert!(output.status.success(),"{}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));print!("{}",String::from_utf8_lossy(&output.stdout));return;
+        }
+        let fixture=Library::new(&[]);let library=fixture.0.join("library");std::fs::create_dir(&library).unwrap();let thumbs=fixture.0.join("thumbs");std::fs::create_dir(&thumbs).unwrap();
+        let image=artwork_fixture_image(&fixture.0,"red");let bytes=std::fs::read(image).unwrap();
+        let bin=fixture.0.join("bin");std::fs::create_dir(&bin).unwrap();let tool=bin.join("ffmpeg");let count=fixture.0.join("ffmpeg-called");
+        std::fs::write(&tool,"#!/bin/sh\nprintf called >> \"$FRAYD_TEST_EPUB_FFMPEG_COUNT\"\nexit 1\n").unwrap();std::fs::set_permissions(&tool,std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("FRAYD_TEST_EPUB_FFMPEG_COUNT",&count);let original=std::env::var_os("PATH").unwrap();std::env::set_var("PATH",std::env::join_paths([bin].into_iter().chain(std::env::split_paths(&original))).unwrap());
+        let db=open(":memory:");
+        for route in ["metadata","declared","root","first","depth","events"] {
+            let source=library.join(format!("{route}.epub"));let mut zip=zip::ZipWriter::new(std::fs::File::create(&source).unwrap());let options=zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("META-INF/container.xml",options).unwrap();zip.write_all(b"<container><rootfile full-path=\"book.opf\"/></container>").unwrap();
+            zip.start_file("book.opf",options).unwrap();
+            let opf=match route {"depth"=>format!("<package>{}{}</package>","<level>".repeat(128),"</level>".repeat(128)),"events"=>format!("<package>{}</package>","<item/>".repeat(100_000)),_=>"<package><manifest><item id=\"c\" href=\"declared.png\" properties=\"cover-image\"/></manifest></package>".into()};zip.write_all(opf.as_bytes()).unwrap();
+            if route=="metadata" {std::io::copy(&mut std::io::repeat(b' ').take(2*1024*1024),&mut zip).unwrap();}
+            let name=match route {"declared"=>"declared.png","first"=>"first.png",_=>"cover.png"};zip.start_file(name,options).unwrap();zip.write_all(&bytes).unwrap();
+            if matches!(route,"declared"|"root"|"first") {std::io::copy(&mut std::io::repeat(b' ').take(32*1024*1024+1-bytes.len() as u64),&mut zip).unwrap();}
+            if matches!(route,"declared"|"root") {zip.start_file("zz-small.png",options).unwrap();zip.write_all(&bytes).unwrap();}
+            zip.finish().unwrap();
+            assert_eq!(upsert_item(&db,String::new(),&source,"ebook",Some(&thumbs),&library),1);
+            assert_eq!(db.query_row("SELECT thumb_path FROM media WHERE path=?1",[source.to_string_lossy()],|row|row.get::<_,Option<String>>(0)).unwrap(),None);
+            assert_eq!(std::fs::read_dir(&thumbs).unwrap().count(),0);assert!(!count.exists(),"{route}: rejected EPUB reached FFmpeg");
+        }
+        println!("scanner_rejected_routes=6 ffmpeg_calls=0 published_artwork=0 cache_files=0");
     }
 
     fn artwork_fixture_image(directory: &Path, color: &str) -> std::path::PathBuf {
