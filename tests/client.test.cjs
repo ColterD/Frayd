@@ -7,7 +7,7 @@ const vm = require('node:vm');
 const clientPath = join(__dirname, '..', 'client');
 
 // Only browser boundaries are doubled: the complete application scripts run as-is.
-function browser() {
+function browser({ now } = {}) {
   const nodes = new Map();
   const listeners = new Map();
   const documentCaptures = new Map();
@@ -119,6 +119,8 @@ function browser() {
     },
   });
   context.window = context;
+  // Date is this VM's intrinsic; the host clock and other browser contexts stay independent.
+  if (now) vm.runInContext('Date', context).now = now;
   vm.runInContext(readFileSync(join(clientPath, 'js/app.js'), 'utf8'), context);
   return {
     context, nodes, requests, intervals, sockets,
@@ -1909,7 +1911,8 @@ for (const kind of ['audio', 'video']) {
 }
 
 async function hostedNativeBrowser(kind) {
-  const b = browser();
+  const clock = { milliseconds: 1700000000000 };
+  const b = browser({ now: () => clock.milliseconds });
   await settle();
   vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), b.context);
   b.run(`LIBRARY = [{id:9,kind:"music",title:"Previous"},
@@ -1919,11 +1922,11 @@ async function hostedNativeBrowser(kind) {
   b.nodes.get('#pt-join').onclick();
   const socket = b.sockets[0];
   socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: true,
-    state: { media_id: 9, title: 'Previous', queue: [], position: 17, playing: true, updated_at: Date.now()/1000 } }) });
+    state: { media_id: 9, title: 'Previous', queue: [], position: 17, playing: true, updated_at: b.run('Date.now()/1000') } }) });
   await settle();
   socket.sent.length = 0;
   b.nodes.get('#pb-audio').readyState = 0;
-  return { b, socket };
+  return { b, socket, clock };
 }
 
 for (const kind of ['audio', 'video']) {
@@ -1945,7 +1948,7 @@ for (const kind of ['audio', 'video']) {
       assert.equal(media.currentTime, expected);
       // The own first state must preserve the native owner and its applied resume.
       socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: true,
-        state: { media_id: 10, title: 'Next', queue: [], position: expected, playing: true, updated_at: Date.now()/1000 } }) });
+        state: { media_id: 10, title: 'Next', queue: [], position: expected, playing: true, updated_at: b.run('Date.now()/1000') } }) });
       assert.equal(media.currentTime, expected);
       media.currentTime = 73;
       media.emit('loadedmetadata');
@@ -2009,7 +2012,7 @@ test('metadata-ready audio publishes its resumed host load once before play', as
 for (const mediaId of [10, 11]) {
   for (const playing of [false, true]) {
     test(`party video ${mediaId === 10 ? 'same stream' : 'changed stream'} takeover retires pending local load before ${playing ? 'autoplay' : 'host Play'}`, async () => {
-      const { b, socket } = await hostedNativeBrowser('video');
+      const { b, socket, clock } = await hostedNativeBrowser('video');
       youtubePlayerFixture(b);
       b.run('LIBRARY.push({id:11,kind:"movie",title:"Takeover"})');
       b.respond(async () => ({ ok: true, json: async () => ({ position: 64 }) }));
@@ -2018,7 +2021,7 @@ for (const mediaId of [10, 11]) {
       const media = b.run('plyr.media');
       assert.equal(b.run('videoLoadPending'), true);
       const state = (value) => socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: true,
-        state: { title: 'Party takeover', queue: [], position: 0, playing: false, updated_at: Date.now()/1000, ...value } }) });
+        state: { title: 'Party takeover', queue: [], position: 0, playing: false, updated_at: b.run('Date.now()/1000'), ...value } }) });
       state({ media_id: null, external_url: 'abcdefghijk' });
       await settle();
       assert.equal(b.run('partyPlaybackKind'), 'external');
@@ -2041,6 +2044,13 @@ for (const mediaId of [10, 11]) {
       assert.equal(media.currentTime, 0, 'Retired local metadata cannot restore the old saved64');
       assert.equal(socket.sent.filter(command => command.type === 'load').length, 0,
         'Party takeover cannot publish the retired local load');
+      const updatedAt = b.run('Date.now()/1000');
+      clock.milliseconds += 1000;
+      socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: false,
+        state: { media_id: mediaId, title: 'Guest clock projection', queue: [], position: 23,
+          playing: true, updated_at: updatedAt } }) });
+      await settle();
+      assert.equal(media.currentTime, 24, 'Guest follow still projects an explicitly advanced clock');
     });
   }
 }
@@ -2053,7 +2063,7 @@ test('own video echo preserves the pending local resume gate until its saved64 l
   const media = b.run('plyr.media');
   media.readyState = 0;
   socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: true,
-    state: { media_id: 10, title: 'Own pending echo', queue: [], position: 0, playing: true, updated_at: Date.now()/1000 } }) });
+    state: { media_id: 10, title: 'Own pending echo', queue: [], position: 0, playing: true, updated_at: b.run('Date.now()/1000') } }) });
   await settle();
   assert.equal(b.run('videoLoadPending'), true, 'A matching local echo must retain local resume authority');
   assert.deepEqual(socket.sent, [], 'A matching echo cannot publish initial play0');
