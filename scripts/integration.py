@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 base = ''
 
 def docker_timeout(args):
-    """Budget only the finite operations this disposable image-only runner uses."""
+    """Budget finite operations used by HTTP QA and the importing context probe."""
     if not args:
         raise ValueError('Missing Docker operation')
     command = args[0]
@@ -46,6 +46,15 @@ def docker_timeout(args):
             return 'lifecycle', 60
     elif command in ('inspect', 'logs'):
         return 'metadata', 20
+    elif command == 'build':
+        # check-build-context builds a local scratch/COPY probe; no network base pull.
+        return 'context-build', 600
+    elif command == 'create':
+        return 'container-create', 30
+    elif command == 'export':
+        return 'container-export', 60
+    elif command == 'rm' or (command == 'image' and len(args) > 1 and args[1] == 'rm'):
+        return 'cleanup', 60
     elif command in ('container', 'network', 'volume') and len(args) > 1 and args[1] in ('ls', 'inspect'):
         return 'metadata', 20
     elif command == 'exec':

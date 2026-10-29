@@ -359,7 +359,7 @@ test('browser setup shares its remaining startup budget across port and HTTP dis
     const configure = vm.runInNewContext(source.slice(start, end) + '\nconfigureOwnedBrowserCache;', context);
     await assert.rejects(configure({ profile: '/owned/profile', fixtureUrl: 'unused', browser: Object.assign(new EventEmitter(), { exitCode: null, signalCode: null }) }),
       expireAfterHttp ? /startup deadline exceeded/ : /HTTP boundary reached/);
-    assert.equal(httpBudget, 11000, 'HTTP discovery uses only the budget left after port discovery');
+    assert.equal(httpBudget, 1000, 'One HTTP attempt is bounded within the remaining shared startup budget');
   }
 });
 
@@ -433,5 +433,109 @@ test('unresponsive owned discovery stops at the shared deadline or browser exit 
     }
     assert.equal(existsSync(profile), false);
     assert.equal(server.listening, false);
+  }
+});
+
+
+test('owned discovery retries a stalled HTTP attempt within the unchanged shared startup budget', { timeout: 8000 }, async () => {
+  const source = readFileSync(join(__dirname, 'browser-regression.cjs'), 'utf8');
+  const setupSource = source.slice(source.indexOf('async function bounded('), source.indexOf('async function main('));
+  for (const scenario of ['headers', 'body']) {
+    let attempts = 0;
+    const browser = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
+    const server = createServer((request, response) => {
+      assert.equal(request.url, '/json/list');
+      attempts++;
+      if (attempts === 1) {
+        if (scenario === 'body') { response.writeHead(200, { 'Content-Type': 'application/json' }); response.write('['); }
+        return;
+      }
+      response.end(JSON.stringify([{ type: 'page', url: 'about:blank',
+        webSocketDebuggerUrl: `ws://127.0.0.1:${server.address().port}/devtools/page/owned-test` }]));
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const configure = vm.runInNewContext(setupSource + '\nconfigureOwnedBrowserCache;', {
+      Date, join, URL, AbortSignal, AbortController, setTimeout, clearTimeout, delay, fetch,
+      existsSync: () => true, readFileSync: () => `${server.address().port}\n/unused`,
+      WebSocket: class { constructor() { throw new Error('Validated owned protocol boundary reached'); } },
+    });
+    const diagnostics = {};
+    // Bound the baseline failure too: release its stuck response without leaving sockets.
+    const failSafe = setTimeout(() => server.closeAllConnections(), 2500);
+    const startedAt = Date.now();
+    try {
+      await assert.rejects(configure({ profile: '/owned/profile', fixtureUrl: 'unused', browser, diagnostics }),
+        /Validated owned protocol boundary reached/);
+      assert.equal(attempts, 2);
+      assert.equal(diagnostics.attempts, 2);
+      assert.equal(diagnostics.transientFailures, 1);
+      assert.equal(diagnostics.budgetMs, 15000);
+      assert.equal(diagnostics.phase, 'socket-open');
+      assert.doesNotMatch(JSON.stringify(diagnostics), /127\.0\.0\.1|devtools|unused/);
+      assert.ok(Date.now() - startedAt < 2000, 'A stalled attempt must leave time for subsequent readiness probes');
+      assert.equal(browser.listenerCount('exit'), 0);
+    } finally {
+      clearTimeout(failSafe);
+      server.closeAllConnections();
+      await new Promise(resolve => server.close(resolve));
+    }
+  }
+});
+
+
+test('retry fixture HTTP renders only trusted mode literals and rejects hostile input without reflection', { timeout: 8000 }, async () => {
+  const fixtureDirectory = mkdtempSync(join(tmpdir(), 'frayd-mode-input-'));
+  const browserScript = join(fixtureDirectory, 'browser.cjs');
+  writeFileSync(browserScript, `#!/usr/bin/env node
+if (process.argv.includes('--version')) { console.log('Owned idle input fixture'); process.exit(0); }
+setInterval(() => {}, 1000);
+`, { mode: 0o700 });
+  const runner = resolve(__dirname, 'browser-regression.cjs');
+  const invocation = spawn(process.execPath, ['-e', `
+    const assert = require('node:assert/strict');
+    require(${JSON.stringify(runner)}).main({ evidenceDirectory: ${JSON.stringify(join(fixtureDirectory, 'result'))},
+      async cacheSetup({ fixtureUrl }) {
+        const controls = [
+          ['responsive?width=320', 200, 'null'],
+          ['responsive?width=320&mode=ignored', 200, 'null'],
+          ['toolbar-retry?width=768', 200, 'null'],
+          ['toolbar-retry?width=1024&mode=transient', 200, '"transient"'],
+          ['toolbar-retry?width=1440&mode=reattach', 200, '"reattach"'],
+          ['toolbar-retry?width=320&mode=other', 400],
+          ['toolbar-retry?width=320&mode=', 400],
+          ['toolbar-retry?width=320&mode=__proto__', 400],
+          ['toolbar-retry?width=320&mode=constructor', 400],
+          ['toolbar-retry?width=319&mode=transient', 400],
+          ['toolbar-retry?width=320&mode=' + encodeURIComponent('</script><script>globalThis.hostileInput=true</script>'), 400],
+        ];
+        for (const [route, status, literal] of controls) {
+          const response = await fetch(fixtureUrl + '__fixture/' + route);
+          const body = await response.text();
+          assert.equal(response.status, status, route);
+          if (status === 200) assert.ok(body.includes('window.__toolbarRetryMode=' + literal + '</script>'), route);
+          else assert.equal(body, '{}', route);
+          assert.ok(!body.includes('globalThis.hostileInput'), route);
+        }
+        console.error('Verified 11 real HTTP fixture input controls');
+        throw new Error('Owned fixture input verification complete');
+      }
+    });
+  `], { env: { ...process.env, BROWSER_BIN: browserScript }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let stdout = '';
+  let stderr = '';
+  invocation.stdout.on('data', bytes => { stdout += bytes; });
+  invocation.stderr.on('data', bytes => { stderr += bytes; });
+  try {
+    const [code] = await once(invocation, 'exit');
+    assert.equal(code, 1, stderr);
+    assert.match(stderr, /Verified 11 real HTTP fixture input controls/);
+    const result = JSON.parse(stdout);
+    assert.match(result.runnerError, /Owned fixture input verification complete/);
+    assert.equal(result.cases.length, 0);
+    assert.equal(Object.values(result.cleanup).every(Boolean), true);
+    assert.deepEqual(result.cleanupErrors, []);
+  } finally {
+    if (invocation.exitCode === null) invocation.kill('SIGKILL');
+    rmSync(fixtureDirectory, { recursive: true, force: true });
   }
 });

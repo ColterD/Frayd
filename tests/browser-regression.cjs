@@ -183,14 +183,17 @@ async function bounded(promise, message, milliseconds = 3000) {
  * its cache before navigation. Retry transient HTTP readiness only; unexpected targets
  * or debugger ownership fail closed. Keep the protocol open until caller teardown.
  */
-async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
+async function configureOwnedBrowserCache({ profile, fixtureUrl, browser, diagnostics = {} }) {
   const startedAt = Date.now();
   const deadline = startedAt + 15000;
+  Object.assign(diagnostics, { budgetMs: 15000, phase: 'port-file', attempts: 0, transientFailures: 0, emptyLists: 0 });
+  function phase(name) { diagnostics.phase = name; diagnostics.elapsedMs = Date.now() - startedAt; }
   /**
    * Return time left on the single startup deadline; advancing to another phase or
    * retrying discovery never resets it. Reject before starting work after expiration.
    */
   function remainingStartupBudget() {
+    diagnostics.elapsedMs = Date.now() - startedAt;
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw new Error('Owned browser startup deadline exceeded');
     return remaining;
@@ -199,6 +202,7 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
   let port;
   while (true) {
     if (browser.exitCode !== null || browser.signalCode !== null) throw new Error('Owned browser exited before cache setup');
+    diagnostics.elapsedMs = Date.now() - startedAt;
     if (Date.now() >= deadline) throw new Error('Owned browser did not expose its cache-control endpoint');
     if (existsSync(portFile)) {
       const contents = readFileSync(portFile, 'utf8');
@@ -208,6 +212,7 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
     }
     await delay(20);
   }
+  phase('http-discovery');
   let pages;
   const browserExited = new AbortController();
   const onBrowserExit = () => browserExited.abort();
@@ -215,24 +220,31 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
   try {
     while (true) {
       if (browser.exitCode !== null || browser.signalCode !== null) throw new Error('Owned browser exited before cache setup');
-      const signal = AbortSignal.any([AbortSignal.timeout(remainingStartupBudget()), browserExited.signal]);
+      // A stalled readiness probe must not monopolize the shared startup deadline.
+      // Abort both headers and body before retry; target validation still fails closed.
+      const signal = AbortSignal.any([AbortSignal.timeout(Math.min(1000, remainingStartupBudget())), browserExited.signal]);
+      diagnostics.attempts++;
+      phase('http-headers');
       let response;
       let targets;
       try {
         response = await fetch(`http://127.0.0.1:${port}/json/list`, { signal });
         if (response.ok) {
-          targets = await bounded(response.json(), 'Owned browser page discovery body timed out', remainingStartupBudget());
+          phase('http-body');
+          targets = await response.json();
         }
       } catch (error) {
         if (browser.exitCode !== null || browser.signalCode !== null) throw new Error('Owned browser exited before cache setup');
         remainingStartupBudget();
         if (!['TypeError', 'AbortError', 'TimeoutError'].includes(error.name)) throw error;
+        diagnostics.transientFailures++;
         await delay(20);
         continue;
       }
       remainingStartupBudget();
       if (!response.ok) {
         if (response.status === 408 || response.status === 429 || response.status >= 500) {
+          diagnostics.transientFailures++;
           await delay(20);
           continue;
         }
@@ -241,6 +253,7 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
       if (!Array.isArray(targets)) throw new Error('Invalid owned browser page discovery response');
       pages = targets.filter(page => page.type === 'page');
       if (pages.length === 0) {
+        diagnostics.emptyLists++;
         await delay(20);
         continue;
       }
@@ -251,6 +264,7 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
   const endpoint = new URL(pages[0].webSocketDebuggerUrl);
   if (endpoint.protocol !== 'ws:' || endpoint.hostname !== '127.0.0.1' || endpoint.port !== String(port)
     || !/^\/devtools\/page\/[a-zA-Z0-9-]+$/.test(endpoint.pathname)) throw new Error('Unexpected owned browser page endpoint');
+  phase('socket-open');
   const openBudget = remainingStartupBudget();
   const socket = new WebSocket(endpoint.href);
   const pending = new Map();
@@ -323,6 +337,7 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
    * by ID. Always remove the pending entry; failures propagate without command retry.
    */
   async function rpc(method, params = {}) {
+    if (!navigated) phase(method);
     const rpcBudget = navigated ? 3000 : remainingStartupBudget();
     const id = ++sequence;
     try {
@@ -360,6 +375,7 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
     Object.assign(receipt, { cacheDisabled: true, browserCacheCleared: true, configuredBeforeFixtureNavigation: true });
     // Keep Network overrides active until the runner finishes all media cases.
     navigated = true;
+    phase('ready');
     // Only fixed keyboard commands are exposed to the loopback fixture, never arbitrary RPC.
     async function key(key, accept = false) {
       const codes = { Tab: 9, Enter: 13, ' ': 32, ArrowRight: 39, t: 84 };
@@ -418,6 +434,7 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
   let runError;
   let cacheControl;
   let cacheSession;
+  const startupDiagnostics = {};
   const cleanupErrors = [];
   let browserGroupStopped = false;
   let resolveResult;
@@ -459,10 +476,17 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
         const width = Number(new URL(request.url, 'http://fixture.invalid').searchParams.get('width'));
         if (![320, 768, 1024, 1440].includes(width)) return json({}, 400);
         const mode = path === '/__fixture/toolbar-retry' ? new URL(request.url, 'http://fixture.invalid').searchParams.get('mode') : null;
-        if (mode !== null && !['transient', 'reattach'].includes(mode)) return json({}, 400);
+        // Render only source-owned literals; request strings never enter inline script.
+        let modeLiteral;
+        switch (mode) {
+          case null: modeLiteral = 'null'; break;
+          case 'transient': modeLiteral = '"transient"'; break;
+          case 'reattach': modeLiteral = '"reattach"'; break;
+          default: return json({}, 400);
+        }
         const source = readFileSync(join(root, 'client/index.html'), 'utf8');
         response.writeHead(200, { 'Content-Type': 'text/html' });
-        return response.end(source.replace('<head>', '<head><base href="/"><script>(' + responsivePreload.toString() + ')(' + width + ');window.__toolbarRetryMode=' + JSON.stringify(mode) + '</script>')
+        return response.end(source.replace('<head>', '<head><base href="/"><script>(' + responsivePreload.toString() + ')(' + width + ');window.__toolbarRetryMode=' + modeLiteral + '</script>')
           .replace('<script src="js/app.js?v=5"></script>', '<script>Plyr.defaults.iconUrl="/vendor/plyr/plyr.svg";</script><script src="js/app.js?v=5"></script>')
           .replace('</body>', '<script src="/__fixture/browser-driver.js"></script></body>'));
       }
@@ -620,7 +644,7 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
     });
     const timedOut = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`Browser regression exceeded 60 seconds; ${logs}`)), 60000); });
     const observed = await Promise.race([(async () => {
-      cacheSession = await cacheSetup({ profile, fixtureUrl: url, browser });
+      cacheSession = await cacheSetup({ profile, fixtureUrl: url, browser, diagnostics: startupDiagnostics });
       cacheControl = cacheSession.receipt;
       return result;
     })(), exited, timedOut]);
@@ -667,6 +691,7 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
     if (!cacheControl) output.startupStderr = redactDebuggerCapabilities(logs).slice(-8192);
   }
   output.cacheControl = cacheControl;
+  output.startupDiagnostics = startupDiagnostics;
   output.mediaGate = { held: Boolean(heldMedia), pending: pendingMedia, events: mediaGateEvents };
   output.cleanupErrors = cleanupErrors;
   output.cleanup = { browserExited: !browser?.pid || browser.exitCode !== null || browser.signalCode !== null,

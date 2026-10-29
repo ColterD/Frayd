@@ -1,5 +1,6 @@
 """Failure-boundary regressions for the disposable Docker integration runner."""
 import contextlib
+import ast
 import base64
 import hashlib
 import http.client
@@ -130,6 +131,11 @@ class DockerTimeoutTests(unittest.TestCase):
     def test_operation_budgets_and_unknown_operations(self):
         cases = [
             (('inspect', 'owned'), ('metadata', 20)),
+            (('build', '-t', 'owned-probe', '/owned-context'), ('context-build', 600)),
+            (('create', 'owned-probe', '/unused'), ('container-create', 30)),
+            (('export', 'owned-container'), ('container-export', 60)),
+            (('rm', '-f', 'owned-container'), ('cleanup', 60)),
+            (('image', 'rm', '-f', 'owned-probe'), ('cleanup', 60)),
             (('container', 'ls', '-a'), ('metadata', 20)),
             (('network', 'inspect', 'owned'), ('metadata', 20)),
             (('volume', 'ls'), ('metadata', 20)),
@@ -144,9 +150,23 @@ class DockerTimeoutTests(unittest.TestCase):
         for arguments, expected in cases:
             with self.subTest(operation=expected[0]):
                 self.assertEqual(integration.docker_timeout(arguments), expected)
-        for arguments in [(), ('unknown',), ('build', '.'), ('compose', '-f', '-', 'unknown')]:
+        for arguments in [(), ('unknown',), ('image', 'prune'), ('compose', '-f', '-', 'unknown')]:
             with self.assertRaises(ValueError):
                 integration.docker_timeout(arguments)
+
+    def test_context_probe_shared_helper_operations_have_budgets(self):
+        # Inspect the actual importing caller, so an added operation cannot silently
+        # escape coverage by changing only this test's representative argv list.
+        source = Path(__file__).parents[1] / 'scripts/check-build-context.py'
+        calls = [node for node in ast.walk(ast.parse(source.read_text()))
+                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'docker']
+        self.assertEqual(len(calls), 5)
+        for call in calls:
+            args = tuple(node.value if isinstance(node, ast.Constant) else 'owned-fixture' for node in call.args)
+            with self.subTest(operation=args[:2]):
+                operation, timeout = integration.docker_timeout(args)
+                self.assertIn(operation, ('context-build', 'container-create', 'container-export', 'cleanup'))
+                self.assertGreater(timeout, 0)
 
     def test_timeout_override_is_finite_and_diagnostics_are_public(self):
         for timeout in [0, -1, float('inf'), float('nan')]:
