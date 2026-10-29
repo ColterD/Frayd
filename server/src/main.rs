@@ -533,12 +533,11 @@ async fn comic_page(
     let Some(path) = media_path(&app, id).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let name = comic_page_names(&app, id, &path).await
-        .and_then(|names| usize::try_from(n).ok().and_then(|index| names.get(index).cloned()));
-    let Some(name) = name else { return StatusCode::NOT_FOUND.into_response() };
-    let mime = mime_guess(&name);
+    let Some(names) = comic_page_names(&app, id, &path).await else { return StatusCode::NOT_FOUND.into_response() };
+    let Some(index) = usize::try_from(n).ok().filter(|&index| index < names.len()) else { return StatusCode::NOT_FOUND.into_response() };
+    let mime = mime_guess(&names[index]);
     match tokio::task::spawn_blocking(move || {
-        comic::read_zip_entry(std::path::Path::new(&path), &name)
+        comic::read_cached_page(std::path::Path::new(&path), &names, index)
     })
     .await
     .ok()
@@ -1966,6 +1965,56 @@ mod backend_regressions {
         assert_eq!(db.query_row("SELECT position FROM progress WHERE media_id=1",[],|r|r.get::<_,f64>(0)).unwrap(),7.0);
         std::fs::remove_dir_all(root).unwrap();
     }
+    /// ZIP0.6 caches used CP437 for unflagged UTF8 bytes; serve their physical order without rewriting state.
+    #[tokio::test]
+    async fn legacy_cp437_cache_http_preserves_page_order_metadata_and_progress() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/legacy-utf8-order.cbz");
+        for (names, expected) in [
+            (vec!["├Ç.png", "├é.png", "├ü.png"], vec!["first physical page", "third physical page", "second physical page"]),
+            (vec!["├é.png"], vec!["third physical page"]),
+            (vec!["Á.png"], vec!["second physical page"]),
+        ] {
+            let app = app_for(path);
+            let metadata = serde_json::json!({"pages": names, "synopsis": "keep"}).to_string();
+            app.db.lock().unwrap().execute("UPDATE media SET meta_json=?1 WHERE id=1", [&metadata]).unwrap();
+            let router = Router::new()
+                .route("/api/comic/:id/pages", get(comic_pages))
+                .route("/api/comic/:id/page/:n", get(comic_page)).with_state(app.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+            let page_count = names.len();
+            let responses = tokio::task::spawn_blocking(move || {
+                let routes = std::iter::once("pages".to_string())
+                    .chain((0..=page_count).map(|index| format!("page/{index}")));
+                routes.map(|route| {
+                    let response = match ureq::get(&format!("http://{address}/api/comic/1/{route}")).call() {
+                        Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+                        Err(error) => panic!("owned HTTP transport: {error}"),
+                    };
+                    let status = response.status();
+                    let mut bytes = Vec::new();
+                    std::io::Read::read_to_end(&mut response.into_reader(), &mut bytes).unwrap();
+                    (status, bytes)
+                }).collect::<Vec<_>>()
+            }).await;
+            server.abort();
+            let _ = server.await;
+            let responses = responses.unwrap();
+            assert_eq!(responses[0].0, 200);
+            assert_eq!(serde_json::from_slice::<Vec<String>>(&responses[0].1).unwrap(), names);
+            for (response, expected) in responses[1..=page_count].iter().zip(expected) {
+                assert_eq!(response.0, 200, "cached names: {names:?}");
+                assert_eq!(response.1, expected.as_bytes());
+            }
+            assert_eq!(responses.last().unwrap().0, 404);
+            let db = app.db.lock().unwrap();
+            assert_eq!(db.query_row("SELECT meta_json FROM media WHERE id=1", [], |r| r.get::<_, String>(0)).unwrap(), metadata);
+            assert_eq!(db.query_row("SELECT position FROM progress WHERE media_id=1", [], |r| r.get::<_, f64>(0)).unwrap(), 7.0);
+            assert_eq!(db.query_row("SELECT title FROM media WHERE id=1", [], |r| r.get::<_, String>(0)).unwrap(), "Original");
+        }
+    }
+
     /// Protect cached UTF-8 names, physical page bytes, metadata, and saved progress together.
     #[tokio::test]
     async fn legacy_comic_cache_keeps_listing_content_and_user_state_consistent() {

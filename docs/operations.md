@@ -198,11 +198,13 @@ test "$SOURCE_TYPE" = volume
 test -n "$SOURCE_VOLUME"
 ```
 
-2. Record these identities privately. Stop the app and every other writer to the volume. Confirm the app is stopped; stopping only the proxy does not stop database writes:
+2. Record these identities privately. Stop the app, proxy and every other writer to the volume. The proxy must release its published port before the destination uses the same configuration; stopping only the proxy does not stop database writes:
 
 ```sh
-docker compose stop app
+docker compose stop proxy app
 test "$(docker inspect --format '{{.State.Running}}' "$SOURCE_CONTAINER")" = false
+SOURCE_RUNNING_PROXY=$(docker compose ps --status running --quiet proxy)
+test -z "$SOURCE_RUNNING_PROXY"
 ```
 
 3. Set `BACKUP_DIR` to a new absolute directory path outside the data volume, whose parent already exists. Do not create the target directory in advance: the block below creates and verifies it privately, and refuses existing paths or symlinks. These permission checks use Linux/GNU `stat`. The archive contains accounts and sessions; protect it as private data. Archive the entire stopped volume, including SQLite WAL/SHM files if present:
@@ -239,7 +241,9 @@ fi
 docker run --rm -i --network none --user 0:0 --entrypoint tar -v "$DEST_VOLUME:/data" "$IMAGE" -C /data -xpf - < "$BACKUP_DIR/data.tar"
 ```
 
-6. Start only the destination project with the same image and verify HTTP health, library/media bytes, accounts and saved progress, plus SQLite `PRAGMA integrity_check` and selected database IDs/progress. If verification fails, stop the destination and retain the original volume/image; do not delete the source or retry extraction over populated data. Back up separately mounted media as a separate data source.
+6. Start only the destination project with the same image and verify HTTP health, library/media bytes, accounts and saved progress, plus SQLite `PRAGMA integrity_check` and selected database IDs/progress. Keep the original app and proxy stopped while the destination uses their published port. If verification fails, stop the destination app and proxy before restarting the original project, and retain the original volume/image; do not delete the source or retry extraction over populated data. Back up separately mounted media as a separate data source.
+
+The published-port clause was checked separately in disposable Compose projects: stopping only the source app reproduced the destination bind failure; stopping both services and creating a fresh destination on the same loopback port passed HTTP 200. This checks port admission, not archive extraction or account/session recovery.
 
 The latest synthetic round trip passed in one uninterrupted invocation on image
 `sha256:858879bf50c7050dfb55f93723e8fa74fbde77e4a2447e00eb574d9e45bca0b5`,

@@ -164,3 +164,98 @@ fn epub_toc_labels_decode_entities_and_collect_only_xml_text() {
         }
     }
 }
+
+struct CachedZipFixture(PathBuf);
+impl Drop for CachedZipFixture {
+    fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+}
+
+/// Construct controlled ZIP metadata, including flags/duplicate names the public writer normalizes.
+fn cached_zip_fixture(entries: &[(&str, &str)], unflagged: bool, rename: Option<(&str, &str)>) -> CachedZipFixture {
+    use std::io::Write;
+    let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for (name, body) in entries {
+        archive.start_file(*name, zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored)).unwrap();
+        archive.write_all(body.as_bytes()).unwrap();
+    }
+    let mut bytes = archive.finish().unwrap().into_inner();
+    if unflagged {
+        for offset in 0..bytes.len().saturating_sub(9) {
+            let flag_offset = match &bytes[offset..offset + 4] {
+                b"PK\x03\x04" => Some(offset + 7),
+                b"PK\x01\x02" => Some(offset + 9),
+                _ => None,
+            };
+            if let Some(flag_offset) = flag_offset { bytes[flag_offset] &= !0x08; }
+        }
+    }
+    if let Some((from, to)) = rename {
+        assert_eq!(from.len(), to.len());
+        for offset in 0..=bytes.len() - from.len() {
+            if &bytes[offset..offset + from.len()] == from.as_bytes() {
+                bytes[offset..offset + to.len()].copy_from_slice(to.as_bytes());
+            }
+        }
+    }
+    let path = std::env::temp_dir().join(format!("frayd-cached-zip-{}.cbz", uuid::Uuid::new_v4()));
+    std::fs::write(&path, bytes).unwrap();
+    CachedZipFixture(path)
+}
+
+#[test]
+fn cached_zip_page_resolves_legacy_order_subsets_and_flagged_names_without_writes() {
+    let fixture = cached_zip_fixture(&[("é2.png", "second"), ("é10.png", "tenth")], true, None);
+    let before = std::fs::read(&fixture.0).unwrap();
+    for (names, page, expected) in [
+        (vec!["├⌐10.png", "├⌐2.png"], 0, Some("tenth")),
+        (vec!["├⌐10.png", "├⌐2.png"], 1, Some("second")),
+        (vec!["├⌐10.png"], 0, Some("tenth")),
+        (vec!["é2.png"], 0, Some("second")),
+        (vec!["missing.png"], 0, None),
+        (vec!["├⌐2.png", "├⌐2.png"], 0, None),
+    ] {
+        let names = names.into_iter().map(String::from).collect::<Vec<_>>();
+        assert_eq!(comic::read_cached_page(&fixture.0, &names, page), expected.map(|s| s.as_bytes().to_vec()));
+    }
+    assert_eq!(std::fs::read(&fixture.0).unwrap(), before);
+    let flagged = cached_zip_fixture(&[("é2.png", "flagged")], false, None);
+    assert_eq!(comic::read_cached_page(&flagged.0, &["├⌐2.png".into()], 0), None);
+    assert_eq!(comic::read_cached_page(&flagged.0, &["é2.png".into()], 0), Some(b"flagged".to_vec()));
+    assert_eq!(comic::read_zip_entry(&flagged.0, "é2.png"), Some(b"flagged".to_vec()));
+}
+
+#[test]
+fn cached_zip_page_holds_colliding_interpretations_and_duplicate_legacy_archives() {
+    for unflagged in [false, true] {
+        let collision = cached_zip_fixture(&[("é2.png", "utf8"), ("├⌐2.png", "literal")], unflagged, None);
+        let names = ["├⌐2.png".into()];
+        if unflagged {
+            // Two individually unique interpretations point to different physical entries.
+            assert_eq!(comic::read_cached_page(&collision.0, &names, 0), None);
+        } else {
+            // The flag means both readers interpret the literal name identically.
+            assert_eq!(comic::read_cached_page(&collision.0, &names, 0), Some(b"literal".to_vec()));
+        }
+        assert_eq!(comic::read_cached_page(&collision.0, &["é2.png".into()], 0), Some(b"utf8".to_vec()));
+    }
+    let mixed_fixture = cached_zip_fixture(&[("é2.png", "utf8"), ("├⌐2.png", "literal")], false, None);
+    let mut mixed = std::fs::read(&mixed_fixture.0).unwrap();
+    // Clear only the first entry's local/central flags; the second remains explicitly UTF8.
+    for signature in [b"PK\x03\x04", b"PK\x01\x02"] {
+        let offset = mixed.windows(4).position(|bytes| bytes == signature).unwrap();
+        mixed[offset + if signature == b"PK\x03\x04" { 7 } else { 9 }] &= !0x08;
+    }
+    std::fs::write(&mixed_fixture.0, mixed).unwrap();
+    let canonical: [String; 2] = ["é2.png".into(), "├⌐2.png".into()];
+    assert_eq!(comic::read_zip_entry(&mixed_fixture.0, &canonical[0]), Some(b"utf8".to_vec()));
+    assert_eq!(comic::read_zip_entry(&mixed_fixture.0, &canonical[1]), Some(b"literal".to_vec()));
+    assert_eq!(comic::read_cached_page(&mixed_fixture.0, &canonical, 0), Some(b"utf8".to_vec()));
+    assert_eq!(comic::read_cached_page(&mixed_fixture.0, &canonical, 1), Some(b"literal".to_vec()));
+    assert_eq!(comic::read_cached_page(&mixed_fixture.0, &["├⌐2.png".into()], 0), None, "legacy label has two targets");
+    let duplicate = cached_zip_fixture(&[("é2.png", "first"), ("é3.png", "second")], true, Some(("é3.png", "é2.png")));
+    assert!(zip::ZipArchive::new(std::fs::File::open(&duplicate.0).unwrap()).unwrap().has_duplicate_names());
+    assert_eq!(comic::read_cached_page(&duplicate.0, &["├⌐2.png".into()], 0), None);
+    let unrelated = cached_zip_fixture(&[("é2.png", "image"), ("note-a.txt", "one"), ("note-b.txt", "two")], true, Some(("note-b.txt", "note-a.txt")));
+    assert_eq!(comic::read_cached_page(&unrelated.0, &["é2.png".into()], 0), Some(b"image".to_vec()));
+    assert_eq!(comic::read_cached_page(&unrelated.0, &["├⌐2.png".into()], 0), None, "legacy recovery conservatively holds on duplicate archives");
+}

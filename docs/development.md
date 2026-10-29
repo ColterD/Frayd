@@ -231,3 +231,9 @@ rejoin can be rejected until server retirement completes. This protects active
 membership, not first-registration or inactive device-identity authentication;
 public device labels remain trusted-local identifiers. Valid creator-proof host
 replacement stays supported.
+
+### Legacy comic page-name compatibility
+
+Persisted ZIP 0.6.6 page labels can differ from ZIP 9 even when the archive bytes are unchanged. The contextual comic reader compares the entire cached list with unique current and historical flag-aware names, preserves its order, and reads the selected physical entry. It never rewrites the cache or user progress. Ambiguous interpretations remain refused; legacy recovery also holds when ZIP reports duplicate central-directory names. Normal canonical subsets retain exact lookup, while directory, RAR and EPUB readers keep their existing paths.
+
+The CP437 high-half is standard encoding data generated with Python's `cp437` codec; no dependency or second ZIP parser was added. Historical algorithm provenance: [zip 0.6.6, MIT, commit 21a20584](https://github.com/zip-rs/zip/blob/21a20584bc9e05dfa4f3c5b0bc420a1389fae2c3/src/read.rs#L1065), checked 2026-10-29; disposition: ADOPT decoding policy, not a second library. Real persisted-cache TCP and archive controls cover old names/order/progress, canonical subsets, flag handling, collisions and conservative refusal.

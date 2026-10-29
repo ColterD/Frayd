@@ -165,7 +165,7 @@ test('original browser failure remains visible alongside an injected profile-rem
   invocation.stdout.on('data', bytes => { stdout += bytes; });
   invocation.stderr.on('data', bytes => { stderr += bytes; });
   try {
-    const [code] = await once(invocation, 'exit');
+    const [code] = await once(invocation, 'close');
     assert.equal(code, 1, stderr);
     const result = JSON.parse(stdout);
     assert.match(result.runnerError, /Browser exited before result: 7\/null; original browser exit sentinel/);
@@ -221,7 +221,7 @@ if (process.argv.includes('--version')) { console.log('Owned native-gate abort f
   invocation.stdout.on('data', bytes => { stdout += bytes; });
   invocation.stderr.on('data', bytes => { stderr += bytes; });
   try {
-    const [code] = await once(invocation, 'exit');
+    const [code] = await once(invocation, 'close');
     assert.equal(code, 1, stderr);
     const result = JSON.parse(stdout);
     assert.match(result.runnerError, /Browser exited before result: 7/);
@@ -303,7 +303,7 @@ setInterval(() => {}, 1000);
   invocation.stdout.on('data', bytes => { stdout += bytes; });
   invocation.stderr.on('data', bytes => { stderr += bytes; });
   try {
-    const [code] = await once(invocation, 'exit');
+    const [code] = await once(invocation, 'close');
     assert.equal(code, 1, stderr);
     const result = JSON.parse(stdout);
     assert.match(result.runnerError, /Owned browser did not expose its cache-control endpoint|Browser startup exceeded 200 milliseconds/);
@@ -556,7 +556,7 @@ setInterval(() => {}, 1000);
   invocation.stdout.on('data', bytes => { stdout += bytes; });
   invocation.stderr.on('data', bytes => { stderr += bytes; });
   try {
-    const [code] = await once(invocation, 'exit');
+    const [code] = await once(invocation, 'close');
     assert.equal(code, 1, stderr);
     assert.match(stderr, /Verified 11 real HTTP fixture input controls/);
     const result = JSON.parse(stdout);
@@ -601,7 +601,7 @@ setInterval(() => {}, 1000);
       let stdout = '', stderr = '';
       invocation.stdout.on('data', bytes => { stdout += bytes; });
       invocation.stderr.on('data', bytes => { stderr += bytes; });
-      const [code] = await once(invocation, 'exit');
+      const [code] = await once(invocation, 'close');
       const result = JSON.parse(stdout);
       assert.equal(code, scenario === 'slow-success' ? 0 : 1, stderr);
       assert.equal(result.complete, scenario === 'slow-success');
@@ -728,7 +728,7 @@ test('unconfirmed browser shutdown retains its active interception session and p
   invocation.stdout.resume();
   invocation.stderr.on('data', bytes => { stderr += bytes; });
   try {
-    const [code] = await once(invocation, 'exit');
+    const [code] = await once(invocation, 'close');
     assert.equal(code, 1, stderr); // Held cleanup must remain a failed runner outcome.
     assert.match(stderr, /Verified active guard and profile held/);
   } finally {

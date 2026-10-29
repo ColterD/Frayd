@@ -649,37 +649,15 @@ mod native {
         if let Err(error) = result {
             // Roll back only paths created in this attempt; never recurse through an
             // unexpected tree. Failure retains exact paths and reports the original error.
-            let mut retained = Vec::new();
-            if created_data
-                && !data.join(DATA_RECEIPT).try_exists()?
-                && fs::remove_dir(data).is_err()
-            {
-                retained.push(data.display().to_string());
-            }
-            for file in created_files.iter().rev() {
-                if fs::remove_file(file).is_err() {
-                    retained.push(file.display().to_string());
-                }
-            }
-            for directory in created_dirs.iter().rev() {
-                if fs::remove_dir(directory).is_err() {
-                    retained.push(directory.display().to_string());
-                }
-            }
-            if fs::remove_dir(&stage).is_err() {
-                retained.push(stage.display().to_string());
-            }
-            let current = fs::symlink_metadata(prefix)?;
-            if current.is_dir()
-                && current.dev() == reservation.dev()
-                && current.ino() == reservation.ino()
-            {
-                if fs::remove_dir(prefix).is_err() {
-                    retained.push(prefix.display().to_string());
-                }
-            } else {
-                retained.push(prefix.display().to_string());
-            }
+            let retained = rollback_install(
+                prefix,
+                data,
+                &stage,
+                &reservation,
+                created_data,
+                &created_files,
+                &created_dirs,
+            );
             return Err(format!(
                 "install failed: {error}; retained paths: {retained:?}; data is never deleted"
             )
@@ -687,6 +665,51 @@ mod native {
         }
         println!("Installed owned prefix; data is preserved independently.");
         Ok(())
+    }
+    /// Clean only attempt-owned paths; uncertainty retains paths without hiding the failure.
+    fn rollback_install(
+        prefix: &Path,
+        data: &Path,
+        stage: &Path,
+        reservation: &fs::Metadata,
+        created_data: bool,
+        created_files: &[PathBuf],
+        created_dirs: &[PathBuf],
+    ) -> Vec<String> {
+        let mut retained = Vec::new();
+        if created_data {
+            match data.join(DATA_RECEIPT).try_exists() {
+                // Preserve marked or uncertain data and report its exact path.
+                Ok(false) if fs::remove_dir(data).is_ok() => (),
+                _ => retained.push(data.display().to_string()),
+            }
+        }
+        for file in created_files.iter().rev() {
+            if fs::remove_file(file).is_err() {
+                retained.push(file.display().to_string());
+            }
+        }
+        for directory in created_dirs.iter().rev() {
+            if fs::remove_dir(directory).is_err() {
+                retained.push(directory.display().to_string());
+            }
+        }
+        if fs::remove_dir(stage).is_err() {
+            retained.push(stage.display().to_string());
+        }
+        match fs::symlink_metadata(prefix) {
+            Ok(current)
+                if current.is_dir()
+                    && current.dev() == reservation.dev()
+                    && current.ino() == reservation.ino() =>
+            {
+                if fs::remove_dir(prefix).is_err() {
+                    retained.push(prefix.display().to_string());
+                }
+            }
+            _ => retained.push(prefix.display().to_string()),
+        }
+        retained
     }
     /// Launch the unchanged owned server with explicit private runtime paths.
     /// Validate prefix/data and hold the lifecycle lock before spawning. Normal
@@ -855,6 +878,7 @@ mod native {
         );
         Ok(())
     }
+
     /// Parse the explicit native CLI and dispatch exactly one supported lifecycle.
     /// Reject unknown, duplicate, purge and malformed arguments before dispatch;
     /// individual operations enforce path, ownership and confirmation boundaries.
@@ -914,6 +938,102 @@ mod native {
                 eprintln!("frayd-native: {error}");
                 ExitCode::from(2)
             }
+        }
+    }
+    #[cfg(test)]
+    mod rollback_tests {
+        use super::*;
+        use std::os::unix::fs::symlink;
+
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                fs::remove_dir_all(&self.0).expect("remove owned rollback fixture");
+            }
+        }
+
+        fn scenario(marker: &str, missing_prefix: bool) {
+            let fixture = Fixture(
+                Path::new("/var/tmp")
+                    .join(format!("frayd-native-rollback-{}", uuid::Uuid::new_v4())),
+            );
+            private_dir(&fixture.0).unwrap();
+            let prefix = fixture.0.join("prefix");
+            let data = fixture.0.join("data");
+            let stage = fixture.0.join("stage");
+            for path in [&prefix, &data, &stage] {
+                private_dir(path).unwrap();
+            }
+            let reservation = fs::symlink_metadata(&prefix).unwrap();
+            let directory = stage.join("payload");
+            private_dir(&directory).unwrap();
+            let file = directory.join("file");
+            fs::write(&file, "owned payload").unwrap();
+            match marker {
+                "marked" => fs::write(data.join(DATA_RECEIPT), "owned marker").unwrap(),
+                "uncertain" => symlink(DATA_RECEIPT, data.join(DATA_RECEIPT)).unwrap(),
+                "nonempty" => fs::write(data.join("unexpected"), "preserve").unwrap(),
+                "empty" => (),
+                _ => panic!("unknown fixture"),
+            }
+            if missing_prefix {
+                fs::remove_dir(&prefix).unwrap();
+            }
+            let retained = rollback_install(
+                &prefix,
+                &data,
+                &stage,
+                &reservation,
+                true,
+                &[file],
+                &[directory],
+            );
+            assert!(!stage.exists(), "stage cleanup skipped");
+            assert!(!prefix.exists(), "empty reservation cleanup skipped");
+            if marker == "empty" {
+                assert!(!data.exists());
+                assert!(retained.is_empty());
+            } else {
+                assert!(data.is_dir());
+                assert!(retained.contains(&data.display().to_string()));
+                match marker {
+                    "marked" => {
+                        assert_eq!(fs::read(data.join(DATA_RECEIPT)).unwrap(), b"owned marker")
+                    }
+                    "uncertain" => assert_eq!(
+                        fs::read_link(data.join(DATA_RECEIPT)).unwrap(),
+                        Path::new(DATA_RECEIPT)
+                    ),
+                    "nonempty" => {
+                        assert_eq!(fs::read(data.join("unexpected")).unwrap(), b"preserve")
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            if missing_prefix {
+                assert!(retained.contains(&prefix.display().to_string()));
+            }
+        }
+
+        #[test]
+        fn marked_data_is_reported() {
+            scenario("marked", false);
+        }
+        #[test]
+        fn marker_metadata_error_continues_cleanup() {
+            scenario("uncertain", false);
+        }
+        #[test]
+        fn prefix_metadata_error_retains_uncertain_path() {
+            scenario("marked", true);
+        }
+        #[test]
+        fn empty_unmarked_data_is_removed() {
+            scenario("empty", false);
+        }
+        #[test]
+        fn nonempty_unmarked_data_is_retained() {
+            scenario("nonempty", false);
         }
     }
 }
