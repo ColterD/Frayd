@@ -7,7 +7,7 @@ fn dir_pages(path: &Path) -> Option<Vec<(String, u64)>> {
     let mut pages: Vec<(String, u64)> = std::fs::read_dir(path)
         .ok()?
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().ok().map_or(false, |t| t.is_file()))
+        .filter(|e| e.file_type().ok().is_some_and(|t| t.is_file()))
         .filter_map(|e| {
             let name = e.file_name().into_string().ok()?;
             if image_entry(&name) {
@@ -116,10 +116,10 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
                 if x.is_ascii_digit() && y.is_ascii_digit() {
                     let mut an = String::new();
                     let mut bn = String::new();
-                    while ai.peek().map_or(false, |c| c.is_ascii_digit()) {
+                    while ai.peek().is_some_and(|c| c.is_ascii_digit()) {
                         an.push(ai.next().unwrap());
                     }
-                    while bi.peek().map_or(false, |c| c.is_ascii_digit()) {
+                    while bi.peek().is_some_and(|c| c.is_ascii_digit()) {
                         bn.push(bi.next().unwrap());
                     }
                     let (av, bv): (u64, u64) = (

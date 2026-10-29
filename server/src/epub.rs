@@ -153,14 +153,14 @@ fn read(zip: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Option<String> 
     String::from_utf8(bytes).ok()
 }
 
-fn attr<'a>(s: &'a str, name: &str) -> Option<String> {
+fn attr(s: &str, name: &str) -> Option<String> {
     let pat = format!("{name}=\"");
     let start = s.find(&pat)? + pat.len();
     let end = s[start..].find('"')? + start;
     Some(s[start..end].to_string())
 }
 
-fn between<'a>(s: &'a str, open: &str, close: &str) -> Option<String> {
+fn between(s: &str, open: &str, close: &str) -> Option<String> {
     let start = s.find(open)? + open.len();
     let end = s[start..].find(close)? + start;
     Some(s[start..end].to_string())

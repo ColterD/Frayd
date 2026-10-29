@@ -1,15 +1,6 @@
 const assert = require('node:assert/strict');
-const { readFileSync } = require('node:fs');
-const { join } = require('node:path');
-const { createRequire } = require('node:module');
-const vm = require('node:vm');
 const { test } = require('node:test');
-const harnessPath = join(__dirname, 'client.test.cjs');
-const marker = "test('closing an ebook";
-const source = readFileSync(harnessPath, 'utf8');
-assert.ok(source.includes(marker), 'client.test.cjs harness marker is missing');
-const harness = source.split(marker)[0];
-const browser = vm.runInNewContext(harness + '\nbrowser;', { require: createRequire(harnessPath), __dirname, queueMicrotask, URL });
+const { browser } = require('./fixtures/client-browser.cjs');
 
 test('authoritative roots, episode permissions and explicit null clearing', () => {
   const b = browser();

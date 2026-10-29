@@ -5,7 +5,7 @@ RUN timeout --kill-after=10s 180s apt-get -o Acquire::http::Timeout=30 -o Acquir
     && rm -rf /var/lib/apt/lists/*
 COPY server/ ./
 ENV CARGO_BUILD_JOBS=2
-RUN rustup component add clippy && cargo test --locked && cargo clippy --locked --all-targets && cargo build --locked --release \
+RUN rustup component add clippy && cargo test --locked && cargo clippy --locked --all-targets -- -D warnings && cargo build --locked --release \
     && rustc -Vv > /app/server/rustc-version.txt
 
 FROM scratch AS native-export

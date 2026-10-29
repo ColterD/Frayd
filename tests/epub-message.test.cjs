@@ -1,79 +1,12 @@
 const assert = require('node:assert/strict');
-const { readFileSync } = require('node:fs');
-const { join } = require('node:path');
 const { test } = require('node:test');
-const vm = require('node:vm');
-
-const clientPath = join(__dirname, '..', 'client');
-
-// Only browser boundaries are doubled: the complete application scripts run as-is.
-function browser() {
-  const nodes = new Map();
-  const listeners = new Map();
-  function element() {
-    const classes = new Set();
-    const attributes = new Map();
-    return {
-      style: {}, dataset: {}, children: [], value: '', type: '', innerHTML: '', textContent: '',
-      src: '', paused: true, readyState: 1, currentTime: 0, clientWidth: 760, clientHeight: 600,
-      classList: {
-        add: name => classes.add(name), remove: name => classes.delete(name),
-        contains: name => classes.has(name),
-      },
-      setAttribute: (name, value) => attributes.set(name, value),
-      getAttribute: name => attributes.get(name),
-      addEventListener() {},
-      appendChild(child) { this.children.push(child); },
-      append(...children) { this.children.push(...children); },
-      pause() { this.paused = true; },
-      play() { this.paused = false; return Promise.resolve(); },
-    };
-  }
-  const html = readFileSync(join(clientPath, 'index.html'), 'utf8');
-  for (const match of html.matchAll(/<[^>]+\bid="([^"]+)"[^>]*>/g)) {
-    const node = element();
-    for (const attr of match[0].matchAll(/([\w-]+)="([^"]*)"/g)) {
-      node.setAttribute(attr[1], attr[2]);
-      if (attr[1] === 'type') node.type = attr[2];
-    }
-    nodes.set('#' + match[1], node);
-  }
-  for (const selector of ['#search input', '.avatar', '#hero-play', '#hero-backdrop', '#pt-host', '#pt-join', '#party-code-input']) nodes.set(selector, element());
-  nodes.get('#em-frame').contentWindow = { postMessage() {} };
-  nodes.get('#add-media').innerHTML = html.match(/<button id="add-media">([\s\S]*?)<\/button>/)[1];
-  const requests = [];
-  let response = async () => ({ ok: true, status: 200, json: async () => null });
-  const document = {
-    body: element(), querySelector: selector => nodes.get(selector) || null,
-    getElementById: id => nodes.get('#' + id), querySelectorAll: () => [],
-    createElement: element, addEventListener() {},
-  };
-  const context = vm.createContext({
-    document, localStorage: {}, location: { hostname: 'test.invalid' },
-    console: { log() {}, warn() {} }, innerWidth: 1000, innerHeight: 800,
-    fetch: async (url, options) => { requests.push({ url, options }); return response(url, options); },
-    addEventListener: (name, fn) => listeners.set(name, fn),
-    setTimeout() {}, clearTimeout() {},
-    setInterval() {}, clearInterval() {},
-    Plyr: class {}, Image: class {},
-    WebSocket: class {},
-  });
-  context.window = context;
-  vm.runInContext(readFileSync(join(clientPath, 'js/app.js'), 'utf8'), context);
-  return {
-    nodes, requests,
-    run: source => vm.runInContext(source, context),
-    respond: fn => { response = fn; },
-    message: event => listeners.get('message')(event),
-  };
-}
-
+const { browser } = require('./fixtures/client-browser.cjs');
 
 const highlight = { type: 'highlight', cfi: 'char:0:5', text: 'Hello' };
 function reader() {
   const b = browser();
   b.run('ebook = { it: { id: 7 }, chunk: 1, spine: ["a", "b", "c"], document: { generation: 1, ready: true, items: [] } }');
-  b.send = (data, overrides = {}) => b.message({
+  b.send = (data, overrides = {}) => b.dispatchMessage({
     data: data && typeof data === "object" && !Array.isArray(data) ? { generation: b.run("ebook?.document?.generation"), ...data } : data, origin: 'null', source: b.nodes.get('#em-frame').contentWindow, ...overrides,
   });
   return b;

@@ -241,11 +241,6 @@ async function saveSettings(payload, generation) {
   return generation === settingsGeneration;
 }
 /**
- * Reload the settings panel after a successful change.
- * @returns {Promise<void>}
- */
-function reopenSettings() { return openSettings(); }
-/**
  * Fetch permissions and library settings, then render controls guarded by a panel generation.
  * @returns {Promise<void>}
  */
@@ -357,7 +352,7 @@ async function openSettings() {
       try {
         if (!await saveSettings({ library_paths: [...libs, path] }, generation)) return;
         toast('Folder added');
-        await reopenSettings();
+        await openSettings();
         await startSettingsScan(settingsGeneration, $('#settings-stage').querySelector('.p-scan'));
       } catch (error) { if (current()) toast(error.message || 'Add failed — server unreachable', true); }
     };
@@ -365,7 +360,7 @@ async function openSettings() {
       if (locked || !current() || !confirm(`Stop scanning "${b.dataset.path}"? Existing items and files remain.`)) return;
       try {
         if (!await saveSettings({ library_paths: libs.filter(path => path !== b.dataset.path) }, generation)) return;
-        toast('Folder removed'); reopenSettings();
+        toast('Folder removed'); openSettings();
       } catch (error) { if (current()) toast(error.message || 'Remove failed — server unreachable', true); }
     });
     // remove a user: sessions, progress, highlights gone. Cannot remove self/last admin.
@@ -375,7 +370,7 @@ async function openSettings() {
       try {
       const r = await fetch(`/api/admin/users/${row.dataset.id}?identity=${encodeURIComponent(IDENTITY)}`, { method: 'DELETE', headers: authHeaders() });
       if (!current()) return;
-      if (r.ok) { toast('User removed'); reopenSettings(); }
+      if (r.ok) { toast('User removed'); openSettings(); }
       else if (r.status === 409) toast('Cannot remove: last admin (or yourself)', true);
       else toast(`Remove failed (${r.status})`, true);
       } catch { if (current()) toast('Remove failed — server unreachable', true); }
@@ -1571,9 +1566,8 @@ const YT_DRIFT = 3;
  * @param {number} position Host position at updatedAt, in seconds.
  * @param {boolean} playing Whether the host is advancing the playback clock.
  * @param {number} updatedAt Unix timestamp used to compensate a playing stream for transit.
- * @param {boolean} isHostOwn Legacy caller hint; current partySend determines host authority.
  */
-window.partyFollowExternal = (vid, title, position, playing, updatedAt, isHostOwn) => {
+window.partyFollowExternal = (vid, title, position, playing, updatedAt) => {
   partyPlaybackKind = 'external';
   ++nativeLoadGeneration;
   pbAudio.pause();
@@ -1641,7 +1635,6 @@ window.partyFollowExternal = (vid, title, position, playing, updatedAt, isHostOw
     if (desired.playing && ytPlayer.getPlayerState && ytPlayer.getPlayerState() !== 1) ytPlayer.playVideo();
     if (!desired.playing && ytPlayer.getPlayerState && ytPlayer.getPlayerState() === 1) ytPlayer.pauseVideo();
   });
-  void isHostOwn;
 };
 
 /**

@@ -161,7 +161,7 @@ const PartyUI = (() => {
   function followState() {
     if (state && state.external_url) {
       if (typeof window.partyFollowExternal === 'function')
-        window.partyFollowExternal(state.external_url, state.title, state.position, state.playing, state.updated_at, false);
+        window.partyFollowExternal(state.external_url, state.title, state.position, state.playing, state.updated_at);
       return;
     }
     if (typeof window.partyFollow !== 'function') return;
@@ -184,7 +184,7 @@ const PartyUI = (() => {
     const ext = state?.external_url;
     if (ext && ext !== hostLoadedExt && typeof window.partyFollowExternal === 'function') {
       hostLoadedExt = ext;
-      window.partyFollowExternal(ext, state.title, 0, state.playing, state.updated_at, true);
+      window.partyFollowExternal(ext, state.title, 0, state.playing, state.updated_at);
       return;
     }
     const id = state?.media_id;
@@ -341,7 +341,7 @@ const PartyUI = (() => {
       if (!m) return renderError('Paste a YouTube URL (youtube.com/watch?v=… or youtu.be/…)');
       const id = m[1];
       send({ type: 'load', external_url: id, title: 'YouTube · ' + id, position: 0 });
-      window.partyFollowExternal(id, 'YouTube · ' + id, 0, true, Math.floor(Date.now() / 1000), true);
+      window.partyFollowExternal(id, 'YouTube · ' + id, 0, true, Math.floor(Date.now() / 1000));
     });
     $('#pt-yt')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#pt-yt-go').click(); });
   }

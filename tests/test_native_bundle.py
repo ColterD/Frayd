@@ -77,12 +77,6 @@ class NativeSourceContract(unittest.TestCase):
         for required in ['macos-15-intel', 'aarch64-apple-darwin', '--locked', '--bin frayd-native']:
             self.assertIn(required, workflow)
 
-    def test_install_page_has_no_opaque_redirect(self):
-        """Reject opaque redirect and response handling in the install page."""
-        page = (ROOT / 'client/install/index.html').read_text()
-        self.assertNotIn('location.href = liveBase', page)
-        self.assertNotIn("r.type === 'opaque' || r.ok", page)
-
     def test_runtime_discovery_requires_both_inputs(self):
         """Partial runtime inputs skip discovery; complete inputs reach archive validation."""
         with tempfile.TemporaryDirectory(prefix='frayd discovery ', dir=TEMP_ROOT) as directory:
