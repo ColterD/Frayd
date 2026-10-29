@@ -1,62 +1,21 @@
-name: Release mac build
+name: Native macOS qualification held on main
 
+# Temporary main-only safety guard: upstream tag-triggered packaging/publication
+# has not been qualified or accepted. Keep this workflow slot discoverable for
+# explicit feature-ref dispatch without enabling any default-main runner work.
+# Functional nonpublishing qualification is prepared on fork PR2, pending acceptance:
+# https://github.com/ColterD/Frayd/blob/fix/coderabbit-all-findings/.github/workflows/release-mac.yml
+# Replace this placeholder when the accepted draft PR2 is merged.
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build-macos:
-    runs-on: macos-14
-    timeout-minutes: 40
+  qualification-held:
+    if: ${{ false }}
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install Rust
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-
-      - name: Build server (universal binary)
-        working-directory: server
-        run: |
-          rustup target add aarch64-apple-darwin x86_64-apple-darwin
-          cargo build --release --target aarch64-apple-darwin
-          cargo build --release --target x86_64-apple-darwin
-          lipo -create \
-            target/aarch64-apple-darwin/release/frayd-server \
-            target/x86_64-apple-darwin/release/frayd-server \
-            -output frayd-server
-
-      - name: Stage zip contents
-        run: |
-          mkdir -p pkg/macos
-          cp server/frayd-server pkg/macos/
-          cp client/install/bootstrap.sh pkg/macos/
-          cp client/install/index.html pkg/macos/
-          cp scripts/uninstall.sh pkg/macos/
-          chmod +x pkg/macos/*.sh
-
-      - name: Zip
-        run: |
-          cd pkg
-          zip -r ../frayd-server-${{ github.ref_name }}-macos.zip macos
-
-      - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: frayd-server-${{ github.ref_name }}-macos.zip
-
-      - name: Upload artifact (manual runs)
-        if: github.ref_name != '' && !startsWith(github.ref, 'refs/tags/')
-        uses: actions/upload-artifact@v4
-        with:
-          name: frayd-macos
-          path: frayd-server-*.zip
+      - name: Qualification remains held on main
+        run: ':'
