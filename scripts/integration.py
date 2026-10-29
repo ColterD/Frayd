@@ -40,6 +40,8 @@ def docker_timeout(args):
         if command == 'up':
             # Existing --wait-timeout90 plus bounded CLI/setup overhead; no builds.
             return 'compose-up', 120
+        if command == 'exec':
+            return 'compose-exec', 30
         if command == 'down':
             return 'cleanup', 60
         if command in ('restart', 'stop', 'rm'):

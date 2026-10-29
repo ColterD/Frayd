@@ -240,6 +240,22 @@ class DockerTimeoutTests(unittest.TestCase):
                 self.assertIn(operation, ('context-build', 'container-create', 'container-export', 'cleanup'))
                 self.assertGreater(timeout, 0)
 
+    def test_compose_exec_build_info_reaches_bounded_cli_with_stdin_config(self):
+        """Dispatch the exact provenance command through a real disposable CLI adapter."""
+        arguments = ('compose', '-p', 'owned', '-f', '-', 'exec', '-T', 'app', 'frayd-server', '--build-info')
+        with tempfile.TemporaryDirectory() as folder:
+            executable = Path(folder) / 'docker'
+            executable.write_text(f'#!{sys.executable}\nimport json,sys\n'
+                                  f'assert sys.argv[1:] == {list(arguments)!r}\n'
+                                  'assert json.load(sys.stdin) == {"services": {"app": {}}}\n'
+                                  'print(json.dumps({"version":"0.1.1","commit":"fixture"}))\n')
+            executable.chmod(0o755)
+            with patch.dict(os.environ, {'PATH': folder}):
+                result = integration.docker(*arguments, input=b'{"services":{"app":{}}}')
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(json.loads(result.stdout), {'version': '0.1.1', 'commit': 'fixture'})
+            self.assertEqual(integration.docker_timeout(arguments), ('compose-exec', 30))
+
     def test_timeout_override_is_finite_and_diagnostics_are_public(self):
         """Reject zero, negative and non-finite Docker timeout overrides."""
         for timeout in [0, -1, float('inf'), float('nan')]:

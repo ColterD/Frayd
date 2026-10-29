@@ -8,16 +8,18 @@ Implementation snapshot: [`6a4d202`](https://github.com/ColterD/Frayd/tree/6a4d2
 
 ## Run with Docker
 
-Requirements: Git, Docker Engine and the Docker Compose plugin. These commands target the fork draft under verification; the [upstream repository](https://github.com/kattiest/Frayd) does not yet contain all of this branch's fixes.
+Requirements: Git, Python 3, Docker Engine and the Docker Compose plugin. These commands target the fork draft under verification; the [upstream repository](https://github.com/kattiest/Frayd) does not yet contain all of this branch's fixes.
 
 ```sh
 git clone --branch fix/coderabbit-all-findings --single-branch https://github.com/ColterD/Frayd.git
 cd Frayd
 docker compose config --quiet
-docker compose up -d --build --wait
+python3 scripts/build-metadata.py -- docker compose up -d --build --wait
 ```
 
 Open **http://127.0.0.1:3100**. If port 3100 is occupied, prefix Compose commands with `FRAYD_PORT=3105` and open http://127.0.0.1:3105. The first build downloads images and Rust dependencies and runs tests, Clippy and a release build; it can take several minutes.
+
+The sign-in screen and sidebar show the running server's version and commit. See [checking a build against upstream](docs/operations.md#check-a-build-against-upstream) to inspect a custom build or check for upstream changes.
 
 The dashboard labels all seven media categories and starts with newest items first; each category can switch to oldest first. Artwork comes from local media when available, with a symbol fallback when no usable cover exists.
 
