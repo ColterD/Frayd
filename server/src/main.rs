@@ -58,6 +58,17 @@ fn bind_address(value: Option<&str>,port: u16) -> Result<std::net::SocketAddr,st
     value.unwrap_or("0.0.0.0").parse::<std::net::IpAddr>().map(|ip|std::net::SocketAddr::new(ip,port))
 }
 
+/// Decide router mapping eligibility from the effective bind and explicit requests.
+/// Loopback listeners must never acquire an external mapping; external binds keep
+/// the existing environment-or-stored-setting opt-in behavior.
+fn upnp_mapping_requested(bind: std::net::IpAddr, environment: bool, stored: bool) -> bool {
+    let loopback=match bind {
+        std::net::IpAddr::V4(address)=>address.is_loopback(),
+        std::net::IpAddr::V6(address)=>address.is_loopback() || address.to_ipv4_mapped().is_some_and(|mapped|mapped.is_loopback()),
+    };
+    !loopback && (environment || stored)
+}
+
 /// Initialize schemas, background scanning, and HTTP routes before accepting requests.
 #[tokio::main]
 async fn main() {
@@ -146,7 +157,8 @@ async fn main() {
                 .and_then(|v| v.as_u64().map(|p| p as u16))
         })
         .unwrap_or(8484);
-    let addr=bind_address(std::env::var("FRAYD_BIND").ok().as_deref(),port).expect("FRAYD_BIND must be an IP address").to_string();
+    let bind=bind_address(std::env::var("FRAYD_BIND").ok().as_deref(),port).expect("FRAYD_BIND must be an IP address");
+    let addr=bind.to_string();
     tracing::info!("frayd listening on {addr}");
 
     // setting helper: read a bool from settings table
@@ -159,7 +171,7 @@ async fn main() {
     };
 
     // UPnP port forward (best-effort, needs `upnpc` binary; router must have UPnP on)
-    if std::env::var("FRAYD_UPNP").map(|v| v == "1").unwrap_or(false) || setting_bool("upnp") {
+    if upnp_mapping_requested(bind.ip(),std::env::var("FRAYD_UPNP").map(|v| v == "1").unwrap_or(false),setting_bool("upnp")) {
         let ext = port; // same external port
         std::thread::spawn(move || {
             match Command::new("upnpc")
@@ -2372,6 +2384,23 @@ mod upstream_integration_tests {
         assert_eq!(bind_address(Some("::1"),8484).unwrap().to_string(),"[::1]:8484");
         assert!(bind_address(Some("localhost"),8484).is_err());assert!(bind_address(Some(""),8484).is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    /// Router intent never escapes loopback, while external binds retain either explicit opt-in.
+    fn native_loopback_upnp_gate_preserves_external_opt_in() {
+        for address in ["127.0.0.1","127.42.0.8","::1","::ffff:127.0.0.1"] {
+            let bind=bind_address(Some(address),8484).unwrap();
+            for (environment,stored) in [(false,false),(true,false),(false,true),(true,true)] {
+                assert!(!upnp_mapping_requested(bind.ip(),environment,stored),"loopback mapping requested: {address}, env={environment}, stored={stored}");
+            }
+        }
+        for address in ["0.0.0.0","192.0.2.1","::","2001:db8::1"] {
+            let bind=bind_address(Some(address),8484).unwrap();
+            for (environment,stored) in [(false,false),(true,false),(false,true),(true,true)] {
+                assert_eq!(upnp_mapping_requested(bind.ip(),environment,stored),environment||stored,"external opt-in changed: {address}");
+            }
+        }
     }
 
     #[test]

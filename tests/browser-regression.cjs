@@ -13,9 +13,105 @@ const { setTimeout: delay } = require('node:timers/promises');
 const root = resolve(__dirname, '..');
 const evidenceDir = join(root, '.codex/evidence/pr2-real-dom');
 const productionFiles = ['client/index.html', 'client/js/app.js', 'client/js/party.js',
-  'client/vendor/plyr/plyr.min.js', 'client/vendor/plyr/plyr.min.css', 'client/vendor/plyr/plyr.svg', 'client/css/frayd.css'];
+  'client/vendor/plyr/plyr.min.js', 'client/vendor/plyr/plyr.min.css', 'client/vendor/plyr/plyr.svg', 'client/css/frayd.css', 'client/install/index.html'];
 const harnessFiles = ['tests/browser-regression.cjs', 'tests/fixtures/browser-driver.js', 'tests/fixtures/reader-probe.js', 'tests/fixtures/native-resume.mp4', 'tests/fixtures/generate-native-resume.sh'];
 function hash(path) { return createHash('sha256').update(readFileSync(path)).digest('hex'); }
+function responsiveAudioFixture() {
+  // Owned deterministic120s mono PCM; no file, dependency, download or physical output.
+  const samples = 120 * 8000;
+  const bytes = Buffer.alloc(44 + samples * 2);
+  bytes.write('RIFF'); bytes.writeUInt32LE(bytes.length - 8, 4); bytes.write('WAVEfmt ', 8);
+  bytes.writeUInt32LE(16, 16); bytes.writeUInt16LE(1, 20); bytes.writeUInt16LE(1, 22);
+  bytes.writeUInt32LE(8000, 24); bytes.writeUInt32LE(16000, 28); bytes.writeUInt16LE(2, 32);
+  bytes.writeUInt16LE(16, 34); bytes.write('data', 36); bytes.writeUInt32LE(samples * 2, 40);
+  // Buffer.alloc leaves all PCM samples silent; only the WAV header is nonzero.
+  return bytes;
+}
+function responsivePreload(width) {
+  const originalFetch = window.fetch.bind(window);
+  const fixture = window.__responsiveFixture = { width, progressResponses: [], mediaEvents: [], cardClicks: [], requests: [] };
+  fixture.items = [
+    ...Array.from({ length: 6 }, (_, n) => ({ id: 60 + n, kind: 'movie', title: n ? `Movie ${n}` : 'Long media title '.repeat(12), created_at: n })),
+    ...Array.from({ length: 8 }, (_, n) => ({ id: 23 + n, kind: 'music', title: n ? `Audio ${n}` : 'Long player title '.repeat(8), author: 'Fixture artist', created_at: n })),
+    ...['ebook', 'comic', 'manga', 'audiobook'].flatMap((kind, k) => Array.from({ length: 8 }, (_, n) => ({
+      id: 70 + k * 10 + n, kind, title: `${kind} book ${n}`, author: 'Fixture author', created_at: n,
+    }))),
+  ];
+  // Per-document auth double: never mutate the parent profile's storage or account.
+  Object.defineProperty(window, 'localStorage', { value: { frayd_identity: `owned-responsive-${width}`, frayd_token: 'owned-fixture-model' } });
+  document.addEventListener('click', event => {
+    const card = event.target.closest?.('.media-card');
+    if (!card) return;
+    const item = fixture.items.find(item => card.title.startsWith(item.title));
+    fixture.cardClicks.push({ id: item?.id || null, isTrusted: event.isTrusted, title: card.title });
+  }, true);
+  const reply = (value, status = 200) => new Response(status === 204 ? null : JSON.stringify(value), {
+    status, headers: { 'Content-Type': 'application/json' },
+  });
+  window.fetch = async (url, options = {}) => {
+    const path = new URL(String(url), location.origin).pathname;
+    if (path.startsWith('/__fixture/')) return originalFetch(url, options);
+    fixture.requests.push({ path, method: options.method || 'GET' });
+    if (path === '/api/library') return reply(fixture.items);
+    if (path === '/api/auth/me') return reply({ name: 'Responsive admin', is_admin: true });
+    if (path === '/api/progress/23') {
+      fixture.progressResponses.push({ url: String(url), id: 23, status: 200, position: 0 });
+      return reply({ position: 0 });
+    }
+    if (path.startsWith('/api/progress/')) return reply(null);
+    if (path === '/api/progress') return reply(null, 204);
+    if (path === '/api/scan') return reply(null, 409);
+    if (path === '/api/admin/perms') return reply([]);
+    if (path === '/api/admin/settings') return reply({ library_paths: [], library_locked: false, server_version: 'fixture' });
+    throw new Error('Unknown responsive API fixture request: ' + path);
+  };
+  for (const name of ['loadstart', 'loadedmetadata', 'loadeddata', 'canplay', 'playing', 'pause', 'seeking', 'seeked', 'ended', 'error']) {
+    document.addEventListener(name, event => {
+      const media = event.target;
+      if (media.id !== 'pb-audio' || fixture.mediaEvents.length >= 80) return;
+      fixture.mediaEvents.push({ event: name, currentTime: media.currentTime, duration: Number.isFinite(media.duration) ? media.duration : null,
+        readyState: media.readyState, paused: media.paused, source: media.currentSrc || media.src,
+        mediaError: media.error?.code || null });
+    }, true);
+  }
+}
+/** Preload only in the installer fixture; production inline script stays byte-identical.
+ * CSP additionally forbids network connections even if this adapter is bypassed.
+ */
+function installerPreload() {
+  const fixture = window.__installerFixture = {
+    mode: location.pathname.split('/').pop(), requests: [], storage: [], errors: [], held: [],
+  };
+  addEventListener('error', event => fixture.errors.push(event.message));
+  addEventListener('unhandledrejection', event => fixture.errors.push(String(event.reason)));
+  for (const name of ['localStorage', 'sessionStorage']) Object.defineProperty(window, name, {
+    get() { fixture.storage.push(name); throw new Error('Forbidden installer storage access'); },
+  });
+  const json = (value, contentType = 'application/json') => new Response(JSON.stringify(value), {
+    headers: { 'Content-Type': contentType },
+  });
+  window.fetch = async (url, options = {}) => {
+    const text = String(url);
+    const entry = { url: text, method: options.method || 'GET', credentials: options.credentials,
+      cache: options.cache, aborted: false };
+    fixture.requests.push(entry);
+    options.signal?.addEventListener('abort', () => { entry.aborted = true; });
+    if (!['http://127.0.0.1:8484/api/health', 'http://127.0.0.1:8484/api/setup'].includes(text)
+      || entry.method !== 'GET' || options.credentials !== 'omit' || options.cache !== 'no-store') {
+      throw new Error('Forbidden installer request');
+    }
+    if (fixture.mode === 'held') return new Promise(resolve => fixture.held.push(resolve));
+    if (fixture.mode === 'unreadable') throw new TypeError('Modeled browser CORS refusal');
+    if (fixture.mode === 'html') return new Response('<html>unrelated</html>', { headers: { 'Content-Type': 'text/html' } });
+    if (fixture.mode === 'malformed') return new Response('{', { headers: { 'Content-Type': 'application/json' } });
+    if (fixture.mode === 'opaque') { const result = json({ status: 'ok' }); Object.defineProperty(result, 'type', { value: 'opaque' }); return result; }
+    if (text.endsWith('/api/health')) return json({ status: fixture.mode === 'unrelated' ? 'different-service' : 'ok' });
+    return json({ needed: fixture.mode === 'nonboolean' ? 'true' : fixture.mode !== 'signed-in' });
+  };
+  fixture.release = () => fixture.held.splice(0).forEach(resolve => resolve(json({ status: 'ok' })));
+  // Resolve production lexical bindings without eval or weakening fixture CSP.
+  fixture.inspectRetirement = () => checkTimer === null && checkTimeout === null && checkController === null;
+}
 /**
  * Resolve an existing BROWSER_BIN or PATH browser without installing or downloading
  * software. Version probing and launch failures remain visible to the caller.
@@ -161,10 +257,20 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
   let navigated = false;
   let acceptDialog = false;
   const dialogs = [];
+  const blockedRequests = [];
+  const protocolErrors = [];
+  let shuttingDown = false;
   socket.addEventListener('message', event => {
     let message;
     try { message = JSON.parse(event.data); }
     catch { for (const waiter of pending.values()) waiter.reject(new Error('Invalid owned browser protocol response')); return; }
+    if (message.method === 'Fetch.requestPaused') {
+      const { requestId, request } = message.params;
+      const owned = new URL(request.url).origin === new URL(fixtureUrl).origin;
+      if (!owned) blockedRequests.push({ url: request.url, resourceType: message.params.resourceType });
+      rpc(owned ? 'Fetch.continueRequest' : 'Fetch.failRequest', owned ? { requestId }
+        : { requestId, errorReason: 'BlockedByClient' }).catch(error => { if (!shuttingDown) protocolErrors.push(error.message); });
+    }
     if (message.method === 'Page.javascriptDialogOpening') {
       dialogs.push({ type: message.params.type, message: message.params.message, accepted: acceptDialog });
       rpc('Page.handleJavaScriptDialog', { accept: acceptDialog }).catch(() => {});
@@ -209,6 +315,8 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
       socket.addEventListener('error', () => reject(new Error('Owned browser cache protocol failed to open')), { once: true });
     }), 'Owned browser cache protocol open timed out', openBudget);
     await rpc('Page.enable');
+    // Intercept before navigation: no request can reach an operator loopback service.
+    await rpc('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
     await rpc('Network.enable');
     await rpc('Network.setCacheDisabled', { cacheDisabled: true });
     await rpc('Network.clearBrowserCache');
@@ -228,7 +336,20 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
       await rpc('Input.dispatchKeyEvent', { type: 'keyUp', key, windowsVirtualKeyCode: codes[key] });
       return { key, dialogs: dialogs.slice(before), trustedBrowserInput: true };
     }
-    return { receipt, close, key };
+    async function viewport(width) {
+      if (![320, 768, 1024, 1440].includes(width)) throw new Error('Unknown fixture viewport');
+      await rpc('Emulation.setDeviceMetricsOverride', { width, height: 1000, deviceScaleFactor: 1, mobile: false });
+      return { width, height: 1000, cssPixels: true };
+    }
+    async function click(x, y) {
+      if (![x, y].every(Number.isFinite) || x < 0 || x > 1440 || y < 0 || y > 1000) throw new Error('Invalid owned fixture click coordinates');
+      await rpc('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
+      await rpc('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
+      await rpc('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
+      return { x, y, trustedBrowserInput: true };
+    }
+    Object.assign(receipt, { blockedRequests, protocolErrors, networkRestrictedToOwnedFixture: true });
+    return { receipt, close, key, viewport, click, beginShutdown() { shuttingDown = true; receipt.networkGuardUntilBrowserStop = true; } };
   } catch (error) {
     await close();
     throw error;
@@ -239,7 +360,7 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
  * profile. Record original and cleanup failures separately; remove the profile only
  * after confirmed group shutdown, retaining it when shutdown cannot be established.
  */
-async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, cacheSetup = configureOwnedBrowserCache } = {}) {
+async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, cacheSetup = configureOwnedBrowserCache, responsiveDiagnosticOnly = false } = {}) {
   if (Number(process.versions.node.split('.')[0]) < 22 || typeof WebSocket !== 'function') {
     throw new Error('Browser regressions require Node.js 22+ with the global WebSocket API');
   }
@@ -268,6 +389,7 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
   const unexpectedRequests = [];
   const nativeRequests = [];
   const mediaGateEvents = [];
+  const responsiveAudio = responsiveAudioFixture();
   /**
    * Clear ownership of the held native stream before waking its waiters. Repeated
    * driver or cleanup releases are harmless and report whether a gate was released.
@@ -294,6 +416,24 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
       for await (const chunk of request) {
         input += chunk;
         if (input.length > 1024 * 1024) throw new Error('Fixture request exceeds size bound');
+      }
+      if (path === '/__fixture/viewport' && request.method === 'POST') return json(await cacheSession.viewport(JSON.parse(input).width));
+      if (path === '/__fixture/click' && request.method === 'POST') { const point = JSON.parse(input); return json(await cacheSession.click(point.x, point.y)); }
+      if (path === '/__fixture/responsive') {
+        const width = Number(new URL(request.url, 'http://fixture.invalid').searchParams.get('width'));
+        if (![320, 768, 1024, 1440].includes(width)) return json({}, 400);
+        const source = readFileSync(join(root, 'client/index.html'), 'utf8');
+        response.writeHead(200, { 'Content-Type': 'text/html' });
+        return response.end(source.replace('<head>', '<head><base href="/"><script>(' + responsivePreload.toString() + ')(' + width + ')</script>')
+          .replace('<script src="js/app.js?v=5"></script>', '<script>Plyr.defaults.iconUrl="/vendor/plyr/plyr.svg";</script><script src="js/app.js?v=5"></script>')
+          .replace('</body>', '<script src="/__fixture/browser-driver.js"></script></body>'));
+      }
+      if (path.startsWith('/__fixture/installer/')) {
+        if (!['valid', 'signed-in', 'opaque', 'html', 'malformed', 'unrelated', 'unreadable', 'nonboolean', 'held'].includes(path.split('/').pop())) return json({}, 404);
+        const source = readFileSync(join(root, 'client/install/index.html'), 'utf8');
+        response.writeHead(200, { 'Content-Type': 'text/html',
+          'Content-Security-Policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; form-action 'none'; base-uri 'none'" });
+        return response.end(source.replace('<head>', '<head><script>(' + installerPreload.toString() + ')()</script>'));
       }
       if (path === '/__fixture/key' && request.method === 'POST') {
         const command = JSON.parse(input);
@@ -355,15 +495,16 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
       if (path === '/api/annotations/7') return json(annotations);
       if (path === '/api/progress/20' || path === '/api/progress/22') { nativeRequests.push({ path, status: 200, position: 64 }); return json({ position: 64 }); }
       if (path === '/api/progress/21') { nativeRequests.push({ path, status: 200, position: 0 }); return json({ position: 0 }); }
+      if (path === '/api/progress/23') { nativeRequests.push({ path, status: 200, position: 0 }); return json({ position: 0 }); }
       if (path.startsWith('/api/progress/')) return json(null);
       if (path === '/api/progress') return json({});
       if (path === '/api/library') return json([]);
       if (path === '/api/auth/logout' && request.method === 'POST') { response.writeHead(204); return response.end(); }
-      if (path === '/api/thumb/9' || path === '/api/thumb/10') {
+      if (path === '/api/thumb/9' || path === '/api/thumb/10' || /^\/api\/thumb\/(6[0-9]|7[0-9])$/.test(path)) {
         response.writeHead(200, { 'Content-Type': 'image/png' });
         return response.end(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII=', 'base64'));
       }
-      if (/^\/api\/stream\/(20|21|22)$/.test(path)) {
+      if (/^\/api\/stream\/(20|21|22|23)$/.test(path)) {
         const gate = heldMedia;
         if (gate?.path === path) {
           gate.waited++;
@@ -373,7 +514,7 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
           finally { pendingMedia--; }
           if (response.destroyed) return;
         }
-        const media = readFileSync(join(root, 'tests/fixtures/native-resume.mp4'));
+        const media = path === '/api/stream/23' ? responsiveAudio : readFileSync(join(root, 'tests/fixtures/native-resume.mp4'));
         const range = request.headers.range?.match(/^bytes=(\d+)-(\d*)$/);
         const start = range ? Number(range[1]) : 0;
         const end = range?.[2] ? Math.min(Number(range[2]), media.length - 1) : media.length - 1;
@@ -382,7 +523,7 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
           return response.end();
         }
         nativeRequests.push({ path, status: range ? 206 : 200, start, end });
-        response.writeHead(range ? 206 : 200, { 'Content-Type': 'video/mp4', 'Accept-Ranges': 'bytes', 'Cache-Control': 'no-store',
+        response.writeHead(range ? 206 : 200, { 'Content-Type': path === '/api/stream/23' ? 'audio/wav' : 'video/mp4', 'Accept-Ranges': 'bytes', 'Cache-Control': 'no-store',
           'Content-Length': end - start + 1, ...(range ? { 'Content-Range': `bytes ${start}-${end}/${media.length}` } : {}) });
         return response.end(media.subarray(start, end + 1));
       }
@@ -396,7 +537,9 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
         return json({ error: 'Unexpected fixture route' }, 404);
       }
       let bytes = readFileSync(join(root, staticFile));
-      if (path === '/') bytes = Buffer.from(bytes.toString().replace('<script src="js/app.js?v=5"></script>', '<script>Plyr.defaults.iconUrl="/vendor/plyr/plyr.svg";</script><script src="js/app.js?v=5"></script>').replace('</body>', '<script src="/__fixture/browser-driver.js"></script></body>'));
+      if (path === '/') bytes = Buffer.from(bytes.toString().replace('<script src="js/app.js?v=5"></script>', '<script>Plyr.defaults.iconUrl="/vendor/plyr/plyr.svg";</script><script src="js/app.js?v=5"></script>')
+        .replace('<head>', '<head>' + (responsiveDiagnosticOnly ? '<script>window.__responsiveDiagnosticOnly=true</script>' : ''))
+        .replace('</body>', '<script src="/__fixture/browser-driver.js"></script></body>'));
       response.writeHead(200, { 'Content-Type': contentTypes[extname(staticFile)] || 'application/octet-stream' });
       response.end(bytes);
     } catch (error) {
@@ -421,7 +564,7 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
     profile = mkdtempSync(join(tmpdir(), 'frayd-browser-regression-'));
     const url = `http://127.0.0.1:${server.address().port}/`;
     const ownedCacheControl = cacheSetup === configureOwnedBrowserCache;
-    browser = spawn(executable, ['--headless', '--no-sandbox', '--disable-gpu', '--disable-background-networking',
+    browser = spawn(executable, ['--headless', '--no-sandbox', '--disable-gpu', '--mute-audio', '--disable-background-networking',
       '--disable-component-update', '--disable-sync', '--no-first-run', '--no-default-browser-check',
       '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1', '--disable-features=MediaRouter',
       ...(ownedCacheControl ? ['--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0'] : []),
@@ -443,24 +586,32 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
       cacheControl = cacheSession.receipt;
       return result;
     })(), exited, timedOut]);
-    const expectedCases = 39;
+    const expectedCases = responsiveDiagnosticOnly ? 1 : 45;
     const complete = observed.cases.length === expectedCases
       && new Set(observed.cases.map(item => item.name)).size === expectedCases
       && observed.cases.every(item => item.status === 'PASS')
       && observed.passed === expectedCases && observed.failed === 0;
     output = { provenance, ...observed, expectedCases, complete, unexpectedRequests, nativeRequests,
       fixtureConfiguration: { iconUrl: '/vendor/plyr/plyr.svg', mediaResponses: 'IDs9/10/11 HTTP204; IDs20/21/22 owned120s H264 MP4 with Range support',
+        responsiveAudio: { id: 23, kind: 'generated mono8000Hz16bitPCM120s WAV', sha256: createHash('sha256').update(responsiveAudio).digest('hex') },
+        installer: 'Exact production HTML/inlineJS with preload Response adapter; CSP connect-src none; all external networking intercepted before transmission',
         browserSandbox: 'Disabled only for this disposable headless process; EPUB iframe keeps sandbox=allow-scripts.' } };
     if (!complete || observed.failed || observed.errors.length || unexpectedRequests.length) process.exitCode = 1;
+    if (cacheControl.protocolErrors?.length || cacheControl.blockedRequests?.some(item => item.resourceType !== 'Font'
+      && !item.url.startsWith('https://fonts.googleapis.com/')
+      && item.url !== 'https://cdn.plyr.io/static/blank.mp4')) process.exitCode = 1;
   } catch (error) {
     runError = error;
   } finally {
     clearTimeout(timer);
     releaseMedia('runner-cleanup');
-    try { await cacheSession?.close(); }
-    catch (error) { cleanupErrors.push(redactDebuggerCapabilities(error.stack)); }
+    // Keep interception active through group death; detaching it while a browser is
+    // alive can release paused requests to operator services.
+    cacheSession?.beginShutdown?.();
     try { await stopBrowserGroup(browser); browserGroupStopped = true; }
     catch (error) { cleanupErrors.push(error.stack); }
+    try { await cacheSession?.close(); }
+    catch (error) { cleanupErrors.push(redactDebuggerCapabilities(error.stack)); }
     try {
       if (pendingAnnotation) pendingAnnotation.destroy();
       if (parserResponse) parserResponse.destroy();

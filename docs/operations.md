@@ -105,6 +105,14 @@ Use this alternative with the app running and without the read-only library over
 
 ## Configuration and storage
 
+Audio classification uses the nearest recognized music or audiobook folder name,
+looking at most six ancestors and stopping at the selected library root. Whole
+words and plurals distinguish names such as `Books` from `Booker T`. Without a
+folder hint, `.m4b` and chapter/part-style filenames select audiobook; other
+supported audio formats default to music. This is a naming heuristic, not content
+recognition. Rescanning can correct an unchanged file's kind without resetting its
+ID, progress, annotations, metadata or conversion references.
+
 Compose publishes `127.0.0.1:3100`. If that port is occupied, prefix Compose commands with `FRAYD_PORT=3105` and open http://127.0.0.1:3105. This changes the proxy's published port; the app still listens on 8484 inside Docker. Keep the same Compose project name/directory to reuse the same named volume.
 
 | Docker path | Contents |

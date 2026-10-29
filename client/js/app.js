@@ -489,7 +489,8 @@ function resumeFor(id) {
     .then(r => r.ok ? r.json() : null).catch(() => null);
 }
 
-function card(it, portrait) {
+function card(it) {
+  const portrait = ['ebook', 'comic', 'manga', 'audiobook'].includes(it.kind);
   const c = el('div', 'media-card ' + (portrait ? 'portrait' : 'landscape'));
   const isVideo = it.kind === 'movie' || it.kind === 'show';
   const isPaged = it.kind === 'comic' || it.kind === 'manga';
@@ -525,7 +526,7 @@ function card(it, portrait) {
   return c;
 }
 
-function section(title, items, portrait) {
+function section(title, items) {
   const wrap = el('section');
   const cards = el('div', 'cards');
   const sortItems = () => [...items].sort((a,b) => (rowSort.get(title) ? 1 : -1) * ((a.created_at || 0) - (b.created_at || 0)) || a.id - b.id);
@@ -538,10 +539,10 @@ function section(title, items, portrait) {
     shown = sortItems();
     sortBtn.textContent = oldest ? 'newest first' : 'oldest first';
     cards.innerHTML = '';
-    shown.forEach(it => cards.appendChild(card(it, portrait)));
+    shown.forEach(it => cards.appendChild(card(it)));
   };
   head.appendChild(sortBtn);
-  shown.forEach(it => cards.appendChild(card(it, portrait)));
+  shown.forEach(it => cards.appendChild(card(it)));
   wrap.append(head, cards);
   return wrap;
 }
@@ -562,7 +563,7 @@ async function continueRow(snapshot = LIBRARY, generation = renderGeneration) {
   wrap.appendChild(el('div', 'row-head', '<h3>Continue watching</h3>'));
   const cards = el('div', 'cards');
   inProgress.forEach(({ it, frac }) => {
-    const c = card(it, false);
+    const c = card(it);
     const strip = c.querySelector('.progress-strip');
     if (strip) { strip.style.display = 'block'; strip.firstElementChild.style.width = (frac * 100).toFixed(1) + '%'; }
     cards.appendChild(c);
@@ -594,7 +595,7 @@ async function renderRows(items) {
     if (kind === 'audiobook' || kind === 'ebook' || kind === 'music') {
       main.appendChild(groupedByAuthor(kind, kindItems));
     } else {
-      main.appendChild(section(kind[0].toUpperCase() + kind.slice(1) + 's', kindItems, false));
+      main.appendChild(section(kind[0].toUpperCase() + kind.slice(1) + 's', kindItems));
     }
   }
   if (filtering && !items.length) { $('#hero').style.display = 'none'; }
@@ -627,7 +628,7 @@ function groupedByAuthor(kind, items) {
         wrap.appendChild(sh);
       }
       const cards = el('div', 'cards');
-      seriesItems.forEach(it => cards.appendChild(card(it, false)));
+      seriesItems.forEach(it => cards.appendChild(card(it)));
       wrap.appendChild(cards);
     }
   }

@@ -203,3 +203,30 @@ test('late progress does not paint detached or superseded cards; row sorting is 
   const refreshed=b.run('section("Movies",sortItems,false)');
   assert.deepEqual(Array.from(refreshed.children[1].children,item=>item.title),['A','B','C']);
 });
+
+test('production library rendering assigns book portraits and retains music/video landscapes', async () => {
+  const b=browser();
+  b.respond(async()=>({ok:true,json:async()=>null}));
+  b.run('account={isAdmin:true}; LIBRARY=["movie","music","audiobook","ebook","comic","manga"].map((kind,id)=>({id:id+1,title:kind,kind,author:"Author"})); filtering=false');
+  await b.run('renderRows(LIBRARY)');
+  const cards=[];
+  const visit=node=>{if(node.className?.startsWith('media-card ')) cards.push(node);for(const child of node.children||[])visit(child);};
+  visit(b.nodes.get('#main'));
+  assert.equal(cards.length,6);
+  for(const card of cards){
+    const kind=card.title.split(' — ')[0];
+    assert.equal(card.className,['movie','music'].includes(kind)?'media-card landscape':'media-card portrait',kind);
+    assert.equal(card.children.filter(child=>child.className==='card-del').length,1);
+    assert.equal(typeof card.onclick,'function');
+  }
+});
+
+test('continue row derives audiobook portrait while retaining playable music/video landscapes', async () => {
+  const b=browser();
+  b.respond(async()=>({ok:true,json:async()=>({position:20})}));
+  b.run('LIBRARY=["movie","music","audiobook","ebook","comic","manga"].map((kind,id)=>({id:id+1,title:kind,kind,duration_secs:100}))');
+  const row=await b.run('continueRow()');
+  const cards=row.children[1].children;
+  assert.equal(cards.length,3);
+  for(const card of cards) assert.equal(card.className,card.title==='audiobook'?'media-card portrait':'media-card landscape',card.title);
+});

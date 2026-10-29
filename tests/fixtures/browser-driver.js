@@ -1,5 +1,170 @@
 /* global ebook, showChunk, LIBRARY, plyr, partyFollowId, partyPlaybackKind, openVideo, PartyUI */
 'use strict';
+function responsiveOverflowInventory() {
+  const main = document.getElementById('main');
+  const edge = main.getBoundingClientRect().left + main.clientWidth;
+  function selector(node) {
+    if (node.id) return '#' + node.id;
+    const classes = typeof node.className === 'string' ? node.className.trim().split(/\s+/).filter(Boolean).join('.') : '';
+    return node.tagName.toLowerCase() + (classes ? '.' + classes : '') + ':nth-child(' + ([...node.parentElement.children].indexOf(node) + 1) + ')';
+  }
+  return [main, ...main.querySelectorAll('*')].map(node => {
+    const rect = node.getBoundingClientRect(), style = getComputedStyle(node);
+    let clippingAncestor = null;
+    for (let parent = node.parentElement; parent && parent !== main; parent = parent.parentElement) {
+      if (['hidden', 'clip'].includes(getComputedStyle(parent).overflowX)) { clippingAncestor = selector(parent); break; }
+    }
+    return { selector: selector(node), parent: node.parentElement ? selector(node.parentElement) : null,
+      text: node.textContent.trim().slice(0, 90), rect: { left: rect.left, right: rect.right, top: rect.top, width: rect.width, height: rect.height },
+      clientWidth: node.clientWidth, scrollWidth: node.scrollWidth, directMainChild: node.parentElement === main,
+      width: style.width, minWidth: style.minWidth, display: style.display, flex: style.flex,
+      gridTemplateColumns: style.gridTemplateColumns, overflowX: style.overflowX,
+      clippingAncestor, exceedsMainRight: rect.right > edge + 1 };
+  }).filter(item => !item.clippingAncestor && (item.selector === '#main' || item.directMainChild
+    || item.exceedsMainRight || item.scrollWidth > item.clientWidth + 1)).slice(0, 100);
+}
+async function isolatedResponsiveCase(width) {
+  const fixture = window.__responsiveFixture;
+  const items = fixture.items;
+  const measured = { viewport: { width: innerWidth, height: innerHeight }, freshDocument: true };
+  const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+  function check(value, message) { if (!value) throw new Error(message); }
+  function equal(actual, expected, message) { check(JSON.stringify(actual) === JSON.stringify(expected), message); }
+  async function until(predicate, label) {
+    const deadline = Date.now() + 4000;
+    while (!(await predicate())) { check(Date.now() < deadline, 'Timed out: ' + label); await delay(20); }
+  }
+  async function api(path, body) {
+    const response = await fetch('/__fixture/' + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    check(response.ok, 'Owned fixture control failed'); return response.json();
+  }
+  const key = (key, accept = false) => api('key', { key, accept });
+    try {
+      await until(() => account?.isAdmin && LIBRARY.length === items.length, 'fresh document authenticates with private fixture model');
+      check(!document.getElementById('party-modal').classList.contains('on') && !document.getElementById('playerbar').classList.contains('on'), 'Fresh document starts with clean party/player state');
+      await filterKind('all', '');
+      const actualCards = [...document.querySelectorAll('#main .media-card')];
+      const portraitItems = items.filter(item => ['ebook', 'comic', 'manga', 'audiobook'].includes(item.kind));
+      for (const item of portraitItems) {
+        const rendered = actualCards.find(node => node.title.startsWith(item.title));
+        check(rendered?.classList.contains('portrait'), `Normal library render derives portrait layout for ${item.kind}`);
+      }
+      check(!Object.hasOwn(pbAudio, 'readyState'), 'Responsive native audio has no synthetic readyState override');
+      measured.nativeAudioReadinessIsUnmodified = true;
+      measured.overflowInventory = responsiveOverflowInventory();
+      measured.overflowInventoryBeforeAudio = measured.overflowInventory;
+      measured.mainBeforeAudio = { client: document.getElementById('main').clientWidth, scroll: document.getElementById('main').scrollWidth };
+      const music = items.find(item => item.id === 23);
+      const audioCard = actualCards.find(node => node.title.startsWith(music.title));
+      check(audioCard, 'Production music card exists for native23');
+      audioCard.scrollIntoView({ block: 'center', inline: 'nearest' });
+      const clickRect = audioCard.getBoundingClientRect();
+      const clickPoint = { x: clickRect.left + clickRect.width / 2, y: clickRect.top + clickRect.height / 2 };
+      const clickHit = document.elementFromPoint(clickPoint.x, clickPoint.y);
+      check(clickHit === audioCard || audioCard.contains(clickHit), 'Native user click reaches production audio card');
+      measured.nativePlaybackGesture = await api('click', clickPoint);
+      check(fixture.cardClicks.some(event => event.id === 23 && event.isTrusted), 'Production audio-card click isTrusted');
+      await until(() => pbAudio.readyState >= 2 && !pbAudio.paused, 'owned PCM audio-element playback starts');
+      const startedAt = pbAudio.currentTime;
+      await until(() => !pbAudio.paused && pbAudio.currentTime > startedAt + 0.03, 'native audio time advances');
+      check(pbAudio.currentTime < 5, 'Fresh source with progress0 cannot inherit stale203/end position');
+      measured.nativeDiagnostics = fixture;
+      measured.overflowInventory = responsiveOverflowInventory();
+      const sizes = {};
+      measured.sizes = sizes;
+      for (const [name, element] of [['document', document.documentElement], ['body', document.body], ['main', document.getElementById('main')]]) {
+        sizes[name] = { client: element.clientWidth, scroll: element.scrollWidth };
+        check(element.scrollWidth <= element.clientWidth + 1, `${width} ${name} must not overflow horizontally: ${JSON.stringify(sizes)}`);
+      }
+      const grids = [...document.querySelectorAll('#main .cards')].map(grid => {
+        const rect = grid.getBoundingClientRect();
+        const cards = [...grid.querySelectorAll('.media-card')];
+        check(grid.scrollWidth <= grid.clientWidth + 1, 'Card grid fits its available width');
+        check(cards.every(c => c.getBoundingClientRect().left >= rect.left - 1 && c.getBoundingClientRect().right <= rect.right + 1), 'Every card fits its grid');
+        check(new Set(cards.map(c => Math.round(c.getBoundingClientRect().top))).size > 1, 'Multiple cards wrap onto new rows');
+        return { width: grid.clientWidth, columns: getComputedStyle(grid).gridTemplateColumns, rows: new Set(cards.map(c => Math.round(c.getBoundingClientRect().top))).size };
+      });
+      const ratios = [...document.querySelectorAll('.portrait .thumb,.portrait .thumb-fallback')].map(node => {
+        const r = node.getBoundingClientRect(); check(Math.abs(r.width / r.height - 2 / 3) < 0.01, 'Portrait thumbnail/fallback keeps2:3');
+        return { tag: node.tagName, width: r.width, height: r.height };
+      });
+      measured.grids = grids; measured.ratios = ratios;
+      equal(ratios.length, portraitItems.length, 'Every normal production book/comic/manga/audiobook portrait measured');
+      function reachable(node) {
+        node.scrollIntoView({ block: 'center', inline: 'nearest' });
+        const r = node.getBoundingClientRect(); const style = getComputedStyle(node);
+        check(style.display !== 'none' && style.visibility !== 'hidden' && r.width > 0 && r.height > 0, 'Control is visibly laid out');
+        check(r.left >= -1 && r.right <= innerWidth + 1, 'Control stays horizontally reachable');
+        check(r.top >= -1 && r.bottom <= innerHeight + 1, 'Control stays vertically reachable');
+        const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+        check(hit === node || node.contains(hit), `Control ${node.id || node.textContent.trim() || node.getAttribute('aria-label')} center accepts a pointer hit; actual=${hit?.id || hit?.className?.baseVal || hit?.className || hit?.tagName}`);
+        node.focus(); check(document.activeElement === node, 'Control accepts focus');
+      }
+      const nav = [...document.querySelectorAll('#sidebar .nav-item')];
+      nav.forEach(node => { check(node.textContent.trim().length > 0, 'Navigation label retained'); reachable(node); });
+      nav.find(node => node.dataset.kind === 'movie').click(); equal(activeKind, 'movie', 'Visible movie navigation works');
+      reachable(document.getElementById('settings-btn')); document.getElementById('settings-btn').click();
+      await until(() => !!document.querySelector('.p-scan'), 'Visible Settings opens usable controls');
+      document.getElementById('settings-close').click();
+      reachable(document.getElementById('logout'));
+      reachable(document.querySelector('#search input'));
+      reachable(document.getElementById('add-media')); document.getElementById('add-media').click();
+      await until(() => !document.getElementById('add-media').disabled, 'Visible scan control handles modeled busy response');
+      reachable(document.getElementById('party-btn')); document.getElementById('party-btn').click();
+      check(document.getElementById('party-modal').classList.contains('on'), 'Visible party control opens panel');
+      document.getElementById('pt-close').click();
+      const playerControls = [...document.querySelectorAll('#playerbar button')];
+      playerControls.forEach(reachable);
+      reachable(document.getElementById('pb-play')); document.getElementById('pb-play').click();
+      await until(() => pbAudio.paused, 'Visible player pause works');
+      document.getElementById('pb-play').click(); await until(() => !pbAudio.paused, 'Visible player play works');
+      for (const id of ['pb-vol', 'pb-bar']) {
+        const node = document.getElementById(id); const r = node.getBoundingClientRect();
+        check(r.width > 0 && r.left >= 0 && r.right <= innerWidth + 1, 'Volume/seek track stays reachable');
+        node.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: r.left + r.width / 2 }));
+      }
+      check(Math.abs(pbAudio.volume - 0.5) < 0.02 && pbAudio.currentTime > 50, 'Volume and seek controls work after wrapping');
+      document.getElementById('pb-close').click();
+      const deleteButton = document.querySelector('#main .card-del');
+      const precedingSort = document.querySelector('#main .row-head button');
+      reachable(precedingSort); await key('Tab');
+      check(document.activeElement === deleteButton && deleteButton.matches(':focus-visible'), 'Delete stays keyboard reachable with visible focus');
+      const before = LIBRARY.length;
+      const enter = await key('Enter'); const space = await key(' ');
+      check(enter.dialogs.length === 1 && space.dialogs.length === 1 && LIBRARY.length === before, 'Native cancellation retains cards at this viewport');
+      check(!document.getElementById('video-modal').classList.contains('on'), 'Delete keys do not open playback');
+      return { viewport: { width: innerWidth, height: innerHeight }, sizes, grids, ratios, navigationLabels: nav.map(n => n.textContent.trim()), adminAndPlayerControlsReachable: true, realMediaControl: true, deletionCancellation: true, nativeDiagnostics: fixture, overflowInventory: measured.overflowInventory };
+    } catch (error) {
+      error.observed = { ...measured, audio: { readyState: pbAudio.readyState, paused: pbAudio.paused,
+        duration: pbAudio.duration, currentTime: pbAudio.currentTime, mediaError: pbAudio.error?.code || null }, nativeDiagnostics: fixture };
+      throw error;
+    } finally { document.getElementById('pb-close').click(); disposeSettings(); }
+}
+async function freshResponsiveDocument(width) {
+  const viewport = await fetch('/__fixture/viewport', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ width }) });
+  if (!viewport.ok) throw Error('Owned viewport control failed');
+  const frame = document.createElement('iframe');
+  frame.style.cssText = 'position:fixed;inset:0;width:100vw;height:100vh;border:0;z-index:100000';
+  let timer;
+  let receive;
+  try {
+    const result = new Promise((resolve, reject) => {
+      timer = setTimeout(() => reject(Error('Fresh responsive document exceeded12s')), 12000);
+      receive = event => {
+        if (event.source !== frame.contentWindow || event.origin !== location.origin || event.data?.type !== 'responsive-case-result' || event.data.width !== width) return;
+        resolve(event.data);
+      };
+      window.addEventListener('message', receive);
+    });
+    frame.src = '/__fixture/responsive?width=' + width;
+    document.body.appendChild(frame);
+    const packet = await result;
+    if (packet.status !== 'PASS' || packet.errors.length) {
+      const error = Error(packet.error || JSON.stringify(packet.errors)); error.observed = { ...packet.observed, childErrors: packet.errors }; throw error;
+    }
+    return packet.observed;
+  } finally { clearTimeout(timer); window.removeEventListener('message', receive); frame.remove(); }
+}
 (async () => {
   const cases = [];
   const errors = [];
@@ -28,6 +193,21 @@
     });
     check(response.ok, `Fixture ${path}: ${response.status}`);
     return response.json();
+  }
+  if (window.__responsiveFixture) {
+    const width = window.__responsiveFixture.width;
+    try {
+      const observed = await isolatedResponsiveCase(width);
+      parent.postMessage({ type: 'responsive-case-result', width, status: 'PASS', observed, errors }, location.origin);
+    } catch (error) {
+      parent.postMessage({ type: 'responsive-case-result', width, status: 'FAIL', error: error.stack, observed: error.observed, errors }, location.origin);
+    }
+    return;
+  }
+  if (window.__responsiveDiagnosticOnly) {
+    await run('fresh isolated responsive diagnostic at768 CSS pixels', () => freshResponsiveDocument(768));
+    return api('result', { cases, errors, mediaDiagnostics, nativeMedia, passed: cases.filter(c => c.status === 'PASS').length,
+      failed: cases.filter(c => c.status !== 'PASS').length, limits: ['Diagnostic only; retained39 and installer cases are not rerun here.'] });
   }
   const logoutReceipt = sessionStorage.getItem('frayd-qa-logout');
   if (logoutReceipt) {
@@ -70,7 +250,7 @@
   }
   async function run(name, fn) {
     try { cases.push({ name, status: 'PASS', observed: await fn() }); }
-    catch (error) { cases.push({ name, status: error.code === 'NATIVE_CODEC_UNAVAILABLE' ? 'BLOCKED' : 'FAIL', error: error.stack }); }
+    catch (error) { cases.push({ name, status: error.code === 'NATIVE_CODEC_UNAVAILABLE' ? 'BLOCKED' : 'FAIL', error: error.stack, ...(error.observed ? { observed: error.observed } : {}) }); }
   }
   async function highlight({ body, start, end, text, offset, search, saved = [] }) {
     await api('configure', { body, annotations: saved });
@@ -638,6 +818,8 @@
       const originalYT = window.YT;
       const originalReady = ytReady;
       const observations = [];
+      const queuedAudioFixture = document.getElementById('pb-audio');
+      const originalAudioReady = Object.getOwnPropertyDescriptor(queuedAudioFixture, 'readyState');
       let mock;
       let playerCreations = 0;
       window.YT = { Player: function (id, config) {
@@ -800,10 +982,13 @@
           roleReuse = { samePlayer: true, hostCommands, guestCommands: 0, departedHostCommands: 0,
             playerCreations: 1, realSeekPoller: true, externalPlaybackMocked: true };
         }
-        return { queuedAudioControl: { stalePauseBroadcasts: 0, legitimatePauseBroadcasts: 1 },
+        return { queuedAudioControl: { stalePauseBroadcasts: 0, legitimatePauseBroadcasts: 1, readinessDescriptorRestoredInFinally: true },
           retiredVideoMetadataIgnored: true, observations, latestPendingStateViaAppFollow: { position: 20, playing: false }, localActivations, roleReuse,
           productionPartyStateHandler: true, mockedYouTubeAPI: true, actualYouTubePlayback: false };
       } finally {
+        if (originalAudioReady) Object.defineProperty(queuedAudioFixture, 'readyState', originalAudioReady);
+        else delete queuedAudioFixture.readyState;
+        equal(Object.getOwnPropertyDescriptor(queuedAudioFixture, 'readyState'), originalAudioReady, 'Synthetic producer restores its original readiness descriptor');
         PartyUI.close();
         clearInterval(window._ytSeekTimer);
         ytPlayer = null;
@@ -1100,6 +1285,87 @@
     document.getElementById('em-close').click();
     targets.slice(2).forEach(target => target.remove());
     return { trustedKeyboard: true, targets: ['search INPUT', 'reader INPUT', 'TEXTAREA', 'SELECT', 'contenteditable', 'BUTTON'], positiveChapter: 1, opaqueOrigin: 'null', outsiderOrigins };
+  });
+  // Retain the original39, then exercise the new production CSS at actual CSS-pixel
+  // viewports. API fixtures supply library/admin responses; native MP4 stays decoded.
+  for (const width of [320, 768, 1024, 1440]) await run(`responsive production layout at ${width} CSS pixels`, () => freshResponsiveDocument(width));
+  await api('viewport', { width: 1440 });
+  async function installer(mode) {
+    const node = document.createElement('iframe'); node.width = '600'; node.height = '900';
+    node.src = '/__fixture/installer/' + mode;
+    const loaded = new Promise(resolve => node.addEventListener('load', resolve, { once: true }));
+    document.body.appendChild(node); await loaded;
+    check(node.contentWindow.__installerFixture, 'Preload adapter exists before installer script');
+    return node;
+  }
+  function closeInstaller(node) {
+    node.contentWindow.dispatchEvent(new PageTransitionEvent('pagehide'));
+    node.remove();
+  }
+  await run('production installer DOM validates typed protocol with manual GET-only navigation', async () => {
+    const observations = [];
+    for (const mode of ['valid', 'signed-in', 'opaque', 'html', 'malformed', 'unrelated', 'unreadable', 'nonboolean']) {
+      const node = await installer(mode);
+      try {
+        const w = node.contentWindow, d = node.contentDocument, fixture = w.__installerFixture;
+        await until(() => d.getElementById('stat').textContent.includes(mode === 'valid' || mode === 'signed-in' ? 'verified at' : 'unverified'), 'Installer publishes protocol decision');
+        check(!d.querySelector('form,input[type=email],input[type=password]'), 'No credential form exists');
+        check(d.getElementById('open-frayd').href === 'http://127.0.0.1:8484/' && !d.getElementById('retry').disabled, 'Manual Open and Retry remain available');
+        check(w.location.pathname === '/__fixture/installer/' + mode, 'Installer never automatically navigates');
+        check(fixture.requests.every(r => r.method === 'GET' && r.credentials === 'omit' && r.cache === 'no-store'), 'All modeled requests are credential-free fixed GETs');
+        equal(fixture.storage, [], 'Installer never accesses storage'); equal(fixture.errors, [], 'Installer has no uncaught errors');
+        if (mode === 'valid') check(d.getElementById('s-stat').textContent.includes('Create your owner'), 'Typed true gives manual owner instruction');
+        if (mode === 'signed-in') check(d.getElementById('s-stat').textContent.includes('Sign in'), 'Typed false gives manual sign-in instruction');
+        d.querySelector('[data-os=linux]').click(); d.getElementById('gen').click();
+        check(d.getElementById('cmd').textContent.includes('/bootstrap.sh'), 'Linux source command remains available');
+        d.querySelector('[data-os=win]').click(); d.getElementById('gen').click();
+        check(d.getElementById('cmd').textContent.includes('/bootstrap.ps1'), 'Windows source command remains available');
+        observations.push({ mode, status: d.getElementById('stat').textContent, instruction: d.getElementById('s-stat').textContent, requests: fixture.requests, storageAccesses: 0, automaticNavigation: false });
+      } finally { closeInstaller(node); }
+    }
+    return { actualProductionHTMLAndInlineJS: true, modeledResponsesOnly: true, real8484Requests: 0, observations };
+  });
+  await run('production installer actual five-poll bound retry and pagehide stale guards', async () => {
+    let node = await installer('html');
+    let result;
+    try {
+      const w = node.contentWindow, d = node.contentDocument, fixture = w.__installerFixture;
+      const deadline = Date.now() + 15000;
+      while (!d.getElementById('stat').textContent.includes('or choose Retry')) {
+        check(Date.now() < deadline, 'Five real-timer attempts finish within15s'); await delay(50);
+      }
+      equal(fixture.requests.length, 5, 'Exactly five automatic real-timer attempts');
+      await delay(150); equal(fixture.requests.length, 5, 'No sixth attempt');
+      fixture.mode = 'valid'; d.getElementById('retry').click();
+      await until(() => d.getElementById('stat').textContent.includes('verified at'), 'Explicit Retry starts a new valid check');
+      equal(fixture.requests.length, 7, 'Explicit Retry performs health and setup');
+      result = { automaticAttempts: 5, retryRequests: 2, realTimers: true };
+    } finally { closeInstaller(node); }
+    node = await installer('held');
+    try {
+      const w = node.contentWindow, d = node.contentDocument, fixture = w.__installerFixture;
+      await until(() => fixture.held.length === 1, 'Old request held');
+      fixture.mode = 'signed-in'; d.getElementById('retry').click();
+      await until(() => d.getElementById('s-stat').textContent.includes('Sign in'), 'New retry wins');
+      const current = d.getElementById('stat').textContent;
+      fixture.release(); await delay(30);
+      equal(d.getElementById('stat').textContent, current, 'Late old request cannot publish');
+      equal(fixture.requests.length, 3, 'Retired request cannot start setup');
+      fixture.mode = 'held'; d.getElementById('retry').click();
+      await until(() => fixture.held.length === 1, 'Pagehide request held');
+      const hiddenText = d.getElementById('stat').textContent;
+      // An actual iframe navigation delivers pagehide to the production page.
+      // Retain only its old fixture/document references to inspect cancellation.
+      const leftPage = new Promise(resolve => node.addEventListener('load', resolve, { once: true }));
+      node.src = 'about:blank'; await leftPage;
+      check(fixture.inspectRetirement(), 'Pagehide disposes both actual timers and controller');
+      check(fixture.requests.at(-1).aborted, 'Pagehide aborts pending request');
+      fixture.release(); await delay(30);
+      equal(d.getElementById('stat').textContent, hiddenText, 'Late pagehide result cannot publish');
+      equal(fixture.requests.length, 4, 'Pagehide stops request chain');
+      equal(fixture.errors, [], 'No uncaught installer errors'); equal(fixture.storage, [], 'No installer storage access');
+      return { ...result, staleRetryIgnored: true, actualPagehideNavigation: true, pagehideAbortedAndDisposed: true, modeledResponsesOnly: true, real8484Requests: 0 };
+    } finally { closeInstaller(node); }
   });
   window.fetch = qaFetch;
   account = qaAccount; IDENTITY = qaIdentity;

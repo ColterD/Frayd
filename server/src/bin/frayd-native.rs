@@ -101,6 +101,50 @@ mod native {
     fn disjoint(a: &Path, b: &Path) -> bool {
         !a.starts_with(b) && !b.starts_with(a)
     }
+    /// Resolve a configured media path without creating missing source directories.
+    /// Existing paths keep canonical alias resolution. For an absent absolute root,
+    /// resolve its nearest existing ancestor and append only normal components;
+    /// inaccessible, dangling or otherwise unresolvable ancestors fail closed.
+    fn prospective_library_path(path: &Path) -> Result<PathBuf> {
+        match fs::canonicalize(path) {
+            Ok(resolved) => return Ok(resolved),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
+        }
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
+        {
+            return reject("missing library must be an absolute path with normal components");
+        }
+        let mut ancestor = path;
+        let mut suffix = Vec::new();
+        loop {
+            match fs::symlink_metadata(ancestor) {
+                Ok(_) => {
+                    let mut resolved = fs::canonicalize(ancestor)?;
+                    if !resolved.is_dir() {
+                        return reject("library ancestor is not a directory");
+                    }
+                    for component in suffix.iter().rev() {
+                        resolved.push(component);
+                    }
+                    return Ok(resolved);
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    suffix.push(
+                        ancestor
+                            .file_name()
+                            .ok_or("unresolvable library ancestor")?
+                            .to_os_string(),
+                    );
+                    ancestor = ancestor.parent().ok_or("unresolvable library ancestor")?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
     /// Preflight an absolute target against protected paths and unsafe ancestors.
     /// Reject ambiguous spelling, symlinks, checkouts, shared toolchains and overlap
     /// with an explicit library before mutation; this does not reserve the path.
@@ -167,7 +211,9 @@ mod native {
             }
         }
         if let Some(library) = std::env::var_os("FRAYD_LIBRARY") {
-            if !library.is_empty() && !disjoint(path, &fs::canonicalize(library)?) {
+            if !library.is_empty()
+                && !disjoint(path, &prospective_library_path(Path::new(&library))?)
+            {
                 return reject("library overlap refused");
             }
         }

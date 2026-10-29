@@ -42,9 +42,15 @@ contents to force acceptance.
 Start checks unchanged payload and data ownership, holds a lifecycle lock and
 supervises one foreground child. It always supplies `FRAYD_DB`, `FRAYD_THUMBS`,
 `FRAYD_TRANSCODES`, `FRAYD_CLIENT_DIR`, `FRAYD_PORT` and loopback `FRAYD_BIND`.
+Loopback binds never request router port mapping, regardless of `FRAYD_UPNP` or
+saved UPnP settings; externally bound servers, including Docker, retain their
+existing opt-in behavior.
 Library roots normally come from database configuration. An explicit inherited
 `FRAYD_LIBRARY` remains an intentional override and must be disjoint from prefix
-and data. Runtime data redirects/hardlinks are refused. No source checkout is
+and data. For an unavailable absolute library root, overlap checks resolve its
+existing ancestors without creating the source directory; the server retains
+configuration and saved metadata while holding source operations. Runtime data
+redirects/hardlinks are refused. No source checkout is
 needed after installation. The helper binary is Unix-only; non-Unix builds retain
 an explicit unsupported-platform entry point so adding this binary does not force
 Unix APIs into the existing Windows source bootstrap build. Windows is unqualified.

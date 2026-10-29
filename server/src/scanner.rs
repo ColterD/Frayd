@@ -264,7 +264,7 @@ pub fn scan_with_roots(db: &Connection, db_path: String, root: std::path::PathBu
         if owned.contains(path.to_string_lossy().as_ref()) {
             continue;
         }
-        let Some(kind) = classify(path) else { continue };
+        let Some(kind) = classify_with_root(path,Some(&root)) else { continue };
         count += upsert_item_with_roots(db, db_path.clone(), path, kind, thumbs_dir, roots);
     }
     count
@@ -276,7 +276,7 @@ pub(crate) fn ingest_indexed(db: &Connection, directory: &Path) -> bool {
     let mut found=false;
     for entry in WalkDir::new(directory).follow_links(false) {
         let Ok(entry)=entry else { return false; };
-        if !entry.file_type().is_file() || classify(entry.path()).is_none() { continue; }
+        if !entry.file_type().is_file() || classify_with_root(entry.path(),Some(directory)).is_none() { continue; }
         let Ok(metadata)=entry.metadata() else { return false; };
         let Some(mtime)=metadata.modified().ok().and_then(|t|t.duration_since(std::time::UNIX_EPOCH).ok()).map(|t|t.as_secs() as i64) else { return false; };
         let indexed=db.query_row("SELECT COUNT(*) FROM media WHERE path=?1 AND size_bytes=?2 AND mtime_secs=?3",rusqlite::params![entry.path().to_string_lossy(),metadata.len() as i64,mtime],|r|r.get::<_,i64>(0));
@@ -300,6 +300,8 @@ fn upsert_item(
     upsert_item_with_roots(db,db_path,path,kind,thumbs_dir,&[library_root.to_path_buf()])
 }
 
+/// Refresh source fingerprints through the existing guarded path, or atomically change only a stale kind.
+/// Known unchanged fingerprints permit no cache, duration, metadata, lease or converter work on reclassification.
 fn upsert_item_with_roots(db: &Connection, db_path: String, path: &Path, kind: &str, thumbs_dir: Option<&Path>, roots: &[std::path::PathBuf]) -> usize {
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
@@ -317,9 +319,20 @@ fn upsert_item_with_roots(db: &Connection, db_path: String, path: &Path, kind: &
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
 
-    let refreshed=(|| -> rusqlite::Result<(usize,bool)> {
+    let refreshed=(|| -> rusqlite::Result<(usize,bool,bool)> {
         let tx=rusqlite::Transaction::new_unchecked(db,rusqlite::TransactionBehavior::Immediate)?;
-        let is_new=tx.query_row("SELECT 1 FROM media WHERE path=?1",[&path_str],|row|row.get::<_,i64>(0)).optional()?.is_none();
+        let existing=tx.query_row("SELECT kind,mtime_secs,size_bytes FROM media WHERE path=?1",[&path_str],
+            |row|Ok((row.get::<_,String>(0)?,row.get::<_,Option<i64>>(1)?,row.get::<_,Option<i64>>(2)?))).optional()?;
+        let is_new=existing.is_none();
+        let kind_only=existing.as_ref().is_some_and(|(old_kind,old_mtime,old_size)|
+            old_kind!=kind && *old_mtime==Some(mtime) && *old_size==Some(meta.len() as i64));
+        if kind_only {
+            let changed=tx.execute("UPDATE media SET kind=?1 WHERE path=?2 AND kind IS NOT ?1
+                AND mtime_secs IS ?3 AND size_bytes IS ?4",rusqlite::params![kind,path_str,mtime,meta.len() as i64])?;
+            if changed!=1 {return Err(rusqlite::Error::InvalidQuery);}
+            tx.commit()?;
+            return Ok((changed,false,true));
+        }
         // Capture the exact prior pointer only when both fingerprint components were known.
         let prior:Option<(i64,String)>=tx.query_row("SELECT id,transcode_path FROM media WHERE path=?1
             AND mtime_secs IS NOT NULL AND size_bytes IS NOT NULL AND transcode_path IS NOT NULL
@@ -348,12 +361,15 @@ fn upsert_item_with_roots(db: &Connection, db_path: String, path: &Path, kind: &
         } else { None };
         tx.commit()?;
         drop(lease);
-        Ok((updated,is_new))
+        Ok((updated,is_new,false))
     })();
-    let (updated,is_new)=match refreshed {
+    let (updated,is_new,kind_only)=match refreshed {
         Ok(result)=>result,
         Err(error)=>{tracing::warn!(%error,"scan refresh held: source and artifact state retained");return 0;}
     };
+
+    // Classification policy changes do not grant source-version or cache mutation authority.
+    if kind_only {return updated;}
 
     // metadata + thumbnails: for new items
     if updated > 0 && is_new {
@@ -445,19 +461,49 @@ fn upsert_item_with_roots(db: &Connection, db_path: String, path: &Path, kind: &
     updated
 }
 
-fn classify(p: &Path) -> Option<&'static str> {
-    let ext = p.extension()?.to_str()?.to_ascii_lowercase();
+/// Preserve upstream standalone-path test classification with the six-ancestor context limit.
+/// Scans use classify_with_root so hints cannot escape their selected library boundary.
+#[cfg(test)]
+fn classify(p: &Path) -> Option<&'static str> {classify_with_root(p,None)}
+
+/// Select the nearest explicit whole-word/plural folder context; substrings such as Bookshop do not qualify.
+fn audio_folder_kind(name:&str) -> Option<&'static str> {
+    let normalized=name.to_ascii_lowercase();
+    let words:Vec<&str>=normalized.split(|c:char|!c.is_alphanumeric()).collect();
+    if words.iter().any(|word|matches!(*word,"music"|"song"|"songs"|"album"|"albums"|"artist"|"artists")) {return Some("music");}
+    if words.iter().any(|word|matches!(*word,"audiobook"|"audiobooks"|"book"|"books"|"librivox")) {return Some("audiobook");}
+    None
+}
+
+/// Recognize complete chapter/part/disc/CD/book words and digit suffixes, excluding Chapterhouse and partition.
+fn audio_filename_is_book(p:&Path) -> bool {
+    let stem=p.file_stem().and_then(|s|s.to_str()).unwrap_or("").to_ascii_lowercase();
+    stem.split(|c:char|!c.is_alphanumeric()).any(|word|
+        ["chapter","chapters","part","parts","disc","discs","cd","cds","book","books"].iter().any(|hint|
+            word==*hint || word.strip_prefix(hint).is_some_and(|suffix|!suffix.is_empty() && suffix.chars().all(|c|c.is_ascii_digit()))))
+}
+
+/// Classify supported files using at most six nearest ancestors, stopping after the selected root itself.
+/// Explicit folder context wins over filenames and containers; otherwise m4b or book-name hints are books,
+/// and other supported audio defaults to music. No duration probing or ambient parent hints are used.
+fn classify_with_root(p:&Path,library_root:Option<&Path>) -> Option<&'static str> {
+    let ext=p.extension()?.to_str()?.to_ascii_lowercase();
     Some(match ext.as_str() {
-        // audio: parent dir "music"-ish → music, else audiobook
-        "m4b" | "mp3" | "flac" | "m4a" => {
-            let dir = p.parent().and_then(|d| d.file_name()).and_then(|d| d.to_str()).unwrap_or("").to_ascii_lowercase();
-            if dir.contains("music") || dir.contains("song") || dir.contains("album") { "music" } else { "audiobook" }
+        "m4b"|"mp3"|"flac"|"m4a"|"opus"|"ogg"=>{
+            if let Some(parent)=p.parent() {
+                for directory in parent.ancestors().take(6) {
+                    if library_root.is_some_and(|root|!directory.starts_with(root)) {break;}
+                    let name=directory.file_name().and_then(|name|name.to_str()).unwrap_or("");
+                    if let Some(kind)=audio_folder_kind(name) {return Some(kind);}
+                    if library_root==Some(directory) {break;}
+                }
+            }
+            if ext=="m4b" || audio_filename_is_book(p) {"audiobook"}else{"music"}
         }
-        "epub" => "ebook",
-        "cbz" | "cbr" => "comic",
-        "mkv" | "mp4" | "webm" => "movie",
-        "opus" | "ogg" => "music",
-        _ => return None,
+        "epub"=>"ebook",
+        "cbz"|"cbr"=>"comic",
+        "mkv"|"mp4"|"webm"=>"movie",
+        _=>return None,
     })
 }
 
@@ -482,6 +528,27 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// Construct synthetic upstream paths without accessing the filesystem.
+    fn p(s: impl Into<std::path::PathBuf>) -> std::path::PathBuf { s.into() }
+
+    /// Retain every upstream ea29 nested-folder, six-extension, m4b, chapter-name and default-music case.
+    #[test]
+    fn classify_audio_music_vs_audiobook() {
+        let audio_exts = ["mp3", "flac", "m4a", "m4b", "opus", "ogg"];
+        // folder-name signals (walks multiple ancestors)
+        for ext in audio_exts {
+            assert_eq!(classify(&p(format!("/media/Music/Album/song.1.{ext}"))), Some("music"), "music folder .{ext}");
+            assert_eq!(classify(&p(format!("/media/audiobooks/Dune/chapter01.{ext}"))), Some("audiobook"), "audiobook folder .{ext}");
+            assert_eq!(classify(&p(format!("/home/me/music/fav/track.{ext}"))), Some("music"), "nested music .{ext}");
+        }
+        // m4b defaults to audiobook without folder signal
+        assert_eq!(classify(&p("/media/stuff/x.m4b")), Some("audiobook"));
+        // chapter/part naming defaults to audiobook
+        assert_eq!(classify(&p("/media/stuff/Book 01 - Chapter 3.mp3")), Some("audiobook"));
+        // plain title defaults to music
+        assert_eq!(classify(&p("/media/stuff/delain-virtue-and-vice.mp3")), Some("music"));
     }
 
     /// Replacement duration comes from the current media while identity and user state remain stable.
@@ -882,4 +949,126 @@ exit "$probe_status"
         assert_eq!(db.query_row("SELECT COUNT(*) FROM media",[],|r|r.get::<_,i64>(0)).unwrap(),4);
         for name in names { assert!(library.0.join(name).exists()); }
     }
+    /// Preserve all persisted row fields except the one deliberately reclassified kind.
+    fn audio_row_snapshot(db:&Connection,id:i64)->String {
+        db.query_row("SELECT json_object('id',id,'path',path,'title',title,'subtitle',subtitle,'author',author,
+            'series',series,'duration',duration_secs,'size',size_bytes,'mtime',mtime_secs,'meta',meta_json,
+            'thumb',thumb_path,'conversion',transcode_path,'created',created_at) FROM media WHERE id=?1",[id],|r|r.get(0)).unwrap()
+    }
+    /// Folder signals are complete tokens; filename hints may be words or a hint followed only by digits.
+    #[test]
+    fn upstream_ea29_audio_tokens_defaults_and_nearest_folder() {
+        for ext in ["mp3","flac","m4a","m4b","opus","ogg"] {
+            for folder in ["Music","Songs","Albums","Artists","my music","song-collection"] {
+                assert_eq!(classify(&p(format!("/media/{folder}/neutral/track.{ext}"))),Some("music"),"{folder} .{ext}");
+            }
+            for folder in ["Audiobooks","Audio Books","audio-book","Books","LibriVox"] {
+                assert_eq!(classify(&p(format!("/media/{folder}/neutral/track.{ext}"))),Some("audiobook"),"{folder} .{ext}");
+            }
+            for folder in ["Booker T","Bookshop","Chapterhouse","Bookkeeping","Musical","Albumen","Artistically"] {
+                assert_eq!(classify(&p(format!("/media/{folder}/neutral/title.{ext}"))),Some(if ext=="m4b" {"audiobook"}else{"music"}),"false context {folder} .{ext}");
+            }
+            assert_eq!(classify_with_root(&p(format!("/media/Music/ordinary.{ext}")),Some(Path::new("/media/Music"))),Some("music"));
+            assert_eq!(classify_with_root(&p(format!("/media/Books/ordinary.{ext}")),Some(Path::new("/media/Books"))),Some("audiobook"));
+            assert_eq!(classify(&p(format!("/media/Music/Booker T/track.{ext}"))),Some("music"));
+            assert_eq!(classify(&p(format!("/media/Books/Chapterhouse/track.{ext}"))),Some("audiobook"));
+            assert_eq!(classify(&p(format!("/media/Music/Books/neutral/track.{ext}"))),Some("audiobook"));
+            assert_eq!(classify(&p(format!("/media/Books/Music/neutral/chapter01.{ext}"))),Some("music"));
+            for stem in ["chapter01","part2","disc03","cd4","Book 01 - Chapter 3","part two"] {
+                assert_eq!(classify(&p(format!("/media/neutral/{stem}.{ext}"))),Some("audiobook"),"filename {stem} .{ext}");
+            }
+            for stem in ["Chapterhouse","Booker T","Bookshop","partition","discovery","ordinary-title"] {
+                assert_eq!(classify(&p(format!("/media/neutral/{stem}.{ext}"))),Some(if ext=="m4b" {"audiobook"}else{"music"}),"false filename {stem} .{ext}");
+            }
+        }
+        assert_eq!(classify(&p("/Music/a/b/c/d/e/track.mp3")),Some("music"));
+        assert_eq!(classify(&p("/Books/a/b/c/d/e/chapterless.mp3")),Some("audiobook"));
+        assert_eq!(classify(&p("/Books/a/b/c/d/e/f/ordinary.mp3")),Some("music"));
+        assert_eq!(classify(&p("/Books/a/b/c/d/e/f/ordinary.M4B")),Some("audiobook"));
+    }
+    /// Real rescans must update stale kinds without touching bytes, user state, cached metadata or conversion leases.
+    #[cfg(unix)]
+    #[test]
+    fn upstream_ea29_audio_unchanged_fingerprint_refreshes_kind_only() {
+        use std::os::unix::fs::{MetadataExt,PermissionsExt};
+        if std::env::var_os("FRAYD_TEST_AUDIO_NO_PROBES").is_none() {
+            let fixture=Library::new(&[]);let bin=fixture.0.join("bin");std::fs::create_dir(&bin).unwrap();
+            for name in ["ffprobe","ffmpeg"] {
+                let path=bin.join(name);std::fs::write(&path,b"#!/bin/sh\nprintf 'called' >> \"$FRAYD_TEST_AUDIO_PROBES\"\nexit 1\n").unwrap();std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let mut paths=vec![bin];paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+            let result=Command::new(std::env::current_exe().unwrap()).args(["--exact","scanner::tests::upstream_ea29_audio_unchanged_fingerprint_refreshes_kind_only","--nocapture"])
+                .env("FRAYD_TEST_AUDIO_NO_PROBES","1").env("FRAYD_TEST_AUDIO_PROBES",fixture.0.join("probes")).env("PATH",std::env::join_paths(paths).unwrap()).env_remove("FRAYD_TRANSCODES").env_remove("FRAYD_THUMBS").output().unwrap();
+            assert!(result.status.success(),"{}{}",String::from_utf8_lossy(&result.stdout),String::from_utf8_lossy(&result.stderr));return;
+        }
+        let fixture=Library::new(&[]);let library=fixture.0.join("Music");std::fs::create_dir(&library).unwrap();
+        let database=fixture.0.join("db.sqlite");let db=open(database.to_str().unwrap());
+        let thumbs=fixture.0.join("thumbs");std::fs::create_dir(&thumbs).unwrap();
+        let job=fixture.0.join("transcodes/41").join(uuid::Uuid::new_v4().to_string());std::fs::create_dir_all(&job).unwrap();
+        let output=job.join("audio.mp4");let temporary=job.join("audio.tmp.mp4");let lease_path=job.join("lease");
+        std::fs::write(&output,b"converted bytes").unwrap();std::fs::write(&temporary,b"temporary bytes").unwrap();std::fs::write(&lease_path,b"lease bytes").unwrap();
+        let lease=std::fs::OpenOptions::new().read(true).write(true).open(&lease_path).unwrap();
+        #[cfg(target_os="linux")] assert!(lease.try_lock().is_ok());
+        let mut sources=Vec::new();
+        for (id,name,old_kind) in [(41,"ordinary.mp3","audiobook"),(42,"movie.mp4","music")] {
+            let path=library.join(name);std::fs::write(&path,b"original exact source bytes").unwrap();let metadata=std::fs::metadata(&path).unwrap();
+            let retained=thumbs.join(format!("retained-{id}.jpg"));std::fs::write(&retained,b"retained thumbnail").unwrap();std::fs::write(thumbs.join(format!("{id}.jpg")),b"unrelated cached thumbnail").unwrap();
+            db.execute("INSERT INTO media(id,kind,path,title,subtitle,author,series,duration_secs,size_bytes,mtime_secs,meta_json,thumb_path,transcode_path,created_at)
+                VALUES(?1,?2,?3,'owner title','owner subtitle','owner author','owner series',111.25,?4,?5,?6,?7,?8,123)",
+                rusqlite::params![id,old_kind,path.to_str().unwrap(),metadata.len() as i64,metadata.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64,r#"{"synopsis":"keep","pages":["keep"],"spine":["keep"],"chapters":[42]}"#,retained.to_str().unwrap(),if id==41 {output.to_str()}else{None}]).unwrap();sources.push(path);
+        }
+        db.execute_batch("INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture');
+            INSERT INTO progress(identity_id,media_id,position) VALUES(1,41,42),(1,42,73);
+            INSERT INTO annotations(identity_id,media_id,kind,spine_idx,cfi,note) VALUES(1,41,'bookmark',0,'audio','keep'),(1,42,'bookmark',0,'video','keep');").unwrap();
+        for (path,role) in [(&temporary,"temp"),(&output,"final")] {db.execute("INSERT INTO transcode_artifacts(path,owner_media_id,owner_source_path,role,provenance,lifecycle) VALUES(?1,41,?2,?3,'generated','completed')",rusqlite::params![path.to_str().unwrap(),sources[0].to_str().unwrap(),role]).unwrap();}
+        let rows_before=[audio_row_snapshot(&db,41),audio_row_snapshot(&db,42)];
+        let artifacts=||db.query_row("SELECT json_group_array(json_object('path',path,'owner',owner_media_id,'source',owner_source_path,'role',role,'provenance',provenance,'lifecycle',lifecycle)) FROM transcode_artifacts",[],|r|r.get::<_,String>(0)).unwrap();let artifacts_before=artifacts();
+        let mut checked_paths=sources.clone();
+        checked_paths.extend([output.clone(),temporary.clone(),lease_path.clone()]);
+        for id in [41,42] {checked_paths.push(thumbs.join(format!("retained-{id}.jpg")));checked_paths.push(thumbs.join(format!("{id}.jpg")));}
+        let file_versions:Vec<_>=checked_paths.into_iter().map(|path|{let metadata=std::fs::metadata(&path).unwrap();(path,metadata.len(),metadata.modified().unwrap(),metadata.dev(),metadata.ino())}).collect();
+        let updated=scan(&db,database.to_string_lossy().into_owned(),library.clone(),Some(&thumbs));
+        assert_eq!(db.query_row("SELECT kind FROM media WHERE id=41",[],|r|r.get::<_,String>(0)).unwrap(),"music","unchanged audio fingerprint retained the stale audiobook kind");
+        assert_eq!(db.query_row("SELECT kind FROM media WHERE id=42",[],|r|r.get::<_,String>(0)).unwrap(),"movie");assert_eq!(updated,2);
+        assert_eq!([audio_row_snapshot(&db,41),audio_row_snapshot(&db,42)],rows_before);assert_eq!(artifacts(),artifacts_before);
+        for (id,position,cfi) in [(41,42.0,"audio"),(42,73.0,"video")] {
+            assert_eq!(db.query_row("SELECT position FROM progress WHERE identity_id=1 AND media_id=?1",[id],|r|r.get::<_,f64>(0)).unwrap(),position);
+            assert_eq!(db.query_row("SELECT cfi,note FROM annotations WHERE identity_id=1 AND media_id=?1",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).unwrap(),(cfi.to_string(),"keep".to_string()));
+        }
+        for (path,length,modified,device,inode) in file_versions {
+            let current=std::fs::metadata(path).unwrap();assert_eq!((current.len(),current.modified().unwrap(),current.dev(),current.ino()),(length,modified,device,inode));
+        }
+        for source in sources {assert_eq!(std::fs::read(source).unwrap(),b"original exact source bytes");}
+        for id in [41,42] {assert_eq!(std::fs::read(thumbs.join(format!("retained-{id}.jpg"))).unwrap(),b"retained thumbnail");assert_eq!(std::fs::read(thumbs.join(format!("{id}.jpg"))).unwrap(),b"unrelated cached thumbnail");}
+        assert_eq!(std::fs::read(output).unwrap(),b"converted bytes");assert_eq!(std::fs::read(temporary).unwrap(),b"temporary bytes");assert_eq!(std::fs::read(&lease_path).unwrap(),b"lease bytes");
+        #[cfg(target_os="linux")] assert!(std::fs::OpenOptions::new().read(true).write(true).open(lease_path).unwrap().try_lock().is_err());
+        assert!(!crate::transcode::BUSY.load(std::sync::atomic::Ordering::SeqCst));
+        std::thread::sleep(std::time::Duration::from_millis(50));assert!(!std::path::PathBuf::from(std::env::var_os("FRAYD_TEST_AUDIO_PROBES").unwrap()).exists(),"kind-only refresh invoked a media probe/converter");
+        for policy in ["ABORT,'fixture'","IGNORE"] {
+            db.execute("UPDATE media SET kind='audiobook' WHERE id=41",[]).unwrap();
+            db.execute_batch(&format!("CREATE TRIGGER reject_kind BEFORE UPDATE OF kind ON media WHEN OLD.id=41 BEGIN SELECT RAISE({policy}); END")).unwrap();
+            let before=audio_row_snapshot(&db,41);
+            assert_eq!(upsert_item(&db,database.to_string_lossy().into_owned(),&library.join("ordinary.mp3"),"music",Some(&thumbs),&library),0);
+            assert_eq!(db.query_row("SELECT kind FROM media WHERE id=41",[],|r|r.get::<_,String>(0)).unwrap(),"audiobook");
+            assert_eq!(audio_row_snapshot(&db,41),before);assert_eq!(artifacts(),artifacts_before);
+            assert!(!std::path::PathBuf::from(std::env::var_os("FRAYD_TEST_AUDIO_PROBES").unwrap()).exists());
+            db.execute_batch("DROP TRIGGER reject_kind").unwrap();
+        }
+    }
+    /// A configured boundary, including its own name, limits ancestor hints; ambient folders never classify its files.
+    #[test]
+    fn upstream_ea29_audio_scans_ignore_ambient_ancestors() {
+        for ambient in ["Books","Music"] {
+            let fixture=Library::new(&[]);let root=fixture.0.join(ambient).join("selected");std::fs::create_dir_all(&root).unwrap();
+            let database=fixture.0.join("db.sqlite");let db=open(database.to_str().unwrap());
+            for (index,ext) in ["mp3","flac","m4a","m4b","opus","ogg"].into_iter().enumerate() {
+                let source=root.join(format!("ordinary.{ext}"));std::fs::write(&source,b"source").unwrap();let metadata=std::fs::metadata(&source).unwrap();
+                let expected=if ext=="m4b" {"audiobook"}else{"music"};let wrong=if expected=="music" {"audiobook"}else{"music"};
+                db.execute("INSERT INTO media(id,kind,path,title,size_bytes,mtime_secs) VALUES(?1,?2,?3,'retained',?4,?5)",rusqlite::params![index as i64+1,wrong,source.to_str().unwrap(),metadata.len() as i64,metadata.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64]).unwrap();
+            }
+            scan(&db,database.to_string_lossy().into_owned(),root.clone(),None);
+            for ext in ["mp3","flac","m4a","m4b","opus","ogg"] {assert_eq!(db.query_row("SELECT kind FROM media WHERE path=?1",[root.join(format!("ordinary.{ext}")).to_str().unwrap()],|r|r.get::<_,String>(0)).unwrap(),if ext=="m4b" {"audiobook"}else{"music"},"ambient {ambient}, .{ext}");}
+        }
+    }
+
 }

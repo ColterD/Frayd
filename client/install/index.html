@@ -64,20 +64,16 @@
 
   <div class="status" id="stat"></div>
 
-  <div id="setup" style="display:none; margin-top:18px; border-top:1px solid var(--line); padding-top:16px">
-    <label>Create your owner account (this becomes the admin)</label>
-    <input type="email" id="s-email" placeholder="you@example.com" style="margin-bottom:8px">
-    <input type="password" id="s-pw" placeholder="Password (min 4 chars)">
-    <button class="btn" id="s-go">Create owner &amp; sign in</button>
-    <div class="status" id="s-stat"></div>
-  </div>
+  <p><a href="http://127.0.0.1:8484/" id="open-frayd">Open Frayd →</a></p>
+  <button class="btn" id="retry">Retry server check</button>
+  <div class="status" id="s-stat">Open Frayd manually to create your owner account inside the app, or sign in.</div>
 
   <ol class="steps">
     <li>Pick your OS, enter your media folder path</li>
     <li>Copy the command, paste it in a terminal (PowerShell on Windows)</li>
     <li>It installs everything, builds, and starts on boot — a few minutes</li>
-    <li>This page turns <span class="ok">green</span> when your server answers</li>
-    <li>Log in — first account becomes the admin</li>
+    <li>Use Open Frayd to open your local app; this page can check its server protocol if your browser permits it</li>
+    <li>Create the owner account inside Frayd when prompted, or sign in</li>
   </ol>
   <p class="sub" style="margin-top:14px">Opening this to the public internet? Add <code>FRAYD_SESSION_DAYS=7</code> to <code>server/.env</code> for shorter sessions. Login attempts are rate-limited automatically.</p>
 </div>
@@ -129,47 +125,75 @@ $('#tunnel-cb').onchange = () => { $('#tunnel-opts').style.display = $('#tunnel-
 $('#tunnel').onchange = gen;
 $('#copy').onclick = () => { navigator.clipboard.writeText($('#cmd').textContent); $('#copy').textContent = 'Copied!'; setTimeout(() => $('#copy').textContent = 'Copy command', 1500); };
 
-// poll for a live server: localhost then LAN hostname
-const targets = ['http://localhost:8484', `http://${location.hostname}:8484`].filter((v, i, a) => a.indexOf(v) === i);
-let liveBase = null;
-async function poll() {
-  for (const t of targets) {
-    try {
-      const r = await fetch(t + '/api/health', { signal: AbortSignal.timeout(2500) });
-      if (r.ok && (await r.json()).status === 'ok') { liveBase = t; break; }
-    } catch {}
+// Only the fixed loopback app is checked; credentials stay inside the app.
+const appBase = 'http://127.0.0.1:8484';
+const maxChecks = 5;
+let checkGeneration = 0;
+let checkTimer = null;
+let checkTimeout = null;
+let checkController = null;
+
+function retireChecks() {
+  ++checkGeneration;
+  clearTimeout(checkTimer);
+  checkTimer = null;
+  clearTimeout(checkTimeout);
+  checkTimeout = null;
+  checkController?.abort();
+  checkController = null;
+}
+
+async function protocolJSON(path, signal) {
+  const response = await fetch(appBase + path, { signal, credentials: 'omit', cache: 'no-store' });
+  if (!response.ok || response.type === 'opaque'
+    || !/^application\/json(?:\s*;|$)/i.test(response.headers.get('content-type') || '')) {
+    throw new Error('Unreadable server protocol');
   }
-  if (!liveBase) { $('#stat').textContent = 'Waiting for your server to come up…'; setTimeout(poll, 3000); return; }
-  $('#stat').innerHTML = `<span class="ok">✓ Server is live at ${liveBase}</span> <a href="${liveBase}" style="color:var(--acc)">open Frayd →</a>`;
-  // setup needed? (only works same-origin or with CORS; best-effort)
+  const value = await response.json();
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid server protocol');
+  return value;
+}
+
+async function checkServer(generation, attempt) {
+  if (generation !== checkGeneration) return;
+  const controller = new AbortController();
+  checkController = controller;
+  const timeout = checkTimeout = setTimeout(() => controller.abort(), 2500);
   try {
-    const s = await (await fetch(liveBase + '/api/setup', { signal: AbortSignal.timeout(2500) })).json();
-    if (s.needed) $('#setup').style.display = 'block';
-    else $('#s-stat').innerHTML = '<span class="ok">Owner already set up — just log in.</span>';
+    const health = await protocolJSON('/api/health', controller.signal);
+    if (generation !== checkGeneration) return;
+    if (health.status !== 'ok') throw new Error('Unknown health response');
+    const setup = await protocolJSON('/api/setup', controller.signal);
+    if (generation !== checkGeneration) return;
+    if (typeof setup.needed !== 'boolean') throw new Error('Unknown setup response');
+    $('#stat').textContent = 'Server protocol verified at ' + appBase + '. Open Frayd manually.';
+    $('#s-stat').textContent = setup.needed
+      ? 'Create your owner account inside Frayd using Open Frayd.'
+      : 'Sign in inside Frayd using Open Frayd.';
   } catch {
-    // CORS-blocked (page hosted off-origin): direct them to the app; app handles first-login bootstrap
-    $('#s-stat').innerHTML = 'Can’t check setup from here — open Frayd and log in; first account becomes admin.';
+    if (generation !== checkGeneration) return;
+    $('#stat').textContent = attempt < maxChecks
+      ? 'Server unverified: unavailable or browser access blocked. You can open Frayd manually. Checking again…'
+      : 'Server unverified. Open Frayd manually, or choose Retry server check.';
+    if (attempt < maxChecks) {
+      checkTimer = setTimeout(() => { checkTimer = null; return checkServer(generation, attempt + 1); }, 3000);
+    }
+  } finally {
+    clearTimeout(timeout);
+    if (checkTimeout === timeout) checkTimeout = null;
+    if (checkController === controller) checkController = null;
   }
 }
-poll();
 
-$('#s-go')?.addEventListener('click', async () => {
-  const email = $('#s-email').value.trim(), pw = $('#s-pw').value;
-  if (!email.includes('@') || pw.length < 4) { $('#s-stat').innerHTML = '<span class="err">Email + password (min 4) required</span>'; return; }
-  try {
-    const r = await fetch(liveBase + '/api/setup', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password: pw }),
-    });
-    const j = await r.json().catch(() => ({}));
-    if (r.ok) {
-      $('#s-stat').innerHTML = `<span class="ok">✓ Owner created. You're signed in.</span> <a href="${liveBase}" style="color:var(--acc)">Open Frayd →</a>`;
-      $('#setup').style.display = 'none';
-    } else {
-      $('#s-stat').innerHTML = `<span class="err">${j.error || 'Failed (' + r.status + ')'}</span>`;
-    }
-  } catch { $('#s-stat').innerHTML = '<span class="err">Could not reach server</span>'; }
-});
+function retryChecks() {
+  retireChecks();
+  $('#stat').textContent = 'Checking local server protocol…';
+  $('#s-stat').textContent = 'Open Frayd manually to create your owner account inside the app, or sign in.';
+  return checkServer(checkGeneration, 1);
+}
+$('#retry').onclick = retryChecks;
+addEventListener('pagehide', retireChecks);
+retryChecks();
 </script>
 </body>
 </html>

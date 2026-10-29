@@ -87,8 +87,8 @@ class NativeOwnership(unittest.TestCase):
             entries.append({'path': p.relative_to(self.bundle).as_posix(), 'kind': 'dir' if p.is_dir() else 'file', 'mode': stat.S_IMODE(p.stat().st_mode), 'size': p.stat().st_size if p.is_file() else 0, 'sha256': hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else ''})
         (self.bundle / 'manifest.json').write_text(json.dumps({'schema': 1, 'version': '0.1.1', 'source': 'a' * 40, 'target': 'fixture', 'toolchain': 'fixture', 'entries': entries}))
 
-    def run_helper(self, command, *args, code=0, answer=''):
-        result = subprocess.run([str(HELPER), command, '--prefix', str(self.prefix), *args], input=answer, text=True, capture_output=True)
+    def run_helper(self, command, *args, code=0, answer='', environment=None):
+        result = subprocess.run([str(HELPER), command, '--prefix', str(self.prefix), *args], input=answer, text=True, capture_output=True, env=environment)
         self.assertEqual(result.returncode, code, result.stderr)
         return result
 
@@ -149,6 +149,56 @@ class NativeOwnership(unittest.TestCase):
         self.assertEqual(sentinel.read_bytes(), b'keep')
         self.install('--yes')
         self.run_helper('uninstall', '--yes')
+
+    def test_missing_absolute_library_keeps_installed_lifecycle_available(self):
+        self.install('--yes')
+        sentinel = self.data / 'frayd.db'
+        sentinel.write_bytes(b'NONSECRET preserved offline fixture database')
+        external = self.base / 'external media parent'
+        external.mkdir()
+        alias = self.base / 'external media alias'
+        alias.symlink_to(external, target_is_directory=True)
+        for parent in [self.base, alias]:
+            missing = parent / 'offline media' / 'nested root'
+            environment = os.environ.copy()
+            environment['FRAYD_LIBRARY'] = str(missing)
+            before = self.snapshot()
+            result = self.run_helper('start', environment=environment)
+            self.assertEqual(result.stdout.splitlines(), ['127.0.0.1', str(self.data / 'frayd.db'), str(self.prefix / 'client')])
+            self.assertEqual(self.snapshot(), before)
+            self.assertFalse(missing.exists())
+        self.run_helper('uninstall', '--yes', environment=environment)
+        self.assertFalse(self.prefix.exists())
+        self.assertEqual(sentinel.read_bytes(), b'NONSECRET preserved offline fixture database')
+        self.assertFalse(missing.exists())
+
+    def test_prospective_missing_library_overlap_refuses_without_writes(self):
+        for parent in [self.prefix, self.data, self.bundle]:
+            with self.subTest(operation='install', parent=parent.name):
+                missing = parent / 'offline media' / 'nested root'
+                environment = os.environ.copy()
+                environment['FRAYD_LIBRARY'] = str(missing)
+                before = self.snapshot()
+                self.install('--yes', code=2, environment=environment)
+                self.assertEqual(self.snapshot(), before)
+                self.assertFalse(missing.exists())
+        self.install('--yes')
+        alias = self.base / 'data alias'
+        alias.symlink_to(self.data, target_is_directory=True)
+        dangling = self.base / 'dangling media alias'
+        dangling.symlink_to(self.base / 'unavailable target', target_is_directory=True)
+        not_directory = self.base / 'not a directory'
+        not_directory.write_bytes(b'NONSECRET immutable fixture file')
+        for parent in [self.prefix, self.data, alias, dangling, not_directory]:
+            with self.subTest(operation='installed', parent=parent.name):
+                missing = parent / 'offline media' / 'nested root'
+                environment = os.environ.copy()
+                environment['FRAYD_LIBRARY'] = str(missing)
+                before = self.snapshot()
+                self.run_helper('start', code=2, environment=environment)
+                self.run_helper('uninstall', '--yes', code=2, environment=environment)
+                self.assertEqual(self.snapshot(), before)
+                self.assertFalse(missing.exists())
 
     def test_incomplete_bundle_refuses_before_writes(self):
         (self.bundle / 'start.sh').unlink()
@@ -364,7 +414,19 @@ class NativeRuntime(unittest.TestCase):
                 probe.bind(('127.0.0.1', 0))
                 port = probe.getsockname()[1]
             url = f'http://127.0.0.1:{port}'
+            tools = base / 'private tools'
+            tools.mkdir(mode=0o700)
+            upnp_record = base / 'router mapping requests'
+            upnp_recorder = tools / 'upnpc'
+            upnp_recorder.write_text('#!/bin/sh\nprintf \'requested\\n\' >> "$FRAYD_NATIVE_UPNP_RECORD"\n')
+            upnp_recorder.chmod(0o700)
             environment = os.environ.copy()
+            environment['PATH'] = str(tools) + os.pathsep + environment.get('PATH', '')
+            environment['FRAYD_NATIVE_UPNP_RECORD'] = str(upnp_record)
+            # Prove the recorder works; it performs no router or network operation.
+            subprocess.run([str(upnp_recorder)], env=environment, check=True)
+            self.assertEqual(upnp_record.read_text(), 'requested\n')
+            upnp_record.unlink()
             for name in ['FRAYD_LIBRARY', 'FRAYD_CERT', 'FRAYD_KEY']:
                 environment.pop(name, None)
             environment['FRAYD_UPNP'] = '0'
@@ -443,19 +505,49 @@ class NativeRuntime(unittest.TestCase):
                 refused = subprocess.run([str(bundle / 'uninstall.sh'), '--prefix', str(prefix), '--yes'], capture_output=True)
                 self.assertEqual(refused.returncode, 2)
                 self.assertEqual(before, [(str(p.relative_to(prefix)), p.stat().st_mode, p.read_bytes() if p.is_file() else None) for p in sorted(prefix.rglob('*'))])
+                request('/api/admin/settings', {'upnp': True}, token, expected=204)
                 stop()
+                environment['FRAYD_UPNP'] = '1'
                 start()
+                # Both inherited and persisted opt-ins must be inert on loopback.
+                deadline = time.monotonic() + 0.5
+                while time.monotonic() < deadline:
+                    self.assertFalse(upnp_record.exists(), 'loopback server requested router mapping')
+                    time.sleep(0.05)
                 self.assertEqual(json.loads(request('/api/setup')), {'needed': False})
                 login = json.loads(request('/api/auth/login', credentials))
                 self.assertEqual(json.loads(request(f'/api/progress/{media_id}', token=login['token']))['position'], 0.5)
                 self.assertEqual(request(f'/api/comic/{media_id}/page/0'), image)
                 self.assertFalse((base / 'MUST NOT EXIST').exists())
+                request('/api/admin/settings', {'upnp': False}, login['token'], expected=204)
+                environment['FRAYD_UPNP'] = '0'
+                stop(group_interrupt=True)
+                # An unavailable explicit root must leave account/metadata reads
+                # healthy without granting permission to recreate source media.
+                missing_library = base / 'unavailable source mount' / 'media'
+                environment['FRAYD_LIBRARY'] = str(missing_library)
+                start()
+                self.assertEqual(json.loads(request('/api/health')), {'status': 'ok'})
+                offline_status = json.loads(request('/api/scan/status'))
+                self.assertTrue(offline_status['library_configured'])
+                self.assertEqual(offline_status['library_count'], 1)
+                offline_login = json.loads(request('/api/auth/login', credentials))
+                self.assertEqual(json.loads(request(f'/api/progress/{media_id}', token=offline_login['token']))['position'], 0.5)
+                offline_metadata = json.loads(request('/api/library'))
+                self.assertTrue(any(item['id'] == media_id and item['kind'] == 'comic' and item['title'] == 'native-reader' for item in offline_metadata))
+                self.assertFalse(missing_library.exists())
+                self.assertFalse(missing_library.parent.exists())
+                stop(group_interrupt=True)
+                environment.pop('FRAYD_LIBRARY')
+                start()
+                self.assertEqual(request(f'/api/comic/{media_id}/page/0'), image)
+                self.assertEqual(json.loads(request(f'/api/progress/{media_id}', token=offline_login['token']))['position'], 0.5)
                 stop(group_interrupt=True)
                 preserved = {str(p.relative_to(data)): p.read_bytes() for p in data.rglob('*') if p.is_file()}
                 subprocess.run([str(bundle / 'uninstall.sh'), '--prefix', str(prefix), '--yes'], check=True, capture_output=True)
                 self.assertFalse(prefix.exists())
                 self.assertTrue(preserved == {str(p.relative_to(data)): p.read_bytes() for p in data.rglob('*') if p.is_file()}, 'application data changed during removal')
-                print(json.dumps({'scenario': 'actual-native-relocated-reader-persistence-removal', 'status': 'passed', 'platform': os.uname().sysname, 'architecture': os.uname().machine, 'archive_sha256': checksum, 'base_source_commit': manifest['source'], 'version': manifest['version'], 'source_files_unavailable': True, 'media_codecs': 'not-qualified'}))
+                print(json.dumps({'scenario': 'actual-native-relocated-reader-persistence-removal', 'status': 'passed', 'platform': os.uname().sysname, 'architecture': os.uname().machine, 'archive_sha256': checksum, 'base_source_commit': manifest['source'], 'version': manifest['version'], 'source_files_unavailable': True, 'unavailable_absolute_library_reads': 'passed', 'loopback_upnp_requests': 0, 'media_codecs': 'not-qualified'}))
             finally:
                 if process is not None and process.poll() is None:
                     # This process group was created by this exact fixture only.
