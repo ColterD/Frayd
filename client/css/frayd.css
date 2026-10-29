@@ -195,16 +195,20 @@ body.auth {
 }
 #em-search:focus { border-color: #5B46F6; }
 #em-searchinfo { color: #8A8F9E; font-size: 12px; min-width: 90px; }
-.cards { display: flex; gap: 14px; overflow-x: auto; padding-bottom: 8px; scrollbar-width: none; }
-.cards::-webkit-scrollbar { display: none; }
+/* responsive grid: cards wrap into rows that fit the viewport instead of
+   scrolling off screen (~5 landscape cards per row at fullscreen 1080p) */
+.cards {
+  display: grid; gap: 14px; padding-bottom: 8px;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+}
 .media-card {
-  position: relative; flex: 0 0 auto; border-radius: var(--radius); overflow: hidden;
+  position: relative; width: auto; border-radius: var(--radius); overflow: hidden;
   background: var(--panel); border: 1px solid var(--border); cursor: pointer;
   transition: transform .15s, border-color .15s;
 }
 .media-card:hover { transform: translateY(-3px); border-color: var(--accent); }
-.media-card.landscape { width: 280px; }
-.media-card.portrait { width: 160px; }
+/* portrait cards (books/comics): taller cells, more per row */
+.cards:has(.media-card.portrait) { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }
 .thumb {
   width: 100%; aspect-ratio: 16/9; object-fit: cover; display: block;
   background: linear-gradient(135deg, #232438, #14151f);
