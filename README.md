@@ -4,7 +4,7 @@
 
 Frayd is a self-hosted media library with a Rust server (axum and SQLite) and a plain JavaScript browser client. It scans local movies, TV episodes, music, audiobooks, ebooks, comics and manga, with series/author navigation, saved progress and watch parties.
 
-Implementation snapshot: [`438837c`](https://github.com/ColterD/Frayd/tree/438837cae29a81bb0899bafbecbf4039b7347de8). See [PR #2](https://github.com/ColterD/Frayd/pull/2) for current deployment and acceptance status. This is an early-stage project. Start on your own computer with trusted media. The Docker setup publishes only to loopback; it does not configure household LAN access or public hosting.
+Implementation snapshot: [`0d69af2`](https://github.com/ColterD/Frayd/tree/0d69af2e1c70bf37d924d5f37a8f716bbe000676). See [PR #2](https://github.com/ColterD/Frayd/pull/2) for current deployment and acceptance status. This is an early-stage project. Start on your own computer with trusted media. The Docker setup publishes only to loopback; it does not configure household LAN access or public hosting.
 
 ## Run with Docker
 
