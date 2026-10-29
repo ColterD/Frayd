@@ -1532,9 +1532,9 @@ mod ingest_tests {
         db.execute_batch("INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture-admin'),(2,'device','fixture-reader');
             INSERT INTO user_perms(identity_id,is_admin) VALUES(1,1),(2,0);").unwrap();
         let library=root.join("library with spaces"); std::fs::create_dir_all(&library).unwrap();
-        Arc::new(App { db:Mutex::new(db),db_path:String::new(),library:Some(library),
+        Arc::new(App { db:Mutex::new(db),db_path:String::new(),library:std::sync::RwLock::new(Some(library)),
             scanning:std::sync::atomic::AtomicBool::new(false),auth_rl:auth::RateLimiter::new(300,10),
-            party:Arc::new(party::Party::new()) })
+            party:Arc::new(party::Party::new()),ingest_status:Mutex::new(None) })
     }
 
     /// Exercise the real handler's authorization and argument construction without a network downloader.
