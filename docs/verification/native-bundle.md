@@ -13,7 +13,9 @@ cargo +1.99.1 build --locked --release --manifest-path server/Cargo.toml \
 scripts/native/package.sh /absolute/new/output x86_64-unknown-linux-gnu \
   /absolute/server/target/release/frayd-server \
   /absolute/server/target/release/frayd-native
-# Verify the adjacent archive checksum before extracting to a new private directory.
+# Verify the adjacent archive checksum; extract into a new private directory.
+# Preserve manifest modes even under umask 077:
+tar -xpzf /absolute/package.tar.gz -C /absolute/new/extraction-directory
 # Run from the extracted bundle:
 ./install.sh --prefix /absolute/new/prefix --data-dir /absolute/new/data
 ./start.sh --prefix /absolute/new/prefix --port 8484
@@ -87,6 +89,8 @@ bash -n scripts/native/package.sh scripts/native/install.sh scripts/native/start
 shellcheck scripts/native/package.sh scripts/native/install.sh scripts/native/start.sh scripts/uninstall.sh
 CARGO_BUILD_JOBS=2 cargo +1.99.1 clippy --locked --manifest-path server/Cargo.toml \
   --bin frayd-native --target-dir target/native-qualification -- -D warnings
+CARGO_BUILD_JOBS=2 cargo +1.99.1 build --locked --manifest-path server/Cargo.toml \
+  --bin frayd-native --target-dir target/native-qualification
 FRAYD_NATIVE_HELPER="$PWD/target/native-qualification/debug/frayd-native" \
 python3 -m unittest discover -s tests -p test_native_bundle.py -v
 ```

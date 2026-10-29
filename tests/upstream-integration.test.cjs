@@ -5,7 +5,10 @@ const { createRequire } = require('node:module');
 const vm = require('node:vm');
 const { test } = require('node:test');
 const harnessPath = join(__dirname, 'client.test.cjs');
-const harness = readFileSync(harnessPath, 'utf8').split("test('closing an ebook")[0];
+const marker = "test('closing an ebook";
+const source = readFileSync(harnessPath, 'utf8');
+assert.ok(source.includes(marker), 'client.test.cjs harness marker is missing');
+const harness = source.split(marker)[0];
 const browser = vm.runInNewContext(harness + '\nbrowser;', { require: createRequire(harnessPath), __dirname, queueMicrotask, URL });
 
 test('authoritative roots, episode permissions and explicit null clearing', () => {

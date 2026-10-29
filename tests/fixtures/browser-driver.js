@@ -1069,6 +1069,67 @@ async function freshResponsiveDocument(width) {
     check(!document.querySelector('#main .card-del') && !document.getElementById('video-modal').classList.contains('on'), 'Success removes card without opening player');
     return { trustedTabEnterSpace: true, nativeConfirmations: 4, cancelledRequests: 0, modeledHttpStatuses: [409, 204], actualBackendDeletion: false };
   });
+  await run('toolbar scan completion survives Settings navigation for the current account', async () => {
+    let releaseStatus;
+    let libraryReads = 0;
+    const scanned = { ...movie, id: 10, title: 'New current-account scan item' };
+    responder = async (url, options) => {
+      if (url === '/api/scan') return reply(null, 202);
+      if (url === '/api/scan/status') return new Promise(resolve => { releaseStatus = resolve; });
+      if (url === '/api/library') { libraryReads++; return reply([scanned]); }
+      return defaultResponder(url, options);
+    };
+    const button = document.getElementById('add-media');
+    const originalMarkup = button.innerHTML;
+    LIBRARY = [];
+    button.click();
+    await until(() => releaseStatus, 'toolbar status request is pending');
+    document.getElementById('settings-btn').click();
+    await until(() => !!document.querySelector('.p-scan'), 'Settings navigation renders');
+    check(button.disabled && button.textContent === 'Scanning…', 'Pending toolbar remains visibly busy');
+    releaseStatus(reply({ scanning: false }));
+    await until(() => !button.disabled, 'current-account toolbar scan completes after Settings navigation');
+    equal(button.innerHTML, originalMarkup, 'Toolbar action is restored');
+    equal(libraryReads, 1, 'Valid completion refreshes library exactly once');
+    check(LIBRARY.some(item => item.id === scanned.id), 'Current account receives newly scanned item');
+    check(document.getElementById('toast-host').textContent.includes('Scan complete — 1 new item(s)'), 'Completion feedback reports new item');
+    check(document.getElementById('settings-modal').classList.contains('on'), 'Completion leaves Settings open');
+    document.getElementById('settings-close').click();
+    responder = defaultResponder;
+    return { pendingStatusBeforeSettings: true, libraryReads, toolbarRestored: true, currentAccountRefreshed: true, modeledAPI: true, realPollingTimer: true };
+  });
+  await run('toolbar scan ignores an old-account status after a new account enters', async () => {
+    let releaseStatus;
+    let libraryReads = 0;
+    responder = async (url, options) => {
+      if (url === '/api/scan') return reply(null, 202);
+      if (url === '/api/scan/status') return new Promise(resolve => { releaseStatus = resolve; });
+      if (url === '/api/library') { libraryReads++; return reply([]); }
+      return defaultResponder(url, options);
+    };
+    const button = document.getElementById('add-media');
+    const originalMarkup = button.innerHTML;
+    button.click();
+    await until(() => releaseStatus, 'old-account toolbar status is pending');
+    const previousAccount = account;
+    account = { name: 'Next disposable account', isAdmin: true };
+    enterApp();
+    await until(() => libraryReads === 1, 'new account loads its own library');
+    await delay(20);
+    const libraryBefore = LIBRARY;
+    const toastBefore = document.getElementById('toast-host').textContent;
+    releaseStatus(reply({ scanning: false }));
+    await delay(50);
+    equal(libraryReads, 1, 'Retired status cannot refresh the next account library');
+    check(LIBRARY === libraryBefore, 'Retired status cannot replace current library state');
+    equal(document.getElementById('toast-host').textContent, toastBefore, 'Retired status cannot publish completion feedback');
+    check(button.disabled && button.textContent === 'Scanning…', 'Retired callback cannot mutate toolbar');
+    // Fixture cleanup restores the deliberately retired busy control, after observing it.
+    button.disabled = false; button.innerHTML = originalMarkup;
+    account = previousAccount;
+    responder = defaultResponder;
+    return { actualEnterAppTransition: true, staleLibraryReads: 0, staleFeedback: false, staleToolbarMutation: false, modeledAccountAndAPI: true, realPollingTimer: true, logoutReloadCoveredSeparately: true };
+  });
   await run('actual settings DOM scopes seven kind permissions and authoritative locked roots', async () => {
     responder = defaultResponder;
     await openSettings();

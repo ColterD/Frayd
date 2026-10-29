@@ -58,6 +58,7 @@ function browser() {
   nodes.get('#add-media').innerHTML = html.match(/<button id="add-media">([\s\S]*?)<\/button>/)[1];
   const requests = [];
   const intervals = new Map();
+  let nextIntervalId = 0;
   let response = async () => ({ ok: true, status: 200, json: async () => null });
   const document = {
     body: element(), querySelector: selector => nodes.get(selector) || null,
@@ -74,7 +75,7 @@ function browser() {
     fetch: async (url, options) => { requests.push({ url, options }); return response(url, options); },
     addEventListener: (name, fn) => listeners.set(name, fn),
     setTimeout() {}, clearTimeout() {},
-    setInterval: fn => { const id = intervals.size + 1; intervals.set(id, fn); return id; },
+    setInterval: fn => { const id = ++nextIntervalId; intervals.set(id, fn); return id; },
     clearInterval: id => intervals.delete(id),
     requestAnimationFrame: fn => fn(),
     confirm: () => false,
@@ -1351,3 +1352,67 @@ test('local audio progress waits for metadata from the current stream', async ()
   media.emit('ended');
   assert.deepEqual(progress(b), []);
 });
+
+test('interval allocation preserves live callbacks after an earlier timer is cleared', () => {
+  const b = browser();
+  b.run('globalThis.timerCalls=[];globalThis.firstTimer=setInterval(()=>timerCalls.push("first"));globalThis.liveTimer=setInterval(()=>timerCalls.push("live"));clearInterval(firstTimer);globalThis.newTimer=setInterval(()=>timerCalls.push("new"))');
+  assert.equal(b.intervals.size, 2);
+  assert.ok(b.context.newTimer > b.context.liveTimer);
+  for (const callback of b.intervals.values()) callback();
+  assert.equal(b.run('JSON.stringify(timerCalls)'), '["live","new"]');
+});
+
+test('toolbar scan refresh survives opening and closing Settings', async () => {
+  const b = browser();
+  b.respond(async url => ({ status: 202, ok: true, json: async () => url === '/api/scan/status' ? { scanning: false } : url === '/api/settings' ? {} : [] }));
+  await b.nodes.get('#add-media').onclick();
+  const poll = [...b.intervals.values()][0];
+  await b.run('openSettings()');
+  b.nodes.get('#settings-close').emit('click');
+  await poll();
+  assert.equal(b.requests.filter(r => r.url === '/api/library').length, 1);
+  assert.equal(b.nodes.get('#add-media').disabled, false);
+  assert.equal(b.intervals.size, 0);
+});
+
+for (const phase of ['start', 'status', 'library']) {
+  for (const rejected of [false, true]) {
+    test(`toolbar scan ignores stale ${phase} ${rejected ? 'failure' : 'success'} after logout and a new account`, async () => {
+      const b = browser();
+      b.context.location.reload = () => {};
+      let release, reject;
+      b.respond(url => {
+        if (url === ({ start: '/api/scan', status: '/api/scan/status', library: '/api/library' })[phase]) {
+          return new Promise((resolve, fail) => { release = resolve; reject = fail; });
+        }
+        return Promise.resolve({ status: 202, ok: true, json: async () => ({ scanning: false }) });
+      });
+      let pending = b.nodes.get('#add-media').onclick();
+      if (phase !== 'start') {
+        await pending;
+        pending = [...b.intervals.values()][0]();
+      }
+      // Let the scan reach the selected asynchronous boundary.
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(typeof release, 'function');
+      b.nodes.get('#logout').emit('click');
+      b.respond(async () => ({ ok: true, json: async () => [] }));
+      b.run('account={name:"Next",isAdmin:false};enterApp()');
+      await new Promise(resolve => setImmediate(resolve));
+      const button = b.nodes.get('#add-media');
+      button.disabled = true;
+      button.innerHTML = 'new account scan';
+      const toastCount = b.context.document.body.children.length;
+      const requestCount = b.requests.length;
+      if (rejected) reject(Error('old request failed'));
+      else release({ status: 202, ok: true, json: async () => phase === 'library' ? [{ id: 9, kind: 'movie' }] : { scanning: false } });
+      await pending;
+      assert.equal(button.disabled, true);
+      assert.equal(button.innerHTML, 'new account scan');
+      assert.equal(b.context.document.body.children.length, toastCount);
+      assert.equal(b.requests.length, requestCount);
+      assert.equal(b.intervals.size, 0);
+      assert.equal(b.run('LIBRARY.length'), 0);
+    });
+  }
+}

@@ -30,6 +30,7 @@ function authHeaders(extra = {}) {
   return h;
 }
 let account = null;
+let accountGeneration = 0;
 
 async function tryResume() {
   if (IDENTITY) {
@@ -50,6 +51,7 @@ async function tryResume() {
 }
 
 function enterApp() {
+  ++accountGeneration;
   document.body.classList.remove('auth');
   $('#login').style.display = 'none';
   $('#app').classList.add('on');
@@ -332,6 +334,7 @@ $('#pw-toggle').onclick = () => {
   $('#pw-toggle').setAttribute('aria-label', p.type === 'password' ? 'Show password' : 'Hide password');
 };
 $('#logout')?.addEventListener('click', () => {
+  ++accountGeneration;
   disposeSettings();
   ++libraryRequestGeneration;
   ++renderGeneration;
@@ -355,27 +358,35 @@ $('#add-media').onclick = async () => {
   if (btn.disabled) return;
   btn.disabled = true;
   btn.textContent = 'Scanning…';
-  const generation = settingsGeneration;
+  const generation = accountGeneration;
   try {
     const r = await fetch('/api/scan', { method: 'POST', headers: authHeaders() });
+    if (generation !== accountGeneration) return;
     if (r.status === 202) {
       toast('Scanning library…');
       // poll status until idle, then refresh library
       const poll = setInterval(async () => {
         try {
-        if (generation !== settingsGeneration) { clearInterval(poll); btn.disabled = false; btn.innerHTML = ADD_BTN_HTML; return; }
+        if (generation !== accountGeneration) { clearInterval(poll); return; }
         const response = await fetch('/api/scan/status');
         if (response.ok === false) throw new Error('Status unavailable');
         const { scanning } = await response.json();
-        if (generation !== settingsGeneration) return;
+        if (generation !== accountGeneration) { clearInterval(poll); return; }
         if (scanning) return;
         clearInterval(poll);
         const before = LIBRARY.length;
         await loadLibrary();
+        if (generation !== accountGeneration) return;
         toast(LIBRARY.length > before ? `Scan complete — ${LIBRARY.length - before} new item(s)` : 'Scan complete');
         btn.disabled = false;
         btn.innerHTML = ADD_BTN_HTML;
-        } catch { clearInterval(poll); btn.disabled = false; btn.innerHTML = ADD_BTN_HTML; toast('Scan status unavailable', true); }
+        } catch {
+          clearInterval(poll);
+          if (generation !== accountGeneration) return;
+          btn.disabled = false;
+          btn.innerHTML = ADD_BTN_HTML;
+          toast('Scan status unavailable', true);
+        }
       }, 1500);
     } else if (r.status === 409) {
       toast('Scan already running', true);
@@ -391,6 +402,7 @@ $('#add-media').onclick = async () => {
       btn.innerHTML = ADD_BTN_HTML;
     }
   } catch {
+    if (generation !== accountGeneration) return;
     toast('Scan failed — server unreachable', true);
     btn.disabled = false;
     btn.innerHTML = ADD_BTN_HTML;

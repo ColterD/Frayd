@@ -9,6 +9,7 @@ import shutil
 import signal
 import socket
 import stat
+import sys
 import subprocess
 import tarfile
 import tempfile
@@ -20,6 +21,35 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = Path(os.environ.get('FRAYD_NATIVE_HELPER', ROOT / 'target/native-qualification/debug/frayd-native'))
 TEMP_ROOT = Path(os.environ.get('FRAYD_NATIVE_TEST_TEMP_ROOT', '/var/tmp')).resolve()
+
+
+def run_bounded(arguments, *, timeout=60, **options):
+    """Bound a finite fixture command and reap its private group on interruption."""
+    input_data = options.pop('input', None)
+    capture = options.pop('capture_output', False)
+    check = options.pop('check', False)
+    if input_data is not None:
+        options['stdin'] = subprocess.PIPE
+    if capture:
+        options['stdout'] = subprocess.PIPE
+        options['stderr'] = subprocess.PIPE
+    process = subprocess.Popen(arguments, start_new_session=True, shell=False, **options)
+    try:
+        stdout, stderr = process.communicate(input_data, timeout=timeout)
+    except BaseException:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        raise
+    result = subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
+    if check:
+        result.check_returncode()
+    return result
 
 
 def setUpModule():
@@ -88,7 +118,7 @@ class NativeOwnership(unittest.TestCase):
         (self.bundle / 'manifest.json').write_text(json.dumps({'schema': 1, 'version': '0.1.1', 'source': 'a' * 40, 'target': 'fixture', 'toolchain': 'fixture', 'entries': entries}))
 
     def run_helper(self, command, *args, code=0, answer='', environment=None):
-        result = subprocess.run([str(HELPER), command, '--prefix', str(self.prefix), *args], input=answer, text=True, capture_output=True, env=environment)
+        result = run_bounded([str(HELPER), command, '--prefix', str(self.prefix), *args], input=answer, text=True, capture_output=True, env=environment)
         self.assertEqual(result.returncode, code, result.stderr)
         return result
 
@@ -98,13 +128,33 @@ class NativeOwnership(unittest.TestCase):
     def snapshot(self):
         return [(str(p.relative_to(self.base)), p.lstat().st_mode, os.readlink(p) if p.is_symlink() else p.read_bytes() if p.is_file() else None) for p in sorted(self.base.rglob('*'))]
 
+    def test_timeout_reaps_owned_descendants(self):
+        import fcntl
+        lease = self.base / 'timeout child lease'
+        ready = self.base / 'timeout child ready'
+        group_record = self.base / 'timeout owned group'
+        child = "import fcntl,pathlib,sys,time; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); pathlib.Path(sys.argv[2]).write_text('ready'); time.sleep(60)"
+        driver = "import os,pathlib,subprocess,sys,time; pathlib.Path(sys.argv[1]).write_text(str(os.getpgrp())); subprocess.Popen([sys.executable,'-c',sys.argv[2],sys.argv[3],sys.argv[4]]); time.sleep(60)"
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                run_bounded([sys.executable, '-c', driver, str(group_record), child, str(lease), str(ready)], timeout=1, capture_output=True, text=True)
+            self.assertTrue(ready.exists(), 'owned descendant must have acquired its lease before timeout')
+            with lease.open('r+') as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            if group_record.exists():
+                try:
+                    os.killpg(int(group_record.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
     def test_package_complete_manifest_and_architecture(self):
         architecture = 'aarch64' if os.uname().machine in ['arm64', 'aarch64'] else 'x86_64'
         target = architecture + ('-apple-darwin' if os.uname().sysname == 'Darwin' else '-unknown-linux-gnu')
         output = self.base / 'package output'
         # Two real Rust executables exercise packaging, without pretending the
         # helper used as a payload fixture is an actual Frayd HTTP server.
-        result = subprocess.run([str(ROOT / 'scripts/native/package.sh'), str(output), target, str(HELPER), str(HELPER)], capture_output=True, text=True)
+        result = run_bounded([str(ROOT / 'scripts/native/package.sh'), str(output), target, str(HELPER), str(HELPER)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         archive = next(output.glob('*.tar.gz'))
         self.assertEqual(archive.with_suffix(archive.suffix + '.sha256').read_text().split()[0], hashlib.sha256(archive.read_bytes()).hexdigest())
@@ -125,9 +175,37 @@ class NativeOwnership(unittest.TestCase):
         wrong_output = self.base / 'wrong architecture output'
         wrong_target = ('x86_64' if architecture == 'aarch64' else 'aarch64') + target[len(architecture):]
         before = self.snapshot()
-        result = subprocess.run([str(ROOT / 'scripts/native/package.sh'), str(wrong_output), wrong_target, str(HELPER), str(HELPER)], capture_output=True)
+        result = run_bounded([str(ROOT / 'scripts/native/package.sh'), str(wrong_output), wrong_target, str(HELPER), str(HELPER)], capture_output=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.snapshot(), before)
+
+    def test_tar_preserved_modes_under_restrictive_umask(self):
+        architecture = 'aarch64' if os.uname().machine in ['arm64', 'aarch64'] else 'x86_64'
+        target = architecture + ('-apple-darwin' if os.uname().sysname == 'Darwin' else '-unknown-linux-gnu')
+        output = self.base / 'umask package'
+        run_bounded([str(ROOT / 'scripts/native/package.sh'), str(output), target, str(HELPER), str(HELPER)], check=True, capture_output=True)
+        archive = next(output.glob('*.tar.gz'))
+        original = next(path for path in output.iterdir() if path.is_dir())
+        self.assertIn('tar -xpzf', (original / 'README.md').read_text())
+        plain = self.base / 'plain extraction'
+        preserved = self.base / 'preserved extraction'
+        plain.mkdir(mode=0o700)
+        preserved.mkdir(mode=0o700)
+        run_bounded(['tar', '-xzf', str(archive), '-C', str(plain)], umask=0o077, check=True, capture_output=True)
+        run_bounded(['tar', '-xpzf', str(archive), '-C', str(preserved)], umask=0o077, check=True, capture_output=True)
+        plain_bundle = next(plain.iterdir())
+        preserved_bundle = next(preserved.iterdir())
+        self.assertNotEqual(stat.S_IMODE((plain_bundle / 'client/index.html').stat().st_mode), 0o644)
+        self.assertEqual(stat.S_IMODE((preserved_bundle / 'client/index.html').stat().st_mode), 0o644)
+        self.assertEqual(stat.S_IMODE((preserved_bundle / 'install.sh').stat().st_mode), 0o755)
+        before = self.snapshot()
+        refused = run_bounded([str(plain_bundle / 'install.sh'), '--prefix', str(self.prefix), '--data-dir', str(self.data), '--yes'], capture_output=True)
+        self.assertEqual(refused.returncode, 2)
+        self.assertEqual(self.snapshot(), before)
+        run_bounded([str(preserved_bundle / 'install.sh'), '--prefix', str(self.prefix), '--data-dir', str(self.data), '--yes'], check=True, capture_output=True)
+        run_bounded([str(preserved_bundle / 'uninstall.sh'), '--prefix', str(self.prefix), '--yes'], check=True, capture_output=True)
+        self.assertFalse(self.prefix.exists())
+        self.assertTrue((self.data / '.frayd-data.json').is_file())
 
     def test_decline_zero_effects(self):
         before = self.snapshot()
@@ -243,7 +321,7 @@ class NativeOwnership(unittest.TestCase):
         (self.data / '.env').unlink()
         (self.data / 'frayd.db').unlink()
         self.data.rmdir()
-        result = subprocess.run([str(HELPER), 'install', '--bundle', str(self.bundle), '--prefix', str(self.prefix), '--data-dir', str(self.data), '--yes'], umask=0, capture_output=True)
+        result = run_bounded([str(HELPER), 'install', '--bundle', str(self.bundle), '--prefix', str(self.prefix), '--data-dir', str(self.data), '--yes'], umask=0, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(stat.S_IMODE(self.prefix.stat().st_mode), 0o700)
         self.assertEqual(stat.S_IMODE(self.data.stat().st_mode), 0o700)
@@ -360,7 +438,7 @@ class NativeOwnership(unittest.TestCase):
     def test_invalid_targets_and_flags_zero_effects(self):
         before = self.snapshot()
         for target in ['relative', '/', '/usr/frayd', str(ROOT / 'native-test-prefix'), str(self.base) + '/./unsafe', str(self.base) + '//unsafe', str(self.base / '.cargo/new'), str(self.base / '.rustup/new'), str(self.base / 'original checkout/new')]:
-            result = subprocess.run([str(HELPER), 'install', '--bundle', str(self.bundle), '--prefix', target, '--data-dir', str(self.data), '--yes'], capture_output=True)
+            result = run_bounded([str(HELPER), 'install', '--bundle', str(self.bundle), '--prefix', target, '--data-dir', str(self.data), '--yes'], capture_output=True)
             self.assertEqual(result.returncode, 2, result.stderr)
         self.run_helper('uninstall', '--purge-library', code=2)
         self.assertEqual(self.snapshot(), before)
@@ -399,7 +477,7 @@ class NativeRuntime(unittest.TestCase):
             data = base / 'application data'
             library = base / 'library fixture'
             library.mkdir(mode=0o700)
-            subprocess.run([str(bundle / 'install.sh'), '--prefix', str(prefix), '--data-dir', str(data), '--yes'], check=True, capture_output=True)
+            run_bounded([str(bundle / 'install.sh'), '--prefix', str(prefix), '--data-dir', str(data), '--yes'], check=True, capture_output=True)
             # Every HTTP asset is compared with this extracted manifest, not source files.
             manifest = json.loads((bundle / 'manifest.json').read_text())
             self.assertTrue(manifest['toolchain'].startswith('rustc '))
@@ -424,7 +502,7 @@ class NativeRuntime(unittest.TestCase):
             environment['PATH'] = str(tools) + os.pathsep + environment.get('PATH', '')
             environment['FRAYD_NATIVE_UPNP_RECORD'] = str(upnp_record)
             # Prove the recorder works; it performs no router or network operation.
-            subprocess.run([str(upnp_recorder)], env=environment, check=True)
+            run_bounded([str(upnp_recorder)], env=environment, check=True)
             self.assertEqual(upnp_record.read_text(), 'requested\n')
             upnp_record.unlink()
             for name in ['FRAYD_LIBRARY', 'FRAYD_CERT', 'FRAYD_KEY']:
@@ -470,7 +548,7 @@ class NativeRuntime(unittest.TestCase):
                     process = None
                     return
                 child = json.loads((prefix / '.frayd-child.json').read_text())['pid']
-                parent = subprocess.check_output(['ps', '-o', 'ppid=', '-p', str(child)], text=True).strip()
+                parent = run_bounded(['ps', '-o', 'ppid=', '-p', str(child)], text=True, capture_output=True, check=True, timeout=10).stdout.strip()
                 self.assertEqual(int(parent), process.pid)
                 os.kill(child, signal.SIGTERM)
                 self.assertEqual(process.wait(timeout=10), 2)
@@ -502,7 +580,7 @@ class NativeRuntime(unittest.TestCase):
                 request('/api/progress', {'media_id': media_id, 'position': 0.5}, token, expected=204)
                 # Active lifecycle refusal must leave every installed byte unchanged.
                 before = [(str(p.relative_to(prefix)), p.stat().st_mode, p.read_bytes() if p.is_file() else None) for p in sorted(prefix.rglob('*'))]
-                refused = subprocess.run([str(bundle / 'uninstall.sh'), '--prefix', str(prefix), '--yes'], capture_output=True)
+                refused = run_bounded([str(bundle / 'uninstall.sh'), '--prefix', str(prefix), '--yes'], capture_output=True)
                 self.assertEqual(refused.returncode, 2)
                 self.assertEqual(before, [(str(p.relative_to(prefix)), p.stat().st_mode, p.read_bytes() if p.is_file() else None) for p in sorted(prefix.rglob('*'))])
                 request('/api/admin/settings', {'upnp': True}, token, expected=204)
@@ -544,7 +622,7 @@ class NativeRuntime(unittest.TestCase):
                 self.assertEqual(json.loads(request(f'/api/progress/{media_id}', token=offline_login['token']))['position'], 0.5)
                 stop(group_interrupt=True)
                 preserved = {str(p.relative_to(data)): p.read_bytes() for p in data.rglob('*') if p.is_file()}
-                subprocess.run([str(bundle / 'uninstall.sh'), '--prefix', str(prefix), '--yes'], check=True, capture_output=True)
+                run_bounded([str(bundle / 'uninstall.sh'), '--prefix', str(prefix), '--yes'], check=True, capture_output=True)
                 self.assertFalse(prefix.exists())
                 self.assertTrue(preserved == {str(p.relative_to(data)): p.read_bytes() for p in data.rglob('*') if p.is_file()}, 'application data changed during removal')
                 print(json.dumps({'scenario': 'actual-native-relocated-reader-persistence-removal', 'status': 'passed', 'platform': os.uname().sysname, 'architecture': os.uname().machine, 'archive_sha256': checksum, 'base_source_commit': manifest['source'], 'version': manifest['version'], 'source_files_unavailable': True, 'unavailable_absolute_library_reads': 'passed', 'loopback_upnp_requests': 0, 'media_codecs': 'not-qualified'}))

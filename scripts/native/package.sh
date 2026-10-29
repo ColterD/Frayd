@@ -70,6 +70,8 @@ for name, relative in [('install.sh', 'scripts/native/install.sh'), ('start.sh',
     shutil.copy2(source / relative, bundle / name)
 (bundle / 'README.md').write_text('''Frayd experimental native bundle
 
+Extract with preserved manifest modes (including under umask 077):
+  tar -xpzf frayd-<version>-<target>.tar.gz
 Install (choose NEW absolute private prefix/data paths with existing parents):
   ./install.sh --prefix /absolute/new/frayd --data-dir /absolute/new/frayd-data
 Start in foreground:
