@@ -245,6 +245,8 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser, diagno
       remainingStartupBudget();
       if (!response.ok) {
         if (response.status === 408 || response.status === 429 || response.status >= 500) {
+          if (response.body) await bounded(response.body.cancel(),
+            'Owned browser page discovery body cancellation timed out', remainingStartupBudget());
           diagnostics.transientFailures++;
           await delay(20);
           continue;
@@ -697,8 +699,10 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
     cacheSession?.beginShutdown?.();
     try { await stopBrowserGroup(browser); browserGroupStopped = true; }
     catch (error) { cleanupErrors.push(error.stack); }
-    try { await cacheSession?.close(); }
-    catch (error) { cleanupErrors.push(redactDebuggerCapabilities(error.stack)); }
+    if (browserGroupStopped) {
+      try { await cacheSession?.close(); }
+      catch (error) { cleanupErrors.push(redactDebuggerCapabilities(error.stack)); }
+    }
     try {
       if (pendingAnnotation) pendingAnnotation.destroy();
       if (parserResponse) parserResponse.destroy();

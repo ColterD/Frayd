@@ -97,8 +97,8 @@ test('scan feedback distinguishes accepted, busy, no roots, server and network f
     b.run('settingsGeneration=3');
     b.respond(async()=>{if(status==='network') throw Error('server unreachable'); return {status};});
     await b.run('startSettingsScan(3,button)');
-    if(status===202) {
-      assert.equal(b.context.button.textContent,'Scanning…');
+    if(status===202 || status===409) {
+      assert.equal(b.context.button.textContent,status===202 ? 'Scanning…' : 'Scan already running — monitoring…');
       assert.equal(b.intervals.size,1);
     } else {
       assert.equal(b.context.button.disabled,false);
@@ -302,3 +302,159 @@ for (const phase of ['admission', 'status']) {
     assert.notEqual(b.context.button.textContent, 'Scan complete');
   });
 }
+
+for (const failure of ['network', 'server']) {
+  test(`settings scan status retries ${failure} and refreshes once after recovery`, async () => {
+    const b = browser();
+    b.context.button = {disabled:true,textContent:'Scanning…'};
+    let reads = 0;
+    b.respond(async url => {
+      if (url !== '/api/scan/status') return {ok:true,json:async()=>[]};
+      if (++reads === 1) {
+        if (failure === 'network') throw Error('connection reset');
+        return {ok:false,status:503};
+      }
+      return {ok:true,json:async()=>({scanning:false})};
+    });
+    b.run('pollSettings(settingsGeneration,"scan",button)');
+    const poll = [...b.intervals.values()][0];
+    await poll();
+    assert.equal(b.intervals.size,1,'transient failure retains observer');
+    assert.equal(b.context.button.disabled,true);
+    await poll();
+    assert.equal(b.intervals.size,0);
+    assert.equal(reads,2);
+    assert.equal(b.requests.filter(r=>r.url==='/api/library').length,1);
+    assert.equal(b.context.button.disabled,false);
+  });
+}
+
+test('settings scan status stops after three consecutive failures; valid busy status resets the count', async () => {
+  const b = browser();
+  b.context.button = {disabled:true,textContent:'Scanning…'};
+  let reads = 0;
+  b.respond(async()=>++reads === 3 ? {ok:true,json:async()=>({scanning:true})} : {ok:false,status:502});
+  b.run('pollSettings(settingsGeneration,"scan",button)');
+  const poll = [...b.intervals.values()][0];
+  for (let n=0;n<5;++n) {
+    await poll();
+    assert.equal(b.intervals.size,1,`observer survives read ${n+1}`);
+    assert.equal(b.context.button.disabled,true);
+  }
+  await poll();
+  assert.equal(reads,6);
+  assert.equal(b.intervals.size,0);
+  assert.equal(b.context.button.disabled,false);
+  assert.equal(b.context.button.textContent,'Status unavailable');
+  assert.equal(b.requests.filter(r=>r.url==='/api/library').length,0);
+});
+
+for (const mode of ['scan','ingest']) {
+  test(`settings ${mode} status never overlaps requests and deterministic HTTP failure stops`, async () => {
+    const b=browser();
+    b.context.button={disabled:true,textContent:'Busy'};
+    let release;
+    b.respond(()=>new Promise(resolve=>{release=resolve;}));
+    b.run(`pollSettings(settingsGeneration,"${mode}",button)`);
+    const poll=[...b.intervals.values()][0];
+    const pending=poll();
+    await poll();
+    assert.equal(b.requests.length,1);
+    release({ok:false,status:403});
+    await pending;
+    assert.equal(b.intervals.size,0);
+    assert.equal(b.context.button.disabled,false);
+  });
+}
+
+test('settings ingest network failure stops immediately', async () => {
+  const b=browser();
+  b.context.button={disabled:true,textContent:'Busy'};
+  b.respond(async()=>{throw Error('offline');});
+  b.run('pollSettings(settingsGeneration,"ingest",button)');
+  await [...b.intervals.values()][0]();
+  assert.equal(b.intervals.size,0);
+  assert.equal(b.context.button.disabled,false);
+});
+
+for (const closeBeforeAdmission of [false,true]) {
+  test(`settings busy scan attaches one observer after POST409 (closed=${closeBeforeAdmission})`, async () => {
+    const b=browser();
+    b.context.button={disabled:false,textContent:''};
+    let release;
+    b.respond(url=>url==='/api/scan' ? new Promise(resolve=>{release=resolve;})
+      : Promise.resolve({ok:true,json:async()=>url==='/api/scan/status'?{scanning:false}:[]}));
+    const admission=b.run('startSettingsScan(settingsGeneration,button)');
+    if(closeBeforeAdmission)b.run('disposeSettings()');
+    release({status:409});
+    await admission;
+    assert.equal(b.intervals.size,1);
+    await [...b.intervals.values()][0]();
+    assert.equal(b.requests.filter(r=>r.url==='/api/scan').length,1,'admission is never replayed');
+    assert.equal(b.requests.filter(r=>r.url==='/api/library').length,1);
+    assert.equal(b.context.button.disabled,closeBeforeAdmission);
+    assert.equal(b.intervals.size,0);
+  });
+}
+
+test('settings POST409 monitor logout rejects late status failure without UI publication', async () => {
+  const b=browser();
+  b.context.button={disabled:false,textContent:''};
+  b.context.location.reload=()=>{};
+  let reject;
+  b.respond(url=>url==='/api/scan/status' ? new Promise((resolve,fail)=>{reject=fail;})
+    : Promise.resolve({status:409,ok:true,json:async()=>null}));
+  await b.run('startSettingsScan(settingsGeneration,button)');
+  const pending=[...b.intervals.values()][0]();
+  const text=b.context.button.textContent;
+  b.nodes.get('#logout').emit('click');
+  reject(Error('retired connection'));
+  await pending;
+  assert.equal(b.intervals.size,0);
+  assert.equal(b.context.button.disabled,true);
+  assert.equal(b.context.button.textContent,text);
+  assert.equal(b.requests.filter(r=>r.url==='/api/library').length,0);
+});
+
+test('settings retired scan retry cannot clear a replacement observer or mutate closed controls', async () => {
+  const b=browser();
+  b.context.button={disabled:true,textContent:'Scanning…'};
+  let reject;
+  b.respond(()=>new Promise((resolve,fail)=>{reject=fail;}));
+  b.run('pollSettings(settingsGeneration,"scan",button)');
+  const pending=[...b.intervals.values()][0]();
+  b.run('disposeSettings();pollSettings(settingsGeneration,"scan",{})');
+  const replacement=b.run('settingsPoll');
+  reject(Error('retired connection'));
+  await pending;
+  assert.equal(b.intervals.has(replacement),true);
+  assert.equal(b.run('settingsPoll'),replacement);
+  assert.equal(b.context.button.disabled,true);
+  assert.equal(b.context.button.textContent,'Scanning…');
+});
+
+test('settings scan malformed status JSON fails fast', async () => {
+  const b=browser();
+  b.context.button={disabled:true,textContent:'Scanning…'};
+  b.respond(async()=>({ok:true,json:async()=>{throw SyntaxError('malformed status');}}));
+  b.run('pollSettings(settingsGeneration,"scan",button)');
+  await [...b.intervals.values()][0]();
+  assert.equal(b.intervals.size,0);
+  assert.equal(b.context.button.disabled,false);
+  assert.equal(b.requests.length,1);
+});
+
+test('closed settings scan exhausts retry budget without mutating its retired button or publishing toasts', async () => {
+  const b=browser();
+  b.context.button={disabled:true,textContent:'Scanning…'};
+  b.respond(async()=>({ok:false,status:503}));
+  b.run('pollSettings(settingsGeneration,"scan",button);disposeSettings()');
+  const poll=[...b.intervals.values()][0];
+  const children=b.context.document.body.children.length;
+  for(let n=0;n<3;++n)await poll();
+  assert.equal(b.intervals.size,0);
+  assert.equal(b.context.button.disabled,true);
+  assert.equal(b.context.button.textContent,'Scanning…');
+  assert.equal(b.context.document.body.children.length,children);
+  assert.equal(b.requests.filter(r=>r.url==='/api/scan/status').length,3);
+});

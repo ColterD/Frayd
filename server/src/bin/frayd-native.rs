@@ -7,6 +7,7 @@ mod native {
     use std::fs::{self, DirBuilder, File, OpenOptions};
     use std::io::{self, Read, Write};
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    use std::os::unix::process::ExitStatusExt;
     use std::path::{Component, Path, PathBuf};
     use std::process::{Command, ExitCode};
     use walkdir::WalkDir;
@@ -740,9 +741,17 @@ mod native {
                 serde_json::to_vec(&serde_json::json!({"pid": child.id(), "state": "running"}))?,
             )?;
             let (status, interrupted) = tokio::select! {
-                result = child.wait() => (result?, false),
+                // Foreground signals can make both the signal and child wait ready.
+                // Prefer the explicit interruption; a child-only INT/TERM is also
+                // normal interruption, even if its wait completes first.
+                biased;
                 _ = interrupt.recv() => { child.start_kill()?; (child.wait().await?, true) },
                 _ = terminate.recv() => { child.start_kill()?; (child.wait().await?, true) },
+                result = child.wait() => {
+                    let status = result?;
+                    let interrupted = matches!(status.signal(), Some(2) | Some(15));
+                    (status, interrupted)
+                },
             };
             fs::remove_file(prefix.join(CHILD))?;
             if !status.success() && !interrupted {

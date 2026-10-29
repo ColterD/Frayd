@@ -128,7 +128,10 @@ test('original browser failure remains visible alongside an injected profile-rem
   const resultDirectory = mkdtempSync(join(tmpdir(), 'frayd-cleanup-result-'));
   let retainedProfile;
   const invocation = spawn(process.execPath, ['-e', `
-    require(${JSON.stringify(runner)}).main({ evidenceDirectory: ${JSON.stringify(resultDirectory)}, cacheSetup: async () => ({ receipt: { injectedTestDouble: true }, close: async () => {} }), removeProfile(profile) {
+    require(${JSON.stringify(runner)}).main({ evidenceDirectory: ${JSON.stringify(resultDirectory)}, cacheSetup: async () => {
+      const receipt = { injectedTestDouble: true, protocolClosed: false };
+      return { receipt, close: async () => { receipt.protocolClosed = true; } };
+    }, removeProfile(profile) {
       throw new Error('cleanup sentinel: ' + profile);
     }}).catch(error => { console.error(error.stack); process.exitCode = 1; });
   `], { env: { ...process.env, BROWSER_BIN: executable, FRAYD_CHILD_FIXTURE_EARLY_EXIT: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -142,6 +145,7 @@ test('original browser failure remains visible alongside an injected profile-rem
     const result = JSON.parse(stdout);
     assert.match(result.runnerError, /Browser exited before result: 7\/null; original browser exit sentinel/);
     assert.equal(result.cleanupErrors.length, 1);
+    assert.equal(result.cacheControl.protocolClosed, true, 'Confirmed group shutdown closes the owned session');
     assert.match(result.cleanupErrors[0], /cleanup sentinel: /);
     retainedProfile = result.cleanupErrors[0].match(/cleanup sentinel: ([^\n]+)/)[1];
     assert.equal(dirname(retainedProfile), tmpdir());
@@ -591,4 +595,147 @@ setInterval(() => {}, 1000);
       }
     }
   } finally { rmSync(fixtureDirectory, { recursive: true, force: true }); }
+});
+
+
+test('transient discovery response bodies are canceled before another attempt', { timeout: 8000 }, async () => {
+  const source = readFileSync(join(__dirname, 'browser-regression.cjs'), 'utf8');
+  const setup = source.slice(source.indexOf('async function bounded('), source.indexOf('async function main('));
+  for (const status of [408, 429, 503]) {
+    let attempts = 0;
+    let canceled = false;
+    let responseClosed;
+    const closed = new Promise(resolve => { responseClosed = resolve; });
+    const server = createServer((request, response) => {
+      assert.equal(request.url, '/json/list');
+      if (++attempts === 1) {
+        response.on('close', responseClosed);
+        response.writeHead(status);
+        response.write('unfinished readiness response');
+        return;
+      }
+      response.end(JSON.stringify([{ type: 'page', url: 'about:blank',
+        webSocketDebuggerUrl: `ws://127.0.0.1:${server.address().port}/devtools/page/owned-test` }]));
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const configure = vm.runInNewContext(setup + '\nconfigureOwnedBrowserCache;', {
+      Date, join, URL, AbortSignal, AbortController, setTimeout, clearTimeout, delay,
+      existsSync: () => true, readFileSync: () => `${server.address().port}\n/unused`,
+      async fetch(...args) {
+        if (attempts) assert.equal(canceled, true, 'Previous body must be canceled before retry');
+        const response = await fetch(...args);
+        if (!response.ok) {
+          const cancel = response.body.cancel.bind(response.body);
+          response.body.cancel = async () => { await cancel(); canceled = true; };
+        }
+        return response;
+      },
+      WebSocket: class { constructor() { throw new Error('Validated owned protocol boundary reached'); } },
+    });
+    const browser = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
+    try {
+      await assert.rejects(configure({ profile: '/owned/profile', fixtureUrl: 'unused', browser, budgetMs: 1000 }),
+        /Validated owned protocol boundary reached/);
+      await Promise.race([closed, delay(1000).then(() => { throw new Error('Canceled response remained open'); })]);
+      assert.equal(attempts, 2);
+      assert.equal(canceled, true);
+      assert.equal(browser.listenerCount('exit'), 0);
+    } finally {
+      server.closeAllConnections();
+      await new Promise(resolve => server.close(resolve));
+    }
+  }
+});
+
+test('unconfirmed browser shutdown retains its active interception session and profile', { timeout: 8000 }, async () => {
+  const runner = resolve(__dirname, 'browser-regression.cjs');
+  const resultDirectory = mkdtempSync(join(tmpdir(), 'frayd-shutdown-held-'));
+  const invocation = spawn(process.execPath, ['-e', `
+    const assert = require('node:assert/strict');
+    const fs = require('node:fs');
+    const source = fs.readFileSync(${JSON.stringify(runner)}, 'utf8').replace(/^#!.*\\n/, '');
+    const ownedModule = { exports: {} };
+    const controls = new Function('require', 'module', '__dirname', source + \`
+      const actualStop = stopBrowserGroup;
+      let ownedBrowser;
+      stopBrowserGroup = async browser => {
+        ownedBrowser = browser;
+        process.kill(-browser.pid, 0);
+        throw new Error('injected group shutdown failure');
+      };
+      return { actualStop, browser: () => ownedBrowser };
+    \`)(require, ownedModule, ${JSON.stringify(__dirname)});
+    let profile;
+    let guardActive = true;
+    let shutdownBegun = false;
+    let removals = 0;
+    (async () => {
+      try {
+        await ownedModule.exports.main({ evidenceDirectory: ${JSON.stringify(resultDirectory)},
+          async cacheSetup(options) {
+            profile = options.profile;
+            return { receipt: { injectedTestDouble: true }, beginShutdown() { shutdownBegun = true; },
+              async close() { guardActive = false; } };
+          },
+          removeProfile() { removals++; }
+        });
+        const result = JSON.parse(fs.readFileSync(${JSON.stringify(join(resultDirectory, 'result.json'))}, 'utf8'));
+        assert.equal(guardActive, true, 'Live browser must retain interception');
+        assert.equal(shutdownBegun, true);
+        assert.equal(removals, 0);
+        assert.equal(fs.existsSync(profile), true);
+        process.kill(-controls.browser().pid, 0);
+        assert.equal(result.cleanup.browserGroupStopped, false);
+        assert.equal(result.cleanup.profileRemoved, false);
+        assert.equal(result.cleanup.serverClosed, true);
+        assert.equal(result.cleanupErrors.length, 1);
+        assert.match(result.cleanupErrors[0], /injected group shutdown failure/);
+        assert.equal(result.complete, false);
+        console.error('Verified active guard and profile held while owned group remains alive');
+      } finally {
+        await controls.actualStop(controls.browser());
+        if (profile) fs.rmSync(profile, { recursive: true, force: true });
+      }
+    })().catch(error => { console.error(error.stack); process.exitCode = 2; });
+  `], { env: { ...process.env, BROWSER_BIN: executable }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let stderr = '';
+  invocation.stdout.resume();
+  invocation.stderr.on('data', bytes => { stderr += bytes; });
+  try {
+    const [code] = await once(invocation, 'exit');
+    assert.equal(code, 1, stderr); // Held cleanup must remain a failed runner outcome.
+    assert.match(stderr, /Verified active guard and profile held/);
+  } finally {
+    if (invocation.exitCode === null) invocation.kill('SIGKILL');
+    rmSync(resultDirectory, { recursive: true, force: true });
+  }
+});
+
+test('discovery cancellation failures propagate without retries or a fresh deadline', { timeout: 3000 }, async () => {
+  const source = readFileSync(join(__dirname, 'browser-regression.cjs'), 'utf8');
+  const setup = source.slice(source.indexOf('async function bounded('), source.indexOf('async function main('));
+  for (const scenario of ['reject', 'stall']) {
+    let attempts = 0;
+    let cancellations = 0;
+    const browser = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
+    const configure = vm.runInNewContext(setup + '\nconfigureOwnedBrowserCache;', {
+      Date, join, URL, AbortSignal, AbortController, setTimeout, clearTimeout, delay,
+      existsSync: () => true, readFileSync: () => '32123\n/unused',
+      async fetch() {
+        attempts++;
+        return { ok: false, status: 503, body: { cancel() {
+          cancellations++;
+          return scenario === 'stall' ? new Promise(() => {}) : Promise.reject(new Error('body cancellation sentinel'));
+        } } };
+      },
+      WebSocket: class { constructor() { throw new Error('Failed cancellation opened a protocol connection'); } },
+    });
+    const startedAt = Date.now();
+    await assert.rejects(configure({ profile: '/owned/profile', fixtureUrl: 'unused', browser, budgetMs: 100 }),
+      scenario === 'stall' ? /body cancellation timed out/ : /body cancellation sentinel/);
+    assert.equal(attempts, 1);
+    assert.equal(cancellations, 1);
+    assert.ok(Date.now() - startedAt < 1000, 'Cancellation stays inside the original startup deadline');
+    assert.equal(browser.listenerCount('exit'), 0);
+  }
 });

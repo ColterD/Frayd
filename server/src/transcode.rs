@@ -170,12 +170,12 @@ fn reserve_job_with_recovery(db: &mut Connection, cache: &Path, library: &Path, 
 }
 
 /// Register unique temporary and completed paths for one source before conversion starts.
-/// Return a lease only after cache and registry admission; unqualified recovery retains
-/// existing unfinished work rather than taking its ownership.
+/// Return a lease only after cache and registry admission. Unknown history always holds
+/// admission; unqualified recovery also retains known unfinished work.
 fn reserve_job_with_roots(db: &mut Connection, cache: &Path, roots: &[PathBuf], id: i64, src: &Path, qualify_recovery: bool) -> Option<(PathBuf,PathBuf,JobLease)> {
     let cache = prepare_cache(cache, roots)?;
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).ok()?;
-    if !qualify_recovery && unfinished_generated_job(&tx,id) { return None; }
+    if unfinished_generated_job(&tx,id,qualify_recovery) { return None; }
     let media = cache.join(id.to_string());
     match std::fs::create_dir(&media) {
         Ok(()) => (),
@@ -423,13 +423,14 @@ fn source_version(src: &Path) -> Option<(std::time::SystemTime,u64)> {
     Some((metadata.modified().ok()?,metadata.len()))
 }
 
-/// A retained generated job without a completed publication must not acquire a second namespace.
+/// Unknown generated history always blocks a new namespace, even with qualified recovery.
+/// Unqualified recovery also holds pending/retiring history; database errors fail closed.
 /// The media ID is stable across source replacement; an old source path cannot prove this job inactive.
-fn unfinished_generated_job(db: &Connection, media_id: i64) -> bool {
+fn unfinished_generated_job(db: &Connection, media_id: i64, qualify_recovery: bool) -> bool {
     db.query_row("SELECT EXISTS(SELECT 1 FROM transcode_artifacts
         WHERE owner_media_id=?1 AND provenance='generated'
-        AND lifecycle IN ('unknown','pending','retiring'))",
-        [media_id], |row| row.get::<_,bool>(0)).unwrap_or(true)
+        AND (lifecycle='unknown' OR (?2=0 AND lifecycle IN ('pending','retiring'))))",
+        rusqlite::params![media_id,qualify_recovery], |row| row.get::<_,bool>(0)).unwrap_or(true)
 }
 
 /// Publish only the converted file/database snapshot, after acquiring the bounded SQLite write lock.
@@ -892,6 +893,54 @@ mod tests {
                 .args(["--exact","transcode::tests::unqualified_recovery_preserves_conversion_and_retains_unknown_failures","--nocapture"])
                 .env("FRAYD_TEST_UNQUALIFIED_ROOT",&fixture.0).env("FRAYD_TEST_UNQUALIFIED_MODE",mode).env("PATH",&bin).output().unwrap();
             assert!(result.status.success(),"unqualified {mode}: {}{}",String::from_utf8_lossy(&result.stdout),String::from_utf8_lossy(&result.stderr));
+        }
+    }
+
+    /// Unknown history cannot gain a fresh namespace merely because Linux recovery is qualified.
+    #[test]
+    fn qualified_recovery_holds_unknown_reservations_by_stable_media_id() {
+        for mode in ["retained", "source-replaced", "referenced"] {
+            let fixture = Fixture::new();
+            let path = fixture.0.join("db.sqlite");
+            let mut db = crate::store::open(path.to_str().unwrap());
+            let src = fixture.source("film.mkv");
+            insert(&db, 1, &src);
+            let cache = fixture.0.join("transcodes");
+            let library = fixture.0.join("library");
+            let (tmp, out, lease) = reserve_job_with_recovery(&mut db, &cache, &library, 1, &src, true).unwrap();
+            assert!(lease.reclaimable, "fixture must qualify its initial Linux lease");
+            std::fs::write(&tmp, b"retained partial").unwrap();
+            std::fs::write(&out, b"retained final").unwrap();
+            db.execute("UPDATE transcode_artifacts SET lifecycle='unknown' WHERE owner_media_id=1", []).unwrap();
+            drop(lease);
+            let current = if mode == "source-replaced" {
+                let replacement = fixture.source("replacement.mkv");
+                db.execute("UPDATE media SET path=?1 WHERE id=1", [replacement.to_str().unwrap()]).unwrap();
+                replacement
+            } else { src.clone() };
+            if mode == "referenced" {
+                insert(&db, 2, &tmp);
+                db.execute_batch("INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture');
+                    INSERT INTO progress(identity_id,media_id,position) VALUES(1,2,42);").unwrap();
+            }
+            for _ in 0..2 {
+                recover_pending_jobs(path.to_str().unwrap(), &library);
+                assert!(reserve_job_with_recovery(&mut db, &cache, &library, 1, &current, true).is_none(),
+                    "qualified reservation bypassed retained unknown history: {mode}");
+                assert_eq!(std::fs::read_dir(cache.join("1")).unwrap().count(), 1);
+                assert_eq!(db.query_row("SELECT COUNT(*) FROM transcode_artifacts
+                    WHERE owner_media_id=1 AND provenance='generated' AND lifecycle='unknown'", [], |r| r.get::<_,i64>(0)).unwrap(), 2);
+                assert_eq!(std::fs::read(&tmp).unwrap(), b"retained partial");
+                assert_eq!(std::fs::read(&out).unwrap(), b"retained final");
+                assert_eq!(std::fs::read(&src).unwrap(), b"original");
+            }
+            if mode == "referenced" {
+                assert_eq!(db.query_row("SELECT position FROM progress WHERE media_id=2", [], |r| r.get::<_,f64>(0)).unwrap(), 42.0);
+            }
+            let other = fixture.source("other.mkv");
+            insert(&db, 3, &other);
+            assert!(reserve_job_with_recovery(&mut db, &cache, &library, 3, &other, true).is_some(),
+                "unknown history must not block another media identity");
         }
     }
 

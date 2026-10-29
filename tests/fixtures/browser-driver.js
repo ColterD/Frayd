@@ -1392,21 +1392,25 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     for (const status of [202, 409, 501, 500, 'network']) {
       responder = defaultResponder;
       await openSettings();
+      let statusReads = 0;
       responder = async (url, options) => {
         if (url === '/api/scan') { if (status === 'network') throw Error('server unreachable'); return reply(null, status); }
+        if (url === '/api/scan/status' && ++statusReads === 1 && status === 202) return reply(null, 503);
         return defaultResponder(url, options);
       };
       const button = document.querySelector('.p-scan');
       button.click(); await delay(0);
-      check(status === 202 ? button.disabled && settingsPoll !== null : !button.disabled && settingsPoll === null, 'Only accepted scan polls');
+      check(status === 202 || status === 409 ? button.disabled && settingsPoll !== null : !button.disabled && settingsPoll === null, 'Accepted or already active scans attach an observer');
       check(status === 202 ? button.textContent === 'Scanning…' : status === 409 ? button.textContent.includes('already running') : status === 501 ? button.textContent.includes('No library folder') : status === 500 ? button.textContent.includes('500') : button.textContent.includes('unreachable'), 'Truthful status feedback');
-      observations.push({ status, text: button.textContent, disabled: button.disabled });
+      const observation = { status, text: button.textContent, disabled: button.disabled };
       document.getElementById('settings-close').click();
-      if (status === 202) {
+      if (status === 202 || status === 409) {
         check(settingsPoll !== null, 'Closing retains account-owned scan completion');
         await until(() => settingsPoll === null, 'closed scan completes and retires observer');
-        equal(button.textContent, 'Scanning…', 'Retired scan control is untouched');
+        equal(button.textContent, observation.text, 'Retired scan control is untouched');
+        equal(statusReads, status === 202 ? 2 : 1, 'Transient server error retries once; busy admission observes completion');
       } else equal(settingsPoll, null, 'Refused scan has no observer');
+      observations.push({ ...observation, statusReads });
     }
     for (const status of [409, 'network']) {
       responder = defaultResponder; await openSettings();

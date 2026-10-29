@@ -142,6 +142,7 @@ function scanFailure(status) {
 }
 /**
  * Observe one admitted job for this account; only its current panel may publish UI.
+ * Scan status tolerates two consecutive transport/server failures; ingest fails fast.
  * @param {number} generation
  * @param {string} mode
  * @param {HTMLButtonElement} button
@@ -153,14 +154,22 @@ function pollSettings(generation, mode, button) {
     && monitor.account === accountGeneration && monitor.identity === IDENTITY;
   const panelCurrent = () => generation === settingsGeneration;
   let pending = false;
+  let failures = 0;
   settingsPoll = setInterval(async () => {
     if (pending || !current()) return;
     pending = true;
+    // Retry transport and server failures only; malformed status and 4xx fail fast.
+    let retryable = true;
     try {
       const response = await fetch('/api/scan/status');
-      if (!response.ok) throw new Error(`Status failed (${response.status})`);
+      if (!response.ok) {
+        retryable = response.status >= 500 && response.status <= 599;
+        throw new Error(`Status failed (${response.status})`);
+      }
+      retryable = false;
       const status = await response.json();
       if (!current()) return;
+      failures = 0;
       const ingest = status.ingesting;
       if (mode === 'ingest' && (ingest === 'downloading' || ingest === 'indexing')) {
         if (panelCurrent()) button.textContent = ingest === 'indexing' ? 'Indexing…' : 'Downloading…';
@@ -178,6 +187,7 @@ function pollSettings(generation, mode, button) {
       if (!failure) await loadLibrary();
     } catch (error) {
       if (!current()) return;
+      if (mode === 'scan' && retryable && ++failures < 3) return;
       stopSettingsMonitor();
       if (panelCurrent()) {
         button.disabled = false;
@@ -199,8 +209,9 @@ async function startSettingsScan(generation, button) {
   try {
     const response = await fetch('/api/scan', { method: 'POST', headers: authHeaders() });
     if (owner !== accountGeneration || identity !== IDENTITY) return;
-    if (response.status !== 202) throw new Error(scanFailure(response.status));
-    if (generation === settingsGeneration) button.textContent = 'Scanning…';
+    if (response.status !== 202 && response.status !== 409) throw new Error(scanFailure(response.status));
+    if (generation === settingsGeneration) button.textContent = response.status === 409
+      ? 'Scan already running — monitoring…' : 'Scanning…';
     pollSettings(generation, 'scan', button);
   } catch (error) {
     if (owner !== accountGeneration || identity !== IDENTITY || generation !== settingsGeneration) return;
@@ -1425,7 +1436,7 @@ function playAudio(it) {
   const load = localAudioLoad = { id: it.id, generation, pendingResume: true };
   $('#video-modal').classList.remove('on', 'yt');
   $('#playerbar').classList.add('on');
-  if (window.partySend) { partyLoadPending = true; partyLoadId = it.id; partyLoadTitle = it.title; }
+  if (window.partySend) partyLoadPending = true;
   $('#pb-title').textContent = it.title;
   $('#pb-sub').textContent = it.author || it.kind;
   resumeFor(it.id).then(p => {
@@ -1436,6 +1447,11 @@ function playAudio(it) {
     const onMeta = () => {
       if (!ownsNativeLoad(pbAudio, 'audio', it.id, generation)) return;
       if (seek) pbAudio.currentTime = seek;
+      // Publish only this owned load, after resume and before playback events.
+      if (window.partySend && partyLoadPending) {
+        partyLoadPending = false;
+        window.partySend({ type: 'load', media_id: it.id, title: it.title, position: pbAudio.currentTime });
+      }
       pbAudio.play();
     };
     if (pbAudio.readyState >= 1) onMeta();
@@ -1644,8 +1660,8 @@ window.partyFollow = (mediaId, title, position, playing, updatedAt, options = {}
     else video.addEventListener('loadedmetadata', onMeta, { once: true });
     return;
   }
-  // The host's first load echo carries zero, before local resume or metadata may
-  // finish. Preserve the pending local intent as well as an already loaded stream.
+  // Preserve local resume and close authority when the host receives its first
+  // load echo, including a pending local intent or an already loaded stream.
   const pendingLocalAudio = localAudioLoad?.id === mediaId
     && localAudioLoad.generation === nativeLoadGeneration && localAudioLoad.pendingResume;
   if (options.preserveActiveVideo && priorPlaybackKind === 'audio'
@@ -1700,17 +1716,10 @@ window.partyHostHook = (send) => {
   pbAudio.addEventListener('play', () => { if (partyPlaybackKind === 'audio' && !pbAudio.paused) send({ type: 'play', position: pbAudio.currentTime }); });
   pbAudio.addEventListener('pause', () => { if (partyPlaybackKind === 'audio' && pbAudio.paused) send({ type: 'pause', position: pbAudio.currentTime }); });
   pbAudio.addEventListener('seeked', () => { if (partyPlaybackKind === 'audio') send({ type: 'seek', position: pbAudio.currentTime }); });
-  // host loads a track locally → broadcast it
-  pbAudio.addEventListener('loadedmetadata', () => {
-    if (window.partySend && partyPlaybackKind === 'audio' && partyLoadPending) {
-      partyLoadPending = false;
-      send({ type: 'load', media_id: partyLoadId, title: partyLoadTitle, position: pbAudio.currentTime });
-    }
-  });
-  // host video: mirror Plyr play/pause/seek + load
   // Capture native events: Plyr's proxy loses the original element identity.
+  // Autoplay may begin before metadata; the owned resume path publishes load first.
   document.addEventListener('play', event => {
-    if (event.target === plyr.media && partyPlaybackKind === 'video' && !plyr.paused)
+    if (event.target === plyr.media && partyPlaybackKind === 'video' && !videoLoadPending && !plyr.paused)
       send({ type: 'play', position: plyr.currentTime });
   }, true);
   document.addEventListener('pause', event => {
@@ -1721,14 +1730,8 @@ window.partyHostHook = (send) => {
     if (event.target === plyr.media && partyPlaybackKind === 'video')
       send({ type: 'seek', position: plyr.currentTime });
   }, true);
-  plyr.on('loadedmetadata', () => {
-    if (window.partySend && partyPlaybackKind === 'video' && videoLoadPending && videoItem) {
-      videoLoadPending = false;
-      send({ type: 'load', media_id: videoItem.id, title: videoItem.title, position: plyr.currentTime });
-    }
-  });
 };
-let partyLoadPending = false, partyLoadId = null, partyLoadTitle = null;
+let partyLoadPending = false;
 let videoLoadPending = false;
 
 /**
@@ -1822,9 +1825,14 @@ function openVideo(it) {
     };
     const media = plyr.media;
     // Plyr forwards metadata from retired media; only this source may resume.
-    if (p && p.position > 5) media.addEventListener('loadedmetadata', () => {
-      if (ownsNativeLoad(media, 'video', it.id, nativeGeneration)
-        && videoItem === it && generation === videoOpenGeneration) plyr.currentTime = p.position;
+    media.addEventListener('loadedmetadata', () => {
+      if (!ownsNativeLoad(media, 'video', it.id, nativeGeneration)
+        || videoItem !== it || generation !== videoOpenGeneration) return;
+      if (p && p.position > 5) plyr.currentTime = p.position;
+      if (window.partySend && videoLoadPending) {
+        videoLoadPending = false;
+        window.partySend({ type: 'load', media_id: it.id, title: it.title, position: plyr.currentTime });
+      }
     }, { once: true });
     plyr.play();
   });

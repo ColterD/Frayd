@@ -1907,3 +1907,100 @@ for (const kind of ['audio', 'video']) {
     });
   }
 }
+
+async function hostedNativeBrowser(kind) {
+  const b = browser();
+  await settle();
+  vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), b.context);
+  b.run(`LIBRARY = [{id:9,kind:"music",title:"Previous"},
+    {id:10,kind:"${kind === 'audio' ? 'music' : 'movie'}",title:"Next"}]`);
+  b.nodes.get('#party-code-input').value = 'ABCD';
+  b.run('PartyUI.open()');
+  b.nodes.get('#pt-join').onclick();
+  const socket = b.sockets[0];
+  socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: true,
+    state: { media_id: 9, title: 'Previous', queue: [], position: 17, playing: true, updated_at: Date.now()/1000 } }) });
+  await settle();
+  socket.sent.length = 0;
+  b.nodes.get('#pb-audio').readyState = 0;
+  return { b, socket };
+}
+
+for (const kind of ['audio', 'video']) {
+  for (const saved of [64, 5, null]) {
+    test(`${kind} first host wire load applies saved ${saved} before publishing controls`, async () => {
+      const { b, socket } = await hostedNativeBrowser(kind);
+      b.respond(async () => ({ ok: true, json: async () => saved === null ? null : { position: saved } }));
+      b.run(`${kind === 'audio' ? 'playAudio' : 'openVideo'}(LIBRARY[1])`);
+      await settle();
+      assert.deepEqual(socket.sent, [], 'A pending local load cannot publish controls against the prior party media');
+      const media = b.run(kind === 'audio' ? 'pbAudio' : 'plyr.media');
+      media.readyState = 1;
+      if (kind === 'video') b.run('plyr.duration = 120');
+      media.emit('loadedmetadata');
+      await settle();
+      const expected = saved > 5 ? saved : 0;
+      assert.deepEqual(socket.sent[0], { type: 'load', media_id: 10, title: 'Next', position: expected });
+      assert.equal(socket.sent.filter(command => command.type === 'load').length, 1);
+      assert.equal(media.currentTime, expected);
+      // The own first state must preserve the native owner and its applied resume.
+      socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: true,
+        state: { media_id: 10, title: 'Next', queue: [], position: expected, playing: true, updated_at: Date.now()/1000 } }) });
+      assert.equal(media.currentTime, expected);
+      media.currentTime = 73;
+      media.emit('loadedmetadata');
+      await settle();
+      assert.equal(media.currentTime, 73, 'Repeated metadata cannot reapply the saved position');
+      assert.equal(socket.sent.filter(command => command.type === 'load').length, 1);
+    });
+  }
+}
+
+
+for (const kind of ['audio', 'video']) {
+  for (const retire of ['close', 'foreign stream', 'external handoff', 'new local load']) {
+    test(`${kind} pending host load ignores metadata after ${retire}`, async () => {
+      const { b, socket } = await hostedNativeBrowser(kind);
+      b.respond(async () => ({ ok: true, json: async () => ({ position: 64 }) }));
+      const entry = kind === 'audio' ? 'playAudio' : 'openVideo';
+      b.run(`${entry}(LIBRARY[1])`);
+      await settle();
+      const retired = b.run(kind === 'audio' ? 'pbAudio' : 'plyr.media');
+      if (retire === 'close') b.nodes.get(kind === 'audio' ? '#pb-close' : '#vm-back').onclick();
+      else if (retire === 'foreign stream') retired.src = 'https://other.invalid/api/stream/10';
+      else if (retire === 'external handoff') {
+        youtubePlayerFixture(b);
+        b.run('partyFollowExternal("abcdefghijk", "External", 0, false, Date.now()/1000)');
+      }
+      else {
+        b.run(`LIBRARY.push({id:11,kind:"${kind === 'audio' ? 'music' : 'movie'}",title:"Successor"}); ${entry}(LIBRARY[2])`);
+        await settle();
+      }
+      retired.readyState = 1;
+      if (kind === 'video') b.run('plyr.duration = 120');
+      retired.emit('loadedmetadata');
+      await settle();
+      assert.equal(socket.sent.filter(command => command.type === 'load' && command.media_id === 10).length, 0);
+      if (retire === 'new local load') {
+        const current = b.run(kind === 'audio' ? 'pbAudio' : 'plyr.media');
+        current.readyState = 1;
+        current.emit('loadedmetadata');
+        await settle();
+        assert.deepEqual(socket.sent.filter(command => command.type === 'load'),
+          [{ type: 'load', media_id: 11, title: 'Successor', position: 64 }]);
+      } else assert.equal(socket.sent.filter(command => command.type === 'load').length, 0);
+    });
+  }
+}
+
+test('metadata-ready audio publishes its resumed host load once before play', async () => {
+  const { b, socket } = await hostedNativeBrowser('audio');
+  b.nodes.get('#pb-audio').readyState = 1;
+  b.respond(async () => ({ ok: true, json: async () => ({ position: 64 }) }));
+  b.run('playAudio(LIBRARY[1])');
+  await settle();
+  assert.deepEqual(socket.sent[0], { type: 'load', media_id: 10, title: 'Next', position: 64 });
+  assert.ok(socket.sent.slice(1).every(command => command.type !== 'load' && command.position === 64));
+  b.nodes.get('#pb-audio').emit('loadedmetadata');
+  assert.equal(socket.sent.filter(command => command.type === 'load').length, 1);
+});

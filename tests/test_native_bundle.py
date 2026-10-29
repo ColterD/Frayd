@@ -486,30 +486,69 @@ class NativeOwnership(unittest.TestCase):
         self.assertTrue((self.data / '.frayd-data.json').exists())
 
     def test_foreground_interrupt_cleans_child_and_allows_removal(self):
-        """Foreground signals reap the owned child and clear its uncertainty marker."""
+        """Helper, child and simultaneous foreground INT/TERM exit cleanly after reaping."""
         (self.bundle / 'frayd-server').write_text('#!/bin/sh\nexec sleep 60\n')
         self.manifest()
-        for interrupt in [signal.SIGINT, signal.SIGTERM]:
-            with self.subTest(interrupt=interrupt):
-                self.install('--yes')
-                process = subprocess.Popen([str(HELPER), 'start', '--prefix', str(self.prefix)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-                try:
-                    marker = self.prefix / '.frayd-child.json'
-                    deadline = time.monotonic() + 10
-                    while time.monotonic() < deadline:
-                        if marker.exists() and json.loads(marker.read_text()).get('state') == 'running':
-                            break
-                        time.sleep(0.02)
-                    else:
-                        self.fail('fixture child did not start')
-                    os.killpg(process.pid, interrupt)
-                    process.wait(timeout=10)
-                    self.assertFalse(marker.exists(), 'normal foreground interruption must remove orphan uncertainty after reaping its owned child')
-                    self.run_helper('uninstall', '--yes')
-                finally:
-                    if process.poll() is None:
-                        os.killpg(process.pid, signal.SIGKILL)
-                        process.wait(timeout=10)
+        for target in ['group', 'helper', 'child', 'both-ready']:
+            for interrupt in [signal.SIGINT, signal.SIGTERM]:
+                with self.subTest(target=target, interrupt=interrupt):
+                    self.install('--yes')
+                    process = subprocess.Popen([str(HELPER), 'start', '--prefix', str(self.prefix)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, start_new_session=True)
+                    try:
+                        marker = self.prefix / '.frayd-child.json'
+                        deadline = time.monotonic() + 10
+                        while time.monotonic() < deadline:
+                            if marker.exists():
+                                try:
+                                    document = json.loads(marker.read_text())
+                                except json.JSONDecodeError:
+                                    continue
+                                if document.get('state') == 'running':
+                                    child = document['pid']
+                                    break
+                            time.sleep(0.02)
+                        else:
+                            self.fail('fixture child did not start')
+                        if target == 'group':
+                            os.killpg(process.pid, interrupt)
+                        elif target == 'helper':
+                            os.kill(process.pid, interrupt)
+                        elif target == 'child':
+                            os.kill(child, interrupt)
+                        else:
+                            # Queue a terminal signal while the helper cannot run,
+                            # and let the child exit before resuming its select.
+                            os.kill(process.pid, signal.SIGSTOP)
+                            os.waitpid(process.pid, os.WUNTRACED)
+                            os.kill(child, interrupt)
+                            time.sleep(0.05)
+                            os.kill(process.pid, interrupt)
+                            os.kill(process.pid, signal.SIGCONT)
+                        _, stderr = process.communicate(timeout=10)
+                        self.assertFalse(marker.exists(), 'normal interruption must clear uncertainty after reaping')
+                        with self.assertRaises(ProcessLookupError):
+                            os.kill(child, 0)
+                        data_before = [(p.relative_to(self.data), p.read_bytes()) for p in self.data.rglob('*') if p.is_file()]
+                        self.run_helper('uninstall', '--yes')
+                        self.assertFalse(self.prefix.exists())
+                        self.assertEqual([(p.relative_to(self.data), p.read_bytes()) for p in self.data.rglob('*') if p.is_file()], data_before)
+                        self.assertEqual(process.returncode, 0, stderr)
+                        self.assertNotIn('server exited with', stderr)
+                    finally:
+                        if process.poll() is None:
+                            os.killpg(process.pid, signal.SIGKILL)
+                            process.wait(timeout=10)
+                        process.stderr.close()
+
+    def test_unexpected_child_exit_remains_an_error(self):
+        """Ordinary failures must remain errors rather than being accepted as interrupts."""
+        (self.bundle / 'frayd-server').write_text('#!/bin/sh\nexit 7\n')
+        self.manifest()
+        self.install('--yes')
+        result = self.run_helper('start', code=2)
+        self.assertIn('server exited with', result.stderr)
+        self.assertFalse((self.prefix / '.frayd-child.json').exists())
+        self.run_helper('uninstall', '--yes')
 
     def test_orphan_receipt_and_active_installation_refusal(self):
         """Active or uncertain child receipts block start and uninstall without writes."""
@@ -533,7 +572,7 @@ class NativeOwnership(unittest.TestCase):
             self.run_helper('uninstall', '--yes', code=2)
             self.run_helper('start', code=2)
             self.assertEqual(self.snapshot(), before)
-            os.kill(child, signal.SIGTERM)
+            os.kill(child, signal.SIGKILL)
             self.assertEqual(process.wait(timeout=10), 2)
             self.assertFalse(marker.exists())
             marker.write_text('{"state":"unknown"}')
@@ -659,7 +698,7 @@ class NativeRuntime(unittest.TestCase):
                     return
                 if group_interrupt:
                     os.killpg(process.pid, signal.SIGINT)
-                    self.assertIn(process.wait(timeout=10), [0, 2])
+                    self.assertEqual(process.wait(timeout=10), 0)
                     self.assertFalse((prefix / '.frayd-child.json').exists())
                     process = None
                     return
@@ -667,7 +706,7 @@ class NativeRuntime(unittest.TestCase):
                 parent = run_bounded(['ps', '-o', 'ppid=', '-p', str(child)], text=True, capture_output=True, check=True, timeout=10).stdout.strip()
                 self.assertEqual(int(parent), process.pid)
                 os.kill(child, signal.SIGTERM)
-                self.assertEqual(process.wait(timeout=10), 2)
+                self.assertEqual(process.wait(timeout=10), 0)
                 self.assertFalse((prefix / '.frayd-child.json').exists())
                 process = None
 
