@@ -1169,7 +1169,7 @@ async function showChunk(n, opts = {}) {
           height:${FRAME_H}vh;width:${PW}px;padding:${PAD}px;
           margin:0;box-sizing:border-box;font-family:Georgia,serif;
           text-align:justify;overflow-wrap:break-word}
-        img{max-width:100%;max-height:calc(${FRAME_H}vh - ${2 * PAD}px);object-fit:contain}
+        img,svg{max-width:100%;max-height:calc(${FRAME_H}vh - ${2 * PAD}px);object-fit:contain}
       </style>
       <script>
         const generation = ${readerDocument.generation};

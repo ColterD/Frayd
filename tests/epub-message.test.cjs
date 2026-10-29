@@ -226,13 +226,15 @@ for (const failure of [false, true]) {
   });
 }
 
-async function paginationDocument({ visible = false, pages = 4, layoutPending = false } = {}) {
+async function paginationDocument({ visible = false, pages = 4, layoutPending = false, uppercaseScript = false } = {}) {
   const vm = require('node:vm');
   const b = reader();
   b.run('ebook.spine.push("d"); ebook.chunk = 2');
   b.respond(async () => ({ ok: true, text: async () => '<html><head></head><body>Saved chapter</body></html>' }));
   await b.run('showChunk(2, { frac: 1 / 3 })');
-  const script = b.nodes.get('#em-frame').srcdoc.match(/<script>([\s\S]*?)<\/script>/)[1];
+  // Extract the bridge for VM execution; this is not an HTML sanitizer.
+  const markup = uppercaseScript ? b.nodes.get('#em-frame').srcdoc.replace(/<(\/?)script>/gi, '<$1SCRIPT>') : b.nodes.get('#em-frame').srcdoc;
+  const script = markup.match(/<script>([\s\S]*?)<\/script>/i)[1];
   const events = new Map(), renders = [];
   let width = visible ? 760 : 0;
   const body = { appendChild() {}, getBoundingClientRect: () => ({ width, height: width ? 600 : 0 }) };
@@ -277,7 +279,7 @@ test('initial unmeasurable chapter retains saved 2.333 until rendered pagination
 });
 
 test('visible rendered single-page chapter legitimately publishes fraction zero', async () => {
-  const reader = await paginationDocument({ visible: true, pages: 1 });
+  const reader = await paginationDocument({ visible: true, pages: 1, uppercaseScript: true });
   reader.load(); await reader.render();
   assert.equal(reader.b.run('ebook.document.ready'), true);
   assert.equal(reader.b.nodes.get('#em-pageinfo').textContent, '3 · p1/1');
