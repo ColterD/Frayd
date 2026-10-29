@@ -564,7 +564,7 @@ class NativeOwnership(unittest.TestCase):
                 if marker.exists():
                     try:
                         document = json.loads(marker.read_text())
-                    except json.JSONDecodeError:
+                    except (json.JSONDecodeError, FileNotFoundError):
                         time.sleep(0.02)
                         continue
                     if document.get('state') == 'running':

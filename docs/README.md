@@ -6,6 +6,7 @@
 | Mount media, fix permissions, inspect storage or stop/remove services | [Operations](operations.md) |
 | Run natively, reproduce checks or understand disposable QA and audit policy | [Development](development.md) |
 | Install, start, qualify or remove an experimental private native bundle | [Native bundle](verification/native-bundle.md) |
+| Read the complete PR #2 base-to-head change and review coverage | [PR #2 changelog](verification/pr-2-changelog.md) |
 | Trace review findings and historical source/image qualifications | [Verification ledger](verification/coderabbit-follow-up.md) |
 | Check bounded browser/media acceptance and its limits | [Browser acceptance](verification/browser-acceptance.md) |
 | Read source-bound public QA counts, artifact IDs and hosted check links | [Acceptance checkpoints](verification/acceptance-checkpoints.json) |

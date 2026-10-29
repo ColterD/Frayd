@@ -1,5 +1,7 @@
 # Frayd
 
+![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/ColterD/Frayd?utm_source=oss&utm_medium=github&utm_campaign=ColterD%2FFrayd&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)
+
 Frayd is a self-hosted media library with a Rust server (axum and SQLite) and a plain JavaScript browser client. It scans local videos, music, audiobooks, ebooks, comics and manga, with saved progress and watch parties.
 
 This is an early-stage project. Start on your own computer with trusted media. The Docker setup publishes only to loopback; it does not configure household LAN access or public hosting.
