@@ -337,15 +337,35 @@ fn upsert_item(
 fn classify(p: &Path) -> Option<&'static str> {
     let ext = p.extension()?.to_str()?.to_ascii_lowercase();
     Some(match ext.as_str() {
-        // audio: parent dir "music"-ish → music, else audiobook
-        "m4b" | "mp3" | "flac" | "m4a" => {
-            let dir = p.parent().and_then(|d| d.file_name()).and_then(|d| d.to_str()).unwrap_or("").to_ascii_lowercase();
-            if dir.contains("music") || dir.contains("song") || dir.contains("album") { "music" } else { "audiobook" }
+        // audio: any ancestor dir "music"-ish → music; "audiobook"/"book"-ish → audiobook;
+        // walk several ancestors so flat and nested libraries both classify correctly
+        "m4b" | "mp3" | "flac" | "m4a" | "opus" | "ogg" => {
+            let musicish = ["music", "song", "album", "artist"];
+            let bookish = ["audiobook", "audio book", "audio-book", "book", "librivox"];
+            let mut is_music = false;
+            let mut is_book = false;
+            let mut dir: Option<&Path> = p.parent();
+            for _ in 0..6 {
+                let Some(d) = dir else { break };
+                let name = d.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
+                if musicish.iter().any(|m| name.contains(m)) { is_music = true; break; }
+                if bookish.iter().any(|b| name.contains(b)) { is_book = true; break; }
+                dir = d.parent();
+            }
+            if is_music { "music" } else if is_book { "audiobook" }
+            // no signal from folder names: chaptered/book formats and very long
+            // single-file runs are books; m4b is chaptered audiobook container
+            else if ext == "m4b" { "audiobook" }
+            else {
+                // filename hints (Artist - Title vs Chapter/Part naming)
+                let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+                let bookish_name = ["chapter", "part ", "disc ", "cd ", "book "].iter().any(|h| stem.contains(h));
+                if bookish_name { "audiobook" } else { "music" }
+            }
         }
         "epub" => "ebook",
         "cbz" | "cbr" => "comic",
         "mkv" | "mp4" | "webm" => "movie",
-        "opus" | "ogg" => "music",
         _ => return None,
     })
 }
@@ -371,6 +391,25 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn p(s: impl Into<std::path::PathBuf>) -> std::path::PathBuf { s.into() }
+
+    #[test]
+    fn classify_audio_music_vs_audiobook() {
+        let audio_exts = ["mp3", "flac", "m4a", "m4b", "opus", "ogg"];
+        // folder-name signals (walks multiple ancestors)
+        for ext in audio_exts {
+            assert_eq!(classify(&p(format!("/media/Music/Album/song.1.{ext}"))), Some("music"), "music folder .{ext}");
+            assert_eq!(classify(&p(format!("/media/audiobooks/Dune/chapter01.{ext}"))), Some("audiobook"), "audiobook folder .{ext}");
+            assert_eq!(classify(&p(format!("/home/me/music/fav/track.{ext}"))), Some("music"), "nested music .{ext}");
+        }
+        // m4b defaults to audiobook without folder signal
+        assert_eq!(classify(&p("/media/stuff/x.m4b")), Some("audiobook"));
+        // chapter/part naming defaults to audiobook
+        assert_eq!(classify(&p("/media/stuff/Book 01 - Chapter 3.mp3")), Some("audiobook"));
+        // plain title defaults to music
+        assert_eq!(classify(&p("/media/stuff/delain-virtue-and-vice.mp3")), Some("music"));
     }
 
     #[test]

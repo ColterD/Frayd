@@ -141,38 +141,81 @@ async function poll() {
   }
   if (!liveBase) { $('#stat').textContent = 'Waiting for your server to come up…'; setTimeout(poll, 3000); return; }
   $('#stat').innerHTML = `<span class="ok">✓ Server is live at ${liveBase}</span> <a href="${liveBase}" style="color:var(--acc)">open Frayd →</a>`;
-  // install done — redirect into the app automatically
-  $('#stat').innerHTML = `<span class="ok">✓ Server is live — taking you to Frayd…</span>`;
-  setTimeout(() => location.href = liveBase, 1500);
-  // setup needed? (only works same-origin or with CORS; best-effort)
+  // setup needed? (only works same-origin or with CORS; best-effort) — check BEFORE redirecting,
+  // otherwise we land in the app with no owner account (guest-only limbo)
+  let needsSetup = null; // null = couldn't tell (CORS)
   try {
     const s = await (await fetch(liveBase + '/api/setup', { signal: AbortSignal.timeout(2500) })).json();
-    if (s.needed) $('#setup').style.display = 'block';
+    needsSetup = !!s.needed;
+    if (needsSetup) $('#setup').style.display = 'block';
     else $('#s-stat').innerHTML = '<span class="ok">Owner already set up — just log in.</span>';
   } catch {
-    // CORS-blocked (page hosted off-origin): direct them to the app; app handles first-login bootstrap
     $('#s-stat').innerHTML = 'Can’t check setup from here — open Frayd and log in; first account becomes admin.';
+  }
+  // only auto-redirect once owner account exists (or server is set up)
+  if (needsSetup === false) {
+    $('#stat').innerHTML = `<span class="ok">✓ Server is live — taking you to Frayd…</span>`;
+    setTimeout(() => location.href = liveBase, 1500);
   }
 }
 poll();
 
-$('#s-go')?.addEventListener('click', async () => {
-  const email = $('#s-email').value.trim(), pw = $('#s-pw').value;
-  if (!email.includes('@') || pw.length < 4) { $('#s-stat').innerHTML = '<span class="err">Email + password (min 4) required</span>'; return; }
+// Admin claim: cache credentials + a locally generated key in the browser, then
+// retry the one-shot /api/setup write until the server's database exists and
+// accepts it. On success the admin session token is cached too, so the redirect
+// lands you signed in as admin (not guest).
+const PENDING_KEY = 'frayd_pending_admin';
+function makeKey() {
+  const b = new Uint8Array(32); crypto.getRandomValues(b);
+  return Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
+}
+async function trySetup(claim) {
+  const r = await fetch(liveBase + '/api/setup', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: claim.email, password: claim.password, key: claim.key }),
+  });
+  return { r, j: await r.json().catch(() => ({})) };
+}
+async function flushPending() {
+  const raw = sessionStorage.getItem(PENDING_KEY);
+  if (!raw || !liveBase) return;
+  const claim = JSON.parse(raw);
   try {
-    const r = await fetch(liveBase + '/api/setup', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password: pw }),
-    });
-    const j = await r.json().catch(() => ({}));
+    const { r, j } = await trySetup(claim);
     if (r.ok) {
-      $('#s-stat').innerHTML = `<span class="ok">✓ Owner created. You're signed in.</span> <a href="${liveBase}" style="color:var(--acc)">Open Frayd →</a>`;
+      sessionStorage.removeItem(PENDING_KEY);
+      localStorage.frayd_token = j.token; // signed-in admin when we land in the app
+      $('#s-stat').innerHTML = '<span class="ok">✓ Owner created — taking you to Frayd…</span>';
       $('#setup').style.display = 'none';
+      setTimeout(() => location.href = liveBase, 1500);
+    } else if (r.status === 409) {
+      // owner already exists — just go sign in
+      sessionStorage.removeItem(PENDING_KEY);
+      $('#s-stat').innerHTML = '<span class="err">Owner already set up — open Frayd and log in.</span>';
+    } else if (r.status >= 500 || r.status === 429) {
+      // server booting / DB not ready / rate-limited — claim stays cached, retry with backoff
+      const wait = r.status === 429 ? 30000 : 3000;
+      $('#s-stat').innerHTML = r.status === 429
+        ? 'Server busy — retrying in 30s…'
+        : 'Server is still starting — writing your owner account…';
+      setTimeout(flushPending, wait);
     } else {
       $('#s-stat').innerHTML = `<span class="err">${j.error || 'Failed (' + r.status + ')'}</span>`;
     }
-  } catch { $('#s-stat').innerHTML = '<span class="err">Could not reach server</span>'; }
+  } catch {
+    $('#s-stat').innerHTML = 'Waiting for server to finish starting…';
+    setTimeout(flushPending, 3000);
+  }
+}
+$('#s-go')?.addEventListener('click', () => {
+  const email = $('#s-email').value.trim(), pw = $('#s-pw').value;
+  if (!email.includes('@') || pw.length < 4) { $('#s-stat').innerHTML = '<span class="err">Email + password (min 4) required</span>'; return; }
+  const claim = { email, password: pw, key: makeKey(), created: Date.now() };
+  sessionStorage.setItem(PENDING_KEY, JSON.stringify(claim));
+  flushPending();
 });
+// resume an interrupted claim (page reloaded mid-install)
+if (sessionStorage.getItem(PENDING_KEY)) flushPending();
 </script>
 </body>
 </html>
