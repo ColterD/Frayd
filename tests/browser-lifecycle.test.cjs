@@ -739,3 +739,50 @@ test('discovery cancellation failures propagate without retries or a fresh deadl
     assert.equal(browser.listenerCount('exit'), 0);
   }
 });
+
+test('installer poll observer keeps its own deadline and retires timers, observers and frame', async () => {
+  const driver = readFileSync(join(__dirname, 'fixtures/browser-driver.js'), 'utf8');
+  const start = driver.indexOf('  function observeInstallerPolling(');
+  const end = driver.indexOf('  // Independent iframe', start);
+  assert.ok(start >= 0 && end > start);
+  for (const scenario of ['complete', 'late-complete', 'deadline', 'dispose']) {
+    let now = 1000;
+    let inspect;
+    let disconnected = 0;
+    let removed = 0;
+    let timer;
+    const status = { textContent: 'Checking again…' };
+    const node = { contentDocument: { getElementById(id) { assert.equal(id, 'stat'); return status; } } };
+    const observe = vm.runInNewContext(driver.slice(start, end) + '\nobserveInstallerPolling;', {
+      Date: { now: () => now },
+      MutationObserver: class {
+        constructor(callback) { inspect = callback; }
+        observe(target) { assert.equal(target, status, 'Observe only the owned iframe status'); }
+        disconnect() { disconnected++; }
+      },
+      setTimeout(callback, milliseconds) { timer = { callback, milliseconds }; return timer; },
+      clearTimeout(id) { if (id === timer) timer = undefined; },
+      closeInstaller(owned) { assert.equal(owned, node); removed++; },
+    });
+    const polling = observe(node);
+    assert.equal(timer.milliseconds, 15000, 'The original five-poll deadline starts immediately');
+    if (scenario === 'dispose') polling.dispose();
+    else if (scenario === 'deadline') { now += 15000; timer.callback(); }
+    else {
+      now += scenario === 'complete' ? 12000 : 15001;
+      status.textContent = 'Server unverified. Open Frayd manually, or choose Retry server check.';
+      inspect();
+    }
+    now += 30000; // Another case may consume the result much later; never reset its clock.
+    const result = await polling.completion;
+    if (scenario === 'complete') {
+      assert.equal(result.elapsedMs, 12000);
+      assert.equal(result.error, undefined);
+    } else assert.match(result.error.message, scenario === 'dispose' ? /disposed before completion/ : /exceeded15s/);
+    assert.equal(timer, undefined, 'Settled observation retires its timer');
+    assert.equal(disconnected, 1, 'Settled observation retires its observer once');
+    polling.dispose();
+    polling.dispose();
+    assert.equal(removed, 1, 'Every completion/failure/disposal path closes its exact frame once');
+  }
+});

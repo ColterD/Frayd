@@ -345,8 +345,9 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
   }
   async function run(name, fn) {
     reportProgress(cases.length + 1);
-    try { cases.push({ name, status: 'PASS', observed: await fn() }); }
-    catch (error) { cases.push({ name, status: error.code === 'NATIVE_CODEC_UNAVAILABLE' ? 'BLOCKED' : 'FAIL', error: error.stack, ...(error.observed ? { observed: error.observed } : {}) }); }
+    const startedAt = performance.now();
+    try { cases.push({ name, status: 'PASS', observed: await fn(), elapsedMs: performance.now() - startedAt }); }
+    catch (error) { cases.push({ name, status: error.code === 'NATIVE_CODEC_UNAVAILABLE' ? 'BLOCKED' : 'FAIL', error: error.stack, elapsedMs: performance.now() - startedAt, ...(error.observed ? { observed: error.observed } : {}) }); }
     reportProgress(null);
   }
   async function highlight({ body, start, end, text, offset, search, saved = [] }) {
@@ -1594,12 +1595,9 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     targets.slice(2).forEach(target => target.remove());
     return { trustedKeyboard: true, targets: ['search INPUT', 'reader INPUT', 'TEXTAREA', 'SELECT', 'contenteditable', 'BUTTON'], positiveChapter: 1, opaqueOrigin: 'null', outsiderOrigins };
   });
-  // Retain the original39, then exercise the new production CSS at actual CSS-pixel
-  // viewports. API fixtures supply library/admin responses; native MP4 stays decoded.
-  for (const width of [320, 768, 1024, 1440]) await run(`responsive production layout at ${width} CSS pixels`, () => freshResponsiveDocument(width));
-  await api('viewport', { width: 1440 });
-  async function installer(mode) {
+  async function installer(mode, isolated = false) {
     const node = document.createElement('iframe'); node.width = '600'; node.height = '900';
+    if (isolated) node.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;border:0;opacity:0;pointer-events:none';
     node.src = '/__fixture/installer/' + mode;
     const loaded = new Promise(resolve => node.addEventListener('load', resolve, { once: true }));
     document.body.appendChild(node); await loaded;
@@ -1610,71 +1608,112 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     node.contentWindow.dispatchEvent(new PageTransitionEvent('pagehide'));
     node.remove();
   }
-  await run('production installer DOM validates typed protocol with manual GET-only navigation', async () => {
-    const observations = [];
-    for (const mode of ['valid', 'signed-in', 'opaque', 'html', 'malformed', 'unrelated', 'unreadable', 'nonboolean']) {
-      const node = await installer(mode);
+  /** Observe only this iframe's terminal poll decision while independent cases run. */
+  function observeInstallerPolling(node) {
+    const startedAt = Date.now();
+    let timer;
+    let observer;
+    let settled = false;
+    let disposed = false;
+    let resolveCompletion;
+    // Resolve failures as data until case48 claims them; never reject unobserved work.
+    const completion = new Promise(resolve => { resolveCompletion = resolve; });
+    function finish(error) {
+      if (settled) return;
+      settled = true;
+      const elapsedMs = Date.now() - startedAt;
+      if (!error && elapsedMs >= 15000) error = new Error('Five real-timer attempts exceeded15s');
+      clearTimeout(timer);
+      observer?.disconnect();
+      resolveCompletion({ elapsedMs, error });
+    }
+    function inspect() {
+      if (node.contentDocument.getElementById('stat').textContent.includes('or choose Retry')) finish();
+    }
+    observer = new MutationObserver(inspect);
+    observer.observe(node.contentDocument.getElementById('stat'), { childList: true, subtree: true, characterData: true });
+    timer = setTimeout(() => finish(new Error('Five real-timer attempts exceeded15s')), 15000);
+    inspect();
+    return { node, completion, dispose() {
+      if (disposed) return;
+      disposed = true;
+      finish(new Error('Installer polling observation disposed before completion'));
+      closeInstaller(node);
+    } };
+  }
+  // Independent iframe owns its fetch adapter, document, timers and protocol state.
+  // It contributes no layout or input target; the production3000ms polling stays real.
+  const installerPolling = observeInstallerPolling(await installer('html', true));
+  try {
+    // Retain the original39, then exercise the new production CSS at actual CSS-pixel
+    // viewports. API fixtures supply library/admin responses; native MP4 stays decoded.
+    for (const width of [320, 768, 1024, 1440]) await run(`responsive production layout at ${width} CSS pixels`, () => freshResponsiveDocument(width));
+    await api('viewport', { width: 1440 });
+    await run('production installer DOM validates typed protocol with manual GET-only navigation', async () => {
+      const observations = [];
+      for (const mode of ['valid', 'signed-in', 'opaque', 'html', 'malformed', 'unrelated', 'unreadable', 'nonboolean']) {
+        const node = await installer(mode);
+        try {
+          const w = node.contentWindow, d = node.contentDocument, fixture = w.__installerFixture;
+          await until(() => d.getElementById('stat').textContent.includes(mode === 'valid' || mode === 'signed-in' ? 'verified at' : 'unverified'), 'Installer publishes protocol decision');
+          check(!d.querySelector('form,input[type=email],input[type=password]'), 'No credential form exists');
+          check(d.getElementById('open-frayd').href === 'http://127.0.0.1:8484/' && !d.getElementById('retry').disabled, 'Manual Open and Retry remain available');
+          check(w.location.pathname === '/__fixture/installer/' + mode, 'Installer never automatically navigates');
+          check(fixture.requests.every(r => r.method === 'GET' && r.credentials === 'omit' && r.cache === 'no-store'), 'All modeled requests are credential-free fixed GETs');
+          equal(fixture.storage, [], 'Installer never accesses storage'); equal(fixture.errors, [], 'Installer has no uncaught errors');
+          if (mode === 'valid') check(d.getElementById('s-stat').textContent.includes('Create your owner'), 'Typed true gives manual owner instruction');
+          if (mode === 'signed-in') check(d.getElementById('s-stat').textContent.includes('Sign in'), 'Typed false gives manual sign-in instruction');
+          d.querySelector('[data-os=linux]').click(); d.getElementById('gen').click();
+          check(d.getElementById('cmd').textContent.includes('/bootstrap.sh'), 'Linux source command remains available');
+          d.querySelector('[data-os=win]').click(); d.getElementById('gen').click();
+          check(d.getElementById('cmd').textContent.includes('/bootstrap.ps1'), 'Windows source command remains available');
+          observations.push({ mode, status: d.getElementById('stat').textContent, instruction: d.getElementById('s-stat').textContent, requests: fixture.requests, storageAccesses: 0, automaticNavigation: false });
+        } finally { closeInstaller(node); }
+      }
+      return { actualProductionHTMLAndInlineJS: true, modeledResponsesOnly: true, real8484Requests: 0, observations };
+    });
+    await run('production installer actual five-poll bound retry and pagehide stale guards', async () => {
+      let node = installerPolling.node;
+      let result;
       try {
         const w = node.contentWindow, d = node.contentDocument, fixture = w.__installerFixture;
-        await until(() => d.getElementById('stat').textContent.includes(mode === 'valid' || mode === 'signed-in' ? 'verified at' : 'unverified'), 'Installer publishes protocol decision');
-        check(!d.querySelector('form,input[type=email],input[type=password]'), 'No credential form exists');
-        check(d.getElementById('open-frayd').href === 'http://127.0.0.1:8484/' && !d.getElementById('retry').disabled, 'Manual Open and Retry remain available');
-        check(w.location.pathname === '/__fixture/installer/' + mode, 'Installer never automatically navigates');
-        check(fixture.requests.every(r => r.method === 'GET' && r.credentials === 'omit' && r.cache === 'no-store'), 'All modeled requests are credential-free fixed GETs');
-        equal(fixture.storage, [], 'Installer never accesses storage'); equal(fixture.errors, [], 'Installer has no uncaught errors');
-        if (mode === 'valid') check(d.getElementById('s-stat').textContent.includes('Create your owner'), 'Typed true gives manual owner instruction');
-        if (mode === 'signed-in') check(d.getElementById('s-stat').textContent.includes('Sign in'), 'Typed false gives manual sign-in instruction');
-        d.querySelector('[data-os=linux]').click(); d.getElementById('gen').click();
-        check(d.getElementById('cmd').textContent.includes('/bootstrap.sh'), 'Linux source command remains available');
-        d.querySelector('[data-os=win]').click(); d.getElementById('gen').click();
-        check(d.getElementById('cmd').textContent.includes('/bootstrap.ps1'), 'Windows source command remains available');
-        observations.push({ mode, status: d.getElementById('stat').textContent, instruction: d.getElementById('s-stat').textContent, requests: fixture.requests, storageAccesses: 0, automaticNavigation: false });
+        const polling = await installerPolling.completion;
+        if (polling.error) throw polling.error;
+        equal(fixture.requests.length, 5, 'Exactly five automatic real-timer attempts');
+        await delay(150); equal(fixture.requests.length, 5, 'No sixth attempt');
+        fixture.mode = 'valid'; d.getElementById('retry').click();
+        await until(() => d.getElementById('stat').textContent.includes('verified at'), 'Explicit Retry starts a new valid check');
+        equal(fixture.requests.length, 7, 'Explicit Retry performs health and setup');
+        result = { automaticAttempts: 5, retryRequests: 2, realTimers: true, automaticPollingElapsedMs: polling.elapsedMs,
+          isolatedPollingOverlappedResponsiveCases: true, completionDeadlineMs: 15000 };
+      } finally { installerPolling.dispose(); }
+      node = await installer('held');
+      try {
+        const w = node.contentWindow, d = node.contentDocument, fixture = w.__installerFixture;
+        await until(() => fixture.held.length === 1, 'Old request held');
+        fixture.mode = 'signed-in'; d.getElementById('retry').click();
+        await until(() => d.getElementById('s-stat').textContent.includes('Sign in'), 'New retry wins');
+        const current = d.getElementById('stat').textContent;
+        fixture.release(); await delay(30);
+        equal(d.getElementById('stat').textContent, current, 'Late old request cannot publish');
+        equal(fixture.requests.length, 3, 'Retired request cannot start setup');
+        fixture.mode = 'held'; d.getElementById('retry').click();
+        await until(() => fixture.held.length === 1, 'Pagehide request held');
+        const hiddenText = d.getElementById('stat').textContent;
+        // An actual iframe navigation delivers pagehide to the production page.
+        // Retain only its old fixture/document references to inspect cancellation.
+        const leftPage = new Promise(resolve => node.addEventListener('load', resolve, { once: true }));
+        node.src = 'about:blank'; await leftPage;
+        check(fixture.inspectRetirement(), 'Pagehide disposes both actual timers and controller');
+        check(fixture.requests.at(-1).aborted, 'Pagehide aborts pending request');
+        fixture.release(); await delay(30);
+        equal(d.getElementById('stat').textContent, hiddenText, 'Late pagehide result cannot publish');
+        equal(fixture.requests.length, 4, 'Pagehide stops request chain');
+        equal(fixture.errors, [], 'No uncaught installer errors'); equal(fixture.storage, [], 'No installer storage access');
+        return { ...result, staleRetryIgnored: true, actualPagehideNavigation: true, pagehideAbortedAndDisposed: true, modeledResponsesOnly: true, real8484Requests: 0 };
       } finally { closeInstaller(node); }
-    }
-    return { actualProductionHTMLAndInlineJS: true, modeledResponsesOnly: true, real8484Requests: 0, observations };
-  });
-  await run('production installer actual five-poll bound retry and pagehide stale guards', async () => {
-    let node = await installer('html');
-    let result;
-    try {
-      const w = node.contentWindow, d = node.contentDocument, fixture = w.__installerFixture;
-      const deadline = Date.now() + 15000;
-      while (!d.getElementById('stat').textContent.includes('or choose Retry')) {
-        check(Date.now() < deadline, 'Five real-timer attempts finish within15s'); await delay(50);
-      }
-      equal(fixture.requests.length, 5, 'Exactly five automatic real-timer attempts');
-      await delay(150); equal(fixture.requests.length, 5, 'No sixth attempt');
-      fixture.mode = 'valid'; d.getElementById('retry').click();
-      await until(() => d.getElementById('stat').textContent.includes('verified at'), 'Explicit Retry starts a new valid check');
-      equal(fixture.requests.length, 7, 'Explicit Retry performs health and setup');
-      result = { automaticAttempts: 5, retryRequests: 2, realTimers: true };
-    } finally { closeInstaller(node); }
-    node = await installer('held');
-    try {
-      const w = node.contentWindow, d = node.contentDocument, fixture = w.__installerFixture;
-      await until(() => fixture.held.length === 1, 'Old request held');
-      fixture.mode = 'signed-in'; d.getElementById('retry').click();
-      await until(() => d.getElementById('s-stat').textContent.includes('Sign in'), 'New retry wins');
-      const current = d.getElementById('stat').textContent;
-      fixture.release(); await delay(30);
-      equal(d.getElementById('stat').textContent, current, 'Late old request cannot publish');
-      equal(fixture.requests.length, 3, 'Retired request cannot start setup');
-      fixture.mode = 'held'; d.getElementById('retry').click();
-      await until(() => fixture.held.length === 1, 'Pagehide request held');
-      const hiddenText = d.getElementById('stat').textContent;
-      // An actual iframe navigation delivers pagehide to the production page.
-      // Retain only its old fixture/document references to inspect cancellation.
-      const leftPage = new Promise(resolve => node.addEventListener('load', resolve, { once: true }));
-      node.src = 'about:blank'; await leftPage;
-      check(fixture.inspectRetirement(), 'Pagehide disposes both actual timers and controller');
-      check(fixture.requests.at(-1).aborted, 'Pagehide aborts pending request');
-      fixture.release(); await delay(30);
-      equal(d.getElementById('stat').textContent, hiddenText, 'Late pagehide result cannot publish');
-      equal(fixture.requests.length, 4, 'Pagehide stops request chain');
-      equal(fixture.errors, [], 'No uncaught installer errors'); equal(fixture.storage, [], 'No installer storage access');
-      return { ...result, staleRetryIgnored: true, actualPagehideNavigation: true, pagehideAbortedAndDisposed: true, modeledResponsesOnly: true, real8484Requests: 0 };
-    } finally { closeInstaller(node); }
-  });
+    });
+  } finally { installerPolling.dispose(); }
   window.fetch = qaFetch;
   account = qaAccount; IDENTITY = qaIdentity;
   disposeSettings();

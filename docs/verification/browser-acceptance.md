@@ -5,6 +5,10 @@
 This records bounded manual acceptance using an isolated library and database.
 It does not authorize deployment or qualify arbitrary media, browsers or public hosting.
 
+## `b755e6f` installer browser-budget follow-up
+
+The [PR browser job](https://github.com/ColterD/Frayd/actions/runs/40857799994/job/123393074707) failed its 60-second case budget with 47 cases passed and no assertion failure. Case 48 began 48.103 seconds into the case phase, leaving 11.897 seconds for a production installer five-poll scenario whose real 3-second × four-gap schedule needs about 12 seconds. The test-only driver now starts its isolated polling iframe before independent responsive cases 43–46, retaining the production timing, five attempts, no sixth request, retry/pagehide/logout guards, separate 15-second completion deadline and unchanged 30/60-second startup/case budgets. One paired local Chrome run moved case time 55.383 → 48.114 seconds and the case-48 wait 12.279 → 5.017 seconds; all 49 cases passed, the browser/profile were removed, and focused 26/full Node 266 passed. This is one measured scheduling recovery, not a general speed guarantee. The new harness bytes are later than `b755e6f`; a committed-head hosted rerun remains pending.
+
 ## `2aca11c` browser checkpoint
 
 The actual Chrome regression ran `tests/browser-regression.cjs` against pre-commit working-tree inputs later verified byte-identical to `2aca11c6372acfbe473c63d5d7b9b5c37a7a7677`. It exited 0 with **49/49** cases in **56.042 seconds**. The owned browser exited, its profile was removed and the fixture server closed. These cases include decoded native playback and modeled API/party responses. This is exact-input carry, not a second post-commit browser execution.
