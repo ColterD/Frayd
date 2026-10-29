@@ -261,7 +261,7 @@ fn upsert_item(
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(path) DO UPDATE SET
                kind = ?1, mtime_secs = ?5, size_bytes = ?4
-             WHERE media.mtime_secs < ?5",
+             WHERE media.mtime_secs < ?5 OR media.kind != ?1",
             rusqlite::params![kind, path_str, title, meta.len() as i64, mtime],
         )
         .unwrap_or(0);
@@ -288,6 +288,17 @@ fn upsert_item(
                 (a.or(fa), s.or(fs))
             }
         };
+        // episodes: series/show name — filename prefix before SxxEyy, then parent dir
+        let series = if kind == "episode" {
+            series.or_else(|| episode_series_from_title(&title))
+                .or_else(|| {
+                    path.parent()
+                        .and_then(|d| d.file_name())
+                        .map(|n| n.to_string_lossy().into_owned())
+                })
+        } else {
+            series
+        };
         let _ = db.execute(
             "UPDATE media SET duration_secs = ?1,
                title = CASE WHEN ?2 != '' THEN ?2 ELSE title END,
@@ -310,6 +321,20 @@ fn upsert_item(
         }
     } else if updated == 0 {
         // existing item (no new metadata work): still needs thumbs + maybe transcode
+        if kind == "episode" {
+            // backfill show name for rows scanned before episode classification existed
+            let cur: Option<String> = db
+                .query_row("SELECT series FROM media WHERE path = ?1", [&path_str], |r| r.get(0))
+                .ok().flatten();
+            if cur.is_none() {
+                if let Some(show) = episode_series_from_title(&title) {
+                    let _ = db.execute(
+                        "UPDATE media SET series = ?1 WHERE path = ?2",
+                        rusqlite::params![show, path_str],
+                    );
+                }
+            }
+        }
         if let Some(thumbs) = thumbs_dir {
             let media_id: Option<i64> = db
                 .query_row("SELECT id FROM media WHERE path = ?1", [&path_str], |r| r.get(0))
@@ -332,6 +357,59 @@ fn upsert_item(
         }
     }
     updated
+}
+
+/// "The IT Crowd S01E01 Yesterdays Jam" → "The IT Crowd" (text before SxxEyy / NxNN marker)
+fn episode_series_from_title(title: &str) -> Option<String> {
+    let s = title.to_ascii_lowercase();
+    let b = s.as_bytes();
+    let mut cut = None;
+    for i in 0..b.len() {
+        // find SxxEyy
+        if b[i] == b's' && i + 4 < b.len() && b[i + 1].is_ascii_digit() && b[i + 2].is_ascii_digit()
+            && (b[i + 3] == b'e' || b[i + 3] == b'x') && b[i + 4].is_ascii_digit() {
+            cut = Some(i);
+            break;
+        }
+        // NxNN
+        if i + 3 < b.len() && b[i].is_ascii_digit() && b[i + 1] == b'x' && b[i + 2].is_ascii_digit() {
+            cut = Some(i);
+            break;
+        }
+    }
+    let c = cut?;
+    let name = title[..c].trim().trim_end_matches(['-', '_']).trim();
+    if name.is_empty() { None } else { Some(name.to_string()) }
+}
+
+/// TV episode patterns: "S01E02", "1x02", "Season 1 Episode 2"
+fn looks_like_episode(stem: &str) -> bool {
+    let s = stem.to_ascii_lowercase();
+    let b = s.as_bytes();
+    // S01E02 (case-insensitive, optional separators)
+    for i in 0..b.len().saturating_sub(4) {
+        if b[i] == b's' && b[i + 1].is_ascii_digit() {
+            let mut j = i + 1;
+            while j < b.len() && b[j].is_ascii_digit() { j += 1; }
+            if j < b.len() && (b[j] == b'e' || b[j] == b'x') {
+                // s01e02 or s01x02
+                let k = j + 1;
+                if j + 1 < b.len() && b[j] == b'e' && b[k].is_ascii_digit() { return true; }
+                if b[j] == b'x' {
+                    let mut m = k;
+                    while m < b.len() && b[m].is_ascii_digit() { m += 1; }
+                    if m > k && m < b.len() && b[m] == b'e' { return true; }
+                }
+            }
+        }
+    }
+    // NxNN: "1x02"
+    for i in 0..b.len().saturating_sub(3) {
+        if b[i].is_ascii_digit() && b[i + 1] == b'x' && b[i + 2].is_ascii_digit() {
+            return true;
+        }
+    }
+    s.contains("season ") && (s.contains("episode ") || s.contains("ep "))
 }
 
 fn classify(p: &Path) -> Option<&'static str> {
@@ -365,7 +443,11 @@ fn classify(p: &Path) -> Option<&'static str> {
         }
         "epub" => "ebook",
         "cbz" | "cbr" => "comic",
-        "mkv" | "mp4" | "webm" => "movie",
+        "mkv" | "mp4" | "webm" => {
+            // TV episode naming: S01E02, 1x02, "Season 1 Episode 2"
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if looks_like_episode(stem) { "episode" } else { "movie" }
+        }
         _ => return None,
     })
 }
