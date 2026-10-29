@@ -23,7 +23,6 @@ jobs:
     env:
       FRAYD_NATIVE_REQUIRE_QUALIFICATION: '1'
       CARGO_BUILD_JOBS: '2'
-      CARGO_TARGET_DIR: ${{ runner.temp }}/frayd-native-target
       FRAYD_NATIVE_EXPECT_ARCH: ${{ matrix.architecture }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -41,6 +40,7 @@ jobs:
           else
             test "$(sysctl -n hw.optional.arm64)" = 1
           fi
+          printf 'CARGO_TARGET_DIR=%s/frayd-native-target\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
           uname -sm
           printf 'Runner image: %s / %s\n' "$ImageOS" "$ImageVersion"
 

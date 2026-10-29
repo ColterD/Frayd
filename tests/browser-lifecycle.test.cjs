@@ -12,6 +12,70 @@ const vm = require('node:vm');
 const { stopBrowserGroup } = require('./browser-regression.cjs');
 const executable = join(__dirname, 'fixtures/browser-child-writer.cjs');
 
+test('interception diagnostics preserve fatal errors and safely correlate retired frames without copying payloads', async () => {
+  const source = readFileSync(join(__dirname, 'browser-regression.cjs'), 'utf8');
+  const setup = source.slice(source.indexOf('async function bounded('), source.indexOf('async function main('));
+  for (const scenario of ['active', 'canceled', 'wrong-network', 'canceled-generic', 'canceled-other-code',
+    'canceled-nonboolean', 'blocked-canceled', 'blocked-unrecognized']) {
+    const cancellationEvent = scenario !== 'active' && scenario !== 'blocked-unrecognized';
+    const exactCancellation = scenario === 'canceled' || scenario === 'blocked-canceled';
+    class ProtocolSocket extends EventTarget {
+      static CLOSED = 3;
+      constructor() {
+        super(); this.readyState = 1;
+        queueMicrotask(() => this.dispatchEvent(new Event('open')));
+      }
+      receive(value) { this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify(value) })); }
+      send(bytes) {
+        const command = JSON.parse(bytes);
+        queueMicrotask(() => {
+          if (command.method.startsWith('Fetch.') && command.method !== 'Fetch.enable') {
+            if (cancellationEvent) {
+              this.receive({ method: 'Network.loadingFailed', params: { requestId: scenario === 'wrong-network' ? 'different-network' : 'owned-network',
+                canceled: scenario === 'canceled-nonboolean' ? 'true' : true } });
+              this.receive({ method: 'Page.frameDetached', params: { frameId: 'owned-frame' } });
+            }
+            this.receive({ id: command.id, error: { code: scenario === 'canceled-other-code' ? -32000 : -32602,
+              message: scenario === 'blocked-unrecognized' ? 'diagnostic-payload-must-not-leak'
+                : scenario === 'canceled-generic' ? 'Invalid parameters' : 'Invalid InterceptionId.',
+              data: 'diagnostic-payload-must-not-leak' } });
+            return;
+          }
+          this.receive({ id: command.id, result: {} });
+          if (command.method === 'Page.navigate') {
+            this.receive({ method: 'Page.frameNavigated', params: { frame: { id: 'owned-frame', loaderId: 'owned-loader' } } });
+            this.receive({ method: 'Fetch.requestPaused', params: { requestId: 'owned-interception', networkId: 'owned-network',
+              frameId: 'owned-frame', resourceType: 'Image', request: { url: scenario.startsWith('blocked-')
+                ? 'https://blocked.invalid/asset' : 'http://127.0.0.1:8080/owned' } } });
+          }
+        });
+      }
+      close() { this.readyState = 3; this.dispatchEvent(new Event('close')); }
+    }
+    const configure = vm.runInNewContext(setup + '\nconfigureOwnedBrowserCache;', {
+      join, existsSync: () => true, readFileSync: () => '32123\n/unused',
+      WebSocket: ProtocolSocket, AbortSignal, AbortController, URL, setTimeout, clearTimeout, delay,
+      fetch: async () => ({ ok: true, json: async () => [{ type: 'page', url: 'about:blank',
+        webSocketDebuggerUrl: 'ws://127.0.0.1:32123/devtools/page/owned-protocol' }] }),
+    });
+    const browser = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
+    const session = await configure({ profile: '/owned/profile', fixtureUrl: 'http://127.0.0.1:8080/', browser });
+    try {
+      await delay(0);
+      assert.equal(session.receipt.protocolErrors.length, exactCancellation ? 0 : 1, 'Only exact correlated cancellation retires; every other error stays fatal');
+      assert.equal(session.receipt.canceledInterceptions.length, exactCancellation ? 1 : 0);
+      const error = (exactCancellation ? session.receipt.canceledInterceptions : session.receipt.protocolErrors)[0];
+      assert.equal(error.method, scenario.startsWith('blocked-') ? 'Fetch.failRequest' : 'Fetch.continueRequest');
+      assert.equal(error.code, scenario === 'canceled-other-code' ? -32000 : -32602);
+      assert.equal(error.message, scenario === 'blocked-unrecognized' ? 'unrecognized CDP message'
+        : scenario === 'canceled-generic' ? 'Invalid parameters' : 'Invalid InterceptionId.');
+      assert.equal(error.lifecycle.matchingNetworkCanceled, cancellationEvent && scenario !== 'wrong-network' && scenario !== 'canceled-nonboolean');
+      assert.equal(error.lifecycle.frameDetached, cancellationEvent);
+      assert.doesNotMatch(JSON.stringify(error), /diagnostic-payload-must-not-leak/);
+    } finally { await session.close(); }
+  }
+});
+
 test('PID-only cleanup leaves a profile writer; owned process-group cleanup stops it before removal', { timeout: 8000 }, async () => {
   const ownedParent = mkdtempSync(join(tmpdir(), 'frayd-cleanup-oracle-'));
   const profile = join(ownedParent, 'frayd=ci/profile');

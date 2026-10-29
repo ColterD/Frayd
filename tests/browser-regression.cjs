@@ -259,17 +259,45 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
   const dialogs = [];
   const blockedRequests = [];
   const protocolErrors = [];
+  const canceledInterceptions = [];
+  const frameStates = new Map();
+  const canceledRequests = new Set();
+  const safeProtocolMessages = new Set(['Invalid InterceptionId.', 'Invalid parameters', 'Invalid RequestId.', 'No resource with given identifier found']);
   let shuttingDown = false;
   socket.addEventListener('message', event => {
     let message;
     try { message = JSON.parse(event.data); }
     catch { for (const waiter of pending.values()) waiter.reject(new Error('Invalid owned browser protocol response')); return; }
+    if (message.method === 'Page.frameNavigated') {
+      const frame = message.params.frame;
+      const prior = frameStates.get(frame.id);
+      if (prior?.loaderId && prior.loaderId !== frame.loaderId) prior.navigated = true;
+      frameStates.set(frame.id, { loaderId: frame.loaderId, navigated: false, detached: false });
+    }
+    if (message.method === 'Page.frameDetached') {
+      const frame = frameStates.get(message.params.frameId);
+      if (frame) frame.detached = true;
+    }
+    if (message.method === 'Network.loadingFailed' && message.params.canceled === true) canceledRequests.add(message.params.requestId);
     if (message.method === 'Fetch.requestPaused') {
       const { requestId, request } = message.params;
+      const frame = frameStates.get(message.params.frameId);
+      const networkId = message.params.networkId;
       const owned = new URL(request.url).origin === new URL(fixtureUrl).origin;
       if (!owned) blockedRequests.push({ url: request.url, resourceType: message.params.resourceType });
       rpc(owned ? 'Fetch.continueRequest' : 'Fetch.failRequest', owned ? { requestId }
-        : { requestId, errorReason: 'BlockedByClient' }).catch(error => { if (!shuttingDown) protocolErrors.push(error.message); });
+        : { requestId, errorReason: 'BlockedByClient' }).catch(error => {
+        if (shuttingDown) return;
+        const diagnostic = { method: error.rpcMethod || (owned ? 'Fetch.continueRequest' : 'Fetch.failRequest'), code: error.rpcCode ?? 'transport-or-timeout',
+          message: error.rpcMessage || 'protocol transport or timeout', resourceType: message.params.resourceType, ownedRequest: owned,
+          lifecycle: { networkIdObserved: Boolean(networkId), matchingNetworkCanceled: canceledRequests.has(networkId),
+            knownFrameAtPause: Boolean(frame), frameNavigated: frame?.navigated === true, frameDetached: frame?.detached === true } };
+        // Only this exact browser response plus the same network request's explicit
+        // canceled=true event proves that a paused interception has already retired.
+        if (error.rpcCode === -32602 && error.rpcMessage === 'Invalid InterceptionId.'
+          && networkId && canceledRequests.has(networkId)) canceledInterceptions.push(diagnostic);
+        else protocolErrors.push(diagnostic);
+      });
     }
     if (message.method === 'Page.javascriptDialogOpening') {
       dialogs.push({ type: message.params.type, message: message.params.message, accepted: acceptDialog });
@@ -277,7 +305,13 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
     }
     const waiter = pending.get(message.id);
     if (!waiter) return;
-    if (message.error) waiter.reject(new Error(`Owned browser cache RPC failed (${message.error.code})`));
+    if (message.error) {
+      const code = Number.isInteger(message.error.code) ? message.error.code : 'unknown';
+      const detail = safeProtocolMessages.has(message.error.message) ? message.error.message : 'unrecognized CDP message';
+      const error = new Error(`Owned browser RPC ${waiter.method} failed (${code}): ${detail}`);
+      Object.assign(error, { rpcMethod: waiter.method, rpcCode: code, rpcMessage: detail });
+      waiter.reject(error);
+    }
     else waiter.resolve(message.result);
   });
   socket.addEventListener('error', () => {
@@ -291,7 +325,7 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
     const rpcBudget = navigated ? 3000 : remainingStartupBudget();
     const id = ++sequence;
     try {
-      const result = new Promise((resolve, reject) => { pending.set(id, { resolve, reject }); });
+      const result = new Promise((resolve, reject) => { pending.set(id, { resolve, reject, method }); });
       socket.send(JSON.stringify({ id, method, params }));
       return await bounded(result, `Owned browser cache RPC ${method} timed out`, rpcBudget);
     } finally { pending.delete(id); }
@@ -348,7 +382,7 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
       await rpc('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
       return { x, y, trustedBrowserInput: true };
     }
-    Object.assign(receipt, { blockedRequests, protocolErrors, networkRestrictedToOwnedFixture: true });
+    Object.assign(receipt, { blockedRequests, protocolErrors, canceledInterceptions, networkRestrictedToOwnedFixture: true });
     return { receipt, close, key, viewport, click, beginShutdown() { shuttingDown = true; receipt.networkGuardUntilBrowserStop = true; } };
   } catch (error) {
     await close();
@@ -360,7 +394,8 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
  * profile. Record original and cleanup failures separately; remove the profile only
  * after confirmed group shutdown, retaining it when shutdown cannot be established.
  */
-async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, cacheSetup = configureOwnedBrowserCache, responsiveDiagnosticOnly = false } = {}) {
+async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, cacheSetup = configureOwnedBrowserCache, responsiveDiagnosticOnly = false, resultFilename = 'result.json' } = {}) {
+  if (!/^[a-zA-Z0-9-]+\.json$/.test(resultFilename)) throw new Error('Evidence result filename must be a simple JSON basename');
   if (Number(process.versions.node.split('.')[0]) < 22 || typeof WebSocket !== 'function') {
     throw new Error('Browser regressions require Node.js 22+ with the global WebSocket API');
   }
@@ -635,7 +670,7 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
     browserGroupStopped, profileRemoved: !profile || !existsSync(profile), serverClosed: !server.listening };
   if (runError || cleanupErrors.length || heldMedia || pendingMedia || !Object.values(output.cleanup).every(Boolean)) process.exitCode = 1;
   mkdirSync(evidenceDirectory, { recursive: true });
-  writeFileSync(join(evidenceDirectory, 'result.json'), JSON.stringify(output, null, 2) + '\n');
+  writeFileSync(join(evidenceDirectory, resultFilename), JSON.stringify(output, null, 2) + '\n');
   console.log(JSON.stringify(output, null, 2));
 }
 module.exports = { main, stopBrowserGroup };
