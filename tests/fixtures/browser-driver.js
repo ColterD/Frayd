@@ -1173,14 +1173,18 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       let playerCreations = 0;
       window.YT = { Player: function (id, config) {
         playerCreations++;
-        mock = { state: 2, position: 0, pauses: 0, ready: false, commands: [],
+        mock = { state: -1, position: 0, cuedStart: 0, pauses: 0, ready: false, commands: [],
           requireReady() { if (!this.ready) throw new Error('Mock YouTube player is not ready'); },
+          setState(state) { const changed = this.state !== state; this.state = state; if (changed) config.events.onStateChange({ target: this, data: state }); },
           emitReady() { this.ready = true; config.events.onReady({ target: this }); },
-          seekTo(position) { this.requireReady(); this.commands.push('seek'); this.position = position; },
+          // Vendor seek from unstarted/cued starts playing; already-paused seek does not.
+          seekTo(position) { this.requireReady(); this.commands.push('seek'); this.position = position; if (this.state !== 2) this.setState(1); },
+          cueVideoById({ videoId, startSeconds }) { this.requireReady(); this.commands.push('cue'); this.cuedStart = startSeconds; this.position = 0; this.setState(5); },
           getCurrentTime() { this.requireReady(); return this.position; },
           getPlayerState() { this.requireReady(); return this.state; },
-          playVideo() { this.requireReady(); this.commands.push('play'); this.state = 1; config.events.onStateChange({ target: this, data: 1 }); },
-          pauseVideo() { this.requireReady(); this.pauses++; this.state = 2; config.events.onStateChange({ target: this, data: 2 }); },
+          playVideo() { this.requireReady(); this.commands.push('play'); if (this.state === 5) this.position = this.cuedStart; this.setState(1); },
+          pauseVideo() { this.requireReady(); this.pauses++; this.setState(2); },
+          elapse(seconds) { if (this.state === 1) this.position += seconds; },
           destroy() {},
         };
         return mock;
@@ -1209,19 +1213,19 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
           check(!socket.sent.some(command => command.type === 'pause'), 'Native pause cannot broadcast a stale host pause');
           if (readyBeforeTransition) mock.emitReady();
           await delay(0);
-          equal(mock.state, readyBeforeTransition ? 1 : 2, 'External mock has the expected readiness and playback');
+          equal(mock.state, readyBeforeTransition ? 1 : -1, 'External mock has the expected readiness and playback');
           const modal = document.getElementById('video-modal');
           check(modal.classList.contains('yt'), 'External presentation is active');
           socket.sent.length = 0;
           socket.onmessage({ data: JSON.stringify({ type: 'state',
             state: { external_url: null, media_id: id, title: 'Native fixture', queue: [],
               position: 24, playing: true, updated_at: Date.now() / 1000 } }) });
-          equal(mock.state, 2, 'External playback is stopped after native transition');
+          equal(mock.state, readyBeforeTransition ? 2 : -1, 'Ready external playback pauses; unready playback stays unstarted after native transition');
           equal(mock.pauses, readyBeforeTransition ? 1 : 0, 'Only a ready external player is paused');
           if (!readyBeforeTransition) {
             mock.emitReady();
             equal(mock.commands, [], 'Late readiness cannot seek or start YouTube after native transition');
-            equal(mock.state, 2, 'Late readiness leaves external playback stopped');
+            equal(mock.state, -1, 'Late readiness cannot start external playback');
           }
           check(!socket.sent.some(command => command.type === 'pause'), 'External pause cannot broadcast a stale host pause');
           check(!modal.classList.contains('yt'), 'Native player presentation is restored');
@@ -1260,9 +1264,14 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
         partyFollowExternal(pendingId, 'First pending state', 5, true, Date.now() / 1000, isHost);
         partyFollowExternal(pendingId, 'Latest pending state', 20, false, Date.now() / 1000, isHost);
         mock.emitReady();
-        equal(mock.commands, ['seek'], 'Ready callback applies the latest paused request without playing');
-        equal(mock.position, 20, 'Ready callback seeks to the latest same-video position');
-        equal(mock.state, 2, 'Latest pending paused request remains paused');
+        check(mock.state !== 1, 'Latest pending paused request does not start playing');
+        const beforePausedElapsed = mock.position; mock.elapse(12);
+        equal(mock.position, beforePausedElapsed, 'Latest pending paused request does not advance');
+        partyFollowExternal(pendingId, 'Later host play', 20, true, Date.now() / 1000);
+        check(mock.state === 1 && Math.abs(mock.position - 20) < 0.05, 'Later host play starts at the latest prepared target');
+        partyFollowExternal(pendingId, 'Later host pause', mock.position, false, Date.now() / 1000);
+        const afterHostPause = mock.position; mock.elapse(5);
+        check(mock.state === 2 && mock.position === afterHostPause, 'Later host pause stops advancement');
         const localActivations = [];
         for (const localKind of ['audio', 'video']) {
           partyFollowExternal(`local-${kind}-${isHost}-${localKind}`, 'External before local action',
@@ -1298,12 +1307,30 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
             document.getElementById('pt-join').click();
             socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: host,
               state: { external_url: 'same-role-video', media_id: null, title: 'Role reuse fixture',
-                queue: [], position: 0, playing: false, updated_at: Date.now() / 1000 } }) });
+                queue: [], position: 16.8285, playing: false, updated_at: Date.now() / 1000 } }) });
             return socket;
           }
           const beforeRolePlayerCount = playerCreations;
           const guestSocket = openRole(false);
           mock.emitReady();
+          const pausedGuestTime = mock.position; mock.elapse(12);
+          check(mock.state !== 1 && mock.position === pausedGuestTime, 'Fresh ordinary paused join never starts or advances');
+          guestSocket.onmessage({ data: JSON.stringify({ type: 'state', state: { external_url: 'same-role-video', media_id: null,
+            title: 'Host reset and Play', queue: [], position: 0, playing: true, updated_at: Date.now() / 1000 } }) });
+          check(mock.state === 1 && mock.position < 0.05, 'Host reset and Play replaces a cued nonzero start despite its zero clock');
+          guestSocket.onmessage({ data: JSON.stringify({ type: 'state', state: { external_url: 'same-role-video', media_id: null,
+            title: 'Role reuse fixture', queue: [], position: 16.8285, playing: true, updated_at: Date.now() / 1000 } }) });
+          check(mock.state === 1 && Math.abs(mock.position - 16.8285) < 0.05, 'Ordinary join follows subsequent host Play at its saved position');
+          mock.elapse(3); const advancedGuestTime = mock.position;
+          guestSocket.onmessage({ data: JSON.stringify({ type: 'state', state: { external_url: 'same-role-video', media_id: null,
+            title: 'Role reuse fixture', queue: [], position: advancedGuestTime, playing: false, updated_at: Date.now() / 1000 } }) });
+          mock.elapse(12);
+          check(mock.state === 2 && mock.position === advancedGuestTime, 'Ordinary join follows subsequent host Pause');
+          guestSocket.onmessage({ data: JSON.stringify({ type: 'state', state: { external_url: 'same-role-video', media_id: null,
+            title: 'Role reuse fixture', queue: [], position: 42, playing: false, updated_at: Date.now() / 1000 } }) });
+          mock.elapse(12);
+          check(mock.state === 2 && mock.position === 42, 'Paused ordinary join follows a later host seek without playing');
+          const pausedJoin = { stoppedOnReady: true, noAdvanceWhilePaused: true, laterHostPlayPause: true, pausedHostSeek: true, playingResetFromCue: true, vendorSeekStartsUnstarted: true };
           const reusedPlayer = mock;
           mock.playVideo(); mock.pauseVideo();
           equal(guestSocket.sent, [], 'Guest-created external player cannot broadcast host commands');
@@ -1326,7 +1353,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
           mock.playVideo(); mock.pauseVideo();
           equal(nextGuest.sent, [], 'Leave clears the current external sender');
           equal(playerCreations, beforeRolePlayerCount + 1, 'Role changes never create a duplicate player');
-          roleReuse = { samePlayer: true, hostCommands, guestCommands: 0, departedHostCommands: 0,
+          roleReuse = { pausedJoin, samePlayer: true, hostCommands, guestCommands: 0, departedHostCommands: 0,
             playerCreations: 1, realSeekPoller: true, externalPlaybackMocked: true };
         }
         return { queuedAudioControl: { stalePauseBroadcasts: 0, legitimatePauseBroadcasts: 1, readinessDescriptorRestoredInFinally: true },

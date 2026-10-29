@@ -873,18 +873,31 @@ for (const kind of ['music', 'movie']) {
 function youtubePlayerFixture(b) {
   const players = [];
   b.context.YT = { Player: class {
-    constructor(id, config) { this.config = config; this.calls = []; this.ready = false; players.push(this); }
+    constructor(id, config) { this.config = config; this.calls = []; this.ready = false; this.state = -1; this.position = 0; this.cuedStart = 0; players.push(this); }
     requireReady() { if (!this.ready) throw new Error('YouTube player is not ready'); }
-    seekTo(position) { this.requireReady(); this.calls.push(['seek', position]); }
-    playVideo() { this.requireReady(); this.calls.push(['play']); }
-    pauseVideo() { this.requireReady(); this.calls.push(['pause']); }
-    getCurrentTime() { this.requireReady(); return 0; }
-    getPlayerState() { this.requireReady(); return 2; }
+    setState(state) { const changed = this.state !== state; this.state = state; if (changed) this.config.events.onStateChange({ target: this, data: state }); }
+    // Vendor contract: seek from unstarted/cued starts playback; paused seek stays paused.
+    seekTo(position) { this.requireReady(); this.calls.push(['seek', position]); this.position = position; if (this.state !== 2) this.setState(1); }
+    cueVideoById({ videoId, startSeconds }) { this.requireReady(); this.calls.push(['cue', videoId, startSeconds]); this.cuedStart = startSeconds; this.position = 0; this.setState(5); }
+    playVideo() { this.requireReady(); this.calls.push(['play']); if (this.state === 5) this.position = this.cuedStart; this.setState(1); }
+    pauseVideo() { this.requireReady(); this.calls.push(['pause']); this.setState(2); }
+    getCurrentTime() { this.requireReady(); return this.position; }
+    getPlayerState() { this.requireReady(); return this.state; }
+    elapse(seconds) { if (this.state === 1) this.position += seconds; }
     destroy() {}
     emitReady() { this.ready = true; this.config.events.onReady({ target: this }); }
   } };
   b.run('ytReady = true');
   return players;
+}
+
+function assertPreparedYouTubePause(player, start) {
+  assert.notEqual(player.getPlayerState(), 1);
+  const before = player.getCurrentTime();
+  player.elapse(5);
+  assert.equal(player.getCurrentTime(), before, 'Prepared paused playback does not advance');
+  player.playVideo();
+  assert.equal(player.getCurrentTime(), start, 'Later play starts from the prepared position');
 }
 
 for (const kind of ['music', 'movie']) {
@@ -928,7 +941,7 @@ test('unready external playback applies the latest same-video paused position on
   b.run('partyFollowExternal("same", "First", 5, true, Date.now()/1000, false)');
   b.run('partyFollowExternal("same", "Latest", 20, false, Date.now()/1000, false)');
   players[0].emitReady();
-  assert.deepEqual(players[0].calls, [['seek', 20]]);
+  assertPreparedYouTubePause(players[0], 20);
 });
 
 test('late API readiness creates only the latest requested video and ignores native handoff', () => {
@@ -944,7 +957,7 @@ test('late API readiness creates only the latest requested video and ignores nat
     assert.deepEqual(players.map(player => player.config.videoId), nativeHandoff ? [] : ['latest']);
     if (!nativeHandoff) {
       players[0].emitReady();
-      assert.deepEqual(players[0].calls, [['seek', 20]]);
+      assertPreparedYouTubePause(players[0], 20);
     }
   }
 });
@@ -966,7 +979,7 @@ for (const nativeKind of ['audio', 'video']) {
     assert.equal(b.run('pbAudio.paused'), true);
     assert.equal(b.run('plyr.paused'), true);
     assert.deepEqual(sends, []);
-    assert.deepEqual(players[0].calls, [['seek', 20]]);
+    assertPreparedYouTubePause(players[0], 20);
     assert.equal(b.run('partyPlaybackKind'), 'external');
   });
 }
@@ -2767,3 +2780,95 @@ for (const boundary of ['toc', 'progress']) {
     assert.equal(b.nodes.get('#em-search').disabled, false);
   });
 }
+
+
+test('fresh paused YouTube join stays still and later host play pause resumes its saved position', () => {
+  const b = browser({ now: () => 100000 });
+  const players = youtubePlayerFixture(b);
+  b.run('partyFollowExternal("paused-video", "Paused fixture", 16.8285, false, 100)');
+  const player = players[0];
+  player.emitReady();
+  const before = player.getCurrentTime();
+  assert.notEqual(player.getPlayerState(), 1, 'Paused first readiness must not start playback');
+  player.elapse(12);
+  assert.equal(player.getCurrentTime(), before, 'A paused new join does not advance');
+  b.run('partyFollowExternal("paused-video", "Host play", 16.8285, true, 100)');
+  assert.equal(player.getPlayerState(), 1);
+  assert.ok(Math.abs(player.getCurrentTime() - 16.8285) < 1e-9);
+  player.elapse(4);
+  assert.ok(Math.abs(player.getCurrentTime() - 20.8285) < 1e-9);
+  b.run('partyFollowExternal("paused-video", "Host pause", 20.8285, false, 100)');
+  assert.equal(player.getPlayerState(), 2);
+  const paused = player.getCurrentTime(); player.elapse(10);
+  assert.equal(player.getCurrentTime(), paused);
+});
+
+test('latest paused YouTube state before readiness remains stopped at the latest prepared start', () => {
+  const b = browser({ now: () => 100000 });
+  const players = youtubePlayerFixture(b);
+  b.run('partyFollowExternal("latest-video", "Earlier playing intent", 5, true, 100)');
+  b.run('partyFollowExternal("latest-video", "Latest paused intent", 31.25, false, 100)');
+  const player = players[0]; player.emitReady();
+  assert.notEqual(player.getPlayerState(), 1);
+  b.run('partyFollowExternal("latest-video", "Host play", 31.25, true, 100)');
+  assert.equal(player.getPlayerState(), 1);
+  assert.equal(player.getCurrentTime(), 31.25);
+});
+
+test('fresh playing YouTube readiness still plays and projects the authoritative clock', () => {
+  const b = browser({ now: () => 105000 });
+  const players = youtubePlayerFixture(b);
+  b.run('partyFollowExternal("playing-video", "Playing fixture", 16, true, 100)');
+  const player = players[0]; player.emitReady();
+  assert.equal(player.getPlayerState(), 1);
+  assert.equal(player.getCurrentTime(), 21);
+  player.elapse(2); assert.equal(player.getCurrentTime(), 23);
+});
+
+for (const preparedState of ['paused', 'cued']) for (const target of [42, 0]) {
+  test(`reused ${preparedState} YouTube player follows paused host seek to ${target} without advancing`, () => {
+    const b = browser({ now: () => 100000 });
+    const players = youtubePlayerFixture(b);
+    b.run('partyFollowExternal("seek-video", "Initial", 16, false, 100)');
+    const player = players[0]; player.emitReady();
+    if (preparedState === 'paused') { player.playVideo(); player.pauseVideo(); }
+    b.run(`partyFollowExternal("seek-video", "Paused host seek", ${target}, false, 100)`);
+    assert.notEqual(player.getPlayerState(), 1);
+    assertPreparedYouTubePause(player, target);
+    b.run(`partyFollowExternal("seek-video", "Host play after seek", ${target}, true, 100)`);
+    assert.equal(player.getPlayerState(), 1);
+    assert.equal(player.getCurrentTime(), target);
+    assert.equal(players.length, 1);
+  });
+}
+
+for (const preparedState of ['cued', 'unstarted']) {
+  test(`playing intent replaces a reused ${preparedState} YouTube start despite a misleading zero clock`, () => {
+    const b = browser({ now: () => 100000 });
+    const players = youtubePlayerFixture(b);
+    b.run('partyFollowExternal("reset-video", "Prepared start", 16, false, 100)');
+    const player = players[0]; player.emitReady();
+    if (preparedState === 'unstarted') player.setState(-1);
+    assert.equal(player.getCurrentTime(), 0);
+    const target = preparedState === 'cued' ? 0 : 1;
+    b.run(`partyFollowExternal("reset-video", "Authoritative play", ${target}, true, 100)`);
+    assert.equal(player.getPlayerState(), 1);
+    assert.equal(player.getCurrentTime(), target);
+    player.elapse(2); assert.equal(player.getCurrentTime(), target + 2);
+    assert.equal(players.length, 1);
+  });
+}
+
+test('already-playing YouTube reuse preserves the drift threshold', () => {
+  const b = browser({ now: () => 100000 });
+  const players = youtubePlayerFixture(b);
+  b.run('partyFollowExternal("drift-video", "Playing", 16, true, 100)');
+  const player = players[0]; player.emitReady(); player.calls.length = 0;
+  b.run('partyFollowExternal("drift-video", "Small drift", 17, true, 100)');
+  assert.equal(player.getCurrentTime(), 16);
+  assert.deepEqual(player.calls, []);
+  b.run('partyFollowExternal("drift-video", "Large drift", 24, true, 100)');
+  assert.equal(player.getCurrentTime(), 24);
+  assert.equal(player.getPlayerState(), 1);
+  assert.deepEqual(player.calls, [['seek', 24]]);
+});

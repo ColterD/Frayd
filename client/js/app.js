@@ -1749,8 +1749,13 @@ window.partyFollowExternal = (vid, title, position, playing, updatedAt) => {
             if (e.target !== ytPlayer || ytDesired?.vid !== vid) return;
             ytPlayerReady = true;
             if (partyPlaybackKind !== 'external') return;
-            e.target.seekTo(expected(), true);
-            if (ytDesired.playing) e.target.playVideo();
+            if (ytDesired.playing) {
+              e.target.seekTo(expected(), true);
+              e.target.playVideo();
+            } else {
+              // Seeking an unstarted player starts playback; cue a paused join instead.
+              e.target.cueVideoById({ videoId: vid, startSeconds: expected() });
+            }
           },
           // host: mirror player state into party broadcasts
           onStateChange: (e) => {
@@ -1766,9 +1771,17 @@ window.partyFollowExternal = (vid, title, position, playing, updatedAt) => {
     if (!ytPlayerReady || !ytPlayer || !ytPlayer.seekTo) return;
     const cur = ytPlayer.getCurrentTime ? ytPlayer.getCurrentTime() : 0;
     const drift = Math.abs(cur - expected());
-    if (desired.playing && drift > YT_DRIFT) ytPlayer.seekTo(expected(), true);
+    const state = ytPlayer.getPlayerState();
+    if (desired.playing && (state === -1 || state === 5 || drift > YT_DRIFT)) ytPlayer.seekTo(expected(), true);
     if (desired.playing && ytPlayer.getPlayerState && ytPlayer.getPlayerState() !== 1) ytPlayer.playVideo();
-    if (!desired.playing && ytPlayer.getPlayerState && ytPlayer.getPlayerState() === 1) ytPlayer.pauseVideo();
+    if (!desired.playing) {
+      if (ytPlayer.getPlayerState() === 1) ytPlayer.pauseVideo();
+      if (ytPlayer.getPlayerState() === 2) {
+        if (drift > 0) ytPlayer.seekTo(expected(), true);
+      } else {
+        ytPlayer.cueVideoById({ videoId: vid, startSeconds: expected() });
+      }
+    }
   });
 };
 
