@@ -12,6 +12,16 @@ const el = (tag, cls, html) => {
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c =>
   ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
 
+// ---------- toast ----------
+function toast(msg, err = false) {
+  let host = $('#toast-host');
+  if (!host) { host = el('div'); host.id = 'toast-host'; document.body.appendChild(host); }
+  const t = el('div', 'toast' + (err ? ' toast-err' : ''), esc(msg));
+  host.appendChild(t);
+  requestAnimationFrame(() => t.classList.add('on'));
+  setTimeout(() => { t.classList.remove('on'); setTimeout(() => t.remove(), 300); }, err ? 5000 : 2600);
+}
+
 // ---------- identity / auth ----------
 let IDENTITY = localStorage.frayd_identity;
 function authHeaders(extra = {}) {
@@ -53,6 +63,7 @@ function enterApp() {
 
 // ---------- settings (admin) ----------
 const KINDS = ['movie', 'music', 'audiobook', 'ebook', 'comic', 'manga'];
+function reopenSettings() { $('#settings-modal').classList.remove('on'); $('#settings-btn').click(); }
 $('#settings-btn')?.addEventListener('click', async () => {
   $('#settings-modal').classList.add('on');
   const stage = $('#settings-stage');
@@ -62,15 +73,23 @@ $('#settings-btn')?.addEventListener('click', async () => {
       fetch('/api/admin/perms', { headers: authHeaders() }).then(r => r.ok ? r.json() : Promise.reject(r.status)),
       fetch('/api/admin/settings', { headers: authHeaders() }).then(r => r.ok ? r.json() : {}),
     ]);
-    stage.innerHTML = (perms.length ? perms.map(p => `
+    const libs = settings.library_paths || [];
+    if (settings.library_path && !libs.includes(settings.library_path)) libs.unshift(settings.library_path);
+    const kindBoxes = (p) => KINDS.map(k => `
+      <label class="p-kind"><input type="checkbox" value="${k}" ${!p.allowed_kinds || p.allowed_kinds.includes(k) ? 'checked' : ''}>${k}</label>`).join('');
+    stage.innerHTML = '<div class="party-sec">Users — untick kinds to hide that section from them</div>'
+      + (perms.length ? perms.map(p => `
       <div class="perm-row" data-id="${p.identity_id}">
         <span class="k">${esc(p.key)}</span>
-        <label><input type="checkbox" class="p-admin" ${p.is_admin ? 'checked' : ''}> admin</label>
-        <select class="p-kinds" multiple size="1">
-          ${KINDS.map(k => `<option value="${k}" ${p.allowed_kinds?.includes(k) ? 'selected' : ''}>${k}</option>`).join('')}
-        </select>
+        <label class="p-kind"><input type="checkbox" class="p-admin" ${p.is_admin ? 'checked' : ''}> admin</label>
+        <span class="p-kinds-box">${kindBoxes(p)}</span>
         <button class="p-save">Save</button>
-      </div>`).join('') : '<div class="party-sec">No accounts</div>')
+        <button class="p-remove" data-name="${esc(p.key)}" title="Remove user, their progress and highlights">Remove</button>
+      </div>`).join('') : '<div class="party-sec">No accounts yet</div>')
+      + '<div class="party-sec">Media folders</div>'
+      + (libs.length ? libs.map((l, i) => `
+      <div class="perm-row"><span class="k">${esc(l)}</span><button class="lib-remove" data-path="${esc(l)}">Remove</button></div>`).join('') : '<div class="party-sec">No folders configured</div>')
+      + `<div class="perm-row"><span class="k">Add folder</span><input class="s-lib-add" placeholder="/path/to/more/media" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px;flex:1"><button class="lib-add">Add + scan</button></div>`
       + '<div class="party-sec">Server settings</div>'
       + `<div class="perm-row"><span class="k">Site name</span><input class="s-site" value="${esc(settings.site_name ?? 'Frayd')}" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px"><button id="s-site-save">Save</button></div>`
       + `<div class="party-sec">Network <span class="s">(restart server to apply)</span></div>`
@@ -80,7 +99,7 @@ $('#settings-btn')?.addEventListener('click', async () => {
       + `<div class="perm-row"><span class="k">HTTPS key path (PEM)</span><input class="s-key" value="${esc(settings.tls_key ?? '')}" placeholder="/path/key.pem" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px;flex:1"></div>`
       + `<div class="perm-row"><span class="k">Domain</span><input class="s-domain" value="${esc(settings.domain ?? '')}" placeholder="media.example.com" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px;flex:1"><span class="s">A record → your IP; use a real cert (e.g. Let's Encrypt) for this</span></div>`
       + `<div class="party-sec">Library</div>`
-      + `<div class="perm-row"><span class="k">Media folder</span><input class="s-library" value="${esc(settings.library_path ?? '')}" placeholder="/home/you/Media" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px;flex:1"><button class="p-scan">Scan now</button></div>`
+      + `<div class="perm-row"><button class="p-scan">Scan all folders</button></div>`
       + `<div class="perm-row"><span class="k">Add from URL</span><input class="s-ingest" placeholder="video URL (yt-dlp supported)" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px;flex:1"><button class="p-ingest">Download</button><span class="s">needs yt-dlp installed</span></div>`
       + `<div class="perm-row" style="border:none"><span class="s">Suggested layout (any subset):</span></div>`
       + `<div class="perm-row" style="border:none"><pre class="s" style="color:#8A8F9E;font-size:12px;margin:0;line-height:1.5">Media/\n  Movies/    *.mp4 *.mkv\n  Shows/     S01E01 files\n  Music/     *.mp3 *.flac\n  Audiobooks/ *.m4b *.mp3\n  Ebooks/    *.epub\n  Comics/    *.cbz *.cbr\n  Manga/     folder of images under a *manga* dir</pre></div>`
@@ -91,13 +110,14 @@ $('#settings-btn')?.addEventListener('click', async () => {
       <button id="s-pw-save" style="margin-top:10px;width:100%;background:#16181E;color:#fff;border:1px solid #2a2d36;border-radius:8px;padding:10px;cursor:pointer">Change password</button>` : '');
     stage.querySelectorAll('.p-save').forEach(b => b.onclick = async () => {
       const row = b.closest('.perm-row');
-      const kinds = [...row.querySelector('.p-kinds').selectedOptions].map(o => o.value);
+      const checked = [...row.querySelectorAll('.p-kind input:checked')].map(o => o.value);
+      const all = checked.length === KINDS.length;
       const r = await fetch('/api/admin/perms', {
         method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           identity_id: +row.dataset.id,
           is_admin: row.querySelector('.p-admin').checked,
-          allowed_kinds: kinds.length ? kinds : null,
+          allowed_kinds: all ? null : checked, // null = no restriction
         }),
       });
       b.textContent = r.ok ? '✓' : '✗';
@@ -140,27 +160,60 @@ $('#settings-btn')?.addEventListener('click', async () => {
       else { const j = await r.json().catch(() => ({})); e.target.textContent = j.error || '✗ Failed'; }
       setTimeout(() => { e.target.textContent = 'Change password'; }, 2500);
     });
-    // library: save path then scan (scan picks up new path without restart)
+    // library: scan all configured roots
     const scanBtn = stage.querySelector('.p-scan');
     scanBtn.onclick = async () => {
-      const path = stage.querySelector('.s-library').value.trim();
-      const r1 = await fetch('/api/admin/settings', {
-        method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ library_path: path || null }),
-      });
-      if (!r1.ok) { scanBtn.textContent = '✗ save'; return; }
       scanBtn.textContent = 'Scanning…';
       const r2 = await fetch('/api/scan', { method: 'POST', headers: authHeaders() });
       if (r2.status === 202) {
         const poll = setInterval(async () => {
           const s = await (await fetch('/api/scan/status')).json();
-          if (!s.scanning) { clearInterval(poll); scanBtn.textContent = '✓ done'; loadLibrary(); setTimeout(() => { scanBtn.textContent = 'Scan now'; }, 2000); }
+          if (!s.scanning) { clearInterval(poll); scanBtn.textContent = '✓ done'; loadLibrary(); setTimeout(() => { scanBtn.textContent = 'Scan all folders'; }, 2000); }
         }, 1000);
       } else {
-        scanBtn.textContent = r2.status === 409 ? 'busy' : '✗ ' + r2.status;
-        setTimeout(() => { scanBtn.textContent = 'Scan now'; }, 2000);
+        scanBtn.textContent = r2.status === 409 ? 'busy' : r2.status === 501 ? 'no folders' : '✗ ' + r2.status;
+        setTimeout(() => { scanBtn.textContent = 'Scan all folders'; }, 2000);
       }
     };
+    // add a media folder: validate server-side (400 if not a dir), persist to library_paths, scan
+    stage.querySelector('.lib-add').onclick = async (e) => {
+      const input = stage.querySelector('.s-lib-add');
+      const path = input.value.trim();
+      if (!path) return;
+      e.target.textContent = '…';
+      const r = await fetch('/api/admin/settings', {
+        method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ library_paths: [...libs, path] }),
+      });
+      if (r.ok) {
+        toast('Folder added — scanning');
+        reopenSettings(); // re-render list with new folder
+        fetch('/api/scan', { method: 'POST', headers: authHeaders() });
+      } else {
+        toast(r.status === 400 ? 'Path is not a directory' : `Add failed (${r.status})`, true);
+        e.target.textContent = 'Add + scan';
+      }
+    };
+    // remove a media folder (rows on disk untouched; rescan to drop from view? no — scan never deletes rows)
+    stage.querySelectorAll('.lib-remove').forEach(b => b.onclick = async () => {
+      const path = b.dataset.path;
+      if (!confirm(`Stop scanning "${path}"? Files on disk are not touched, but already-scanned items stay in the library until you delete them from the library view.`)) return;
+      const remaining = libs.filter(l => l !== path);
+      const r = await fetch('/api/admin/settings', {
+        method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ library_paths: remaining, ...(remaining.length ? {} : { library_path: null }) }),
+      });
+      if (r.ok) { toast('Folder removed'); reopenSettings(); } else toast('Remove failed', true);
+    });
+    // remove a user: sessions, progress, highlights gone. Cannot remove self/last admin.
+    stage.querySelectorAll('.p-remove').forEach(b => b.onclick = async () => {
+      const row = b.closest('.perm-row');
+      if (!confirm(`Remove user ${b.dataset.name}? Their progress and highlights will be deleted. This cannot be undone.`)) return;
+      const r = await fetch(`/api/admin/users/${row.dataset.id}?identity=${encodeURIComponent(IDENTITY)}`, { method: 'DELETE', headers: authHeaders() });
+      if (r.ok) { toast('User removed'); reopenSettings(); }
+      else if (r.status === 409) toast('Cannot remove: last admin (or yourself)', true);
+      else toast(`Remove failed (${r.status})`, true);
+    });
     // ingest: yt-dlp download into library, then rescan picks it up
     const ingestBtn = stage.querySelector('.p-ingest');
     ingestBtn.onclick = async () => {
@@ -169,9 +222,26 @@ $('#settings-btn')?.addEventListener('click', async () => {
       ingestBtn.textContent = 'Starting…';
       const r = await fetch('/api/ingest', { method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ url }) });
       if (r.status === 202) {
-        ingestBtn.textContent = 'Downloading… (check library later)';
-        setTimeout(() => { ingestBtn.textContent = 'Download'; }, 5000);
-      } else if (r.status === 501) { ingestBtn.textContent = '✗ no yt-dlp'; setTimeout(() => { ingestBtn.textContent = 'Download'; }, 3000); }
+        ingestBtn.textContent = 'Downloading…';
+        ingestBtn.disabled = true;
+        // poll until ingest finishes, then refresh library
+        const poll = setInterval(async () => {
+          let st;
+          try { st = (await (await fetch('/api/scan/status')).json()).ingesting; }
+          catch { return; }
+          if (st === 'downloading') return;
+          clearInterval(poll);
+          ingestBtn.disabled = false;
+          ingestBtn.textContent = 'Download';
+          if (st === 'done') {
+            toast('Download complete — added to library');
+            LIBRARY = await (await fetch('/api/library')).json();
+            renderRows(LIBRARY);
+          } else if (st === 'failed') toast('yt-dlp download failed', true);
+          else setTimeout(() => { ingestBtn.textContent = 'Download'; }, 2000);
+        }, 2000);
+      } else if (r.status === 409) { ingestBtn.textContent = '✗ already downloading'; setTimeout(() => { ingestBtn.textContent = 'Download'; }, 3000); }
+      else if (r.status === 501) { ingestBtn.textContent = '✗ no yt-dlp'; setTimeout(() => { ingestBtn.textContent = 'Download'; }, 3000); }
       else { ingestBtn.textContent = '✗ ' + r.status; setTimeout(() => { ingestBtn.textContent = 'Download'; }, 3000); }
     };
   } catch (e) {
@@ -236,21 +306,34 @@ $('#add-media').onclick = async () => {
   try {
     const r = await fetch('/api/scan', { method: 'POST', headers: authHeaders() });
     if (r.status === 202) {
+      toast('Scanning library…');
       // poll status until idle, then refresh library
       const poll = setInterval(async () => {
         const { scanning } = await (await fetch('/api/scan/status')).json();
         if (scanning) return;
         clearInterval(poll);
+        const before = LIBRARY.length;
         LIBRARY = await (await fetch('/api/library')).json();
         renderRows(LIBRARY);
+        toast(LIBRARY.length > before ? `Scan complete — ${LIBRARY.length - before} new item(s)` : 'Scan complete');
         btn.disabled = false;
         btn.innerHTML = ADD_BTN_HTML;
       }, 1500);
+    } else if (r.status === 409) {
+      toast('Scan already running', true);
+      btn.disabled = false;
+      btn.innerHTML = ADD_BTN_HTML;
+    } else if (r.status === 501) {
+      toast('No library folder configured — set it in settings', true);
+      btn.disabled = false;
+      btn.innerHTML = ADD_BTN_HTML;
     } else {
+      toast(`Scan failed (${r.status})`, true);
       btn.disabled = false;
       btn.innerHTML = ADD_BTN_HTML;
     }
   } catch {
+    toast('Scan failed — server unreachable', true);
     btn.disabled = false;
     btn.innerHTML = ADD_BTN_HTML;
   }
@@ -261,6 +344,7 @@ document.querySelectorAll('.nav-item').forEach(btn => {
   btn.onclick = () => {
     document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
+    filtering = btn.dataset.kind !== 'all';
     filterKind(btn.dataset.kind);
   };
 });
@@ -271,6 +355,7 @@ $('#search input').addEventListener('input', (e) => {
 });
 
 async function serverSearch(q) {
+  filtering = !!q;
   if (!q) { filterKind(currentKind()); return; }
   try {
     const results = await (await fetch(`/api/library?q=${encodeURIComponent(q)}`)).json();
@@ -285,6 +370,7 @@ function currentKind() {
 
 // ---------- library ----------
 let LIBRARY = [];
+let filtering = false; // suppress continue-watching row while a nav filter/search is active
 window.getLibrary = () => LIBRARY;
 
 async function loadLibrary() {
@@ -313,6 +399,20 @@ function card(it, portrait) {
   const c = el('div', 'media-card ' + (portrait ? 'portrait' : 'landscape'));
   const isVideo = it.kind === 'movie' || it.kind === 'show';
   const isPaged = it.kind === 'comic' || it.kind === 'manga';
+  c.title = `${it.title}${it.author ? ' — ' + it.author : ''}`;
+  if (account?.isAdmin) {
+    const del = el('button', 'card-del');
+    del.setAttribute('aria-label', 'Remove from library');
+    del.innerHTML = '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg>';
+    del.onclick = async (e) => {
+      e.stopPropagation();
+      if (!confirm(`Remove "${it.title}" from the library?\n(The file on disk is not deleted.)`)) return;
+      const r = await fetch(`/api/media/${it.id}?identity=${encodeURIComponent(IDENTITY)}`, { method: 'DELETE', headers: authHeaders() });
+      if (r.ok) { toast('Removed from library'); LIBRARY = LIBRARY.filter(x => x.id !== it.id); renderRows(LIBRARY); }
+      else toast(r.status === 403 ? 'Admin access required' : 'Remove failed', true);
+    };
+    c.appendChild(del);
+  }
   c.innerHTML = `
     ${isVideo
       ? `<img class="thumb" loading="lazy" src="/api/thumb/${it.id}" onerror="this.outerHTML='<div class=&quot;thumb-fallback${portrait?' portrait':''}&quot;>▶</div>'">`
@@ -336,20 +436,57 @@ function card(it, portrait) {
 
 function section(title, items, portrait) {
   const wrap = el('section');
-  const head = el('div', 'row-head',
-    `<h3>${esc(title)}</h3><button class="link">view all</button>`);
   const cards = el('div', 'cards');
-  items.forEach(it => cards.appendChild(card(it, portrait)));
+  let shown = [...items];
+  const head = el('div', 'row-head', `<h3>${esc(title)}</h3>`);
+  const sortBtn = el('button', 'link', 'oldest first');
+  sortBtn.onclick = () => {
+    const oldest = sortBtn.textContent === 'oldest first';
+    shown.sort((a, b) => oldest ? (a.created_at || 0) - (b.created_at || 0) : (b.created_at || 0) - (a.created_at || 0));
+    sortBtn.textContent = oldest ? 'newest first' : 'oldest first';
+    cards.innerHTML = '';
+    shown.forEach(it => cards.appendChild(card(it, portrait)));
+  };
+  head.appendChild(sortBtn);
+  shown.forEach(it => cards.appendChild(card(it, portrait)));
   wrap.append(head, cards);
   return wrap;
 }
 
-function renderRows(items) {
+async function continueRow() {
+  // in-progress items, most recently touched first
+  const items = LIBRARY.filter(i => i.kind !== 'ebook' && i.kind !== 'comic' && i.kind !== 'manga');
+  const withP = await Promise.all(items.map(async it => {
+    const p = await resumeFor(it.id);
+    return p && p.position > 5 && it.duration_secs && p.position < it.duration_secs * 0.95
+      ? { it, frac: Math.min(1, p.position / it.duration_secs) } : null;
+  }));
+  const inProgress = withP.filter(Boolean);
+  if (!inProgress.length) return null;
+  inProgress.sort((a, b) => b.frac - a.frac);
+  const wrap = el('section');
+  wrap.appendChild(el('div', 'row-head', '<h3>Continue watching</h3>'));
+  const cards = el('div', 'cards');
+  inProgress.forEach(({ it, frac }) => {
+    const c = card(it, false);
+    const strip = c.querySelector('.progress-strip');
+    if (strip) { strip.style.display = 'block'; strip.firstElementChild.style.width = (frac * 100).toFixed(1) + '%'; }
+    cards.appendChild(c);
+  });
+  wrap.appendChild(cards);
+  return wrap;
+}
+
+async function renderRows(items) {
   const main = $('#main');
   main.innerHTML = '<div id="hero"></div>';
   // hero: first movie with backdrop, else first item
   const heroItem = items.find(i => i.kind === 'movie') || items[0];
   if (heroItem) renderHero(heroItem);
+  if (!filtering) {
+    const cont = await continueRow();
+    if (cont) main.appendChild(cont);
+  }
   const byKind = {};
   items.forEach(i => (byKind[i.kind] ||= []).push(i));
   const order = ['movie', 'music', 'audiobook', 'ebook', 'comic', 'manga'];
@@ -363,7 +500,17 @@ function renderRows(items) {
       main.appendChild(section(kind[0].toUpperCase() + kind.slice(1) + 's', kindItems, false));
     }
   }
-  if (!items.length) main.appendChild(el('p', '', '<br>No media found. Place files in the server’s media folder, then choose Scan library. Ask the server administrator if no media folder is configured.'));
+  if (filtering && !items.length) { $('#hero').style.display = 'none'; }
+  if (!items.length) {
+    if (currentKind() !== 'all' || $('#search input').value) {
+      main.appendChild(el('p', 'empty-state', 'Nothing matches that filter. Try “All”.'));
+    } else {
+      main.appendChild(el('p', 'empty-state',
+        'No media found. Place files in the server’s media folder, then choose Scan library.<br>' +
+        'Supported: video (mp4/mkv/avi…), music, audiobooks (m4b/mp3), epubs, comics (cbz/cbr), manga folders. ' +
+        'Ask the server administrator if no media folder is configured.'));
+    }
+  }
 }
 
 // author → series → books: one section per author, sub-rows per series
@@ -793,6 +940,17 @@ function ebookSearchNext() {
 
 $('#em-prev').onclick = () => ebookFlip(-1);
 $('#em-next').onclick = () => ebookFlip(1);
+// reader shortcuts: ←/→/space flip, s search, t toc, f fullscreen, Esc closes overlays
+document.addEventListener('keydown', (e) => {
+  if (!$('#ebook-modal').classList.contains('on')) return;
+  if (e.target.tagName === 'INPUT') return;
+  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); ebookFlip(1); }
+  else if (e.key === 'ArrowLeft') { e.preventDefault(); ebookFlip(-1); }
+  else if (e.key === 's') { e.preventDefault(); $('#em-search').focus(); }
+  else if (e.key === 't') { renderToc(); $('#em-toc').classList.toggle('on'); }
+  else if (e.key === 'f') { $('#em-toc').classList.remove('on'); document.fullscreenElement ? document.exitFullscreen() : $('#ebook-modal').requestFullscreen?.(); }
+  else if (e.key === 'Escape' && $('#em-toc').classList.contains('on')) $('#em-toc').classList.remove('on');
+});
 $('#em-close').onclick = closeEbook;
 // TOC drawer
 $('#em-toc-btn').onclick = () => { renderToc(); $('#em-toc').classList.toggle('on'); };
