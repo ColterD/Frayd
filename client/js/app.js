@@ -411,6 +411,9 @@ async function doLogin(ev) {
   ev.preventDefault();
   const email = $('#email').value.trim();
   const pw = $('#password').value;
+  if (!email || !pw) return;
+  const owner = ++accountGeneration;
+  const current = () => owner === accountGeneration;
   const err = $('#auth-error');
   err.style.display = 'none';
   try {
@@ -419,13 +422,16 @@ async function doLogin(ev) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email, password: pw })
     });
+    if (!current()) return;
     if (!r.ok) throw new Error(r.status === 401 ? 'Invalid email or password' : `Server error (${r.status})`);
     const data = await r.json();
+    if (!current()) return;
     account = { name: data.name || email.split('@')[0], token: data.token, isAdmin: !!data.is_admin };
     localStorage.frayd_token = data.token;
     IDENTITY = localStorage.frayd_identity ||= location.hostname + ':' + crypto.randomUUID();
     enterApp();
   } catch (e) {
+    if (!current()) return;
     err.textContent = e.message;
     err.style.display = 'block';
   }

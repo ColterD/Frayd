@@ -2282,3 +2282,94 @@ test('retired render progress cannot paint cards or start new reads after an acc
   assert.equal(b.nodes.get('#main').innerHTML, 'new account view');
   assert.equal(b.nodes.get('#main').children.length, 0);
 });
+
+async function pendingLoginFixture(completion) {
+  const storage = { frayd_identity: 'owned-login-fixture', frayd_logout: '1' };
+  const b = browser({ storage });
+  await settle();
+  b.nodes.get('#email').value = 'fixture@example.invalid';
+  b.nodes.get('#password').value = 'nonfunctional-fixture-password';
+  let resolve, reject;
+  const held = new Promise((accept, fail) => { resolve = accept; reject = fail; });
+  b.respond(async url => {
+    if (url !== '/api/auth/login') return { ok: true, json: async () => [] };
+    return completion.startsWith('body-') ? { ok: true, json: () => held } : held;
+  });
+  const pending = b.run('doLogin({ preventDefault() {} })');
+  await settle();
+  const release = () => {
+    const data = { name: 'Fixture account', token: 'nonfunctional-fixture-token', is_admin: false };
+    if (completion === 'http-success') resolve({ ok: true, json: async () => data });
+    else if (completion === 'body-success') resolve(data);
+    else if (completion === 'http-failure') resolve({ ok: false, status: 401 });
+    else reject(new Error('owned fixture failure'));
+  };
+  return { b, storage, pending, release };
+}
+
+for (const completion of ['http-success', 'body-success', 'http-failure', 'network-failure', 'body-failure']) {
+  test(`late login ${completion} cannot replace explicit guest entry or repaint its hidden sign-in`, async () => {
+    const { b, storage, pending, release } = await pendingLoginFixture(completion);
+    b.nodes.get('#guest').emit('click');
+    await settle();
+    const owner = b.run('accountGeneration');
+    assert.equal(b.nodes.get('#user-name').textContent, 'Local user');
+    release();
+    await pending;
+    await settle();
+    assert.equal(b.run('accountGeneration'), owner);
+    assert.equal(b.run('account'), null);
+    assert.equal(Object.hasOwn(storage, 'frayd_token'), false);
+    assert.equal(b.nodes.get('#user-name').textContent, 'Local user');
+    assert.equal(b.nodes.get('#app').classList.contains('on'), true);
+    assert.equal(b.nodes.get('#login').style.display, 'none');
+    assert.equal(b.nodes.get('#auth-error').style.display, 'none');
+  });
+}
+
+for (const completion of ['http-success', 'http-failure']) {
+  test(`current login ${completion} still publishes its account or visible error`, async () => {
+    const { b, storage, pending, release } = await pendingLoginFixture(completion);
+    release();
+    await pending;
+    await settle();
+    const success = completion === 'http-success';
+    assert.equal(b.run('account !== null'), success);
+    assert.equal(Object.hasOwn(storage, 'frayd_token'), success);
+    assert.equal(b.nodes.get('#app').classList.contains('on'), success);
+    assert.equal(b.nodes.get('#login').style.display, success ? 'none' : 'flex');
+    assert.equal(b.nodes.get('#auth-error').style.display, success ? 'none' : 'block');
+  });
+}
+
+for (const completionOrder of [[0, 1], [1, 0]]) {
+  test(`latest explicit login owns the result when completion order is ${completionOrder.join(' then ')}`, async () => {
+    const b = browser({ storage: { frayd_identity: 'owned-login-fixture', frayd_logout: '1' } });
+    await settle();
+    const releases = [];
+    b.respond(url => url === '/api/auth/login' ? new Promise(resolve => releases.push(resolve))
+      : Promise.resolve({ ok: true, json: async () => [] }));
+    b.nodes.get('#email').value = 'fixture@example.invalid';
+    b.nodes.get('#password').value = 'nonfunctional-fixture-password';
+    const earlier = b.run('doLogin({ preventDefault() {} })');
+    const latest = b.run('doLogin({ preventDefault() {} })');
+    for (const index of completionOrder) {
+      releases[index]({ ok: true, json: async () => ({ name: index ? 'Latest fixture' : 'Earlier fixture', token: 'nonfunctional-fixture-token' }) });
+      await settle();
+    }
+    await Promise.all([earlier, latest]);
+    assert.equal(b.run('account.name'), 'Latest fixture');
+    assert.equal(b.nodes.get('#app').classList.contains('on'), true);
+    assert.equal(b.nodes.get('#auth-error').style.display, 'none');
+
+    // An empty form is not a new valid login intent and must not retire its owner.
+    const owner = b.run('accountGeneration');
+    b.nodes.get('#email').value = '';
+    b.nodes.get('#password').value = '';
+    const ignored = b.run('doLogin({ preventDefault() {} })');
+    assert.equal(releases.length, 2, 'Empty form never issues another login request');
+    await ignored;
+    assert.equal(b.run('accountGeneration'), owner);
+    assert.equal(b.run('account.name'), 'Latest fixture');
+  });
+}
