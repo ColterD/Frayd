@@ -2,7 +2,7 @@
 
 [Documentation index](../README.md) · [Review dispositions](coderabbit-follow-up.md) · [Canonical checks](../development.md#canonical-checks) · [Draft PR #2](https://github.com/ColterD/Frayd/pull/2)
 
-Net inventory against synced fork main `21b2e9b6bf4cff26254f5dfcec9deecd02453718`: 70 files (2026-10-29). `e7bee5f` is an implementation checkpoint; reviewed `82f8a34` adds five documentation changes. Later fixes appear below; the PR identifies the final head. The historical 129 dispositions are not 129 reproduced bugs; checks remain source-bound.
+Net inventory against synced fork main `21b2e9b6bf4cff26254f5dfcec9deecd02453718`: 71 files (2026-10-29). `e7bee5f` is an implementation checkpoint; reviewed `82f8a34` adds five documentation changes. Later fixes appear below; the PR identifies the final head. The historical 129 dispositions are not 129 reproduced bugs; checks remain source-bound.
 
 Pending, held and staged statuses describe their named **2026-10-29 pre-cutover source checkpoint**, initially `8d87905`. Later deployment, sample-import and acceptance outcomes belong to the [current PR #2 status](https://github.com/ColterD/Frayd/pull/2); this source-bound snapshot does not predict them.
 
@@ -12,7 +12,7 @@ PR #2 is a fork-only draft, unmerged and unreleased. The separately authorized l
 
 The branch includes [upstream `dd8eaf42d692dee118525b6d98d883cbe76967f4`](https://github.com/kattiest/Frayd/tree/dd8eaf42d692dee118525b6d98d883cbe76967f4): TV shelves, author/series folders and absolute native-player sizing after the earlier `ea29a5c43b3fe973bbaef667138debde4364f832` integration. Provenance: pinned upstream history; disposition: ADOPT. No root/package license declaration exists in this snapshot; no repository license is inferred.
 
-Merge checkpoints: `fafad69`, `d9c91eb`, `a6af5f5`, `426caf5`, `d9b047f`, `b8ec9f2`, `1a4301c` (fork-main guards/shared installers), `d1e9fdf` (TV/grouping), `288cf7c` (synced-main ancestry). Ancestry does not imply every upstream line survives. Fork main already includes narrow fixes, shared installers and the original EPUB-message patch; identical inputs, including `client/install/index.html`, Compose and CodeQL workflow, are excluded from the net inventory.
+Merge checkpoints: `fafad69`, `d9c91eb`, `a6af5f5`, `426caf5`, `d9b047f`, `b8ec9f2`, `1a4301c` (fork-main guards/shared installers), `d1e9fdf` (TV/grouping), `288cf7c` (synced-main ancestry). Ancestry does not imply every upstream line survives. Fork main already includes narrow fixes, shared installers and the original EPUB-message patch; identical inputs, including `client/install/index.html` and CodeQL workflow, are excluded from the net inventory.
 
 Merge resolutions preserve the fork's stable media IDs/progress, source replacement guards, separate conversion ownership, transactional administration and conservative native lifecycle. The upstream audio rules use the nearest relevant folder within the configured library root and filename tokens, avoid ambient ancestors, and can refresh classification alone on an unchanged fingerprint without running media probes/converters. Responsive card sizing is retained with narrow-screen navigation, search, party controls and player accessibility fixes.
 
@@ -210,6 +210,7 @@ The first attempt triggered a safe full rollback because the initial preservatio
 | `.github/workflows/release-mac.yml` | [native packaging and platform boundaries](#native-packaging-and-platform-boundaries) |
 | `.gitignore` | [containers dependency checks and harness reliability](#containers-dependency-checks-and-harness-reliability) |
 | `Dockerfile` | [containers dependency checks and harness reliability](#containers-dependency-checks-and-harness-reliability) |
+| `compose.yaml` | [build identity and upstream freshness](#build-identity-and-upstream-freshness) |
 | `Dockerfile.proxy` | [containers dependency checks and harness reliability](#containers-dependency-checks-and-harness-reliability) |
 | `README.md` | [documentation and review accounting](#documentation-and-review-accounting) |
 | `client/css/frayd.css` | [upstream integration](#upstream-integration) |
