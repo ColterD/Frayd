@@ -118,6 +118,34 @@ npm dependency is introduced, and the Cargo audit does not scan that external
 browser. These DOM checks complement the manual media matrix; they do not close
 its held interactive acceptance cases.
 
+### Dashboard and artwork qualification
+
+The seven dashboard shelves share `categoryShelf()` in `client/js/app.js`: newest
+first by default, one per-category oldest toggle, and folder ordering by the
+maximum/minimum actual member `created_at`. Numeric TV episode order and the
+render-scoped progress reader remain separate. `artwork()` uses the thumbnail
+API and a URL version derived from the encoded `artwork_version` field, never a
+cache path. The library/search API exposes that nullable opaque basename only
+for the same media ID's canonical UUID or retained legacy name. Missing art falls
+back to a category symbol; an artwork image does not
+establish a title/artist match.
+
+Scanner tests in `server/src/scanner.rs` exercise seven local-source kinds,
+missing-cover repair, guarded publication, replacement and conservative
+retirement. `server/src/main.rs` covers thumbnail MIME and deletion. Run
+`cargo test --locked --manifest-path server/Cargo.toml` and the strict Clippy
+command in [canonical checks](#canonical-checks); run the Node and real-DOM
+commands there for dashboard sort, representative folder art and the 320×568
+footer reachability oracle. The integration test reads the database-selected
+UUID JPEG path and asserts exact bytes, rollback preservation and 204 cleanup;
+the older `id.jpg` expectation failed before that test correction. EPUB DOM
+controls check fresh-frame publication and rejection of retired messages. These
+fixture checks do not replace current-image browser acceptance. The filename-first
+online iTunes path is **UNWIRED**:
+recover `44d1ed7` `extract_thumb`/`fetch_online_thumb`/`itunes_artwork` only
+with verified artist/album matching and explicit provider opt-in. There is no
+new provider, dependency, flag or schema; no general catalog metadata lookup.
+
 ### Unwired UI design fragments
 
 `client/index.html` retains five named `<template id="unwired-…">` fragments

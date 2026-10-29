@@ -4,7 +4,7 @@
 
 Frayd is a self-hosted media library with a Rust server (axum and SQLite) and a plain JavaScript browser client. It scans local movies, TV episodes, music, audiobooks, ebooks, comics and manga, with series/author navigation, saved progress and watch parties.
 
-Implementation snapshot: [`a8b1f8e`](https://github.com/ColterD/Frayd/tree/a8b1f8ed49df1bc66c12c3923269373f9c91c504). See [PR #2](https://github.com/ColterD/Frayd/pull/2) for current deployment and acceptance status. This is an early-stage project. Start on your own computer with trusted media. The Docker setup publishes only to loopback; it does not configure household LAN access or public hosting.
+Implementation snapshot: [`b42a37e`](https://github.com/ColterD/Frayd/tree/b42a37e0e9b3bf11f6c7fa840ec629b9a06fb646). See [PR #2](https://github.com/ColterD/Frayd/pull/2) for current deployment and acceptance status. This is an early-stage project. Start on your own computer with trusted media. The Docker setup publishes only to loopback; it does not configure household LAN access or public hosting.
 
 ## Run with Docker
 
@@ -18,6 +18,8 @@ docker compose up -d --build --wait
 ```
 
 Open **http://127.0.0.1:3100**. If port 3100 is occupied, prefix Compose commands with `FRAYD_PORT=3105` and open http://127.0.0.1:3105. The first build downloads images and Rust dependencies and runs tests, Clippy and a release build; it can take several minutes.
+
+The dashboard labels all seven media categories and starts with newest items first; each category can switch to oldest first. Artwork comes from local media when available, with a symbol fallback when no usable cover exists.
 
 The first account becomes the owner/admin. You can continue as a guest, and logging in with an unused email creates another account. This is not invite-only: **guest access and library/media routes are not a private authentication boundary**. Keep the deployment on a trusted machine and do not expose it directly to the internet. Saving ebook highlights requires a signed-in account. Sign-in uses local email/password; OAuth/SSO and notifications are not implemented.
 
