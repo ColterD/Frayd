@@ -20,18 +20,42 @@ use std::path::{Path as StdPath, PathBuf};
 use std::sync::{Arc, Mutex};
 use tower_http::services::fs::ServeDir;
 
+pub(crate) static ROOT_ADMISSION: Mutex<()> = Mutex::new(());
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// The committed effective roots and override lock state, published together under App.library.
+pub struct LibraryConfig { roots: Vec<PathBuf>, locked: bool }
+
+/// One scan generation with its original complete roots and optional ingest-completion obligation.
+pub struct ScanRequest { generation:u64, roots:Vec<PathBuf>, for_ingest:bool }
+
+#[derive(Default)]
+/// Serialize pending generations and the transition between an admitted worker and an empty queue.
+pub struct ScanQueue { next_generation: u64, requests: std::collections::VecDeque<ScanRequest> }
+
 pub struct App {
     pub db: Mutex<Connection>,
     /// Path to the SQLite file (transcode thread reopens its own handle).
     pub db_path: String,
-    /// Library root from FRAYD_LIBRARY (scan target).
-    pub library: Option<PathBuf>,
+    /// Library root from FRAYD_LIBRARY (scan target). RwLock so admin UI can change it live.
+    pub library: std::sync::RwLock<LibraryConfig>,
+    pub scan_queue: Mutex<ScanQueue>,
     /// True while a scan is running (single scan at a time).
     pub scanning: std::sync::atomic::AtomicBool,
     /// Login/setup/password attempts: 10 per 5 min per IP.
     pub auth_rl: auth::RateLimiter,
     /// Active listening party (single party — household scale).
     pub party: Arc<party::Party>,
+    /// yt-dlp ingest state: "downloading" | "done" | "failed" | None. Single ingest at a time.
+    pub ingest_status: std::sync::Mutex<Option<String>>,
+}
+
+/// Expose the exact path-free liveness response independently of library availability.
+async fn health() -> Json<serde_json::Value> { Json(serde_json::json!({"status":"ok"})) }
+
+/// Parse only a literal IPv4/IPv6 bind address; default to all IPv4 interfaces and reject invalid overrides.
+fn bind_address(value: Option<&str>,port: u16) -> Result<std::net::SocketAddr,std::net::AddrParseError> {
+    value.unwrap_or("0.0.0.0").parse::<std::net::IpAddr>().map(|ip|std::net::SocketAddr::new(ip,port))
 }
 
 /// Initialize schemas, background scanning, and HTTP routes before accepting requests.
@@ -43,39 +67,34 @@ async fn main() {
     let default_db = concat!(env!("CARGO_MANIFEST_DIR"), "/frayd.db");
     let db_path = std::env::var("FRAYD_DB").unwrap_or_else(|_| default_db.into());
     let db = store::open(&db_path);
-    // Library root: env FRAYD_LIBRARY > settings.library_path (persistent, set via admin UI)
-    let library: Option<PathBuf> = std::env::var("FRAYD_LIBRARY").ok().map(PathBuf::from).or_else(|| {
-        let raw: Option<String> = db
-            .query_row("SELECT value FROM settings WHERE key='library_path'", [], |r| r.get(0))
-            .ok();
-        raw.and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
-            .and_then(|v| v.as_str().map(String::from))
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-    });
+    let library=effective_library_config(&db,std::env::var("FRAYD_LIBRARY").ok().as_deref()).expect("valid library configuration");
 
     let state = std::sync::Arc::new(App {
         db: Mutex::new(db),
         db_path: db_path.clone(),
-        library: library.clone(),
+        library: std::sync::RwLock::new(library.clone()),
+        scan_queue: Mutex::new(ScanQueue::default()),
         scanning: std::sync::atomic::AtomicBool::new(false),
         auth_rl: auth::RateLimiter::new(300, 10),
         party: Arc::new(party::Party::new()),
+        ingest_status: std::sync::Mutex::new(None),
     });
 
     // optional immediate scan
-    if let Some(lib) = library {
+    if !library.roots.is_empty() {
         state
             .scanning
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        run_scan(state.clone(), lib);
+        run_scan(state.clone(), library.roots);
     }
 
     // The scan trigger consumes server-owned state and no HTTP-provided arguments.
     let scan_state = state.clone();
     let ingest_state = state.clone();
     let app = Router::new()
-        .route("/api/health", get(|| async { Json(serde_json::json!({"status": "ok"})) }))
+        .route("/api/health", get(health))
+        .route("/api/media/:id", axum::routing::delete(delete_media))
+        .route("/api/admin/users/:id", axum::routing::delete(remove_user))
         .route("/api/library", get(library_handler))
         .route("/api/stream/:id", get(stream))
         .route("/api/progress", post(set_progress))
@@ -105,7 +124,7 @@ async fn main() {
         .route("/api/annotations/:id", get(list_annotations))
         .route("/api/annotations", post(create_annotation))
         .route("/api/annotations", axum::routing::delete(delete_annotation))
-        .nest_service("/", ServeDir::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../client")))
+        .nest_service("/", ServeDir::new(client_dir()))
         .layer(
             tower_http::cors::CorsLayer::new()
                 .allow_origin(tower_http::cors::Any)
@@ -127,7 +146,7 @@ async fn main() {
                 .and_then(|v| v.as_u64().map(|p| p as u16))
         })
         .unwrap_or(8484);
-    let addr = format!("0.0.0.0:{port}");
+    let addr=bind_address(std::env::var("FRAYD_BIND").ok().as_deref(),port).expect("FRAYD_BIND must be an IP address").to_string();
     tracing::info!("frayd listening on {addr}");
 
     // setting helper: read a bool from settings table
@@ -185,10 +204,14 @@ async fn main() {
     }
 }
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(serde::Serialize)]
 struct LibraryItem {
     id: i64,
     kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created_at: Option<i64>,
     title: String,
     author: Option<String>,
     duration_secs: Option<f64>,
@@ -256,7 +279,7 @@ async fn auth_login(
 
     // first account ever = admin (bootstrap); grant if no admin exists yet
     let _ = db.execute(
-        "INSERT OR IGNORE INTO user_perms (identity_id, is_admin) 
+        "INSERT OR IGNORE INTO user_perms (identity_id, is_admin)
          SELECT ?1, 1 WHERE NOT EXISTS (SELECT 1 FROM user_perms WHERE is_admin = 1)",
         [identity_id],
     );
@@ -432,15 +455,10 @@ fn resolve_identity(
     Err(StatusCode::UNAUTHORIZED)
 }
 
-/// Thumbs cache dir: $FRAYD_THUMBS or "thumbs" next to the db file.
-fn thumbs_dir() -> PathBuf {
-    if let Ok(t) = std::env::var("FRAYD_THUMBS") {
-        return PathBuf::from(t);
-    }
-    let db_path = std::env::var("FRAYD_DB").unwrap_or_else(|_| {
-        concat!(env!("CARGO_MANIFEST_DIR"), "/frayd.db").into()
-    });
-    StdPath::new(&db_path)
+/// Resolve the explicit thumbnail override or cache beside this application's DB.
+fn thumbs_dir_for(db_path: &str) -> PathBuf {
+    if let Some(path)=std::env::var_os("FRAYD_THUMBS") { return PathBuf::from(path); }
+    StdPath::new(db_path)
         .parent()
         .unwrap_or(StdPath::new("."))
         .join("thumbs")
@@ -539,47 +557,166 @@ async fn comic_page_names(app: &Arc<App>, id: i64, path: &str) -> Option<Vec<Str
     }
 }
 
-/// Clear the scan admission flag on success, errors, and unwinding.
-struct ScanReset(Arc<App>);
+/// Clear scan admission and abandon queued ingest on errors or unwinding.
+struct ScanReset { app:Arc<App>, armed:bool }
 impl Drop for ScanReset {
-    /// Release scan admission even if the worker exits through an error or panic.
+    /// Release admission atomically with queue abandonment unless normal drainage disarmed this guard.
     fn drop(&mut self) {
-        self.0.scanning.store(false, std::sync::atomic::Ordering::SeqCst);
+        if !self.armed { return; }
+        let mut queue=self.app.scan_queue.lock().unwrap_or_else(|e| e.into_inner());
+        queue.requests.clear();
+        let mut ingest=self.app.ingest_status.lock().unwrap_or_else(|e| e.into_inner());
+        if ingest.as_deref()==Some("indexing") { *ingest=Some("failed".into()); }
+        self.app.scanning.store(false,std::sync::atomic::Ordering::SeqCst);
     }
 }
 
-/// Spawn a background library scan. Caller must have set `scanning` = true
-/// via compare_exchange; this just runs the scan and clears the flag after.
-fn run_scan(state: std::sync::Arc<App>, lib: PathBuf) {
-    tokio::task::spawn_blocking(move || {
-        let _reset = ScanReset(state.clone());
-        let db = match store::connect(&state.db_path) {
-            Ok(db) => db,
-            Err(error) => { tracing::error!(%error, "scan database unavailable"); return; }
+/// Validate new settings paths strictly, canonicalizing existing directories and preserving ordered deduplication.
+fn normalize_roots(value: &serde_json::Value) -> Result<Vec<PathBuf>,String> { parse_roots(value,false) }
+
+/// Persisted canonical/absolute roots remain configured during a temporary outage.
+/// Only configuration reads tolerate unavailability; new path writes stay strict.
+fn parse_roots(value:&serde_json::Value,retain_unavailable:bool) -> Result<Vec<PathBuf>,String> {
+    let list=value.as_array().ok_or("library_paths must be an array")?;
+    let mut roots=Vec::new();
+    for value in list {
+        let text=value.as_str().filter(|s| !s.is_empty()).ok_or("library path must be nonempty")?;
+        let path=PathBuf::from(text);
+        let normal_absolute=path.is_absolute() && !path.components().any(|c|matches!(c,std::path::Component::ParentDir|std::path::Component::CurDir));
+        let root=match path.canonicalize() {
+            Ok(root)=>root,
+            Err(error) if retain_unavailable && normal_absolute && matches!(error.kind(),std::io::ErrorKind::NotFound|std::io::ErrorKind::PermissionDenied)=>{
+                tracing::warn!(operation="configure",path=%path.display(),%error,"configured library unavailable; retaining path without filesystem effects");
+                path
+            }
+            Err(error)=>return Err(error.to_string()),
         };
-        let thumbs = thumbs_dir();
-        let n = scanner::scan(&db, state.db_path.clone(), lib, Some(&thumbs));
-        tracing::info!("scan complete: {n} items");
+        match std::fs::metadata(&root) {
+            Ok(metadata) if metadata.is_dir()=>(),
+            Ok(_)=>return Err("library path must be a directory".into()),
+            Err(error) if retain_unavailable && normal_absolute && matches!(error.kind(),std::io::ErrorKind::NotFound|std::io::ErrorKind::PermissionDenied)=>(),
+            Err(error)=>return Err(error.to_string()),
+        }
+        if !roots.contains(&root) {roots.push(root);}
+    }
+    Ok(roots)
+}
+
+/// Read authoritative library_paths, including [], falling back to legacy only when the array key is absent.
+/// Typed unavailable absolute roots retain configuration without acquiring filesystem-write authority.
+fn stored_roots(db: &Connection) -> Result<Vec<PathBuf>,String> {
+    use rusqlite::OptionalExtension;
+    let read=|key| -> Result<Option<serde_json::Value>,String> {
+        let raw:Option<String>=db.query_row("SELECT value FROM settings WHERE key=?1",[key],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+        raw.map(|v|serde_json::from_str(&v).map_err(|e|e.to_string())).transpose()
+    };
+    if let Some(value)=read("library_paths")? { return parse_roots(&value,true); }
+    match read("library_path")? {
+        None|Some(serde_json::Value::Null)=>Ok(Vec::new()),
+        Some(serde_json::Value::String(s)) if s.is_empty()=>Ok(Vec::new()),
+        Some(value)=>parse_roots(&serde_json::json!([value]),true),
+    }
+}
+
+/// Select one exclusive locked nonempty environment root or the unlocked persisted root array.
+/// Empty environment values enable persisted configuration and never add an implicit fallback root.
+fn effective_library_config(db: &Connection, env_override: Option<&str>) -> Result<LibraryConfig,String> {
+    if let Some(path)=env_override.filter(|s| !s.is_empty()) {
+        return Ok(LibraryConfig { roots:parse_roots(&serde_json::json!([path]),true)?,locked:true });
+    }
+    Ok(LibraryConfig { roots:stored_roots(db)?,locked:false })
+}
+
+/// Web client directory. Resolution order:
+/// 1. FRAYD_CLIENT_DIR env (explicit)
+/// 2. ./client next to the server binary (release zips: server + client/ side by side)
+/// 3. ./client in cwd
+/// 4. source checkout (CARGO_MANIFEST_DIR/../client) — dev builds
+fn client_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("FRAYD_CLIENT_DIR") {
+        return PathBuf::from(d);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent().map(|p| p.join("client")) {
+            if d.is_dir() { return d; }
+        }
+    }
+    if PathBuf::from("client").is_dir() {
+        return PathBuf::from("client");
+    }
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../client"))
+}
+
+/// Copy one committed configuration snapshot without rereading settings or merging legacy paths.
+fn library_roots(app: &App) -> Vec<PathBuf> { app.library.read().unwrap().roots.clone() }
+
+/// Run admitted scans on a dedicated connection and drain queued snapshots before releasing admission.
+/// Unavailable roots/cache boundaries hold filesystem work; errors/unwinds fail abandoned indexing through ScanReset.
+fn run_scan(state: Arc<App>, libs: Vec<PathBuf>) {
+    tokio::task::spawn_blocking(move || {
+        let mut reset=ScanReset {app:state.clone(),armed:true};
+        let db=match store::connect(&state.db_path) {
+            Ok(db)=>db,
+            Err(error)=>{ tracing::error!(%error,"scan database unavailable");return; }
+        };
+        let thumbs=thumbs_dir_for(&state.db_path);
+        let mut request={
+            let mut queue=state.scan_queue.lock().unwrap();
+            if let Some(request)=queue.requests.pop_front() { request }
+            else {queue.next_generation+=1;ScanRequest{generation:queue.next_generation,roots:libs,for_ingest:false}}
+        };
+        loop {
+            let ScanRequest{generation,roots,for_ingest}=request;
+            let cache=std::env::var_os("FRAYD_TRANSCODES").map(PathBuf::from).unwrap_or_else(|| StdPath::new(&state.db_path).parent().unwrap_or(StdPath::new(".")).join("transcodes"));
+            if let Some(root)=roots.iter().find(|root| !root.is_dir()) {
+                tracing::warn!(operation="walk",path=%root.display(),generation,"library scan held: configured root unavailable");return;
+            }
+            if transcode::validate_cache(&cache,&roots).is_none() || transcode::validate_cache(&thumbs,&roots).is_none() {
+                tracing::warn!(generation,"library scan held: cache boundary unavailable or overlapping");return;
+            }
+            let mut n=0;
+            for root in &roots { n+=scanner::scan_with_roots(&db,state.db_path.clone(),root.clone(),Some(&thumbs),&roots); }
+            if for_ingest {
+                let indexed=scanner::ingest_indexed(&db,&roots[0].join("Internet"));
+                *state.ingest_status.lock().unwrap()=Some(if indexed {"done"} else {"failed"}.into());
+            }
+            tracing::info!(generation,"scan complete: {n} items");
+            let mut queue=state.scan_queue.lock().unwrap();
+            if let Some(next)=queue.requests.pop_front() { request=next;continue; }
+            state.scanning.store(false,std::sync::atomic::Ordering::SeqCst);
+            reset.armed=false;
+            drop(queue);
+            drop(reset);
+            return;
+        }
     });
+}
+
+/// Queue the download admission snapshot, coalescing only identical pending roots.
+/// Queue mutation and CAS worker admission share a mutex so no indexing request loses its worker.
+fn queue_ingest_scan(app: Arc<App>, roots: Vec<PathBuf>) {
+    let _admission=ROOT_ADMISSION.lock().unwrap();
+    let mut queue=app.scan_queue.lock().unwrap();
+    if let Some(request)=queue.requests.iter_mut().find(|request|request.roots==roots) { request.for_ingest=true; }
+    else {
+        queue.next_generation+=1;
+        let generation=queue.next_generation;
+        queue.requests.push_back(ScanRequest{generation,roots:roots.clone(),for_ingest:true});
+    }
+    if app.scanning.compare_exchange(false,true,std::sync::atomic::Ordering::SeqCst,std::sync::atomic::Ordering::SeqCst).is_ok() {
+        drop(queue);
+        run_scan(app,roots);
+    }
 }
 
 /// POST /api/scan → trigger library rescan. 202 if started, 409 if busy.
 async fn trigger_scan(State(app): State<std::sync::Arc<App>>) -> StatusCode {
     use std::sync::atomic::Ordering;
-    // re-read: env > settings.library_path (so admin UI changes work without restart)
-    let lib = app.library.clone().or_else(|| {
-        let db = app.db.lock().unwrap();
-        let raw: Option<String> = db
-            .query_row("SELECT value FROM settings WHERE key='library_path'", [], |r| r.get(0))
-            .ok();
-        raw.and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
-            .and_then(|v| v.as_str().map(String::from))
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-    });
-    let Some(lib) = lib else {
+    let _admission=ROOT_ADMISSION.lock().unwrap();
+    let libs = library_roots(&app);
+    if libs.is_empty() {
         return StatusCode::NOT_IMPLEMENTED; // no library configured
-    };
+    }
     match app.scanning.compare_exchange(
         false,
         true,
@@ -587,10 +724,20 @@ async fn trigger_scan(State(app): State<std::sync::Arc<App>>) -> StatusCode {
         Ordering::SeqCst,
     ) {
         Ok(_) => {
-            run_scan(app, lib);
+            run_scan(app, libs);
             StatusCode::ACCEPTED
         }
         Err(_) => StatusCode::CONFLICT,
+    }
+}
+
+/// Fail an abandoned downloader without overwriting a successful handoff to queued indexing.
+struct IngestReset(Arc<App>);
+impl Drop for IngestReset {
+    /// Only downloading belongs to this guard; indexing has transferred to the scan coordinator.
+    fn drop(&mut self) {
+        let mut status=self.0.ingest_status.lock().unwrap_or_else(|e|e.into_inner());
+        if status.as_deref()==Some("downloading") { *status=Some("failed".into()); }
     }
 }
 
@@ -622,22 +769,27 @@ async fn ingest(
     if std::process::Command::new("yt-dlp").arg("--version").output().is_err() {
         return StatusCode::NOT_IMPLEMENTED; // yt-dlp not installed
     }
-    let lib = app.library.clone().or_else(|| {
-        let db = app.db.lock().unwrap();
-        let raw: Option<String> = db
-            .query_row("SELECT value FROM settings WHERE key='library_path'", [], |r| r.get(0))
-            .ok();
-        raw.and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
-            .and_then(|v| v.as_str().map(String::from))
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-    });
-    let Some(lib) = lib else { return StatusCode::NOT_IMPLEMENTED };
-    let dest = lib.join("Internet");
-    std::fs::create_dir_all(&dest).ok();
+    let libs;
+    let dest;
+    {
+        let _admission=ROOT_ADMISSION.lock().unwrap();
+        libs=library_roots(&app);
+        if libs.is_empty() { return StatusCode::NOT_IMPLEMENTED; }
+        // An unavailable configured root cannot grant authority to recreate media directories.
+        let cache=std::env::var_os("FRAYD_TRANSCODES").map(PathBuf::from).unwrap_or_else(|| StdPath::new(&app.db_path).parent().unwrap_or(StdPath::new(".")).join("transcodes"));
+        if libs.iter().any(|root| !root.is_dir()) || transcode::validate_cache(&cache,&libs).is_none()
+            || transcode::validate_cache(&thumbs_dir_for(&app.db_path),&libs).is_none() {return StatusCode::SERVICE_UNAVAILABLE;}
+        let mut st=app.ingest_status.lock().unwrap();
+        if matches!(st.as_deref(),Some("downloading"|"indexing")) { return StatusCode::CONFLICT; }
+        *st=Some("downloading".into());
+        dest=libs[0].join("Internet");
+        if std::fs::create_dir_all(&dest).is_err() { *st=Some("failed".into());return StatusCode::INTERNAL_SERVER_ERROR; }
+    }
+    let state = app.clone();
     let url = body.url;
     // spawn detached: download can take minutes; rescan after success
     tokio::task::spawn_blocking(move || {
+        let _reset=IngestReset(state.clone());
         let out = dest.join("%(title)s.%(ext)s");
         let ok = std::process::Command::new("yt-dlp")
             .args(["-f", "mp4", "--no-playlist", "-o"])
@@ -647,6 +799,10 @@ async fn ingest(
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
+        if ok {
+            *state.ingest_status.lock().unwrap()=Some("indexing".into());
+            queue_ingest_scan(state.clone(),libs);
+        } else { *state.ingest_status.lock().unwrap()=Some("failed".into()); }
         tracing::info!("ingest yt-dlp {url}: {}", if ok { "ok" } else { "failed" });
     });
     StatusCode::ACCEPTED
@@ -660,11 +816,23 @@ struct PartyCreateReq {
 
 /// POST /api/party → { code, host_capability }; the proof is returned only to this creator.
 async fn party_create(
-    State(app): State<std::sync::Arc<App>>,
-    Json(req): Json<PartyCreateReq>,
-) -> impl IntoResponse {
-    let (code, host_capability) = app.party.create(&req.identity);
-    (StatusCode::OK, Json(serde_json::json!({ "code": code, "host_capability": host_capability.to_string() })))
+    State(app): State<Arc<App>>, headers:axum::http::HeaderMap, Json(req): Json<PartyCreateReq>,
+) -> axum::response::Response {
+    let key={
+        let db=app.db.lock().unwrap();
+        match party_identity_key(&db,&headers,Some(&req.identity)) {
+            Ok(key)=>key,
+            Err(status)=>return status.into_response(),
+        }
+    };
+    let (code,host_capability)=app.party.create(&key);
+    (StatusCode::OK,Json(serde_json::json!({"code":code,"host_capability":host_capability.to_string()}))).into_response()
+}
+
+/// Both HTTP creation and socket registration use the canonical token-first identity.
+fn party_identity_key(db:&Connection,headers:&axum::http::HeaderMap,identity:Option<&str>) -> Result<String,StatusCode> {
+    let id=resolve_identity(db,headers,identity)?;
+    db.query_row("SELECT key FROM identities WHERE id=?1",[id],|r|r.get(0)).map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// GET /api/party/:code/ws — join party socket. Identity via ?identity= or Bearer.
@@ -682,14 +850,11 @@ async fn party_ws(
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    // resolve identity: token first, LAN fallback
-    let key = {
-        let db = app.db.lock().unwrap();
-        match resolve_identity(&db, &headers, q.get("identity").map(|s| s.as_str())) {
-            Ok(id) => db
-                .query_row("SELECT key FROM identities WHERE id = ?1", [id], |r| r.get(0))
-                .unwrap_or_else(|_| format!("anon-{id}")),
-            Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+    let key={
+        let db=app.db.lock().unwrap();
+        match party_identity_key(&db,&headers,q.get("identity").map(String::as_str)) {
+            Ok(key)=>key,
+            Err(status)=>return status.into_response(),
         }
     };
     if !app.party.can_register(&admission, &key) {
@@ -700,11 +865,15 @@ async fn party_ws(
         .into_response()
 }
 
-/// GET /api/scan/status → { scanning: bool }
+/// Report scanning, configured/count metadata and ingest lifecycle from one effective configuration read.
+/// Paths remain confined to authorized settings responses.
 async fn scan_status(State(app): State<std::sync::Arc<App>>) -> Json<serde_json::Value> {
+    let config=app.library.read().unwrap();
     Json(serde_json::json!({
         "scanning": app.scanning.load(std::sync::atomic::Ordering::SeqCst),
-        "library_configured": app.library.is_some(),
+        "library_configured": !config.roots.is_empty(),
+        "library_count":config.roots.len(),
+        "ingesting": app.ingest_status.lock().unwrap().as_deref(),
     }))
 }
 
@@ -846,6 +1015,129 @@ async fn media_path(app: &std::sync::Arc<App>, id: i64) -> Option<String> {
         .ok()
 }
 
+/// Resolve and recheck administrative authority under the caller's write transaction.
+fn transaction_admin(db: &Connection, headers: &axum::http::HeaderMap, qid: Option<&str>) -> Result<i64,StatusCode> {
+    use rusqlite::OptionalExtension;
+    let iid=resolve_identity(db,headers,qid).map_err(|status| if status==StatusCode::INTERNAL_SERVER_ERROR {status} else {StatusCode::FORBIDDEN})?;
+    let admin:Option<i64>=db.query_row("SELECT is_admin FROM user_perms WHERE identity_id=?1",[iid],|r|r.get(0)).optional().map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?;
+    if admin==Some(1) { Ok(iid) } else { Err(StatusCode::FORBIDDEN) }
+}
+
+/// Remove only another account's owned child rows, atomically with the identity.
+async fn remove_user(
+    State(app): State<Arc<App>>, headers: axum::http::HeaderMap,
+    Query(q): Query<std::collections::HashMap<String,String>>, Path(id): Path<i64>,
+) -> StatusCode {
+    use rusqlite::OptionalExtension;
+    let mut db=app.db.lock().unwrap();
+    let result=(|| -> Result<(),StatusCode> {
+        let tx=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?;
+        let caller=transaction_admin(&tx,&headers,q.get("identity").map(String::as_str))?;
+        if caller==id {return Err(StatusCode::CONFLICT);}
+        let kind:Option<String>=tx.query_row("SELECT kind FROM identities WHERE id=?1",[id],|r|r.get(0)).optional().map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?;
+        if kind.as_deref()!=Some("account") {return Err(StatusCode::NOT_FOUND);}
+        let target_admin:i64=tx.query_row("SELECT COALESCE((SELECT is_admin FROM user_perms WHERE identity_id=?1),0)",[id],|r|r.get(0)).map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?;
+        let other_admins:i64=tx.query_row("SELECT COUNT(*) FROM user_perms WHERE is_admin=1 AND identity_id!=?1",[id],|r|r.get(0)).map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?;
+        if target_admin==1 && other_admins==0 {return Err(StatusCode::CONFLICT);}
+        for sql in [
+            "DELETE FROM playlist_items WHERE playlist_id IN (SELECT id FROM playlists WHERE identity_id=?1)",
+            "DELETE FROM playlists WHERE identity_id=?1",
+            "DELETE FROM sessions WHERE identity_id=?1",
+            "DELETE FROM user_perms WHERE identity_id=?1",
+            "DELETE FROM progress WHERE identity_id=?1",
+            "DELETE FROM annotations WHERE identity_id=?1",
+        ] {tx.execute(sql,[id]).map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?;}
+        let deleted=tx.execute("DELETE FROM identities WHERE id=?1",[id]).map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?;
+        if deleted!=1 {return Err(StatusCode::INTERNAL_SERVER_ERROR);}
+        tx.commit().map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)
+    })();
+    match result {Ok(())=>StatusCode::NO_CONTENT,Err(status)=>status}
+}
+
+/// Remove a proven, unshared cache thumbnail only after its media row committed deletion.
+/// A second write transaction prevents new database references during optional cleanup.
+fn cleanup_owned_thumbnail(db: &mut Connection, thumbs: &StdPath, roots: &[PathBuf], id:i64,
+    source:&str, thumbnail:Option<&str>) -> Result<(),String> {
+    let Some(thumbnail)=thumbnail else {return Ok(());};
+    let expected=thumbs.join(format!("{id}.jpg"));
+    let metadata=match std::fs::symlink_metadata(&expected) {
+        Ok(metadata)=>metadata,
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(()),
+        Err(error)=>return Err(error.to_string()),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {return Err("thumbnail is not an owned regular file".into());}
+    let directory=thumbs.canonicalize().map_err(|e|e.to_string())?;
+    let owned=expected.canonicalize().map_err(|e|e.to_string())?;
+    let saved=StdPath::new(thumbnail);
+    let saved_metadata=std::fs::symlink_metadata(saved).map_err(|e|e.to_string())?;
+    if saved_metadata.file_type().is_symlink() || !saved_metadata.is_file()
+        || owned!=directory.join(format!("{id}.jpg")) || saved.canonicalize().map_err(|e|e.to_string())?!=owned {
+        return Err("thumbnail path does not prove configured cache ownership".into());
+    }
+    if StdPath::new(source).canonicalize().ok().as_ref()==Some(&owned) {return Err("thumbnail is the original source".into());}
+    for root in roots {
+        let canonical=root.canonicalize().map_err(|e|e.to_string())?;
+        if owned.starts_with(canonical) {return Err("thumbnail overlaps a configured library".into());}
+    }
+    let tx=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+    {
+        let mut statement=tx.prepare("SELECT path FROM media UNION ALL SELECT thumb_path FROM media WHERE thumb_path IS NOT NULL
+            UNION ALL SELECT transcode_path FROM media WHERE transcode_path IS NOT NULL
+            UNION ALL SELECT path FROM transcode_artifacts UNION ALL SELECT owner_source_path FROM transcode_artifacts").map_err(|e|e.to_string())?;
+        let paths=statement.query_map([],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?;
+        for path in paths {
+            let path=path.map_err(|e|e.to_string())?;
+            if StdPath::new(&path).canonicalize().ok().as_ref()==Some(&owned) {return Err("thumbnail still has a database reference".into());}
+        }
+    }
+    std::fs::remove_file(&owned).map_err(|e|e.to_string())?;
+    tx.commit().map_err(|e|e.to_string())
+}
+
+/// Delete only an unreferenced media row after rechecking admin and converter admission in a write transaction.
+/// Return 403/404/409/500 for denial/missing/references-or-busy/database failure; committed deletion returns 204.
+/// Source files never grant unlink authority; optional thumbnail cleanup follows the committed row deletion.
+async fn delete_media(
+    State(app): State<Arc<App>>, headers: axum::http::HeaderMap,
+    Query(q): Query<std::collections::HashMap<String,String>>, Path(id): Path<i64>,
+) -> StatusCode {
+    use rusqlite::OptionalExtension;
+    // Serialize conversion admission and retain one complete root snapshot through cleanup.
+    let _admission=ROOT_ADMISSION.lock().unwrap();
+    let config=app.library.read().unwrap();
+    let mut db=app.db.lock().unwrap();
+    let result=(|| -> Result<(String,Option<String>),StatusCode> {
+        let tx=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?;
+        transaction_admin(&tx,&headers,q.get("identity").map(String::as_str))?;
+        let row:Option<(String,Option<String>,Option<String>)>=tx.query_row("SELECT path,thumb_path,transcode_path FROM media WHERE id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?;
+        let Some((source,thumbnail,conversion))=row else {return Err(StatusCode::NOT_FOUND);};
+        if conversion.is_some() || transcode::BUSY.load(std::sync::atomic::Ordering::SeqCst) {return Err(StatusCode::CONFLICT);}
+        let referenced:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM progress WHERE media_id=?1)
+            OR EXISTS(SELECT 1 FROM annotations WHERE media_id=?1)
+            OR EXISTS(SELECT 1 FROM tracks WHERE media_id=?1)
+            OR EXISTS(SELECT 1 FROM playlist_items WHERE media_id=?1)
+            OR EXISTS(SELECT 1 FROM media WHERE transcode_path=?2)
+            OR EXISTS(SELECT 1 FROM transcode_artifacts WHERE owner_media_id=?1 OR path=?2 OR owner_source_path=?2)",rusqlite::params![id,source],|r|r.get(0)).map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?;
+        if referenced {return Err(StatusCode::CONFLICT);}
+        let deleted=tx.execute("DELETE FROM media WHERE id=?1",[id]).map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?;
+        if deleted!=1 {return Err(StatusCode::INTERNAL_SERVER_ERROR);}
+        tx.commit().map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?;
+        Ok((source,thumbnail))
+    })();
+    match result {
+        Err(status)=>status,
+        Ok((source,thumbnail))=>{
+            // An admitted scan may regenerate the same ID's cache; leave optional bytes alone.
+            if !app.scanning.load(std::sync::atomic::Ordering::SeqCst) {
+                if let Err(error)=cleanup_owned_thumbnail(&mut db,&thumbs_dir_for(&app.db_path),&config.roots,id,&source,thumbnail.as_deref()) {
+                    tracing::warn!(id,%error,"media deletion committed; thumbnail cleanup held");
+                }
+            }
+            StatusCode::NO_CONTENT
+        }
+    }
+}
+
 async fn library_handler(
     State(app): State<std::sync::Arc<App>>,
     headers: axum::http::HeaderMap,
@@ -870,14 +1162,14 @@ async fn library_handler(
             (),
         )
     });
-    let filter = q.get("q").map(|s| format!("%{}%", s.replace('%', "").replace('_', "")));
+    let filter = q.get("q").map(|s| format!("%{}%", s.replace(['%', '_'], "")));
     let sql = format!(
         "SELECT id, kind, title, author, duration_secs,
-                json_extract(meta_json, '$.synopsis'), series
+                json_extract(meta_json, '$.synopsis'), series, created_at
          FROM media
          WHERE (?1 IS NULL OR title LIKE ?1 OR author LIKE ?1
                 OR json_extract(meta_json, '$.synopsis') LIKE ?1){}
-         ORDER BY kind, title",
+         ORDER BY created_at DESC",
         kinds_clause.as_ref().map(|(c, _)| c.as_str()).unwrap_or("")
     );
     let mut stmt = db.prepare(&sql).unwrap();
@@ -891,6 +1183,7 @@ async fn library_handler(
                 duration_secs: r.get(4)?,
                 synopsis: r.get(5)?,
                 series: r.get(6)?,
+                created_at: r.get(7)?,
             })
         })
         .unwrap()
@@ -1217,37 +1510,44 @@ async fn list_perms(
     Json(rows).into_response()
 }
 
-/// POST /api/admin/perms {identity_id, is_admin?, allowed_kinds?: [..]|null}
+/// Atomically update validated permissions while preserving at least one administrator.
+/// Omitted kinds preserve the prior restriction, null clears it, and [] denies every kind.
 async fn set_perm(
-    State(app): State<std::sync::Arc<App>>,
-    headers: axum::http::HeaderMap,
-    Query(q): Query<std::collections::HashMap<String, String>>,
-    Json(body): Json<serde_json::Value>,
+    State(app): State<Arc<App>>, headers: axum::http::HeaderMap,
+    Query(q): Query<std::collections::HashMap<String,String>>, Json(body): Json<serde_json::Value>,
 ) -> StatusCode {
-    let db = app.db.lock().unwrap();
-    if require_admin(&db, &headers, q.get("identity").map(|s| s.as_str())).is_err() {
-        return StatusCode::FORBIDDEN;
-    }
-    let Some(iid) = body["identity_id"].as_i64() else { return StatusCode::BAD_REQUEST };
-    // demoting last admin blocked
-    if body["is_admin"] == serde_json::json!(false) {
-        let admins: i64 = db.query_row("SELECT COUNT(*) FROM user_perms WHERE is_admin = 1 AND identity_id != ?1", [iid], |r| r.get(0)).unwrap_or(0);
-        if admins == 0 { return StatusCode::CONFLICT; }
-    }
-    let kinds_json: Option<String> = match body.get("allowed_kinds") {
-        Some(v) if v.is_null() => None,
-        Some(v) if v.is_array() => Some(v.to_string()),
-        _ => None, // not provided: leave unchanged
-    };
-    let admin_chg = body.get("is_admin").and_then(|v| v.as_bool());
-    let _ = db.execute(
-        "INSERT INTO user_perms (identity_id, is_admin, allowed_kinds) VALUES (?1, ?2, ?3)
-         ON CONFLICT(identity_id) DO UPDATE SET
-           is_admin = COALESCE(?2, is_admin),
-           allowed_kinds = COALESCE(?3, allowed_kinds)",
-        rusqlite::params![iid, admin_chg.map(|b| b as i64), kinds_json],
-    );
-    StatusCode::NO_CONTENT
+    use rusqlite::OptionalExtension;
+    let mut db=app.db.lock().unwrap();
+    let result=(|| -> Result<(),StatusCode> {
+        let tx=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?;
+        transaction_admin(&tx,&headers,q.get("identity").map(String::as_str))?;
+        let map=body.as_object().ok_or(StatusCode::BAD_REQUEST)?;
+        let iid=body["identity_id"].as_i64().ok_or(StatusCode::BAD_REQUEST)?;
+        let admin=match map.get("is_admin") {None=>None,Some(value)=>Some(value.as_bool().ok_or(StatusCode::BAD_REQUEST)?)};
+        let kinds_present=map.contains_key("allowed_kinds");
+        let kinds=match map.get("allowed_kinds") {
+            None|Some(serde_json::Value::Null)=>None,
+            Some(serde_json::Value::Array(values))=>{
+                if !values.iter().all(|v|v.as_str().is_some_and(|kind|matches!(kind,"audiobook"|"ebook"|"comic"|"manga"|"movie"|"music"|"episode"))) {return Err(StatusCode::BAD_REQUEST);}
+                Some(serde_json::json!(values).to_string())
+            }
+            Some(_)=>return Err(StatusCode::BAD_REQUEST),
+        };
+        let target:Option<i64>=tx.query_row("SELECT id FROM identities WHERE id=?1",[iid],|r|r.get(0)).optional().map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?;
+        if target.is_none() {return Err(StatusCode::NOT_FOUND);}
+        if admin==Some(false) {
+            let other_admins:i64=tx.query_row("SELECT COUNT(*) FROM user_perms WHERE is_admin=1 AND identity_id!=?1",[iid],|r|r.get(0)).map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?;
+            if other_admins==0 {return Err(StatusCode::CONFLICT);}
+        }
+        let changed=tx.execute("INSERT INTO user_perms(identity_id,is_admin,allowed_kinds) VALUES(?1,?2,?3)
+            ON CONFLICT(identity_id) DO UPDATE SET
+            is_admin=CASE WHEN ?4 THEN excluded.is_admin ELSE user_perms.is_admin END,
+            allowed_kinds=CASE WHEN ?5 THEN excluded.allowed_kinds ELSE user_perms.allowed_kinds END",
+            rusqlite::params![iid,admin.unwrap_or(false) as i64,kinds,admin.is_some(),kinds_present]).map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?;
+        if changed!=1 {return Err(StatusCode::INTERNAL_SERVER_ERROR);}
+        tx.commit().map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)
+    })();
+    match result {Ok(())=>StatusCode::NO_CONTENT,Err(status)=>status}
 }
 
 /// GET /api/admin/settings → {key: value,...}
@@ -1256,6 +1556,7 @@ async fn get_settings(
     headers: axum::http::HeaderMap,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
+    let config=app.library.read().unwrap();
     let db = app.db.lock().unwrap();
     if require_admin(&db, &headers, q.get("identity").map(|s| s.as_str())).is_err() {
         return StatusCode::FORBIDDEN.into_response();
@@ -1271,28 +1572,68 @@ async fn get_settings(
             map.insert(k, parsed);
         }
     }
+    // Persisted paths and effective override are distinct authorized metadata.
+    let normalized=stored_roots(&db).unwrap_or_else(|_| config.roots.clone());
+    map.remove("library_path");
+    map.insert("library_paths".into(),serde_json::json!(normalized));
+    map.insert("library_locked".into(),serde_json::json!(config.locked));
+    map.insert("effective_library_paths".into(),serde_json::json!(config.roots));
+    map.insert("server_version".into(),serde_json::json!(VERSION));
     Json(serde_json::Value::Object(map)).into_response()
 }
 
-/// POST /api/admin/settings {key: value}
+/// Validate the whole settings payload before one immediate transaction and publish roots only after commit.
+/// Admission/config/database lock ordering prevents jobs from retaining an obsolete newly expanded root set.
 async fn set_setting(
-    State(app): State<std::sync::Arc<App>>,
-    headers: axum::http::HeaderMap,
-    Query(q): Query<std::collections::HashMap<String, String>>,
-    Json(body): Json<serde_json::Value>,
-) -> StatusCode {
-    let db = app.db.lock().unwrap();
-    if require_admin(&db, &headers, q.get("identity").map(|s| s.as_str())).is_err() {
-        return StatusCode::FORBIDDEN;
+    State(app): State<Arc<App>>, headers: axum::http::HeaderMap,
+    Query(q): Query<std::collections::HashMap<String,String>>, Json(body): Json<serde_json::Value>,
+) -> axum::response::Response {
+    // Global order: admission -> config -> database -> ingest. Workers never hold
+    // application database/config locks during filesystem traversal.
+    let _admission=ROOT_ADMISSION.lock().unwrap();
+    let mut config=app.library.write().unwrap();
+    let mut db=app.db.lock().unwrap();
+    if require_admin(&db,&headers,q.get("identity").map(String::as_str)).is_err() { return StatusCode::FORBIDDEN.into_response(); }
+    let Some(mut map)=body.as_object().cloned() else { return StatusCode::BAD_REQUEST.into_response(); };
+    let paths_changed=map.contains_key("library_path") || map.contains_key("library_paths");
+    if map.contains_key("library_path") && map.contains_key("library_paths") { return StatusCode::BAD_REQUEST.into_response(); }
+    if paths_changed && (config.locked || app.scanning.load(std::sync::atomic::Ordering::SeqCst)
+        || transcode::BUSY.load(std::sync::atomic::Ordering::SeqCst)
+        || matches!(app.ingest_status.lock().unwrap().as_deref(),Some("downloading"|"indexing"))) {
+        return StatusCode::CONFLICT.into_response();
     }
-    let Some(serde_json::Value::Object(map)) = Some(body) else { return StatusCode::BAD_REQUEST };
-    for (k, v) in map {
-        let _ = db.execute(
-            "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
-            rusqlite::params![k, v.to_string()],
-        );
+    if map.keys().any(|k| matches!(k.as_str(),"library_locked"|"effective_library_paths"|"server_version")) { return StatusCode::BAD_REQUEST.into_response(); }
+    let roots=if paths_changed {
+        let value=if let Some(value)=map.remove("library_path") {
+            if value.is_null() || value=="" { serde_json::json!([]) } else { serde_json::json!([value]) }
+        } else { map.remove("library_paths").unwrap() };
+        let Ok(roots)=normalize_roots(&value) else { return StatusCode::BAD_REQUEST.into_response(); };
+        let cache=std::env::var_os("FRAYD_TRANSCODES").map(PathBuf::from).unwrap_or_else(|| StdPath::new(&app.db_path).parent().unwrap_or(StdPath::new(".")).join("transcodes"));
+        if !roots.is_empty() && (transcode::validate_cache(&cache,&roots).is_none() || transcode::validate_cache(&thumbs_dir_for(&app.db_path),&roots).is_none()) { return StatusCode::BAD_REQUEST.into_response(); }
+        map.insert("library_paths".into(),serde_json::json!(roots));
+        Some(roots)
+    } else { None };
+    for (key,value) in &map {
+        let valid=match key.as_str() {
+            "library_paths"=>true,
+            "port"=>value.as_u64().is_some_and(|p| p>0 && p<=65535),
+            "upnp"=>value.is_boolean(),
+            "tls_cert"|"tls_key"=>value.is_string() || value.is_null(),
+            _=>true,
+        };
+        if !valid { return StatusCode::BAD_REQUEST.into_response(); }
     }
-    StatusCode::NO_CONTENT
+    let result=(|| -> rusqlite::Result<()> {
+        let tx=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for (key,value) in map {
+            tx.execute("INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=?2",rusqlite::params![key,value.to_string()])?;
+        }
+        if paths_changed { tx.execute("DELETE FROM settings WHERE key='library_path'",[])?; }
+        tx.commit()
+    })();
+    if result.is_err() { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); }
+    if let Some(roots)=roots { config.roots=roots; }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 
@@ -1336,7 +1677,7 @@ mod backend_regressions {
             rusqlite::params![path,r#"{"pages":["À.png","Á.png","Â.png"],"synopsis":"keep"}"#]).unwrap();
         db.execute("INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture')", []).unwrap();
         db.execute("INSERT INTO progress(identity_id,media_id,position) VALUES(1,1,7)", []).unwrap();
-        Arc::new(App { db: Mutex::new(db), db_path: String::new(), library: None,
+        Arc::new(App { db: Mutex::new(db), db_path: String::new(), library: std::sync::RwLock::new(LibraryConfig::default()), scan_queue:Mutex::new(ScanQueue::default()), ingest_status: Mutex::new(None),
             scanning: std::sync::atomic::AtomicBool::new(false), auth_rl: auth::RateLimiter::new(300,10),
             party: Arc::new(party::Party::new()) })
     }
@@ -1698,7 +2039,7 @@ mod backend_regressions {
             locked_tx.send(()).unwrap(); release_rx.recv().unwrap();
         });
         locked_rx.recv().unwrap();
-        run_scan(app.clone(),root.join("library"));
+        run_scan(app.clone(),vec![root.join("library")]);
         for _ in 0..100 {
             if !app.scanning.load(std::sync::atomic::Ordering::SeqCst) { break; }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -1714,7 +2055,7 @@ mod backend_regressions {
         let mut app = app_for("unused.cbz");
         Arc::get_mut(&mut app).unwrap().db_path = "/nonexistent/frayd/fixture.db".into();
         app.scanning.store(true,std::sync::atomic::Ordering::SeqCst);
-        run_scan(app.clone(),PathBuf::from("/nonexistent"));
+        run_scan(app.clone(),vec![PathBuf::from("/nonexistent")]);
         for _ in 0..100 {
             if !app.scanning.load(std::sync::atomic::Ordering::SeqCst) { break; }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -1722,7 +2063,7 @@ mod backend_regressions {
         assert!(!app.scanning.load(std::sync::atomic::Ordering::SeqCst));
         app.scanning.store(true,std::sync::atomic::Ordering::SeqCst);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _reset=ScanReset(app.clone()); panic!("fixture unwind");
+            let _reset=ScanReset {app:app.clone(),armed:true}; panic!("fixture unwind");
         }));
         assert!(result.is_err());
         assert!(!app.scanning.load(std::sync::atomic::Ordering::SeqCst));
@@ -1750,9 +2091,9 @@ mod ingest_tests {
         db.execute_batch("INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture-admin'),(2,'device','fixture-reader');
             INSERT INTO user_perms(identity_id,is_admin) VALUES(1,1),(2,0);").unwrap();
         let library=root.join("library with spaces"); std::fs::create_dir_all(&library).unwrap();
-        Arc::new(App { db:Mutex::new(db),db_path:String::new(),library:Some(library),
+        Arc::new(App { db:Mutex::new(db),db_path:String::new(),library:std::sync::RwLock::new(LibraryConfig{roots:vec![library],locked:false}),scan_queue:Mutex::new(ScanQueue::default()),
             scanning:std::sync::atomic::AtomicBool::new(false),auth_rl:auth::RateLimiter::new(300,10),
-            party:Arc::new(party::Party::new()) })
+            party:Arc::new(party::Party::new()),ingest_status:Mutex::new(None) })
     }
 
     /// Exercise the real handler's authorization and argument construction without a network downloader.
@@ -1812,4 +2153,619 @@ mod ingest_tests {
         std::fs::remove_dir_all(&root).unwrap();
         assert!(output.status.success(),"isolated ingestion worker: {}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
     }
+}
+
+#[cfg(test)]
+mod upstream_integration_tests {
+    use super::*;
+    /// Create independent two-root data and a disposable database with a synthetic administrator.
+    fn fixture() -> (PathBuf, Arc<App>) {
+        let root=std::env::temp_dir().join(format!("frayd-roots-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        let db=store::open(root.join("db.sqlite").to_str().unwrap());
+
+        db.execute_batch("INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture-admin'); INSERT INTO user_perms(identity_id,is_admin) VALUES(1,1);").unwrap();
+        let app=Arc::new(App {db:Mutex::new(db),db_path:root.join("db.sqlite").to_string_lossy().into_owned(),library:std::sync::RwLock::new(LibraryConfig::default()),scan_queue:Mutex::new(ScanQueue::default()),scanning:std::sync::atomic::AtomicBool::new(false),auth_rl:auth::RateLimiter::new(300,10),party:Arc::new(party::Party::new()),ingest_status:Mutex::new(None)});
+        (root,app)
+    }
+    #[test]
+    fn upstream_integration_roots_array_replaces_legacy() {
+        let (root,app)=fixture();
+        app.db.lock().unwrap().execute("INSERT INTO settings(key,value) VALUES('library_path',?1)",[serde_json::json!(root.join("a")).to_string()]).unwrap();
+        *app.library.write().unwrap()=effective_library_config(&app.db.lock().unwrap(),None).unwrap();
+        app.db.lock().unwrap().execute("INSERT INTO settings(key,value) VALUES('library_paths',?1)",[serde_json::json!([root.join("b")]).to_string()]).unwrap();
+        *app.library.write().unwrap()=effective_library_config(&app.db.lock().unwrap(),None).unwrap();
+        assert_eq!(library_roots(&app),vec![root.join("b")]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    /// Exercise the production settings transaction through the fixture administrator identity.
+    async fn setting(app: &Arc<App>, value:serde_json::Value) -> StatusCode {
+        set_setting(State(app.clone()),axum::http::HeaderMap::new(),Query(std::collections::HashMap::from([("identity".into(),"fixture-admin".into())])),Json(value)).await.status()
+    }
+    #[test]
+    fn upstream_integration_roots_override_empty_array_and_aliases() {
+        let (root,app)=fixture(); let db=app.db.lock().unwrap();
+        db.execute("INSERT INTO settings(key,value) VALUES('library_path',?1)",[serde_json::json!(root.join("a")).to_string()]).unwrap();
+        assert_eq!(effective_library_config(&db,Some("")).unwrap().roots,vec![root.join("a")]);
+        db.execute("INSERT INTO settings(key,value) VALUES('library_paths','[]')",[]).unwrap();
+        assert!(effective_library_config(&db,None).unwrap().roots.is_empty());
+        let overridden=effective_library_config(&db,root.join("b").to_str()).unwrap();
+        assert_eq!(overridden.roots,vec![root.join("b")]);assert!(overridden.locked);
+        #[cfg(unix)] {
+            std::os::unix::fs::symlink(root.join("a"),root.join("alias")).unwrap();
+            assert_eq!(normalize_roots(&serde_json::json!([root.join("a"),root.join("alias"),root.join("b")])).unwrap(),vec![root.join("a"),root.join("b")]);
+        }
+        for value in [serde_json::json!("bad"),serde_json::json!([""]),serde_json::json!([root.join("a"),root.join("missing")]),serde_json::json!([root.join("db.sqlite")])] { assert!(normalize_roots(&value).is_err()); }
+        drop(db);std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn upstream_integration_roots_settings_atomic_failure_and_metadata() {
+        let (root,app)=fixture();
+        assert_eq!(setting(&app,serde_json::json!({"library_path":root.join("a"),"port":9999})).await,StatusCode::NO_CONTENT);
+        assert_eq!(library_roots(&app),vec![root.join("a")]);
+        assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM settings WHERE key='library_path'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        let before=app.library.read().unwrap().clone();
+        for value in [serde_json::json!({"library_paths":[root.join("b"),root.join("missing")],"port":9998}),serde_json::json!({"library_paths":[root.join("b")],"port":0}),serde_json::json!({"library_path":root.join("a"),"library_paths":[]})] {
+            assert_eq!(setting(&app,value).await,StatusCode::BAD_REQUEST);assert_eq!(*app.library.read().unwrap(),before);
+            assert_eq!(app.db.lock().unwrap().query_row("SELECT value FROM settings WHERE key='port'",[],|r|r.get::<_,String>(0)).unwrap(),"9999");
+        }
+        app.db.lock().unwrap().execute_batch("CREATE TRIGGER reject_port BEFORE UPDATE ON settings WHEN NEW.key='port' BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
+        assert_eq!(setting(&app,serde_json::json!({"library_paths":[root.join("b")],"port":9998})).await,StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(*app.library.read().unwrap(),before);
+        assert_eq!(stored_roots(&app.db.lock().unwrap()).unwrap(),before.roots);
+        let response=get_settings(State(app.clone()),axum::http::HeaderMap::new(),Query(std::collections::HashMap::from([("identity".into(),"fixture-admin".into())]))).await.into_response();
+        let value:serde_json::Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),65536).await.unwrap()).unwrap();
+        assert_eq!(value["library_paths"],serde_json::json!([root.join("a")])); assert_eq!(value["effective_library_paths"],value["library_paths"]);
+        assert_eq!(value["library_locked"],false);assert_eq!(value["server_version"],VERSION);
+        assert!(value.get("library_path").is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn upstream_integration_roots_override_and_active_jobs_refuse_whole_request() {
+        let (root,app)=fixture();
+        *app.library.write().unwrap()=LibraryConfig{roots:vec![root.join("a")],locked:true};
+        assert_eq!(setting(&app,serde_json::json!({"library_paths":[],"port":9998})).await,StatusCode::CONFLICT);
+        app.library.write().unwrap().locked=false;
+        for status in ["downloading","indexing"] {
+            *app.ingest_status.lock().unwrap()=Some(status.into());
+            assert_eq!(setting(&app,serde_json::json!({"library_paths":[],"port":9998})).await,StatusCode::CONFLICT);
+        }
+        *app.ingest_status.lock().unwrap()=None;app.scanning.store(true,std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(setting(&app,serde_json::json!({"library_paths":[],"port":9998})).await,StatusCode::CONFLICT);
+        app.scanning.store(false,std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM settings",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn upstream_integration_scan_ingest_queue_indexes_before_done_and_retains_removed_roots() {
+        let (root,app)=fixture();
+        let roots=vec![root.join("a"),root.join("b")];
+        *app.library.write().unwrap()=LibraryConfig{roots:roots.clone(),locked:false};
+        std::fs::write(root.join("b/retained.cbz"),b"source").unwrap();
+        std::fs::create_dir(root.join("a/Internet")).unwrap();std::fs::write(root.join("a/Internet/download.cbz"),b"download").unwrap();
+        // Simulate an admitted busy worker: ingestion must queue its complete snapshot.
+        app.scanning.store(true,std::sync::atomic::Ordering::SeqCst);
+        *app.ingest_status.lock().unwrap()=Some("indexing".into());
+        queue_ingest_scan(app.clone(),roots.clone());
+        assert_eq!(app.scan_queue.lock().unwrap().requests.len(),1);
+        let status=scan_status(State(app.clone())).await.0;
+        assert_eq!(status,serde_json::json!({"scanning":true,"library_configured":true,"library_count":2,"ingesting":"indexing"}));
+        assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM media",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        run_scan(app.clone(),roots.clone());
+        for _ in 0..400 { if !app.scanning.load(std::sync::atomic::Ordering::SeqCst) {break;} tokio::time::sleep(std::time::Duration::from_millis(5)).await; }
+        assert!(!app.scanning.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(app.ingest_status.lock().unwrap().as_deref(),Some("done"));
+        let id:i64=app.db.lock().unwrap().query_row("SELECT id FROM media WHERE path=?1",[root.join("b/retained.cbz").to_str().unwrap()],|r|r.get(0)).unwrap();
+        app.db.lock().unwrap().execute("INSERT INTO progress(identity_id,media_id,position) VALUES(1,?1,42)",[id]).unwrap();
+        let thumbnail=root.join("thumbs/retained.jpg");std::fs::write(&thumbnail,b"thumbnail").unwrap();
+        app.db.lock().unwrap().execute(r#"UPDATE media SET thumb_path=?1,meta_json='{"synopsis":"keep","pages":["one"]}' WHERE id=?2"#,rusqlite::params![thumbnail.to_str().unwrap(),id]).unwrap();
+        app.db.lock().unwrap().execute("INSERT INTO annotations(identity_id,media_id,kind,spine_idx,cfi,note) VALUES(1,?1,'bookmark',0,'fixture','keep')",[id]).unwrap();
+        assert_eq!(setting(&app,serde_json::json!({"library_paths":[root.join("a")]})).await,StatusCode::NO_CONTENT);
+        assert_eq!(trigger_scan(State(app.clone())).await,StatusCode::ACCEPTED);
+        for _ in 0..400 { if !app.scanning.load(std::sync::atomic::Ordering::SeqCst) {break;} tokio::time::sleep(std::time::Duration::from_millis(5)).await; }
+        assert_eq!(app.db.lock().unwrap().query_row("SELECT position FROM progress WHERE media_id=?1",[id],|r|r.get::<_,f64>(0)).unwrap(),42.0);
+        assert_eq!(std::fs::read(root.join("b/retained.cbz")).unwrap(),b"source");
+        assert_eq!(std::fs::read(&thumbnail).unwrap(),b"thumbnail");
+        assert_eq!(app.db.lock().unwrap().query_row("SELECT note FROM annotations WHERE media_id=?1",[id],|r|r.get::<_,String>(0)).unwrap(),"keep");
+        assert_eq!(app.db.lock().unwrap().query_row("SELECT json_extract(meta_json,'$.pages[0]') FROM media WHERE id=?1",[id],|r|r.get::<_,String>(0)).unwrap(),"one");
+        assert_eq!(setting(&app,serde_json::json!({"library_paths":[]})).await,StatusCode::NO_CONTENT);
+        assert!(effective_library_config(&app.db.lock().unwrap(),Some("")).unwrap().roots.is_empty());
+        assert_eq!(trigger_scan(State(app.clone())).await,StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(app.db.lock().unwrap().query_row("SELECT position FROM progress WHERE media_id=?1",[id],|r|r.get::<_,f64>(0)).unwrap(),42.0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn upstream_integration_cache_all_roots_refuse_before_registry_or_directory_mutation() {
+        let (root,app)=fixture(); let roots=vec![root.join("a"),root.join("b")];
+        let alias=root.join("alias");
+        #[cfg(unix)] std::os::unix::fs::symlink(root.join("b"),&alias).unwrap();
+        for cache in [root.join("b/nested/missing"),root.clone(),alias.join("nested")] {
+            assert!(transcode::validate_cache(&cache,&roots).is_none());
+            assert!(!root.join("b/nested").exists());
+        }
+        assert!(transcode::validate_cache(&root.join("cache/nested"),&roots).is_some());
+        assert!(!root.join("cache").exists());
+        assert!(transcode::validate_cache(&root.join("cache"),&[]).is_none());
+        // Thumbnail overlap with B refuses the entire A pass, before reconciliation.
+        std::fs::write(root.join("a/untouched.cbz"),b"source").unwrap();
+        let db=app.db.lock().unwrap();
+        assert_eq!(scanner::scan_with_roots(&db,app.db_path.clone(),root.join("a"),Some(&root.join("b/thumbs")),&roots),0);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM media",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        assert!(!root.join("b/thumbs").exists());drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upstream_integration_scan_ingest_blocked_downloader_queues_original_snapshot() {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(root)=std::env::var_os("FRAYD_TEST_QUEUE_ROOT") {
+            let root=PathBuf::from(root);let (fixture_root,app)=fixture();
+            let roots=vec![fixture_root.join("a"),fixture_root.join("b")];
+            *app.library.write().unwrap()=LibraryConfig{roots:roots.clone(),locked:false};
+            std::fs::write(roots[1].join("blocking.mkv"),b"synthetic").unwrap();
+            assert_eq!(trigger_scan(State(app.clone())).await,StatusCode::ACCEPTED);
+            for _ in 0..400 {if root.join("probe-ready").exists(){break;}tokio::time::sleep(std::time::Duration::from_millis(5)).await;}
+            assert!(root.join("probe-ready").exists());
+            let submit=|| ingest(State(app.clone()),axum::http::HeaderMap::new(),Query(std::collections::HashMap::from([("identity".into(),"fixture-admin".into())])),Json(IngestReq{url:"https://example.invalid/video".into()}));
+            assert_eq!(submit().await,StatusCode::ACCEPTED);
+            for _ in 0..400 {if root.join("download-ready").exists(){break;}tokio::time::sleep(std::time::Duration::from_millis(5)).await;}
+            assert!(root.join("download-ready").exists());assert_eq!(submit().await,StatusCode::CONFLICT);
+            assert_eq!(setting(&app,serde_json::json!({"library_paths":[]})).await,StatusCode::CONFLICT);
+            std::fs::write(root.join("download-release"),[]).unwrap();
+            for _ in 0..400 {if app.ingest_status.lock().unwrap().as_deref()==Some("indexing"){break;}tokio::time::sleep(std::time::Duration::from_millis(5)).await;}
+            assert_eq!(app.ingest_status.lock().unwrap().as_deref(),Some("indexing"));
+            assert_eq!(app.scan_queue.lock().unwrap().requests.front().unwrap().roots,roots);
+            assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM media WHERE path LIKE '%download.cbz'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+            std::fs::write(root.join("probe-release"),[]).unwrap();
+            for _ in 0..800 {if !app.scanning.load(std::sync::atomic::Ordering::SeqCst){break;}tokio::time::sleep(std::time::Duration::from_millis(5)).await;}
+            assert!(!app.scanning.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(app.ingest_status.lock().unwrap().as_deref(),Some("done"));
+            assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM media WHERE path LIKE '%download.cbz'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+            // Conversion admission holds reconfiguration through the real blocked codec probe.
+            for _ in 0..400 {if !transcode::BUSY.load(std::sync::atomic::Ordering::SeqCst){break;}tokio::time::sleep(std::time::Duration::from_millis(5)).await;}
+            std::fs::remove_file(root.join("probe-ready")).unwrap();std::fs::remove_file(root.join("probe-release")).unwrap();
+            let movie=roots[1].join("blocking.mkv");
+            let id=app.db.lock().unwrap().query_row("SELECT id FROM media WHERE path=?1",[movie.to_str().unwrap()],|r|r.get::<_,i64>(0)).unwrap();
+            transcode::maybe_enqueue_with_roots(app.db_path.clone(),id,movie,roots.clone());
+            for _ in 0..400 {if root.join("probe-ready").exists(){break;}tokio::time::sleep(std::time::Duration::from_millis(5)).await;}
+            assert!(transcode::BUSY.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(setting(&app,serde_json::json!({"library_paths":[],"port":9999})).await,StatusCode::CONFLICT);
+            std::fs::write(root.join("probe-release"),[]).unwrap();
+            for _ in 0..400 {if !transcode::BUSY.load(std::sync::atomic::Ordering::SeqCst){break;}tokio::time::sleep(std::time::Duration::from_millis(5)).await;}
+            assert!(!transcode::BUSY.load(std::sync::atomic::Ordering::SeqCst));
+            // Failed/unwound scan abandons indexing, clears its queue and admits later scans.
+            *app.ingest_status.lock().unwrap()=Some("indexing".into());app.scanning.store(true,std::sync::atomic::Ordering::SeqCst);
+            queue_ingest_scan(app.clone(),roots.clone());
+            drop(ScanReset {app:app.clone(),armed:true});
+            assert_eq!(app.ingest_status.lock().unwrap().as_deref(),Some("failed"));assert!(app.scan_queue.lock().unwrap().requests.is_empty());
+            assert_eq!(trigger_scan(State(app.clone())).await,StatusCode::ACCEPTED);
+            for _ in 0..800 {if !app.scanning.load(std::sync::atomic::Ordering::SeqCst){break;}tokio::time::sleep(std::time::Duration::from_millis(5)).await;}
+            std::fs::remove_dir_all(fixture_root).unwrap();return;
+        }
+        let root=std::env::temp_dir().join(format!("frayd-queue-{}",uuid::Uuid::new_v4()));std::fs::create_dir_all(root.join("bin")).unwrap();
+        let downloader=root.join("bin/yt-dlp");let probe=root.join("bin/ffprobe");
+        std::fs::write(&downloader,b"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\ntouch \"$FRAYD_TEST_QUEUE_ROOT/download-ready\"\nwhile [ ! -e \"$FRAYD_TEST_QUEUE_ROOT/download-release\" ]; do sleep 0.01; done\nout=$5\ndest=${out%/*}\nprintf 'fixture' > \"$dest/download.cbz\"\n").unwrap();
+        std::fs::write(&probe,b"#!/bin/sh\ntouch \"$FRAYD_TEST_QUEUE_ROOT/probe-ready\"\nwhile [ ! -e \"$FRAYD_TEST_QUEUE_ROOT/probe-release\" ]; do sleep 0.01; done\nexit 1\n").unwrap();
+        for path in [&downloader,&probe] {std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o755)).unwrap();}
+        let mut paths=vec![root.join("bin")];paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+        let result=Command::new(std::env::current_exe().unwrap()).args(["--exact","upstream_integration_tests::upstream_integration_scan_ingest_blocked_downloader_queues_original_snapshot","--nocapture"]).env("FRAYD_TEST_QUEUE_ROOT",&root).env("PATH",std::env::join_paths(paths).unwrap()).output().unwrap();
+        std::fs::remove_dir_all(root).unwrap();assert!(result.status.success(),"{}{}",String::from_utf8_lossy(&result.stdout),String::from_utf8_lossy(&result.stderr));
+    }
+
+    #[tokio::test]
+    async fn upstream_integration_scan_ingest_database_rejection_and_unavailable_root_fail() {
+        let (root,app)=fixture();let roots=vec![root.join("a")];
+        std::fs::create_dir(root.join("a/Internet")).unwrap();std::fs::write(root.join("a/Internet/download.cbz"),b"download").unwrap();
+        app.db.lock().unwrap().execute_batch("CREATE TRIGGER reject_media BEFORE INSERT ON media BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
+        *app.ingest_status.lock().unwrap()=Some("indexing".into());queue_ingest_scan(app.clone(),roots.clone());
+        for _ in 0..400 {if !app.scanning.load(std::sync::atomic::Ordering::SeqCst){break;}tokio::time::sleep(std::time::Duration::from_millis(5)).await;}
+        assert_eq!(app.ingest_status.lock().unwrap().as_deref(),Some("failed"));
+        assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM media",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        *app.ingest_status.lock().unwrap()=Some("indexing".into());queue_ingest_scan(app.clone(),vec![root.join("missing")]);
+        for _ in 0..400 {if !app.scanning.load(std::sync::atomic::Ordering::SeqCst){break;}tokio::time::sleep(std::time::Duration::from_millis(5)).await;}
+        assert_eq!(app.ingest_status.lock().unwrap().as_deref(),Some("failed"));assert!(app.scan_queue.lock().unwrap().requests.is_empty());
+        assert_eq!(health().await.0,serde_json::json!({"status":"ok"}));
+        assert_eq!(bind_address(None,8484).unwrap().to_string(),"0.0.0.0:8484");
+        assert_eq!(bind_address(Some("127.0.0.1"),8484).unwrap().to_string(),"127.0.0.1:8484");
+        assert_eq!(bind_address(Some("::1"),8484).unwrap().to_string(),"[::1]:8484");
+        assert!(bind_address(Some("localhost"),8484).is_err());assert!(bind_address(Some(""),8484).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn upstream_integration_roots_scan_admission_reconfiguration_race() {
+        for _ in 0..12 {
+            let (root,app)=fixture();
+            *app.library.write().unwrap()=LibraryConfig{roots:vec![root.join("a")],locked:false};
+            let barrier=Arc::new(std::sync::Barrier::new(2));
+            let scanning=app.clone();let scan_barrier=barrier.clone();
+            let worker=std::thread::spawn(move || {
+                let runtime=tokio::runtime::Runtime::new().unwrap();
+                scan_barrier.wait();
+                runtime.block_on(trigger_scan(State(scanning)))
+            });
+            let runtime=tokio::runtime::Runtime::new().unwrap();
+            barrier.wait();
+            let result=runtime.block_on(setting(&app,serde_json::json!({"library_paths":[root.join("b")]})));
+            assert!(matches!(result,StatusCode::NO_CONTENT|StatusCode::CONFLICT));
+            assert_eq!(worker.join().unwrap(),StatusCode::ACCEPTED);
+            let config=app.library.read().unwrap().clone();
+            if result==StatusCode::NO_CONTENT { assert_eq!(config.roots,vec![root.join("b")]);assert_eq!(stored_roots(&app.db.lock().unwrap()).unwrap(),config.roots); }
+            else {assert_eq!(config.roots,vec![root.join("a")]);}
+            assert!(!app.scanning.load(std::sync::atomic::Ordering::SeqCst));
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+}
+
+#[cfg(test)]
+mod integration_regressions {
+    use super::*;
+    /// Keep source bytes, thumbnail ownership and account data separate in a fresh disposable database.
+    fn fixture() -> (PathBuf,Arc<App>) {
+        let root=std::env::temp_dir().join(format!("frayd-admin-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("library")).unwrap();std::fs::create_dir(root.join("thumbs")).unwrap();
+        let db=store::open(root.join("db.sqlite").to_str().unwrap());
+        db.execute_batch(r#"INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture-admin'),(2,'account','target'),(3,'account','other');
+            INSERT INTO user_perms(identity_id,is_admin,allowed_kinds) VALUES(1,1,NULL),(2,0,'["movie"]'),(3,0,NULL);"#).unwrap();
+        let app=Arc::new(App{db:Mutex::new(db),db_path:root.join("db.sqlite").to_string_lossy().into_owned(),library:std::sync::RwLock::new(LibraryConfig{roots:vec![root.join("library")],locked:false}),scan_queue:Mutex::new(ScanQueue::default()),scanning:std::sync::atomic::AtomicBool::new(false),auth_rl:auth::RateLimiter::new(300,10),party:Arc::new(party::Party::new()),ingest_status:Mutex::new(None)});
+        (root,app)
+    }
+    /// Supply the existing fixture device administrator without creating an account-name fallback.
+    fn query() -> Query<std::collections::HashMap<String,String>> {Query(std::collections::HashMap::from([("identity".into(),"fixture-admin".into())]))}
+    /// Exercise the real media deletion handler with the fixture administrator and target ID.
+    async fn media(app:&Arc<App>,id:i64)->StatusCode {delete_media(State(app.clone()),axum::http::HeaderMap::new(),query(),Path(id)).await}
+    /// Exercise the real account deletion handler through its administrative identity boundary.
+    async fn user(app:&Arc<App>,id:i64)->StatusCode {remove_user(State(app.clone()),axum::http::HeaderMap::new(),query(),Path(id)).await}
+    /// Exercise validated permission writes through the production transaction path.
+    async fn permission(app:&Arc<App>,value:serde_json::Value)->StatusCode {set_perm(State(app.clone()),axum::http::HeaderMap::new(),query(),Json(value)).await}
+    /// Bind one indexed source and its distinct configured id.jpg thumbnail for byte-preservation oracles.
+    fn seed_media(root:&StdPath,app:&Arc<App>) {
+        let source=root.join("library/source.cbz");let thumb=root.join("thumbs/1.jpg");
+        std::fs::write(&source,b"original").unwrap();std::fs::write(&thumb,b"thumbnail").unwrap();
+        app.db.lock().unwrap().execute("INSERT INTO media(id,kind,path,title,thumb_path) VALUES(1,'comic',?1,'fixture',?2)",rusqlite::params![source.to_str().unwrap(),thumb.to_str().unwrap()]).unwrap();
+    }
+    #[tokio::test]
+    /// Preserve the causal progress-reference regression: conflict refusal must retain both source and thumbnail bytes.
+    async fn upstream_integration_admin_referenced_media_refuses_without_losing_thumbnail() {
+        let (root,app)=fixture();seed_media(&root,&app);
+        app.db.lock().unwrap().execute_batch("INSERT INTO progress(identity_id,media_id,position) VALUES(2,1,42);").unwrap();
+        assert_eq!(media(&app,1).await,StatusCode::CONFLICT);
+        assert_eq!(std::fs::read(root.join("thumbs/1.jpg")).unwrap(),b"thumbnail");
+        assert_eq!(std::fs::read(root.join("library/source.cbz")).unwrap(),b"original");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    /// Prove ABORT and IGNORE at the final identity delete roll back previously removed children.
+    async fn upstream_integration_admin_user_failure_rolls_back_children() {
+        let (root,app)=fixture();seed_media(&root,&app);
+        app.db.lock().unwrap().execute_batch("INSERT INTO progress(identity_id,media_id,position) VALUES(2,1,42);
+            CREATE TRIGGER reject_target BEFORE DELETE ON identities WHEN OLD.id=2 BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
+        assert_eq!(user(&app,2).await,StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM progress WHERE identity_id=2",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM user_perms WHERE identity_id=2",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        app.db.lock().unwrap().execute_batch("DROP TRIGGER reject_target;CREATE TRIGGER reject_target BEFORE DELETE ON identities WHEN OLD.id=2 BEGIN SELECT RAISE(IGNORE); END").unwrap();
+        assert_eq!(user(&app,2).await,StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM progress WHERE identity_id=2",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM user_perms WHERE identity_id=2",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    /// Explicit null must persist SQL NULL rather than silently retaining the previous movie-only restriction.
+    async fn upstream_integration_admin_permission_null_clears_restriction() {
+        let (root,app)=fixture();
+        assert_eq!(permission(&app,serde_json::json!({"identity_id":2,"allowed_kinds":null})).await,StatusCode::NO_CONTENT);
+        assert_eq!(app.db.lock().unwrap().query_row("SELECT allowed_kinds FROM user_perms WHERE identity_id=2",[],|r|r.get::<_,Option<String>>(0)).unwrap(),None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    /// Compare complete table cardinalities for rollback without serializing session values.
+    fn table_counts(app:&Arc<App>) -> Vec<(String,i64)> {
+        let db=app.db.lock().unwrap();
+        ["identities","sessions","user_perms","progress","annotations","playlists","playlist_items","media","albums","tracks","transcode_artifacts"].into_iter().map(|table|(table.to_string(),db.query_row(&format!("SELECT COUNT(*) FROM {table}"),[],|r|r.get(0)).unwrap())).collect()
+    }
+    /// Create two owners with separate sessions/playlists/user data over shared media, tracks and artifacts.
+    fn seed_user_children(app:&Arc<App>) {
+        let db=app.db.lock().unwrap();
+        for id in [2,3] {
+            db.execute("INSERT INTO sessions(token,identity_id,expires_at) VALUES(?1,?2,unixepoch()+3600)",rusqlite::params![uuid::Uuid::new_v4().to_string(),id]).unwrap();
+        }
+        db.execute_batch("INSERT INTO progress(identity_id,media_id,position) VALUES(2,1,42),(3,1,73);
+            INSERT INTO annotations(identity_id,media_id,kind,spine_idx,cfi,note) VALUES(2,1,'bookmark',0,'target','target-note'),(3,1,'bookmark',0,'other','other-note');
+            INSERT INTO playlists(id,identity_id,title) VALUES(2,2,'target'),(3,3,'other');
+            INSERT INTO playlist_items(playlist_id,media_id,pos) VALUES(2,1,0),(3,1,0);
+            INSERT INTO albums(id,title) VALUES(1,'shared'); INSERT INTO tracks(media_id,album_id) VALUES(1,1);
+            INSERT INTO transcode_artifacts(path,owner_media_id,owner_source_path,role,provenance) VALUES('/synthetic-artifact',1,'/synthetic-source','final','generated');").unwrap();
+    }
+    #[tokio::test]
+    /// Seed each independent media reference and require conflict with unchanged table counts and file bytes.
+    async fn upstream_integration_admin_all_media_references_refuse_unchanged() {
+        for reference in ["progress","annotations","tracks","playlist_items","own_conversion","other_conversion","artifact_owner","artifact_path","artifact_source"] {
+            let (root,app)=fixture();seed_media(&root,&app);
+            {
+                let db=app.db.lock().unwrap();
+                match reference {
+                    "progress"=>{db.execute_batch("INSERT INTO progress(identity_id,media_id,position) VALUES(2,1,42)").unwrap();}
+                    "annotations"=>{db.execute_batch("INSERT INTO annotations(identity_id,media_id,kind,spine_idx,cfi) VALUES(2,1,'bookmark',0,'fixture')").unwrap();}
+                    "tracks"=>{db.execute_batch("INSERT INTO tracks(media_id) VALUES(1)").unwrap();}
+                    "playlist_items"=>{db.execute_batch("INSERT INTO playlists(id,identity_id,title) VALUES(1,2,'fixture');INSERT INTO playlist_items(playlist_id,media_id,pos) VALUES(1,1,0)").unwrap();}
+                    "own_conversion"=>{db.execute("UPDATE media SET transcode_path='/synthetic-cache' WHERE id=1",[]).unwrap();}
+                    "other_conversion"=>{db.execute("INSERT INTO media(id,kind,path,title,transcode_path) VALUES(2,'movie','/synthetic-other','other',?1)",[root.join("library/source.cbz").to_str().unwrap()]).unwrap();}
+                    "artifact_owner"=>{db.execute("INSERT INTO transcode_artifacts VALUES('/synthetic-output',1,?1,'final','generated','completed')",[root.join("library/source.cbz").to_str().unwrap()]).unwrap();}
+                    "artifact_path"|"artifact_source"=>{
+                        db.execute_batch("INSERT INTO media(id,kind,path,title) VALUES(2,'movie','/synthetic-other','other')").unwrap();
+                        let source=root.join("library/source.cbz").to_string_lossy().into_owned();
+                        let (artifact_path,artifact_source)=if reference=="artifact_path" {(source,"/synthetic-other".to_string())}else{("/synthetic-output".into(),source)};
+                        db.execute("INSERT INTO transcode_artifacts VALUES(?1,2,?2,'final','generated','completed')",rusqlite::params![artifact_path,artifact_source]).unwrap();
+                    }
+                    _=>unreachable!(),
+                }
+            }
+            let before=table_counts(&app);assert_eq!(media(&app,1).await,StatusCode::CONFLICT,"reference {reference}");assert_eq!(table_counts(&app),before);
+            assert_eq!(std::fs::read(root.join("thumbs/1.jpg")).unwrap(),b"thumbnail");assert_eq!(std::fs::read(root.join("library/source.cbz")).unwrap(),b"original");
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+    #[tokio::test]
+    /// Only a committed unreferenced deletion removes the owned thumbnail; ABORT/IGNORE retain source and cache.
+    async fn upstream_integration_admin_media_commit_and_database_failure_preserve_sources() {
+        for failure in [false,true] {
+            let (root,app)=fixture();seed_media(&root,&app);
+            if failure {app.db.lock().unwrap().execute_batch("CREATE TRIGGER reject_media BEFORE DELETE ON media BEGIN SELECT RAISE(ABORT,'fixture'); END").unwrap();}
+            assert_eq!(media(&app,1).await,if failure {StatusCode::INTERNAL_SERVER_ERROR}else{StatusCode::NO_CONTENT});
+            assert_eq!(root.join("thumbs/1.jpg").exists(),failure);
+            assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM media",[],|r|r.get::<_,i64>(0)).unwrap(),if failure {1}else{0});
+            assert_eq!(std::fs::read(root.join("library/source.cbz")).unwrap(),b"original");
+            if !failure {assert_eq!(media(&app,1).await,StatusCode::NOT_FOUND);}
+            else {
+                app.db.lock().unwrap().execute_batch("DROP TRIGGER reject_media;CREATE TRIGGER reject_media BEFORE DELETE ON media BEGIN SELECT RAISE(IGNORE); END").unwrap();
+                assert_eq!(media(&app,1).await,StatusCode::INTERNAL_SERVER_ERROR);
+                assert_eq!(std::fs::read(root.join("thumbs/1.jpg")).unwrap(),b"thumbnail");
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+    #[tokio::test]
+    /// Unproven/shared/redirected/root-overlapping or scan-active thumbnails survive a successful metadata deletion.
+    async fn upstream_integration_admin_thumbnail_refusals_are_postcommit_and_byte_preserving() {
+        for refusal in ["shared","alias-shared","artifact-shared","symlink","unowned","missing-saved","library-b","unavailable-root","source","scan-active"] {
+            let (root,app)=fixture();seed_media(&root,&app);
+            match refusal {
+                "shared"|"alias-shared"=>{
+                    let mut path=root.join("thumbs/1.jpg");
+                    #[cfg(unix)] if refusal=="alias-shared" {std::os::unix::fs::symlink(&path,root.join("alias.jpg")).unwrap();path=root.join("alias.jpg");}
+                    app.db.lock().unwrap().execute("INSERT INTO media(id,kind,path,title,thumb_path) VALUES(2,'comic','/synthetic-other','other',?1)",[path.to_str().unwrap()]).unwrap();
+                }
+                "artifact-shared"=>{
+                    let db=app.db.lock().unwrap();db.execute_batch("INSERT INTO media(id,kind,path,title) VALUES(2,'movie','/synthetic-other','other')").unwrap();
+                    db.execute("INSERT INTO transcode_artifacts VALUES(?1,2,'/synthetic-other','final','generated','completed')",[root.join("thumbs/1.jpg").to_str().unwrap()]).unwrap();
+                }
+                "symlink"=>{
+                    #[cfg(unix)] {std::fs::remove_file(root.join("thumbs/1.jpg")).unwrap();std::fs::write(root.join("outside.jpg"),b"thumbnail").unwrap();std::os::unix::fs::symlink(root.join("outside.jpg"),root.join("thumbs/1.jpg")).unwrap();}
+                }
+                "unowned"=>{app.db.lock().unwrap().execute("UPDATE media SET thumb_path=NULL WHERE id=1",[]).unwrap();}
+                "missing-saved"=>{app.db.lock().unwrap().execute("UPDATE media SET thumb_path=?1 WHERE id=1",[root.join("missing.jpg").to_str().unwrap()]).unwrap();}
+                "library-b"=>app.library.write().unwrap().roots.push(root.join("thumbs")),
+                "unavailable-root"=>app.library.write().unwrap().roots.push(root.join("missing-root")),
+                "source"=>{app.db.lock().unwrap().execute("UPDATE media SET path=?1 WHERE id=1",[root.join("thumbs/1.jpg").to_str().unwrap()]).unwrap();}
+                "scan-active"=>app.scanning.store(true,std::sync::atomic::Ordering::SeqCst),
+                _=>unreachable!(),
+            }
+            assert_eq!(media(&app,1).await,StatusCode::NO_CONTENT,"refusal {refusal}");
+            assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM media WHERE id=1",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+            assert_eq!(std::fs::read(root.join("thumbs/1.jpg")).unwrap(),b"thumbnail");assert_eq!(std::fs::read(root.join("library/source.cbz")).unwrap(),b"original");
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+    #[tokio::test]
+    /// Remove one account including its playlist graph and session, preserving another owner and shared media graph.
+    async fn upstream_integration_admin_user_cleanup_targets_only_one_account() {
+        let (root,app)=fixture();seed_media(&root,&app);seed_user_children(&app);
+        let session=auth::create_session(&app.db.lock().unwrap(),2).unwrap();
+        assert_eq!(auth::identity_from_token(&app.db.lock().unwrap(),&session),Some(2));
+        assert_eq!(user(&app,2).await,StatusCode::NO_CONTENT);
+        assert_eq!(auth::identity_from_token(&app.db.lock().unwrap(),&session),None);
+        {
+        let db=app.db.lock().unwrap();
+        for table in ["sessions","user_perms","progress","annotations","playlists"] {
+            assert_eq!(db.query_row(&format!("SELECT COUNT(*) FROM {table} WHERE identity_id=2"),[],|r|r.get::<_,i64>(0)).unwrap(),0);
+            assert_eq!(db.query_row(&format!("SELECT COUNT(*) FROM {table} WHERE identity_id=3"),[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        }
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM playlist_items WHERE playlist_id=3",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        for table in ["media","albums","tracks","transcode_artifacts"] {assert_eq!(db.query_row(&format!("SELECT COUNT(*) FROM {table}"),[],|r|r.get::<_,i64>(0)).unwrap(),1);}
+        assert_eq!(db.query_row("SELECT position FROM progress WHERE identity_id=3",[],|r|r.get::<_,f64>(0)).unwrap(),73.0);
+        assert_eq!(db.query_row("SELECT note FROM annotations WHERE identity_id=3",[],|r|r.get::<_,String>(0)).unwrap(),"other-note");        }
+        assert_eq!(std::fs::read(root.join("library/source.cbz")).unwrap(),b"original");assert_eq!(std::fs::read(root.join("thumbs/1.jpg")).unwrap(),b"thumbnail");
+        assert_eq!(user(&app,2).await,StatusCode::NOT_FOUND);assert_eq!(user(&app,1).await,StatusCode::CONFLICT);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    /// Check whole-graph rollback, omitted/null/empty semantics, all schema kinds, type refusals and failed writes.
+    async fn upstream_integration_admin_user_full_rollback_and_permission_validation() {
+        let (root,app)=fixture();seed_media(&root,&app);seed_user_children(&app);
+        let before=table_counts(&app);
+        app.db.lock().unwrap().execute_batch("CREATE TRIGGER reject_user BEFORE DELETE ON identities WHEN OLD.id=2 BEGIN SELECT RAISE(ABORT,'fixture'); END").unwrap();
+        assert_eq!(user(&app,2).await,StatusCode::INTERNAL_SERVER_ERROR);assert_eq!(table_counts(&app),before);
+        assert_eq!(permission(&app,serde_json::json!({"identity_id":2,"is_admin":true})).await,StatusCode::NO_CONTENT);
+        assert_eq!(app.db.lock().unwrap().query_row("SELECT allowed_kinds FROM user_perms WHERE identity_id=2",[],|r|r.get::<_,String>(0)).unwrap(),"[\"movie\"]");
+        for kinds in [serde_json::json!([]),serde_json::json!(["audiobook","ebook","comic","manga","movie","music","episode"])] {
+            assert_eq!(permission(&app,serde_json::json!({"identity_id":2,"allowed_kinds":kinds})).await,StatusCode::NO_CONTENT);
+            assert_eq!(app.db.lock().unwrap().query_row("SELECT allowed_kinds FROM user_perms WHERE identity_id=2",[],|r|r.get::<_,String>(0)).unwrap(),kinds.to_string());
+            let listed=library_handler(State(app.clone()),bearer(&app,2),Query(std::collections::HashMap::new())).await.0;
+            assert_eq!(listed.len(),if kinds.as_array().unwrap().is_empty() {0}else{1});
+        }
+        let before=app.db.lock().unwrap().query_row("SELECT is_admin,allowed_kinds FROM user_perms WHERE identity_id=2",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Option<String>>(1)?))).unwrap();
+        for value in [serde_json::json!({"identity_id":2,"is_admin":"true"}),serde_json::json!({"identity_id":2,"is_admin":null}),serde_json::json!({"identity_id":2,"allowed_kinds":["unknown"],"is_admin":false}),serde_json::json!({"identity_id":2,"allowed_kinds":[1]}),serde_json::json!({"identity_id":2,"allowed_kinds":"movie"})] {
+            assert_eq!(permission(&app,value).await,StatusCode::BAD_REQUEST);
+            assert_eq!(app.db.lock().unwrap().query_row("SELECT is_admin,allowed_kinds FROM user_perms WHERE identity_id=2",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Option<String>>(1)?))).unwrap(),before);
+        }
+        app.db.lock().unwrap().execute_batch("UPDATE user_perms SET is_admin=0 WHERE identity_id=2").unwrap();
+        assert_eq!(permission(&app,serde_json::json!({"identity_id":1,"is_admin":false,"allowed_kinds":[]})).await,StatusCode::CONFLICT);
+        app.db.lock().unwrap().execute_batch("CREATE TRIGGER reject_perm BEFORE UPDATE ON user_perms WHEN NEW.identity_id=2 BEGIN SELECT RAISE(ABORT,'fixture'); END").unwrap();
+        assert_eq!(permission(&app,serde_json::json!({"identity_id":2,"allowed_kinds":null})).await,StatusCode::INTERNAL_SERVER_ERROR);
+        app.db.lock().unwrap().execute_batch("DROP TRIGGER reject_perm;CREATE TRIGGER reject_perm BEFORE UPDATE ON user_perms WHEN NEW.identity_id=2 BEGIN SELECT RAISE(IGNORE); END").unwrap();
+        assert_eq!(permission(&app,serde_json::json!({"identity_id":2,"allowed_kinds":null})).await,StatusCode::INTERNAL_SERVER_ERROR);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    /// Revoke admin while each real handler waits behind a write lock; no cached pre-transaction authority may survive.
+    fn upstream_integration_admin_rechecks_authority_after_database_write_admission() {
+        for operation in ["media","user","permission"] {
+            let (root,app)=fixture();seed_media(&root,&app);
+            let other=store::connect(&app.db_path).unwrap();other.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let target=app.clone();let (ready_tx,ready_rx)=std::sync::mpsc::channel();let (done_tx,done_rx)=std::sync::mpsc::channel();
+            let worker=std::thread::spawn(move || {
+                let runtime=tokio::runtime::Runtime::new().unwrap();ready_tx.send(()).unwrap();
+                let result=runtime.block_on(async {match operation {"media"=>media(&target,1).await,"user"=>user(&target,2).await,_=>permission(&target,serde_json::json!({"identity_id":2,"allowed_kinds":null})).await}});
+                done_tx.send(result).unwrap();
+            });
+            ready_rx.recv().unwrap();std::thread::sleep(std::time::Duration::from_millis(30));assert!(done_rx.try_recv().is_err());
+            other.execute_batch("UPDATE user_perms SET is_admin=0 WHERE identity_id=1;COMMIT").unwrap();
+            assert_eq!(done_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap(),StatusCode::FORBIDDEN);worker.join().unwrap();
+            assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM identities WHERE id=2",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+            assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM media WHERE id=1",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+            assert_eq!(std::fs::read(root.join("thumbs/1.jpg")).unwrap(),b"thumbnail");
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+    #[test]
+    /// Hold conversion admission while starting deletion, then publish BUSY and require conflict with unchanged bytes.
+    fn upstream_integration_admin_converter_admission_refuses_media_delete() {
+        if std::env::var_os("FRAYD_TEST_ADMIN_BUSY").is_none() {
+            let result=Command::new(std::env::current_exe().unwrap()).args(["--exact","integration_regressions::upstream_integration_admin_converter_admission_refuses_media_delete","--nocapture"]).env("FRAYD_TEST_ADMIN_BUSY","1").output().unwrap();
+            assert!(result.status.success(),"{}{}",String::from_utf8_lossy(&result.stdout),String::from_utf8_lossy(&result.stderr));return;
+        }
+        let (root,app)=fixture();seed_media(&root,&app);let admission=ROOT_ADMISSION.lock().unwrap();
+        let target=app.clone();let (ready_tx,ready_rx)=std::sync::mpsc::channel();let (done_tx,done_rx)=std::sync::mpsc::channel();
+        let worker=std::thread::spawn(move || {let runtime=tokio::runtime::Runtime::new().unwrap();ready_tx.send(()).unwrap();done_tx.send(runtime.block_on(media(&target,1))).unwrap();});
+        ready_rx.recv().unwrap();std::thread::sleep(std::time::Duration::from_millis(30));assert!(done_rx.try_recv().is_err());
+        transcode::BUSY.store(true,std::sync::atomic::Ordering::SeqCst);drop(admission);
+        assert_eq!(done_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap(),StatusCode::CONFLICT);worker.join().unwrap();
+        assert_eq!(std::fs::read(root.join("thumbs/1.jpg")).unwrap(),b"thumbnail");assert_eq!(std::fs::read(root.join("library/source.cbz")).unwrap(),b"original");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    /// Decode the creation status/code/proof in memory for admission tests; do not record private proof values.
+    async fn created_party(app:&Arc<App>,headers:axum::http::HeaderMap,identity:&str) -> (StatusCode,serde_json::Value) {
+        let response=party_create(State(app.clone()),headers,Json(PartyCreateReq{identity:identity.into()})).await;
+        let status=response.status();let bytes=axum::body::to_bytes(response.into_body(),65536).await.unwrap();
+        (status,serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+    /// Create a disposable account session and return its header without logging or persisting credentials.
+    fn bearer(app:&Arc<App>,id:i64) -> axum::http::HeaderMap {
+        let token=auth::create_session(&app.db.lock().unwrap(),id).unwrap();
+        let mut headers=axum::http::HeaderMap::new();headers.insert(header::AUTHORIZATION,format!("Bearer {token}").parse().unwrap());headers
+    }
+    #[tokio::test]
+    /// The creator key matches socket token precedence; only the current generation private proof admits that host.
+    async fn upstream_integration_identity_party_bearer_overrides_body_and_requires_current_proof() {
+        let (root,app)=fixture();let headers=bearer(&app,2);
+        let (status,created)=created_party(&app,headers.clone(),"different-device-body").await;assert_eq!(status,StatusCode::OK);
+        let key=party_identity_key(&app.db.lock().unwrap(),&headers,Some("different-device-query")).unwrap();assert_eq!(key,"target");
+        let code=created["code"].as_str().unwrap();let proof=uuid::Uuid::parse_str(created["host_capability"].as_str().unwrap()).unwrap();
+        assert!(app.party.can_register(&app.party.authorize(code,Some(proof)).unwrap(),&key));
+        assert!(!app.party.can_register(&app.party.authorize(code,None).unwrap(),&key));
+        assert!(!app.party.can_register(&app.party.authorize(code,Some(uuid::Uuid::new_v4())).unwrap(),&key));
+        let old_admission=app.party.authorize(code,Some(proof)).unwrap();
+        let (_,replacement)=created_party(&app,headers.clone(),"different-device-body").await;
+        assert!(!app.party.can_register(&old_admission,&key));
+        let replacement_code=replacement["code"].as_str().unwrap();
+        assert!(!app.party.can_register(&app.party.authorize(replacement_code,Some(proof)).unwrap(),&key));
+        assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM identities WHERE key='different-device-body'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    /// Public device creation remains compatible; copied account keys and failed device inserts cannot replace a room.
+    async fn upstream_integration_identity_party_device_compatibility_and_creation_denial_preserve_room() {
+        let (root,app)=fixture();let (status,created)=created_party(&app,axum::http::HeaderMap::new(),"new-device").await;assert_eq!(status,StatusCode::OK);
+        let code=created["code"].as_str().unwrap();let proof=uuid::Uuid::parse_str(created["host_capability"].as_str().unwrap()).unwrap();
+        assert!(app.party.can_register(&app.party.authorize(code,Some(proof)).unwrap(),"new-device"));
+        assert!(!app.party.can_register(&app.party.authorize(code,None).unwrap(),"new-device"));
+        assert_eq!(created_party(&app,axum::http::HeaderMap::new(),"target").await.0,StatusCode::UNAUTHORIZED);
+        assert!(app.party.can_register(&app.party.authorize(code,Some(proof)).unwrap(),"new-device"));
+        app.db.lock().unwrap().execute_batch("CREATE TRIGGER reject_identity BEFORE INSERT ON identities BEGIN SELECT RAISE(ABORT,'fixture'); END").unwrap();
+        assert_eq!(created_party(&app,axum::http::HeaderMap::new(),"blocked-device").await.0,StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(app.party.can_register(&app.party.authorize(code,Some(proof)).unwrap(),"new-device"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    /// Distinguish denied/missing/self-or-last-admin/database errors without committing metadata or filesystem changes.
+    async fn upstream_integration_admin_denials_last_admin_missing_and_query_failures() {
+        let (root,app)=fixture();seed_media(&root,&app);
+        let empty=||Query(std::collections::HashMap::new());
+        assert_eq!(delete_media(State(app.clone()),axum::http::HeaderMap::new(),empty(),Path(1)).await,StatusCode::FORBIDDEN);
+        assert_eq!(remove_user(State(app.clone()),axum::http::HeaderMap::new(),empty(),Path(2)).await,StatusCode::FORBIDDEN);
+        assert_eq!(set_perm(State(app.clone()),axum::http::HeaderMap::new(),empty(),Json(serde_json::json!({"identity_id":2}))).await,StatusCode::FORBIDDEN);
+        assert_eq!(media(&app,999).await,StatusCode::NOT_FOUND);assert_eq!(user(&app,999).await,StatusCode::NOT_FOUND);
+        assert_eq!(permission(&app,serde_json::json!({"identity_id":999,"allowed_kinds":[]})).await,StatusCode::NOT_FOUND);
+        assert_eq!(permission(&app,serde_json::json!({"identity_id":1,"is_admin":false})).await,StatusCode::CONFLICT);
+        app.db.lock().unwrap().execute_batch("UPDATE identities SET kind='account' WHERE id=1").unwrap();
+        let headers=bearer(&app,1);
+        assert_eq!(remove_user(State(app.clone()),headers.clone(),empty(),Path(1)).await,StatusCode::CONFLICT);
+        assert_eq!(set_perm(State(app.clone()),headers.clone(),empty(),Json(serde_json::json!({"identity_id":1,"is_admin":false}))).await,StatusCode::CONFLICT);
+        app.db.lock().unwrap().execute_batch("DROP TABLE user_perms").unwrap();
+        assert_eq!(delete_media(State(app.clone()),headers.clone(),empty(),Path(1)).await,StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(remove_user(State(app.clone()),headers.clone(),empty(),Path(2)).await,StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(set_perm(State(app.clone()),headers,empty(),Json(serde_json::json!({"identity_id":2,"allowed_kinds":null}))).await,StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(std::fs::read(root.join("thumbs/1.jpg")).unwrap(),b"thumbnail");assert_eq!(std::fs::read(root.join("library/source.cbz")).unwrap(),b"original");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    /// A token pointing at a missing canonical key fails 500 rather than creating an anonymous host or replacing a room.
+    async fn upstream_integration_identity_party_orphan_token_key_failure_preserves_room() {
+        let (root,app)=fixture();let (_,created)=created_party(&app,axum::http::HeaderMap::new(),"device").await;
+        let code=created["code"].as_str().unwrap();let proof=uuid::Uuid::parse_str(created["host_capability"].as_str().unwrap()).unwrap();
+        let token=uuid::Uuid::new_v4().to_string();
+        {
+            let db=app.db.lock().unwrap();db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            db.execute("INSERT INTO sessions(token,identity_id,expires_at) VALUES(?1,999,unixepoch()+3600)",[&token]).unwrap();
+            db.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        }
+        let mut headers=axum::http::HeaderMap::new();headers.insert(header::AUTHORIZATION,format!("Bearer {token}").parse().unwrap());
+        assert_eq!(party_identity_key(&app.db.lock().unwrap(),&headers,Some("device")),Err(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(created_party(&app,headers,"device").await.0,StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(app.party.can_register(&app.party.authorize(code,Some(proof)).unwrap(),"device"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    /// An unavailable absolute stored/env root retains configuration while new writes and malformed values stay rejected.
+    fn upstream_integration_roots_persisted_unavailable_paths_are_retained_but_writes_remain_strict() {
+        let (root,app)=fixture();let missing=root.join("temporarily-offline");
+        let db=app.db.lock().unwrap();db.execute("INSERT INTO settings(key,value) VALUES('library_paths',?1)",[serde_json::json!([missing]).to_string()]).unwrap();
+        let stored=effective_library_config(&db,Some("")).unwrap();assert_eq!(stored.roots,vec![missing.clone()]);assert!(!stored.locked);
+        let locked=effective_library_config(&db,missing.to_str()).unwrap();assert_eq!(locked.roots,vec![missing.clone()]);assert!(locked.locked);
+        assert!(normalize_roots(&serde_json::json!([missing])).is_err());assert!(!missing.exists());
+        for value in [serde_json::json!("bad"),serde_json::json!([""]),serde_json::json!([root.join("db.sqlite")]),serde_json::json!(["unresolvable-relative-root"])] {assert!(parse_roots(&value,true).is_err());}
+        std::fs::create_dir(&missing).unwrap();assert_eq!(effective_library_config(&db,None).unwrap(),stored);
+        drop(db);std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os="linux")]
+    #[test]
+    /// Use an actually unprivileged child and mode000 parent to prove PermissionDenied retains configured roots only on reads.
+    fn upstream_integration_roots_persisted_permission_denied_path_stays_configured() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+        if std::env::var_os("FRAYD_TEST_ROOT_DAC").is_none() {
+            let status=std::fs::read_to_string("/proc/self/status").unwrap();
+            let effective_uid:u32=status.lines().find(|line|line.starts_with("Uid:")).unwrap().split_whitespace().nth(2).unwrap().parse().unwrap();
+            let mut child=Command::new(std::env::current_exe().unwrap());child.args(["--exact","integration_regressions::upstream_integration_roots_persisted_permission_denied_path_stays_configured","--nocapture"]).env("FRAYD_TEST_ROOT_DAC","1");
+            if effective_uid==0 {child.gid(65534).uid(65534);}
+            let result=child.output().unwrap();assert!(result.status.success(),"{}{}",String::from_utf8_lossy(&result.stdout),String::from_utf8_lossy(&result.stderr));return;
+        }
+        struct RestoreDirectory(PathBuf);
+        impl Drop for RestoreDirectory {fn drop(&mut self){let _=std::fs::set_permissions(&self.0,std::fs::Permissions::from_mode(0o700));}}
+        let (root,app)=fixture();let parent=root.join("protected");let library=parent.join("library");std::fs::create_dir_all(&library).unwrap();
+        let db=app.db.lock().unwrap();db.execute("INSERT INTO settings(key,value) VALUES('library_paths',?1)",[serde_json::json!([library]).to_string()]).unwrap();
+        let restore=RestoreDirectory(parent.clone());std::fs::set_permissions(&parent,std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(std::fs::read_dir(&library).unwrap_err().kind(),std::io::ErrorKind::PermissionDenied);
+        assert_eq!(effective_library_config(&db,None).unwrap().roots,vec![library.clone()]);
+        assert_eq!(effective_library_config(&db,library.to_str()).unwrap().roots,vec![library.clone()]);
+        assert!(normalize_roots(&serde_json::json!([library])).is_err());
+        drop(restore);drop(db);std::fs::remove_dir_all(root).unwrap();
+    }
+
 }

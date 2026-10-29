@@ -5,6 +5,7 @@
 | Start the fork draft locally and add a first library | [Quick start](../README.md) |
 | Mount media, fix permissions, inspect storage or stop/remove services | [Operations](operations.md) |
 | Run natively, reproduce checks or understand disposable QA and audit policy | [Development](development.md) |
+| Install, start, qualify or remove an experimental private native bundle | [Native bundle](verification/native-bundle.md) |
 | Trace review findings and historical source/image qualifications | [Verification ledger](verification/coderabbit-follow-up.md) |
 | Check bounded browser/media acceptance and its limits | [Browser acceptance](verification/browser-acceptance.md) |
 

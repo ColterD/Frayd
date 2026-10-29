@@ -4,7 +4,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 COPY server/ ./
 ENV CARGO_BUILD_JOBS=2
-RUN rustup component add clippy && cargo test --locked && cargo clippy --locked --all-targets && cargo build --locked --release
+RUN rustup component add clippy && cargo test --locked && cargo clippy --locked --all-targets && cargo build --locked --release \
+    && rustc -Vv > /app/server/rustc-version.txt
+
+FROM scratch AS native-export
+COPY --from=build /app/server/target/release/frayd-server /frayd-server
+COPY --from=build /app/server/target/release/frayd-native /frayd-native
+COPY --from=build /app/server/rustc-version.txt /rustc-version.txt
 
 FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg \

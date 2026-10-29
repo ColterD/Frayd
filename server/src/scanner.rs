@@ -210,11 +210,27 @@ fn manga_directory_has_files(dir: &Path) -> bool {
 }
 
 /// Incremental scan of a library root. Returns number of new/updated items.
+#[allow(dead_code)] // Single-root compatibility API.
 pub fn scan(db: &Connection, db_path: String, root: std::path::PathBuf, thumbs_dir: Option<&Path>) -> usize {
-    if let Some(t) = thumbs_dir {
-        let _ = std::fs::create_dir_all(t);
+    let roots=vec![root.clone()];
+    scan_with_roots(db,db_path,root,thumbs_dir,&roots)
+}
+
+/// Scan one root against the complete admitted root snapshot, preserving existing source-version refresh guards.
+/// Refuse unavailable roots or either-direction canonical cache overlap before thumbnail creation,
+/// artifact recovery/reconciliation or item updates. Source reads never grant source deletion authority.
+pub fn scan_with_roots(db: &Connection, db_path: String, root: std::path::PathBuf, thumbs_dir: Option<&Path>, roots: &[std::path::PathBuf]) -> usize {
+    if let Some(root)=roots.iter().find(|r| !r.is_dir()) {
+        tracing::warn!(operation="walk",path=%root.display(),"library scan traversal failed: configured root unavailable");
+        return 0;
     }
-    crate::transcode::recover_pending_jobs(&db_path, &root);
+    let cache=std::env::var_os("FRAYD_TRANSCODES").map(std::path::PathBuf::from).unwrap_or_else(|| Path::new(&db_path).parent().unwrap_or(Path::new(".")).join("transcodes"));
+    if crate::transcode::validate_cache(&cache,roots).is_none() { return 0; }
+    if let Some(t)=thumbs_dir {
+        if crate::transcode::validate_cache(t,roots).is_none() { return 0; }
+        if std::fs::create_dir_all(t).is_err() { return 0; }
+    }
+    crate::transcode::recover_pending_jobs_with_roots(&db_path, roots);
     let owned = crate::transcode::reconcile_artifacts(db);
     let mut count = 0;
     let mut seen_manga_dirs: Vec<std::path::PathBuf> = Vec::new();
@@ -237,7 +253,7 @@ pub fn scan(db: &Connection, db_path: String, root: std::path::PathBuf, thumbs_d
                 || name_manga(dir.parent().and_then(|p| p.file_name()));
             if parent_manga && manga_directory_has_files(dir) {
                 seen_manga_dirs.push(dir.to_path_buf());
-                count += upsert_item(db, db_path.clone(), dir, "manga", thumbs_dir, &root);
+                count += upsert_item_with_roots(db, db_path.clone(), dir, "manga", thumbs_dir, roots);
             }
             continue;
         }
@@ -249,13 +265,30 @@ pub fn scan(db: &Connection, db_path: String, root: std::path::PathBuf, thumbs_d
             continue;
         }
         let Some(kind) = classify(path) else { continue };
-        count += upsert_item(db, db_path.clone(), path, kind, thumbs_dir, &root);
+        count += upsert_item_with_roots(db, db_path.clone(), path, kind, thumbs_dir, roots);
     }
     count
 }
 
+/// Confirm downloaded supported files reached their current source-version rows.
+/// A successful downloader exit alone does not prove indexing or database publication.
+pub(crate) fn ingest_indexed(db: &Connection, directory: &Path) -> bool {
+    let mut found=false;
+    for entry in WalkDir::new(directory).follow_links(false) {
+        let Ok(entry)=entry else { return false; };
+        if !entry.file_type().is_file() || classify(entry.path()).is_none() { continue; }
+        let Ok(metadata)=entry.metadata() else { return false; };
+        let Some(mtime)=metadata.modified().ok().and_then(|t|t.duration_since(std::time::UNIX_EPOCH).ok()).map(|t|t.as_secs() as i64) else { return false; };
+        let indexed=db.query_row("SELECT COUNT(*) FROM media WHERE path=?1 AND size_bytes=?2 AND mtime_secs=?3",rusqlite::params![entry.path().to_string_lossy(),metadata.len() as i64,mtime],|r|r.get::<_,i64>(0));
+        if !matches!(indexed,Ok(1)) { return false; }
+        found=true;
+    }
+    found
+}
+
 /// Update scan fingerprints and reader caches; clear converted playback only for known replacements.
 /// Preserve identity, user metadata, unchanged order and version-unqualified legacy playback.
+#[cfg(test)]
 fn upsert_item(
     db: &Connection,
     db_path: String,
@@ -264,6 +297,10 @@ fn upsert_item(
     thumbs_dir: Option<&Path>,
     library_root: &Path,
 ) -> usize {
+    upsert_item_with_roots(db,db_path,path,kind,thumbs_dir,&[library_root.to_path_buf()])
+}
+
+fn upsert_item_with_roots(db: &Connection, db_path: String, path: &Path, kind: &str, thumbs_dir: Option<&Path>, roots: &[std::path::PathBuf]) -> usize {
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
         Err(_) => return 0,
@@ -307,7 +344,7 @@ fn upsert_item(
         )?;
 
         let lease=if let Some((id,out))=prior.filter(|_|updated==1) {
-            crate::transcode::retire_replaced_job(&tx,&db_path,library_root,id,path,Path::new(&out))?
+            crate::transcode::retire_replaced_job_with_roots(&tx,&db_path,roots,id,path,Path::new(&out))?
         } else { None };
         tx.commit()?;
         drop(lease);
@@ -358,7 +395,7 @@ fn upsert_item(
         );
         // movies/shows: background transcode if audio codec isn't browser-playable
         if matches!(kind, "movie" | "episode") {
-            crate::transcode::maybe_enqueue(db_path, id, path_pb, library_root.to_path_buf());
+            crate::transcode::maybe_enqueue_with_roots(db_path, id, path_pb, roots.to_vec());
         }
     } else if updated > 0 && matches!(kind, "movie" | "episode") {
         // Known replacements already invalidated their old duration in the fingerprint transaction.
@@ -381,7 +418,7 @@ fn upsert_item(
             if let Err(error) = published { tracing::warn!(%error,"video duration refresh held"); }
         }
         // A replaced video can queue its current version without waiting for another scan.
-        crate::transcode::maybe_enqueue_for_existing(db_path,path.to_path_buf(),library_root.to_path_buf());
+        crate::transcode::maybe_enqueue_for_existing_with_roots(db_path,path.to_path_buf(),roots.to_vec());
     } else if updated == 0 {
         // Existing unchanged items still need thumbnails and possibly a conversion.
         if let Some(thumbs) = thumbs_dir {
@@ -401,7 +438,7 @@ fn upsert_item(
                 .ok()
                 .flatten();
             if has.is_none() {
-                crate::transcode::maybe_enqueue_for_existing(db_path, path.to_path_buf(), library_root.to_path_buf());
+                crate::transcode::maybe_enqueue_for_existing_with_roots(db_path, path.to_path_buf(), roots.to_vec());
             }
         }
     }
@@ -777,7 +814,7 @@ exit "$probe_status"
         let new_bytes=b"genuine replacement with a different size";std::fs::write(&genuine,new_bytes).unwrap();
         std::fs::File::open(&genuine).unwrap().set_times(std::fs::FileTimes::new().set_modified(modified)).unwrap();
         let generated=library.0.join(names[2]);std::fs::write(&generated,b"changed generated output remains excluded").unwrap();
-        let thumbs=library.0.join("thumbs");std::fs::create_dir(&thumbs).unwrap();
+        let thumbs=library.0.with_file_name(format!("frayd-thumbs-{}",uuid::Uuid::new_v4()));std::fs::create_dir(&thumbs).unwrap();
         for id in 1..=4 {std::fs::write(thumbs.join(format!("{id}.jpg")),b"fixture thumbnail").unwrap();}
         let changed=scan(&db,String::new(),library.0.clone(),Some(&thumbs));
         assert_eq!(db.query_row("SELECT size_bytes FROM media WHERE id=2",[],|r|r.get::<_,i64>(0)).unwrap(),new_bytes.len() as i64);
@@ -795,6 +832,7 @@ exit "$probe_status"
         assert_eq!(std::fs::read(genuine).unwrap(),new_bytes);
         assert_eq!(std::fs::read(generated).unwrap(),b"changed generated output remains excluded");
         for name in names {assert!(library.0.join(name).exists());}
+        std::fs::remove_dir_all(thumbs).unwrap();
     }
     /// Filling any unknown prior fingerprint component cannot qualify legacy playback as stale.
     #[test]

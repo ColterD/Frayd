@@ -76,6 +76,8 @@ function browser() {
     setTimeout() {}, clearTimeout() {},
     setInterval: fn => { const id = intervals.size + 1; intervals.set(id, fn); return id; },
     clearInterval: id => intervals.delete(id),
+    requestAnimationFrame: fn => fn(),
+    confirm: () => false,
     Plyr: class {
       constructor() { this.events = element(); this.duration = 0; this.bindMedia(nodes.get('#plyr-video')); }
       bindMedia(media) {

@@ -158,10 +158,17 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
   const socket = new WebSocket(endpoint.href);
   const pending = new Map();
   let sequence = 0;
+  let navigated = false;
+  let acceptDialog = false;
+  const dialogs = [];
   socket.addEventListener('message', event => {
     let message;
     try { message = JSON.parse(event.data); }
     catch { for (const waiter of pending.values()) waiter.reject(new Error('Invalid owned browser protocol response')); return; }
+    if (message.method === 'Page.javascriptDialogOpening') {
+      dialogs.push({ type: message.params.type, message: message.params.message, accepted: acceptDialog });
+      rpc('Page.handleJavaScriptDialog', { accept: acceptDialog }).catch(() => {});
+    }
     const waiter = pending.get(message.id);
     if (!waiter) return;
     if (message.error) waiter.reject(new Error(`Owned browser cache RPC failed (${message.error.code})`));
@@ -175,7 +182,7 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
    * by ID. Always remove the pending entry; failures propagate without command retry.
    */
   async function rpc(method, params = {}) {
-    const rpcBudget = remainingStartupBudget();
+    const rpcBudget = navigated ? 3000 : remainingStartupBudget();
     const id = ++sequence;
     try {
       const result = new Promise((resolve, reject) => { pending.set(id, { resolve, reject }); });
@@ -201,6 +208,7 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
       socket.addEventListener('open', resolve, { once: true });
       socket.addEventListener('error', () => reject(new Error('Owned browser cache protocol failed to open')), { once: true });
     }), 'Owned browser cache protocol open timed out', openBudget);
+    await rpc('Page.enable');
     await rpc('Network.enable');
     await rpc('Network.setCacheDisabled', { cacheDisabled: true });
     await rpc('Network.clearBrowserCache');
@@ -208,7 +216,19 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser }) {
     if (navigation.errorText) throw new Error('Owned browser fixture navigation failed');
     Object.assign(receipt, { cacheDisabled: true, browserCacheCleared: true, configuredBeforeFixtureNavigation: true });
     // Keep Network overrides active until the runner finishes all media cases.
-    return { receipt, close };
+    navigated = true;
+    // Only fixed keyboard commands are exposed to the loopback fixture, never arbitrary RPC.
+    async function key(key, accept = false) {
+      const codes = { Tab: 9, Enter: 13, ' ': 32, ArrowRight: 39, t: 84 };
+      if (!(key in codes)) throw new Error('Unknown fixture keyboard key');
+      acceptDialog = accept;
+      const before = dialogs.length;
+      await rpc('Input.dispatchKeyEvent', { type: 'keyDown', key,
+        windowsVirtualKeyCode: codes[key], ...(key === 'Enter' ? { text: '\r' } : key.length === 1 ? { text: key } : {}) });
+      await rpc('Input.dispatchKeyEvent', { type: 'keyUp', key, windowsVirtualKeyCode: codes[key] });
+      return { key, dialogs: dialogs.slice(before), trustedBrowserInput: true };
+    }
+    return { receipt, close, key };
   } catch (error) {
     await close();
     throw error;
@@ -275,6 +295,10 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
         input += chunk;
         if (input.length > 1024 * 1024) throw new Error('Fixture request exceeds size bound');
       }
+      if (path === '/__fixture/key' && request.method === 'POST') {
+        const command = JSON.parse(input);
+        return json(await cacheSession.key(command.key, command.accept));
+      }
       if (path === '/__fixture/hold-media' && request.method === 'POST') {
         const target = JSON.parse(input).path;
         if (!/^\/api\/stream\/(20|22)$/.test(target)) return json({ error: 'Unknown requested native stream' }, 400);
@@ -334,6 +358,11 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
       if (path.startsWith('/api/progress/')) return json(null);
       if (path === '/api/progress') return json({});
       if (path === '/api/library') return json([]);
+      if (path === '/api/auth/logout' && request.method === 'POST') { response.writeHead(204); return response.end(); }
+      if (path === '/api/thumb/9' || path === '/api/thumb/10') {
+        response.writeHead(200, { 'Content-Type': 'image/png' });
+        return response.end(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII=', 'base64'));
+      }
       if (/^\/api\/stream\/(20|21|22)$/.test(path)) {
         const gate = heldMedia;
         if (gate?.path === path) {
@@ -414,7 +443,7 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
       cacheControl = cacheSession.receipt;
       return result;
     })(), exited, timedOut]);
-    const expectedCases = 32;
+    const expectedCases = 39;
     const complete = observed.cases.length === expectedCases
       && new Set(observed.cases.map(item => item.name)).size === expectedCases
       && observed.cases.every(item => item.status === 'PASS')

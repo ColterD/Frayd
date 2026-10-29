@@ -1,12 +1,14 @@
 """Failure-boundary regressions for the disposable Docker integration runner."""
 import contextlib
 import http.client
+import http.server
 import importlib.util
 import io
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import urllib.error
 from pathlib import Path
@@ -15,6 +17,44 @@ from unittest.mock import patch
 SPEC = importlib.util.spec_from_file_location('integration', Path(__file__).parents[1] / 'scripts/integration.py')
 integration = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(integration)
+
+
+class CurlHttpTests(unittest.TestCase):
+    """Execute the credential-safe curl -i adapter against an owned HTTP server."""
+
+    def test_real_http_status_body_and_in_memory_authorization(self):
+        observed = []
+        capability = 'ephemeral-fixture-only'
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                observed.append((self.path, self.headers.get('Authorization'),
+                                 self.rfile.read(int(self.headers['Content-Length']))))
+                self.send_response(409)
+                self.end_headers()
+                self.wfile.write(b'{"reason":"busy"}')
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        output = io.StringIO()
+        try:
+            with patch.object(integration, 'base', f'http://127.0.0.1:{server.server_port}'), contextlib.redirect_stdout(output):
+                result = integration.curl_request('/owned-settings', {'library_paths': []},
+                                                  capability, 'POST', 409)
+            self.assertEqual(result, b'{"reason":"busy"}')
+            self.assertEqual(observed, [('/owned-settings', 'Bearer ' + capability,
+                                         b'{"library_paths": []}')])
+            self.assertNotIn(capability, output.getvalue())
+            self.assertIn('HTTP curl-i POST /owned-settings: 409 expected 409', output.getvalue())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
 
 
 class DockerFailureTests(unittest.TestCase):

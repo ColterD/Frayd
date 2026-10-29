@@ -12,6 +12,16 @@ const el = (tag, cls, html) => {
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c =>
   ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
 
+// ---------- toast ----------
+function toast(msg, err = false) {
+  let host = $('#toast-host');
+  if (!host) { host = el('div'); host.id = 'toast-host'; document.body.appendChild(host); }
+  const t = el('div', 'toast' + (err ? ' toast-err' : ''), esc(msg));
+  host.appendChild(t);
+  requestAnimationFrame(() => t.classList.add('on'));
+  setTimeout(() => { t.classList.remove('on'); setTimeout(() => t.remove(), 300); }, err ? 5000 : 2600);
+}
+
 // ---------- identity / auth ----------
 let IDENTITY = localStorage.frayd_identity;
 function authHeaders(extra = {}) {
@@ -52,26 +62,118 @@ function enterApp() {
 }
 
 // ---------- settings (admin) ----------
-const KINDS = ['movie', 'music', 'audiobook', 'ebook', 'comic', 'manga'];
-$('#settings-btn')?.addEventListener('click', async () => {
+const KINDS = ['movie', 'episode', 'music', 'audiobook', 'ebook', 'comic', 'manga'];
+let settingsGeneration = 0;
+let settingsPoll = null;
+function disposeSettings() {
+  ++settingsGeneration;
+  clearInterval(settingsPoll);
+  settingsPoll = null;
+}
+function settingsRoots(settings) {
+  if (settings.library_locked && Array.isArray(settings.effective_library_paths)) return [...settings.effective_library_paths];
+  return Array.isArray(settings.library_paths) ? [...settings.library_paths]
+    : settings.library_path ? [settings.library_path] : [];
+}
+function permissionKinds(row) {
+  const checked = [...row.querySelectorAll('.p-kinds-box input:checked')].map(input => input.value);
+  return KINDS.every(kind => checked.includes(kind)) ? null : checked;
+}
+function scanFailure(status) {
+  return status === 409 ? 'Scan already running' : status === 501
+    ? 'No library folder configured — set it in settings' : `Scan failed (${status})`;
+}
+function pollSettings(generation, mode, button) {
+  clearInterval(settingsPoll);
+  let pending = false;
+  settingsPoll = setInterval(async () => {
+    if (pending || generation !== settingsGeneration) return;
+    pending = true;
+    try {
+      const response = await fetch('/api/scan/status');
+      if (!response.ok) throw new Error(`Status failed (${response.status})`);
+      const status = await response.json();
+      if (generation !== settingsGeneration) return;
+      const ingest = status.ingesting;
+      if (mode === 'ingest' && (ingest === 'downloading' || ingest === 'indexing')) {
+        button.textContent = ingest === 'indexing' ? 'Indexing…' : 'Downloading…';
+        return;
+      }
+      if (mode === 'scan' && status.scanning) return;
+      clearInterval(settingsPoll); settingsPoll = null;
+      button.disabled = false;
+      if (mode === 'ingest' && ingest !== 'done') {
+        button.textContent = 'Download failed';
+        toast('Download or indexing failed', true);
+        return;
+      }
+      button.textContent = mode === 'scan' ? 'Scan complete' : 'Download complete';
+      await loadLibrary();
+    } catch (error) {
+      if (generation !== settingsGeneration) return;
+      clearInterval(settingsPoll); settingsPoll = null;
+      button.disabled = false;
+      button.textContent = 'Status unavailable';
+      toast(error.message || 'Status unavailable', true);
+    } finally { pending = false; }
+  }, 1000);
+}
+async function startSettingsScan(generation, button) {
+  button.disabled = true;
+  button.textContent = 'Starting scan…';
+  try {
+    const response = await fetch('/api/scan', { method: 'POST', headers: authHeaders() });
+    if (generation !== settingsGeneration) return;
+    if (response.status !== 202) throw new Error(scanFailure(response.status));
+    button.textContent = 'Scanning…';
+    pollSettings(generation, 'scan', button);
+  } catch (error) {
+    if (generation !== settingsGeneration) return;
+    button.disabled = false;
+    button.textContent = error.message || 'Scan failed — server unreachable';
+    toast(button.textContent, true);
+  }
+}
+async function saveSettings(payload, generation) {
+  const response = await fetch('/api/admin/settings', {
+    method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(payload),
+  });
+  if (!response.ok) throw new Error(response.status === 409
+    ? 'Settings refused: library override or active job' : `Settings failed (${response.status})`);
+  return generation === settingsGeneration;
+}
+function reopenSettings() { return openSettings(); }
+async function openSettings() {
+  disposeSettings();
+  const generation = settingsGeneration;
+  const current = () => generation === settingsGeneration;
   $('#settings-modal').classList.add('on');
   const stage = $('#settings-stage');
   stage.innerHTML = '<div class="party-sec">Accounts & permissions</div>';
   try {
     const [perms, settings] = await Promise.all([
       fetch('/api/admin/perms', { headers: authHeaders() }).then(r => r.ok ? r.json() : Promise.reject(r.status)),
-      fetch('/api/admin/settings', { headers: authHeaders() }).then(r => r.ok ? r.json() : {}),
+      fetch('/api/admin/settings', { headers: authHeaders() }).then(r => r.ok ? r.json() : Promise.reject(r.status)),
     ]);
-    stage.innerHTML = (perms.length ? perms.map(p => `
+    if (!current()) return;
+    const libs = settingsRoots(settings);
+    const locked = !!settings.library_locked;
+    const kindBoxes = (p) => KINDS.map(k => `
+      <label class="p-kind"><input type="checkbox" value="${k}" ${!p.allowed_kinds || p.allowed_kinds.includes(k) ? 'checked' : ''}>${k}</label>`).join('');
+    stage.innerHTML = '<div class="party-sec">Users — untick kinds to hide that section from them</div>'
+      + (perms.length ? perms.map(p => `
       <div class="perm-row" data-id="${p.identity_id}">
         <span class="k">${esc(p.key)}</span>
-        <label><input type="checkbox" class="p-admin" ${p.is_admin ? 'checked' : ''}> admin</label>
-        <select class="p-kinds" multiple size="1">
-          ${KINDS.map(k => `<option value="${k}" ${p.allowed_kinds?.includes(k) ? 'selected' : ''}>${k}</option>`).join('')}
-        </select>
+        <label class="p-kind"><input type="checkbox" class="p-admin" ${p.is_admin ? 'checked' : ''}> admin</label>
+        <span class="p-kinds-box">${kindBoxes(p)}</span>
         <button class="p-save">Save</button>
-      </div>`).join('') : '<div class="party-sec">No accounts</div>')
-      + '<div class="party-sec">Server settings</div>'
+        <button class="p-remove" data-name="${esc(p.key)}" title="Remove user, their progress and highlights">Remove</button>
+      </div>`).join('') : '<div class="party-sec">No accounts yet</div>')
+      + `<div class="party-sec">Media folders${locked ? ' — locked by FRAYD_LIBRARY' : ''}</div>`
+      + (libs.length ? libs.map((l, i) => `
+      <div class="perm-row"><span class="k">${esc(l)}</span><button class="lib-remove" ${locked ? 'disabled' : ''} data-path="${esc(l)}">Remove</button></div>`).join('') : '<div class="party-sec">No folders configured</div>')
+      + `<div class="perm-row"><span class="k">Add folder</span><input class="s-lib-add" placeholder="/path/to/more/media" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px;flex:1"><button class="lib-add" ${locked ? 'disabled' : ''}>Add + scan</button></div>`
+      + `<div class="party-sec">Server settings — ${esc(settings.server_version || '')}</div>`
       + `<div class="perm-row"><span class="k">Site name</span><input class="s-site" value="${esc(settings.site_name ?? 'Frayd')}" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px"><button id="s-site-save">Save</button></div>`
       + `<div class="party-sec">Network <span class="s">(restart server to apply)</span></div>`
       + `<div class="perm-row"><span class="k">Port</span><input class="s-port" type="number" min="1024" max="65535" value="${esc(settings.port ?? 8484)}" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px;width:90px"></div>`
@@ -80,7 +182,7 @@ $('#settings-btn')?.addEventListener('click', async () => {
       + `<div class="perm-row"><span class="k">HTTPS key path (PEM)</span><input class="s-key" value="${esc(settings.tls_key ?? '')}" placeholder="/path/key.pem" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px;flex:1"></div>`
       + `<div class="perm-row"><span class="k">Domain</span><input class="s-domain" value="${esc(settings.domain ?? '')}" placeholder="media.example.com" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px;flex:1"><span class="s">A record → your IP; use a real cert (e.g. Let's Encrypt) for this</span></div>`
       + `<div class="party-sec">Library</div>`
-      + `<div class="perm-row"><span class="k">Media folder</span><input class="s-library" value="${esc(settings.library_path ?? '')}" placeholder="/home/you/Media" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px;flex:1"><button class="p-scan">Scan now</button></div>`
+      + `<div class="perm-row"><button class="p-scan">Scan all folders</button></div>`
       + `<div class="perm-row"><span class="k">Add from URL</span><input class="s-ingest" placeholder="video URL (yt-dlp supported)" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px;flex:1"><button class="p-ingest">Download</button><span class="s">needs yt-dlp installed</span></div>`
       + `<div class="perm-row" style="border:none"><span class="s">Suggested layout (any subset):</span></div>`
       + `<div class="perm-row" style="border:none"><pre class="s" style="color:#8A8F9E;font-size:12px;margin:0;line-height:1.5">Media/\n  Movies/    *.mp4 *.mkv\n  Shows/     S01E01 files\n  Music/     *.mp3 *.flac\n  Audiobooks/ *.m4b *.mp3\n  Ebooks/    *.epub\n  Comics/    *.cbz *.cbr\n  Manga/     folder of images under a *manga* dir</pre></div>`
@@ -90,26 +192,26 @@ $('#settings-btn')?.addEventListener('click', async () => {
       <div class="perm-row"><span class="k">New (min 4)</span><input type="password" class="pw-new" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px"></div>
       <button id="s-pw-save" style="margin-top:10px;width:100%;background:#16181E;color:#fff;border:1px solid #2a2d36;border-radius:8px;padding:10px;cursor:pointer">Change password</button>` : '');
     stage.querySelectorAll('.p-save').forEach(b => b.onclick = async () => {
+      try {
       const row = b.closest('.perm-row');
-      const kinds = [...row.querySelector('.p-kinds').selectedOptions].map(o => o.value);
+      const allowedKinds = permissionKinds(row);
       const r = await fetch('/api/admin/perms', {
         method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           identity_id: +row.dataset.id,
           is_admin: row.querySelector('.p-admin').checked,
-          allowed_kinds: kinds.length ? kinds : null,
+          allowed_kinds: allowedKinds, // explicit null clears restrictions
         }),
       });
+      if (!current()) return;
       b.textContent = r.ok ? '✓' : '✗';
-      setTimeout(() => { b.textContent = 'Save'; }, 1200);
+      setTimeout(() => { if (current()) b.textContent = 'Save'; }, 1200);
+      } catch { if (current()) toast('Permission save failed — server unreachable', true); }
     });
-    $('#s-site-save').onclick = async () => {
-      const r = await fetch('/api/admin/settings', {
-        method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ site_name: $('.s-site').value }),
-      });
-      $('#s-site-save').textContent = r.ok ? '✓' : '✗';
-      setTimeout(() => { $('#s-site-save').textContent = 'Save'; }, 1200);
+    $('#s-site-save').onclick = async (e) => {
+      try {
+        if (await saveSettings({site_name: stage.querySelector('.s-site').value}, generation)) e.target.textContent = 'Saved';
+      } catch (error) { if (current()) toast(error.message || 'Save failed — server unreachable', true); }
     };
     $('#s-net-save').onclick = async (e) => {
       const stage = $('#settings-stage');
@@ -122,65 +224,82 @@ $('#settings-btn')?.addEventListener('click', async () => {
         tls_key: stage.querySelector('.s-key').value.trim() || null,
         domain: stage.querySelector('.s-domain').value.trim() || null,
       };
-      const r = await fetch('/api/admin/settings', {
-        method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify(body),
-      });
-      e.target.textContent = r.ok ? '✓ Saved — restart to apply port/TLS' : '✗ Failed';
-      setTimeout(() => { e.target.textContent = 'Save network settings'; }, 2000);
+      try {
+        if (await saveSettings(body, generation)) e.target.textContent = 'Saved — restart to apply port/TLS';
+      } catch (error) { if (current()) toast(error.message || 'Save failed — server unreachable', true); }
     };
     $('#s-pw-save')?.addEventListener('click', async (e) => {
+      try {
       const old_ = stage.querySelector('.pw-old').value, nw = stage.querySelector('.pw-new').value;
       if (nw.length < 4) { e.target.textContent = 'Too short (min 4)'; return; }
       const r = await fetch('/api/auth/password', {
         method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ old: old_, new: nw }),
       });
+      if (!current()) return;
       if (r.ok) { e.target.textContent = '✓ Changed'; stage.querySelector('.pw-old').value = stage.querySelector('.pw-new').value = ''; }
       else { const j = await r.json().catch(() => ({})); e.target.textContent = j.error || '✗ Failed'; }
-      setTimeout(() => { e.target.textContent = 'Change password'; }, 2500);
+      setTimeout(() => { if (current()) e.target.textContent = 'Change password'; }, 2500);
+      } catch { if (current()) toast('Password change failed — server unreachable', true); }
     });
-    // library: save path then scan (scan picks up new path without restart)
     const scanBtn = stage.querySelector('.p-scan');
-    scanBtn.onclick = async () => {
-      const path = stage.querySelector('.s-library').value.trim();
-      const r1 = await fetch('/api/admin/settings', {
-        method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ library_path: path || null }),
-      });
-      if (!r1.ok) { scanBtn.textContent = '✗ save'; return; }
-      scanBtn.textContent = 'Scanning…';
-      const r2 = await fetch('/api/scan', { method: 'POST', headers: authHeaders() });
-      if (r2.status === 202) {
-        const poll = setInterval(async () => {
-          const s = await (await fetch('/api/scan/status')).json();
-          if (!s.scanning) { clearInterval(poll); scanBtn.textContent = '✓ done'; loadLibrary(); setTimeout(() => { scanBtn.textContent = 'Scan now'; }, 2000); }
-        }, 1000);
-      } else {
-        scanBtn.textContent = r2.status === 409 ? 'busy' : '✗ ' + r2.status;
-        setTimeout(() => { scanBtn.textContent = 'Scan now'; }, 2000);
-      }
+    scanBtn.onclick = () => startSettingsScan(generation, scanBtn);
+    stage.querySelector('.lib-add').onclick = async (e) => {
+      if (locked || !current()) return;
+      const path = stage.querySelector('.s-lib-add').value.trim();
+      if (!path) return;
+      try {
+        if (!await saveSettings({ library_paths: [...libs, path] }, generation)) return;
+        toast('Folder added');
+        await reopenSettings();
+        await startSettingsScan(settingsGeneration, $('#settings-stage').querySelector('.p-scan'));
+      } catch (error) { if (current()) toast(error.message || 'Add failed — server unreachable', true); }
     };
-    // ingest: yt-dlp download into library, then rescan picks it up
+    stage.querySelectorAll('.lib-remove').forEach(b => b.onclick = async () => {
+      if (locked || !current() || !confirm(`Stop scanning "${b.dataset.path}"? Existing items and files remain.`)) return;
+      try {
+        if (!await saveSettings({ library_paths: libs.filter(path => path !== b.dataset.path) }, generation)) return;
+        toast('Folder removed'); reopenSettings();
+      } catch (error) { if (current()) toast(error.message || 'Remove failed — server unreachable', true); }
+    });
+    // remove a user: sessions, progress, highlights gone. Cannot remove self/last admin.
+    stage.querySelectorAll('.p-remove').forEach(b => b.onclick = async () => {
+      const row = b.closest('.perm-row');
+      if (!confirm(`Remove user ${b.dataset.name}? Their progress and highlights will be deleted. This cannot be undone.`)) return;
+      try {
+      const r = await fetch(`/api/admin/users/${row.dataset.id}?identity=${encodeURIComponent(IDENTITY)}`, { method: 'DELETE', headers: authHeaders() });
+      if (!current()) return;
+      if (r.ok) { toast('User removed'); reopenSettings(); }
+      else if (r.status === 409) toast('Cannot remove: last admin (or yourself)', true);
+      else toast(`Remove failed (${r.status})`, true);
+      } catch { if (current()) toast('Remove failed — server unreachable', true); }
+    });
     const ingestBtn = stage.querySelector('.p-ingest');
     ingestBtn.onclick = async () => {
       const url = stage.querySelector('.s-ingest').value.trim();
-      if (!/^https?:\/\//.test(url)) { ingestBtn.textContent = '✗ bad url'; return; }
-      ingestBtn.textContent = 'Starting…';
-      const r = await fetch('/api/ingest', { method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ url }) });
-      if (r.status === 202) {
-        ingestBtn.textContent = 'Downloading… (check library later)';
-        setTimeout(() => { ingestBtn.textContent = 'Download'; }, 5000);
-      } else if (r.status === 501) { ingestBtn.textContent = '✗ no yt-dlp'; setTimeout(() => { ingestBtn.textContent = 'Download'; }, 3000); }
-      else { ingestBtn.textContent = '✗ ' + r.status; setTimeout(() => { ingestBtn.textContent = 'Download'; }, 3000); }
+      if (!/^https?:\/\//.test(url)) { ingestBtn.textContent = 'Invalid URL'; return; }
+      ingestBtn.disabled = true;
+      try {
+        const response = await fetch('/api/ingest', { method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ url }) });
+        if (!current()) return;
+        if (response.status !== 202) throw new Error(response.status === 409 ? 'Download already active' : response.status === 501 ? 'Download unavailable: configure a folder and yt-dlp' : `Download failed (${response.status})`);
+        ingestBtn.textContent = 'Downloading…';
+        pollSettings(generation, 'ingest', ingestBtn);
+      } catch (error) {
+        if (!current()) return;
+        ingestBtn.disabled = false;
+        ingestBtn.textContent = 'Download failed';
+        toast(error.message || 'Download failed — server unreachable', true);
+      }
     };
   } catch (e) {
+    if (!current()) return;
     stage.innerHTML = `<div class="party-sec">Admin access required (${e}). Log out and back in to refresh your session.</div>`;
     return;
   }
-  // (bindings below only run on successful render)
-});
-$('#settings-close')?.addEventListener('click', () => $('#settings-modal').classList.remove('on'));
+}
+$('#settings-btn')?.addEventListener('click', openSettings);
+$('#settings-close')?.addEventListener('click', () => { disposeSettings(); $('#settings-modal').classList.remove('on'); });
 
 async function doLogin(ev) {
   ev.preventDefault();
@@ -213,6 +332,9 @@ $('#pw-toggle').onclick = () => {
   $('#pw-toggle').setAttribute('aria-label', p.type === 'password' ? 'Show password' : 'Hide password');
 };
 $('#logout')?.addEventListener('click', () => {
+  disposeSettings();
+  ++libraryRequestGeneration;
+  ++renderGeneration;
   fetch('/api/auth/logout', { method: 'POST', headers: authHeaders() }).catch(() => {});
   account = null;
   delete localStorage.frayd_token;
@@ -233,24 +355,43 @@ $('#add-media').onclick = async () => {
   if (btn.disabled) return;
   btn.disabled = true;
   btn.textContent = 'Scanning…';
+  const generation = settingsGeneration;
   try {
     const r = await fetch('/api/scan', { method: 'POST', headers: authHeaders() });
     if (r.status === 202) {
+      toast('Scanning library…');
       // poll status until idle, then refresh library
       const poll = setInterval(async () => {
-        const { scanning } = await (await fetch('/api/scan/status')).json();
+        try {
+        if (generation !== settingsGeneration) { clearInterval(poll); btn.disabled = false; btn.innerHTML = ADD_BTN_HTML; return; }
+        const response = await fetch('/api/scan/status');
+        if (response.ok === false) throw new Error('Status unavailable');
+        const { scanning } = await response.json();
+        if (generation !== settingsGeneration) return;
         if (scanning) return;
         clearInterval(poll);
-        LIBRARY = await (await fetch('/api/library')).json();
-        renderRows(LIBRARY);
+        const before = LIBRARY.length;
+        await loadLibrary();
+        toast(LIBRARY.length > before ? `Scan complete — ${LIBRARY.length - before} new item(s)` : 'Scan complete');
         btn.disabled = false;
         btn.innerHTML = ADD_BTN_HTML;
+        } catch { clearInterval(poll); btn.disabled = false; btn.innerHTML = ADD_BTN_HTML; toast('Scan status unavailable', true); }
       }, 1500);
+    } else if (r.status === 409) {
+      toast('Scan already running', true);
+      btn.disabled = false;
+      btn.innerHTML = ADD_BTN_HTML;
+    } else if (r.status === 501) {
+      toast('No library folder configured — set it in settings', true);
+      btn.disabled = false;
+      btn.innerHTML = ADD_BTN_HTML;
     } else {
+      toast(`Scan failed (${r.status})`, true);
       btn.disabled = false;
       btn.innerHTML = ADD_BTN_HTML;
     }
   } catch {
+    toast('Scan failed — server unreachable', true);
     btn.disabled = false;
     btn.innerHTML = ADD_BTN_HTML;
   }
@@ -261,6 +402,7 @@ document.querySelectorAll('.nav-item').forEach(btn => {
   btn.onclick = () => {
     document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
+    filtering = btn.dataset.kind !== 'all';
     filterKind(btn.dataset.kind);
   };
 });
@@ -271,11 +413,19 @@ $('#search input').addEventListener('input', (e) => {
 });
 
 async function serverSearch(q) {
-  if (!q) { filterKind(currentKind()); return; }
+  activeQuery = q;
+  filtering = activeKind !== 'all' || !!q;
+  const generation = ++searchGeneration;
+  if (!q) { filterKind(activeKind, ''); return; }
+  const libraryGeneration = libraryRequestGeneration;
   try {
-    const results = await (await fetch(`/api/library?q=${encodeURIComponent(q)}`)).json();
+    const response = await fetch(`/api/library?q=${encodeURIComponent(q)}`);
+    if (!response.ok) throw new Error('Search failed');
+    let results = await response.json();
+    if (generation !== searchGeneration || libraryGeneration !== libraryRequestGeneration) return;
+    if (activeKind !== 'all') results = results.filter(item => item.kind === activeKind);
     renderRows(results);
-  } catch { filterKind(currentKind(), q); }
+  } catch { if (generation === searchGeneration) filterKind(activeKind, q); }
 }
 
 function currentKind() {
@@ -285,22 +435,52 @@ function currentKind() {
 
 // ---------- library ----------
 let LIBRARY = [];
+let libraryRequestGeneration = 0;
+let renderGeneration = 0;
+let searchGeneration = 0;
+let activeQuery = '';
+let activeKind = 'all';
+const rowSort = new Map();
+let filtering = false; // suppress continue-watching row while a nav filter/search is active
 window.getLibrary = () => LIBRARY;
 
 async function loadLibrary() {
-  LIBRARY = await (await fetch('/api/library')).json();
-  renderRows(LIBRARY);
+  const generation = ++libraryRequestGeneration;
+  const response = await fetch('/api/library');
+  if (response.ok === false) throw new Error(`Library failed (${response.status})`);
+  const items = await response.json();
+  if (generation !== libraryRequestGeneration) return;
+  LIBRARY = items;
+  filterKind(activeKind, activeQuery);
 }
 
-function filterKind(kind, query) {
+function filterKind(kind, query = activeQuery) {
+  ++searchGeneration;
+  activeKind = kind || 'all';
+  activeQuery = query || '';
+  filtering = activeKind !== 'all' || !!activeQuery;
   let items = LIBRARY;
-  if (kind && kind !== 'all') items = items.filter(i => i.kind === kind);
-  if (query) {
-    const q = query.toLowerCase();
-    items = items.filter(i =>
-      (i.title || '').toLowerCase().includes(q) || (i.author || '').toLowerCase().includes(q));
+  if (activeKind !== 'all') items = items.filter(i => i.kind === activeKind);
+  if (activeQuery) {
+    const q = activeQuery.toLowerCase();
+    items = items.filter(i => (i.title || '').toLowerCase().includes(q) || (i.author || '').toLowerCase().includes(q));
   }
-  renderRows(items);
+  return renderRows(items);
+}
+
+async function deleteMedia(it) {
+  if (!confirm(`Remove "${it.title}" from the library? The source file remains on disk and may return after a later scan.`)) return;
+  try {
+    const response = await fetch(`/api/media/${it.id}?identity=${encodeURIComponent(IDENTITY)}`, {method:'DELETE', headers:authHeaders()});
+    if (!response.ok) {
+      toast(response.status === 409 ? 'Cannot remove: media is referenced or a job is active' : response.status === 403 ? 'Admin access required' : `Remove failed (${response.status})`, true);
+      return;
+    }
+    ++libraryRequestGeneration;
+    LIBRARY = LIBRARY.filter(item => item.id !== it.id);
+    filterKind(activeKind, activeQuery);
+    toast('Removed from library; source remains on disk');
+  } catch { toast('Remove failed — server unreachable', true); }
 }
 
 function resumeFor(id) {
@@ -313,6 +493,7 @@ function card(it, portrait) {
   const c = el('div', 'media-card ' + (portrait ? 'portrait' : 'landscape'));
   const isVideo = it.kind === 'movie' || it.kind === 'show';
   const isPaged = it.kind === 'comic' || it.kind === 'manga';
+  c.title = `${it.title}${it.author ? ' — ' + it.author : ''}`;
   c.innerHTML = `
     ${isVideo
       ? `<img class="thumb" loading="lazy" src="/api/thumb/${it.id}" onerror="this.outerHTML='<div class=&quot;thumb-fallback${portrait?' portrait':''}&quot;>▶</div>'">`
@@ -322,7 +503,17 @@ function card(it, portrait) {
       <div class="sub">${esc(it.author || it.kind)}</div>
     </div>
     <div class="progress-strip" style="display:none"><div></div></div>`;
+  if (account?.isAdmin) {
+    const del = el('button', 'card-del', 'Delete');
+    del.type = 'button';
+    del.setAttribute('aria-label', `Remove ${it.title} from library`);
+    del.onclick = event => { event.stopPropagation(); return deleteMedia(it); };
+    del.onkeydown = event => { event.stopPropagation(); };
+    c.appendChild(del);
+  }
+  const generation = renderGeneration;
   resumeFor(it.id).then(p => {
+    if (generation !== renderGeneration || !c.isConnected) return;
     if (p && p.position > 5 && it.duration_secs) {
       const frac = Math.min(1, p.position / it.duration_secs);
       const strip = c.querySelector('.progress-strip');
@@ -336,20 +527,63 @@ function card(it, portrait) {
 
 function section(title, items, portrait) {
   const wrap = el('section');
-  const head = el('div', 'row-head',
-    `<h3>${esc(title)}</h3><button class="link">view all</button>`);
   const cards = el('div', 'cards');
-  items.forEach(it => cards.appendChild(card(it, portrait)));
+  const sortItems = () => [...items].sort((a,b) => (rowSort.get(title) ? 1 : -1) * ((a.created_at || 0) - (b.created_at || 0)) || a.id - b.id);
+  let shown = sortItems();
+  const head = el('div', 'row-head', `<h3>${esc(title)}</h3>`);
+  const sortBtn = el('button', 'link', rowSort.get(title) ? 'newest first' : 'oldest first');
+  sortBtn.onclick = () => {
+    const oldest = sortBtn.textContent === 'oldest first';
+    rowSort.set(title, oldest);
+    shown = sortItems();
+    sortBtn.textContent = oldest ? 'newest first' : 'oldest first';
+    cards.innerHTML = '';
+    shown.forEach(it => cards.appendChild(card(it, portrait)));
+  };
+  head.appendChild(sortBtn);
+  shown.forEach(it => cards.appendChild(card(it, portrait)));
   wrap.append(head, cards);
   return wrap;
 }
 
-function renderRows(items) {
+async function continueRow(snapshot = LIBRARY, generation = renderGeneration) {
+  // in-progress items, most recently touched first
+  const items = snapshot.filter(i => i.kind !== 'ebook' && i.kind !== 'comic' && i.kind !== 'manga');
+  const withP = await Promise.all(items.map(async it => {
+    const p = await resumeFor(it.id);
+    return p && p.position > 5 && it.duration_secs && p.position < it.duration_secs * 0.95
+      ? { it, frac: Math.min(1, p.position / it.duration_secs) } : null;
+  }));
+  if (generation !== renderGeneration) return null;
+  const inProgress = withP.filter(Boolean);
+  if (!inProgress.length) return null;
+  inProgress.sort((a, b) => b.frac - a.frac);
+  const wrap = el('section');
+  wrap.appendChild(el('div', 'row-head', '<h3>Continue watching</h3>'));
+  const cards = el('div', 'cards');
+  inProgress.forEach(({ it, frac }) => {
+    const c = card(it, false);
+    const strip = c.querySelector('.progress-strip');
+    if (strip) { strip.style.display = 'block'; strip.firstElementChild.style.width = (frac * 100).toFixed(1) + '%'; }
+    cards.appendChild(c);
+  });
+  wrap.appendChild(cards);
+  return wrap;
+}
+
+async function renderRows(items) {
+  const generation = ++renderGeneration;
+  const snapshot = [...LIBRARY];
   const main = $('#main');
   main.innerHTML = '<div id="hero"></div>';
   // hero: first movie with backdrop, else first item
   const heroItem = items.find(i => i.kind === 'movie') || items[0];
   if (heroItem) renderHero(heroItem);
+  if (!filtering) {
+    const cont = await continueRow(snapshot, generation);
+    if (generation !== renderGeneration) return;
+    if (cont) main.appendChild(cont);
+  }
   const byKind = {};
   items.forEach(i => (byKind[i.kind] ||= []).push(i));
   const order = ['movie', 'music', 'audiobook', 'ebook', 'comic', 'manga'];
@@ -363,7 +597,17 @@ function renderRows(items) {
       main.appendChild(section(kind[0].toUpperCase() + kind.slice(1) + 's', kindItems, false));
     }
   }
-  if (!items.length) main.appendChild(el('p', '', '<br>No media found. Place files in the server’s media folder, then choose Scan library. Ask the server administrator if no media folder is configured.'));
+  if (filtering && !items.length) { $('#hero').style.display = 'none'; }
+  if (!items.length) {
+    if (currentKind() !== 'all' || $('#search input').value) {
+      main.appendChild(el('p', 'empty-state', 'Nothing matches that filter. Try “All”.'));
+    } else {
+      main.appendChild(el('p', 'empty-state',
+        'No media found. Place files in the server’s media folder, then choose Scan library.<br>' +
+        'Supported: video (mp4/mkv/avi…), music, audiobooks (m4b/mp3), epubs, comics (cbz/cbr), manga folders. ' +
+        'Ask the server administrator if no media folder is configured.'));
+    }
+  }
 }
 
 // author → series → books: one section per author, sub-rows per series
@@ -418,7 +662,8 @@ function renderHero(it) {
   // backdrop: full thumb, blurred + darkened behind copy
   const bd = $('#hero-backdrop');
   const img = new Image();
-  img.onload = () => { bd.style.backgroundImage = `url(${img.src})`; hero.classList.add('has-backdrop'); };
+  const generation = renderGeneration;
+  img.onload = () => { if (generation !== renderGeneration || !hero.isConnected) return; bd.style.backgroundImage = `url(${img.src})`; hero.classList.add('has-backdrop'); };
   img.src = `/api/thumb/${it.id}`;
   $('#hero-play').onclick = () => openItem(it);
 }
@@ -465,13 +710,6 @@ document.addEventListener('keydown', e => {
   if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); comic && showComicPage(comic.page + 1); }
   else if (e.key === 'ArrowLeft') { e.preventDefault(); comic && showComicPage(comic.page - 1); }
   else if (e.key === 'Escape') closeComic();
-});
-// ebook shares arrow/escape handling via separate listener
-document.addEventListener('keydown', e => {
-  if (!$('#ebook-modal').classList.contains('on')) return;
-  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); ebookFlip(1); }
-  else if (e.key === 'ArrowLeft') { e.preventDefault(); ebookFlip(-1); }
-  else if (e.key === 'Escape') closeEbook();
 });
 function closeComic() {
   $('#comic-modal').classList.remove('on');
@@ -861,6 +1099,23 @@ function ebookSearchNext() {
 
 $('#em-prev').onclick = () => ebookFlip(-1);
 $('#em-next').onclick = () => ebookFlip(1);
+function ebookShortcutAllowed(event) {
+  const target = event.target;
+  return !!ebook && $('#ebook-modal').classList.contains('on')
+    && !$('#settings-modal').classList.contains('on')
+    && !['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON'].includes(target?.tagName)
+    && !target?.isContentEditable;
+}
+// reader shortcuts: ←/→/space flip, s search, t toc, f fullscreen, Esc closes overlays
+document.addEventListener('keydown', (e) => {
+  if (!ebookShortcutAllowed(e)) return;
+  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); ebookFlip(1); }
+  else if (e.key === 'ArrowLeft') { e.preventDefault(); ebookFlip(-1); }
+  else if (e.key === 's') { e.preventDefault(); $('#em-search').focus(); }
+  else if (e.key === 't') { renderToc(); $('#em-toc').classList.toggle('on'); }
+  else if (e.key === 'f') { $('#em-toc').classList.remove('on'); document.fullscreenElement ? document.exitFullscreen() : $('#ebook-modal').requestFullscreen?.(); }
+  else if (e.key === 'Escape') { if ($('#em-toc').classList.contains('on')) $('#em-toc').classList.remove('on'); else closeEbook(); }
+});
 $('#em-close').onclick = closeEbook;
 // TOC drawer
 $('#em-toc-btn').onclick = () => { renderToc(); $('#em-toc').classList.toggle('on'); };

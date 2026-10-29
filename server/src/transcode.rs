@@ -73,32 +73,34 @@ pub fn reconcile_artifacts(db: &Connection) -> HashSet<String> {
     owned
 }
 
-/// Resolve the dedicated cache and refuse either direction of overlap with a library.
-fn prepare_cache(cache: &Path, library: &Path) -> Option<PathBuf> {
-    // Canonicalize the existing ancestor before creating anything inside a library.
-    let absolute = if cache.is_absolute() { cache.to_path_buf() } else { std::env::current_dir().ok()?.join(cache) };
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            std::path::Component::ParentDir => { normalized.pop(); }
-            std::path::Component::CurDir => (),
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    let mut ancestor = normalized.as_path();
-    let mut suffix = Vec::new();
+/// Resolve existing ancestors and canonical root aliases without creating a cache or mutating registry/files.
+/// Refuse empty/unresolvable snapshots and both directions of overlap with every configured root.
+/// This validates the private-cache boundary; it does not qualify hostile concurrent filesystem writers.
+pub(crate) fn validate_cache(cache: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
+    if roots.is_empty() { return None; }
+    let absolute=if cache.is_absolute() { cache.to_path_buf() } else { std::env::current_dir().ok()?.join(cache) };
+    let mut ancestor=absolute.as_path(); let mut suffix=Vec::new();
     while !ancestor.exists() {
-        suffix.push(ancestor.file_name()?.to_os_string());
-        ancestor = ancestor.parent()?;
+        suffix.push(ancestor.file_name()?.to_os_string()); ancestor=ancestor.parent()?;
     }
-    let mut resolved = ancestor.canonicalize().ok()?;
-    for part in suffix.into_iter().rev() { resolved.push(part); }
-    let library = library.canonicalize().ok()?;
-    if resolved.starts_with(&library) || library.starts_with(&resolved) { return None; }
+    let mut resolved=ancestor.canonicalize().ok()?;
+    for part in suffix.into_iter().rev() {
+        if part==".." || part=="." { return None; }
+        resolved.push(part);
+    }
+    for root in roots {
+        let root=root.canonicalize().ok()?;
+        if !root.is_dir() || resolved.starts_with(&root) || root.starts_with(&resolved) { return None; }
+    }
+    Some(resolved)
+}
+
+fn prepare_cache(cache: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
+    let resolved=validate_cache(cache,roots)?;
     std::fs::create_dir_all(&resolved).ok()?;
-    let canonical = resolved.canonicalize().ok()?;
-    if !canonical.is_dir() || canonical.starts_with(&library) || library.starts_with(&canonical) { return None; }
-    Some(canonical)
+    let canonical=resolved.canonicalize().ok()?;
+    if !canonical.is_dir() { return None; }
+    validate_cache(&canonical,roots)
 }
 
 /// A fresh reservation capability binds publication to its exact output and recovery qualification.
@@ -110,14 +112,20 @@ struct JobLease {
 
 /// Reserve a unique job namespace and persist both exact paths before launching ffmpeg.
 /// The cache must remain private: path checks reject existing redirects, not hostile writer races.
+#[cfg(test)]
 fn reserve_job(db: &mut Connection, cache: &Path, library: &Path, id: i64, src: &Path) -> Option<(PathBuf,PathBuf,JobLease)> {
-    reserve_job_with_recovery(db,cache,library,id,src,cfg!(target_os = "linux"))
+    reserve_job_with_roots(db,cache,&[library.to_path_buf()],id,src,cfg!(target_os = "linux"))
 }
 
 /// Preserve conversion without granting recovery authority when the platform/filesystem lease is unqualified.
+#[cfg(test)]
 fn reserve_job_with_recovery(db: &mut Connection, cache: &Path, library: &Path, id: i64, src: &Path,
     qualify_recovery: bool) -> Option<(PathBuf,PathBuf,JobLease)> {
-    let cache = prepare_cache(cache, library)?;
+    reserve_job_with_roots(db,cache,&[library.to_path_buf()],id,src,qualify_recovery)
+}
+
+fn reserve_job_with_roots(db: &mut Connection, cache: &Path, roots: &[PathBuf], id: i64, src: &Path, qualify_recovery: bool) -> Option<(PathBuf,PathBuf,JobLease)> {
+    let cache = prepare_cache(cache, roots)?;
     let media = cache.join(id.to_string());
     match std::fs::create_dir(&media) {
         Ok(()) => (),
@@ -217,7 +225,15 @@ fn job_state(db: &Connection, id: i64, src: &Path, tmp: &Path, out: &Path, allow
 /// Grant recovery authority only to the exact completed pair displaced by a known source replacement.
 /// The caller holds an immediate transaction after clearing the old pointer; retain the returned lease
 /// until commit so a live converter and a partially updated registry cannot acquire retirement authority.
-pub(crate) fn retire_replaced_job(db: &Connection, db_path: &str, library: &Path,
+#[allow(dead_code)]
+pub(crate) fn retire_replaced_job(db: &Connection, db_path: &str, library: &Path, id: i64, src: &Path, out: &Path) -> rusqlite::Result<Option<File>> {
+    retire_replaced_job_with_roots(db,db_path,&[library.to_path_buf()],id,src,out)
+}
+
+/// Check the complete root snapshot before granting retirement of an exact inactive, unreferenced generated pair.
+/// The caller holds its immediate source-replacement transaction and retains the returned lease through commit.
+/// Canonical cache overlap/unavailable roots and unqualified non-Linux recovery retain bytes and registry state.
+pub(crate) fn retire_replaced_job_with_roots(db: &Connection, db_path: &str, roots: &[PathBuf],
     id: i64, src: &Path, out: &Path) -> rusqlite::Result<Option<File>> {
     if !cfg!(target_os = "linux") { return Ok(None); }
     let Some(parent)=out.parent() else { return Ok(None) };
@@ -225,7 +241,7 @@ pub(crate) fn retire_replaced_job(db: &Connection, db_path: &str, library: &Path
     let Some(job)=job_namespace(&tmp,out,id) else { return Ok(None) };
     let cache=std::env::var_os("FRAYD_TRANSCODES").map(PathBuf::from)
         .unwrap_or_else(|| Path::new(db_path).parent().unwrap_or(Path::new(".")).join("transcodes"));
-    let Some(cache)=prepare_cache(&cache,library) else { return Ok(None) };
+    let Some(cache)=prepare_cache(&cache,roots) else { return Ok(None) };
     if job.parent().and_then(Path::parent)!=Some(cache.as_path()) { return Ok(None); }
     let lease_path=job.join("lease");
     let Ok(metadata)=std::fs::symlink_metadata(&lease_path) else { return Ok(None) };
@@ -277,12 +293,18 @@ fn discard_failed_job(db: &mut Connection, id: i64, src: &Path, tmp: &Path, out:
 
 /// Recover only inactive known pending jobs on Linux; unsupported locks and historical unknown jobs retain provenance.
 /// Startup and explicit scans invoke this path again after a database timeout; no age or PID grants ownership.
-pub fn recover_pending_jobs(db_path: &str, library: &Path) {
+#[allow(dead_code)] // Single-root compatibility API.
+pub fn recover_pending_jobs(db_path: &str, library: &Path) { recover_pending_jobs_with_roots(db_path,&[library.to_path_buf()]); }
+
+/// Recover only known pending/retiring generated pairs under qualified Linux leases and the complete root snapshot.
+/// Empty/unresolvable roots or either-direction canonical cache overlap stop before registry or file mutations.
+/// Unsupported platforms and unknown/completed history remain unchanged; age or path shape alone grants no authority.
+pub fn recover_pending_jobs_with_roots(db_path: &str, roots: &[PathBuf]) {
     if !cfg!(target_os = "linux") { return; }
     let cache = std::env::var_os("FRAYD_TRANSCODES").map(PathBuf::from)
         .unwrap_or_else(|| Path::new(db_path).parent().unwrap_or(Path::new(".")).join("transcodes"));
     if !cache.exists() { return; }
-    let Some(cache) = prepare_cache(&cache,library) else { return };
+    let Some(cache) = prepare_cache(&cache,roots) else { return };
     let Ok(mut db) = crate::store::connect(db_path) else { return };
     let candidates = (|| {
         db.prepare("SELECT owner_media_id,owner_source_path,path,lifecycle FROM transcode_artifacts
@@ -316,21 +338,34 @@ pub fn recover_pending_jobs(db_path: &str, library: &Path) {
 }
 
 /// Queue one source; codec detection and all conversion work use a worker connection.
-pub fn maybe_enqueue(db_path: String, media_id: i64, src: PathBuf, library: PathBuf) {
+#[allow(dead_code)] // Compatibility entrypoint for single-root callers.
+pub fn maybe_enqueue(db_path: String, media_id: i64, src: PathBuf, library: PathBuf) { maybe_enqueue_with_roots(db_path,media_id,src,vec![library]); }
+
+/// Serialize converter admission with root reconfiguration, retaining the worker's complete immutable root snapshot.
+/// The shared BUSY gate admits one worker; cache checks precede registry/filesystem mutation and publication
+/// still requires current file/database source versions plus the exact reservation lease. Non-Linux jobs
+/// retain conversion support without acquiring Linux-only reclamation qualification.
+pub fn maybe_enqueue_with_roots(db_path: String, media_id: i64, src: PathBuf, roots: Vec<PathBuf>) {
+    let _admission=crate::ROOT_ADMISSION.lock().unwrap();
     if BUSY.swap(true, Ordering::SeqCst) { return; }
     std::thread::spawn(move || {
         let _reset = JobReset;
-        run_job(&db_path, media_id, &src, &library);
+        run_job_with_roots(&db_path, media_id, &src, &roots);
     });
 }
 
 /// Resolve an existing media ID before queueing the same guarded worker path.
-pub fn maybe_enqueue_for_existing(db_path: String, src: PathBuf, library: PathBuf) {
+#[allow(dead_code)] // Compatibility entrypoint for single-root callers.
+pub fn maybe_enqueue_for_existing(db_path: String, src: PathBuf, library: PathBuf) { maybe_enqueue_for_existing_with_roots(db_path,src,vec![library]); }
+
+/// Resolve an existing media ID on a dedicated non-migrating connection, then use the same whole-root worker admission.
+/// Passing all roots preserves cache-containment, source-version publication and lease guards for unchanged sources.
+pub fn maybe_enqueue_for_existing_with_roots(db_path: String, src: PathBuf, roots: Vec<PathBuf>) {
     if BUSY.load(Ordering::SeqCst) { return; }
     let Ok(db) = crate::store::connect(&db_path) else { return };
     let Ok(id) = db.query_row("SELECT id FROM media WHERE path=?1 AND transcode_path IS NULL",
         [src.to_string_lossy().as_ref()], |r| r.get(0)) else { return };
-    maybe_enqueue(db_path, id, src, library);
+    maybe_enqueue_with_roots(db_path, id, src, roots);
 }
 
 /// Capture the actual file's modification time and length without treating it as a content hash.
@@ -359,8 +394,13 @@ fn publish_completed_job(db: &mut Connection, id: i64, src: &Path, completed: &P
 }
 
 /// Fail closed on database/cache/registry errors and persist the actual completed path.
+#[cfg(test)]
 fn run_job(db_path: &str, media_id: i64, src: &Path, library: &Path) {
-    recover_pending_jobs(db_path,library);
+    run_job_with_roots(db_path,media_id,src,&[library.to_path_buf()]);
+}
+
+fn run_job_with_roots(db_path: &str, media_id: i64, src: &Path, roots: &[PathBuf]) {
+    recover_pending_jobs_with_roots(db_path,roots);
     let Ok(mut db) = crate::store::connect(db_path) else { return };
     let Ok(database_version)=db.query_row("SELECT mtime_secs,size_bytes FROM media WHERE id=?1 AND path=?2 AND transcode_path IS NULL",
         rusqlite::params![media_id,src.to_string_lossy()],|row|Ok((row.get::<_,Option<i64>>(0)?,row.get::<_,Option<i64>>(1)?))) else { return };
@@ -373,7 +413,7 @@ fn run_job(db_path: &str, media_id: i64, src: &Path, library: &Path) {
     if !needs_transcode(&src.to_string_lossy()) { return; }
     let cache = std::env::var_os("FRAYD_TRANSCODES").map(PathBuf::from)
         .unwrap_or_else(|| Path::new(db_path).parent().unwrap_or(Path::new(".")).join("transcodes"));
-    let Some((tmp,out,lease)) = reserve_job(&mut db,&cache,library,media_id,src) else {
+    let Some((tmp,out,lease)) = reserve_job_with_roots(&mut db,&cache,roots,media_id,src,cfg!(target_os="linux")) else {
         tracing::warn!(media_id,"transcode held: cache or registry unavailable"); return;
     };
     let Some(completed) = transcode_to_browser_mp4(src,&tmp,&out,&lease) else {
@@ -442,6 +482,36 @@ mod tests {
     }
 
     /// Keep correlated lookups indexed at realistic cardinality while retaining protected media identities.
+    #[test]
+    fn upstream_integration_cache_other_root_holds_reservation_recovery_and_retirement() {
+        let fixture=std::env::temp_dir().join(format!("frayd-all-root-cache-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(fixture.join("a")).unwrap();std::fs::create_dir(fixture.join("b")).unwrap();
+        let roots=vec![fixture.join("a"),fixture.join("b")];
+        let path=fixture.join("db.sqlite");let mut db=crate::store::open(path.to_str().unwrap());
+        let src=roots[0].join("film.mkv");std::fs::write(&src,b"source").unwrap();
+        db.execute("INSERT INTO media(id,kind,path,title) VALUES(1,'movie',?1,'fixture')",[src.to_str().unwrap()]).unwrap();
+        for cache in [roots[1].join("cache/nested"),fixture.clone()] {
+            assert!(reserve_job_with_roots(&mut db,&cache,&roots,1,&src,true).is_none());
+            assert!(!roots[1].join("cache").exists());
+            assert_eq!(db.query_row("SELECT COUNT(*) FROM transcode_artifacts",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        }
+        let cache=fixture.join("transcodes");
+        let (tmp,out,lease)=reserve_job_with_roots(&mut db,&cache,&roots,1,&src,true).unwrap();
+        std::fs::write(&tmp,b"pending").unwrap();drop(lease);
+        // Adding the former cache directory itself as a root holds every recovery byte/row.
+        let blocked_roots=vec![roots[0].clone(),cache.clone()];
+        recover_pending_jobs_with_roots(path.to_str().unwrap(),&blocked_roots);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM transcode_artifacts WHERE lifecycle='pending'",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+        db.execute("UPDATE transcode_artifacts SET lifecycle='completed'",[]).unwrap();
+        assert!(retire_replaced_job_with_roots(&db,path.to_str().unwrap(),&blocked_roots,1,&src,&out).unwrap().is_none());
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM transcode_artifacts WHERE lifecycle='completed'",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+        assert!(prepare_cache(&cache,&blocked_roots).is_none());
+        assert_eq!(std::fs::read(&tmp).unwrap(),b"pending");
+        assert!(!out.exists());
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM transcode_artifacts",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
     #[test]
     fn reconciliation_uses_indexed_lookups_and_preserves_referenced_rows_at_scale() {
         let db=crate::store::open(":memory:");

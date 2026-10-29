@@ -50,6 +50,32 @@ jobs:
         run: |
           docker build -t frayd-qa:local .
           docker build -f Dockerfile.proxy -t frayd-proxy-qa:local .
+      - name: Export and qualify Linux native bundle
+        shell: bash
+        env:
+          FRAYD_NATIVE_REQUIRE_QUALIFICATION: '1'
+          FRAYD_NATIVE_BUILD_SOURCE: /app/server
+          FRAYD_NATIVE_EXPECT_ARCH: x86_64
+        run: |
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = "$FRAYD_NATIVE_EXPECT_ARCH"
+          test ! -e "$FRAYD_NATIVE_BUILD_SOURCE"
+          FRAYD_NATIVE_EXPORT="$(mktemp -d "$RUNNER_TEMP/frayd-native-export.XXXXXXXX")"
+          # Reuse the exact preceding normal Docker build; record its actual compiler.
+          docker build --target native-export --output "type=local,dest=$FRAYD_NATIVE_EXPORT" .
+          export FRAYD_NATIVE_HELPER="$FRAYD_NATIVE_EXPORT/frayd-native"
+          export FRAYD_NATIVE_TOOLCHAIN_FILE="$FRAYD_NATIVE_EXPORT/rustc-version.txt"
+          test -x "$FRAYD_NATIVE_EXPORT/frayd-server"
+          test -x "$FRAYD_NATIVE_HELPER"
+          test -s "$FRAYD_NATIVE_TOOLCHAIN_FILE"
+          cat "$FRAYD_NATIVE_TOOLCHAIN_FILE"
+          FRAYD_NATIVE_PACKAGE_ROOT="$(mktemp -d "$RUNNER_TEMP/frayd-native-packages.XXXXXXXX")"
+          scripts/native/package.sh "$FRAYD_NATIVE_PACKAGE_ROOT/bundle" x86_64-unknown-linux-gnu "$FRAYD_NATIVE_EXPORT/frayd-server" "$FRAYD_NATIVE_HELPER"
+          FRAYD_NATIVE_ARCHIVES=("$FRAYD_NATIVE_PACKAGE_ROOT/bundle/"*.tar.gz)
+          test "${#FRAYD_NATIVE_ARCHIVES[@]}" -eq 1
+          export FRAYD_NATIVE_ARCHIVE="${FRAYD_NATIVE_ARCHIVES[0]}"
+          test -f "$FRAYD_NATIVE_ARCHIVE"
+          python3 -m unittest discover -s tests -p test_native_bundle.py -v
       - name: Disposable HTTP and persistence integration
         run: |
           python3 scripts/check-build-context.py

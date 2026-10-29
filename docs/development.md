@@ -6,7 +6,7 @@ Use an isolated checkout of the exact commit being qualified and disposable data
 
 ## Native server
 
-Install a current Rust toolchain, Clippy and a C compiler. On Linux, the Rust tests also require `ffmpeg` and `ffprobe` on `PATH` for the real replacement-duration oracle. The Docker build stage supplies both tools before running tests. Keep `client/` beside `server/`: the server embeds that source path at build time. From `server/`:
+Install a current Rust toolchain, Clippy and a C compiler. On Linux, the Rust tests also require `ffmpeg` and `ffprobe` on `PATH` for the real replacement-duration oracle. The Docker build stage supplies both tools before running tests. Keep `client/` beside `server/` for the source workflow. For a packaged installation, follow the [native bundle guide](verification/native-bundle.md). From `server/`:
 
 ```sh
 cargo test --locked
@@ -15,7 +15,7 @@ cargo build --locked --release
 FRAYD_LIBRARY=/absolute/path/to/your/media cargo run --locked
 ```
 
-Use a disposable media directory for development. Native runs have no Compose network isolation. The default port is 8484; the default database is `frayd.db` under the build-time server source directory. Thumbnails and conversions default beside the database. Configure `FRAYD_DB`, `FRAYD_THUMBS` and `FRAYD_TRANSCODES` for disposable writable data, separate from any read-only source library. See [configuration and storage](operations.md#configuration-and-storage) for environment overrides and cache caveats. Native media tools such as `ffmpeg`/`ffprobe` must be available separately; the Docker image supplies those tools.
+Use a disposable media directory for development. Native runs have no Compose network isolation. Set `FRAYD_BIND=127.0.0.1` for loopback access. The default port is 8484; the default database is `frayd.db` under the build-time server source directory. Thumbnails and conversions default beside the database. Configure `FRAYD_DB`, `FRAYD_THUMBS` and `FRAYD_TRANSCODES` for disposable writable data, separate from any read-only source library; set `FRAYD_CLIENT_DIR` to the intended client assets. Raw `cargo run` retains its compile-time database default: moving a bare server binary does not qualify relocation. The packaged launcher supplies explicit private data/client paths and loopback binding, and verifies ownership before start/removal. `default-run = "frayd-server"` preserves `cargo run` after adding the `frayd-native` helper binary; the helper adds no Cargo dependency. See [configuration and storage](operations.md#configuration-and-storage) for environment overrides and cache caveats. Native media tools such as `ffmpeg`/`ffprobe` must be available separately; the Docker image supplies those tools.
 
 ## Canonical checks
 
@@ -55,7 +55,9 @@ python3 tests/test_dns_recovery.py
 python3 scripts/audit-dependencies.py
 ```
 
-The [Dockerfile](../Dockerfile) runs locked Rust tests, Clippy and the release build. [Checks CI](../.github/workflows/checks.yml) runs client syntax/tests, real browser DOM regressions, locked Python lint, Compose validation, both image builds, context/integration and controlled DNS-failure checks, Python tests and the live dependency audit. Native Cargo commands, `git diff --check` and the standalone nginx configuration probe are additional local checks; the workflow does not invoke them separately. [CodeQL](../.github/workflows/codeql.yml) provides separate source/workflow analysis. Remote reviews, coverage and check conclusions must be read for the actual PR head; this guide does not reproduce their hosted results.
+The [Dockerfile](../Dockerfile) runs locked Rust tests, Clippy and the release build. [Checks CI](../.github/workflows/checks.yml) runs client syntax/tests, real browser DOM regressions, locked Python lint, Compose validation, both image builds, context/integration and controlled DNS-failure checks, Python tests and the live dependency audit. Linux CI also exports both native binaries and actual compiler metadata from the Docker build and runs the native ownership/runtime suite with `FRAYD_NATIVE_REQUIRE_QUALIFICATION=1`; missing inputs fail instead of silently skipping. Default Python discovery in the dependency-audit job still checks packaging/static policy and explicitly skips helper or actual-server scenarios when their inputs are absent. See [native reproducible checks](verification/native-bundle.md#reproducible-checks) for the required inputs. Native Cargo commands, `git diff --check` and the standalone nginx configuration probe are additional local checks; the workflow does not invoke them separately. [CodeQL](../.github/workflows/codeql.yml) provides separate source/workflow analysis. Remote reviews, coverage and check conclusions must be read for the actual PR head; this guide does not reproduce their hosted results.
+
+The manual [macOS qualification workflow](../.github/workflows/release-mac.yml) uses standard `macos-15` ARM64 and `macos-15-intel` Intel runners, each bounded to 35 minutes. It checks actual architecture and executes each platform's native lifecycle suite. It has no tag trigger, publication or artifact upload, and introduces no new action. The proposed upload action remains rejected pending a qualified dependency check. Actual Mac execution is held until the coordinator accepts the final source and local gates; workflow configuration is not a Mac pass. Keep final source/image and architecture results in the [PR description](https://github.com/ColterD/Frayd/pull/2).
 
 ## Disposable QA scope
 

@@ -1,7 +1,8 @@
 [package]
 name = "frayd-server"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
+default-run = "frayd-server"
 
 [dependencies]
 axum = { version = "0.7", features = ["http2", "macros", "ws"] }

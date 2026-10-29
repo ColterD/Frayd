@@ -135,8 +135,8 @@ let liveBase = null;
 async function poll() {
   for (const t of targets) {
     try {
-      const r = await fetch(t + '/api/library', { mode: 'no-cors', signal: AbortSignal.timeout(2500) });
-      if (r.type === 'opaque' || r.ok) { liveBase = t; break; }
+      const r = await fetch(t + '/api/health', { signal: AbortSignal.timeout(2500) });
+      if (r.ok && (await r.json()).status === 'ok') { liveBase = t; break; }
     } catch {}
   }
   if (!liveBase) { $('#stat').textContent = 'Waiting for your server to come up…'; setTimeout(poll, 3000); return; }

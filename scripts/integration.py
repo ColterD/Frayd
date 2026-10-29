@@ -67,6 +67,25 @@ def request(path, data=None, token=None, headers=None, expected=200, timeout=15)
     assert response.status == expected, (path, response.status, expected)
     return response.read()
 
+
+def curl_request(path, data=None, token=None, method='GET', expected=200):
+    """Capture real HTTP headers with curl -i; credentials remain in stdin/memory."""
+    config = [f'url = {json.dumps(base + path)}', f'request = {json.dumps(method)}']
+    if token:
+        config.append('header = ' + json.dumps('Authorization: Bearer ' + token))
+    if data is not None:
+        config.extend(['header = "Content-Type: application/json"',
+                       'data = ' + json.dumps(json.dumps(data))])
+    result = subprocess.run(['curl', '-i', '--silent', '--show-error', '--max-time', '15',
+                             '--config', '-'], input='\n'.join(config).encode(),
+                            capture_output=True, check=True)
+    headers, body = result.stdout.split(b'\r\n\r\n', 1)
+    status = int(headers.split(b'\r\n', 1)[0].split()[1])
+    # Never print response bodies: setup and login bodies contain session capabilities.
+    print(f'HTTP curl-i {method} {path}: {status} expected {expected}')
+    assert status == expected, (method, path, status, expected)
+    return body
+
 def websocket_upgrade(token):
     """Verify creator identity and private host proof survive the recovered proxy handshake."""
     party = json.loads(request('/api/party', {'identity': 'qa-host'}, token))
@@ -224,13 +243,259 @@ def assert_project_removed(project):
         assert not remaining, (resource, project, remaining)
 
 
+def upstream_contract_qualification(args):
+    """Run fresh two-root/admin/queued-ingest HTTP paths on the caller-qualified image."""
+    global base
+    project = 'frayd-upstream-qa-' + secrets.token_hex(4)
+    print(f'SCENARIO upstream-contract: fresh {project}; curl -i through isolated proxy; expected transactional roots/admin and queued indexing')
+    config = json.loads(docker('compose', '-f', str(ROOT / 'compose.yaml'), 'config', '--format', 'json').stdout)
+    config['name'] = project
+    for key, network in config['networks'].items():
+        network['name'] = project + '_' + key
+    for key, volume in config['volumes'].items():
+        volume['name'] = project + '_' + key
+    for service in config['services'].values():
+        service.pop('build', None)
+        service['restart'] = 'no'
+    config['services']['app']['image'] = args.app_image
+    config['services']['proxy']['image'] = args.proxy_image
+    config['services']['proxy']['ports'][0]['published'] = '0'
+    with tempfile.TemporaryDirectory(prefix=project) as directory:
+        folder = Path(directory)
+        data, roots, tools = (folder / key for key in ('data', 'roots', 'tools'))
+        for path in (data, roots, tools, roots / 'a', roots / 'b',
+                     data / 'thumbs', data / 'transcodes', roots / 'a/Internet'):
+            path.mkdir(); path.chmod(0o2770)
+        # This owned synthetic DB is shared with the image's actual uid10001.
+        # Precreating it fixes both host SQL access and inherited WAL/SHM modes.
+        (data / 'frayd.sqlite').touch(mode=0o660)
+        (data / 'frayd.sqlite').chmod(0o660)
+        image = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII=')
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, 'w') as comic:
+            comic.writestr('001.png', image)
+        source_bytes = archive.getvalue()
+        for path in (roots / 'a/first.cbz', roots / 'b/second.cbz', tools / 'comic.cbz'):
+            path.write_bytes(source_bytes)
+        (tools / 'yt-dlp').write_text('#!/bin/sh\nif [ "$1" = --version ]; then echo owned-fixture; exit 0; fi\n'
+                                    'cp /qa/comic.cbz /roots/a/Internet/queued.cbz\n')
+        (tools / 'ffprobe').write_text('#!/bin/sh\nif [ -e /data/hold-probe ]; then touch /data/probe-entered; '
+                                     'while [ -e /data/hold-probe ]; do sleep 0.05; done; fi\nexec /usr/bin/ffprobe "$@"\n')
+        for command in ('yt-dlp', 'ffprobe'):
+            (tools / command).chmod(0o755)
+        app = config['services']['app']
+        # Only the private disposable fixture group is shared; keep actual app UID
+        # and dropped capabilities while avoiding world-readable synthetic sessions.
+        app['group_add'] = [str(os.getgid())]
+        app['volumes'] = [{'type': 'bind', 'source': str(data), 'target': '/data'},
+                          {'type': 'bind', 'source': str(roots), 'target': '/roots'},
+                          {'type': 'bind', 'source': str(tools), 'target': '/qa', 'read_only': True}]
+        app['environment'] = {**app.get('environment', {}), 'FRAYD_LIBRARY': '',
+                              'PATH': '/qa:/usr/local/bin:/usr/bin:/bin'}
+
+        def compose(*commands):
+            return docker('compose', '-p', project, '-f', '-', *commands, input=json.dumps(config).encode())
+
+        def sql(statement, parameters=()):
+            with closing(sqlite3.connect(data / 'frayd.sqlite', timeout=10)) as db:
+                result = db.execute(statement, parameters).fetchall()
+                db.commit()
+                return result
+
+        def settings():
+            return json.loads(curl_request('/api/admin/settings', token=token))
+
+        def library():
+            return json.loads(curl_request('/api/library', token=token))
+
+        def post_settings(payload, expected=204):
+            return curl_request('/api/admin/settings', payload, token, 'POST', expected)
+
+        with cleanup_project(compose):
+            compose('up', '-d', '--wait', '--wait-timeout', '90')
+            base = 'http://' + compose('port', 'proxy', '8080').stdout.decode().strip()
+            ready()
+            assert json.loads(curl_request('/api/health')) == {'status': 'ok'}
+            owner = json.loads(curl_request('/api/setup', {'email': 'upstream-qa@example.invalid',
+                                                         'password': secrets.token_urlsafe(32)}, method='POST'))
+            token = owner['token']
+            assert settings()['effective_library_paths'] == []
+            assert json.loads(curl_request('/api/scan/status')) == {
+                'scanning': False, 'library_configured': False, 'library_count': 0, 'ingesting': None}
+            curl_request('/api/scan', token=token, method='POST', expected=501)
+            post_settings({'library_paths': ['/roots/a', '/roots/b']})
+            curl_request('/api/scan', token=token, method='POST', expected=202)
+            wait_for_scan_idle()
+            assert json.loads(curl_request('/api/scan/status')) == {
+                'scanning': False, 'library_configured': True, 'library_count': 2, 'ingesting': None}
+            items = library()
+            ids = dict(sql('SELECT path,id FROM media'))
+            assert set(ids) == {'/roots/a/first.cbz', '/roots/b/second.cbz'}, ids
+            assert {item['id'] for item in items} == set(ids.values())
+            media_id = ids['/roots/a/first.cbz']
+            curl_request('/api/progress', {'media_id': media_id, 'position': 0.5}, token, 'POST', 204)
+            curl_request('/api/annotations', {'media_id': media_id, 'kind': 'bookmark', 'spine_idx': 0,
+                                             'cfi': 'qa-root-preservation'}, token, 'POST', 201)
+            before_settings = settings()
+            post_settings({'library_paths': ['/roots/a', '/missing-owned-qa'], 'site_name': 'must-not-commit'}, 400)
+            assert settings() == before_settings
+            sql("CREATE TRIGGER qa_settings_failure BEFORE INSERT ON settings WHEN NEW.key='qa_failure' BEGIN SELECT RAISE(ABORT,'owned QA'); END")
+            post_settings({'library_paths': ['/roots/b'], 'qa_failure': True}, 500)
+            assert settings() == before_settings
+            sql('DROP TRIGGER qa_settings_failure')
+            post_settings({'library_paths': ['/roots/b']})
+            compose('restart', 'app'); ready(); wait_for_scan_idle()
+            assert dict(sql('SELECT path,id FROM media')) == ids
+            assert {item['id'] for item in library()} == set(ids.values())
+            assert json.loads(curl_request(f'/api/progress/{media_id}', token=token))['position'] == 0.5
+            assert len(json.loads(curl_request(f'/api/annotations/{media_id}', token=token))) == 1
+            assert curl_request(f'/api/stream/{media_id}') == source_bytes
+            assert settings()['effective_library_paths'] == ['/roots/b']
+            post_settings({'library_path': '/roots/a'})
+            post_settings({'library_paths': []})
+            compose('restart', 'app'); ready(); wait_for_scan_idle()
+            assert settings()['effective_library_paths'] == []
+            assert sql("SELECT key FROM settings WHERE key='library_path'") == []
+            print('PASS upstream-roots: two-root IDs, root removal, restart, progress, annotations, original bytes, legacy clear, missing-path400 and atomic DB500')
+
+            app['environment']['FRAYD_LIBRARY'] = '/roots/b'
+            compose('up', '-d', '--no-deps', 'app'); ready(); wait_for_scan_idle()
+            assert settings()['library_locked'] is True
+            assert settings()['library_paths'] == []
+            assert settings()['effective_library_paths'] == ['/roots/b']
+            post_settings({'library_paths': ['/roots/a']}, 409)
+            app['environment']['FRAYD_LIBRARY'] = ''
+            compose('up', '-d', '--no-deps', 'app'); ready(); wait_for_scan_idle()
+            post_settings({'library_paths': ['/roots/a', '/roots/b']})
+
+            # An actual scan blocks in our owned probe while the fake downloader exits.
+            # Indexing must queue behind that scan, never advertise completion early.
+            (data / 'hold-probe').touch()
+            (roots / 'b/block.mp4').write_bytes(b'owned invalid probe input')
+            curl_request('/api/scan', token=token, method='POST', expected=202)
+            deadline = time.monotonic() + 10
+            while not (data / 'probe-entered').exists():
+                assert time.monotonic() < deadline, 'scan never reached owned blocking probe'
+                time.sleep(0.05)
+            curl_request('/api/ingest', {'url': 'https://example.invalid/owned-queue'}, token, 'POST', 202)
+            deadline = time.monotonic() + 10
+            while True:
+                status = json.loads(curl_request('/api/scan/status'))
+                if status['ingesting'] == 'indexing':
+                    break
+                assert time.monotonic() < deadline, status
+                time.sleep(0.05)
+            assert status['scanning'] is True
+            curl_request('/api/ingest', {'url': 'https://example.invalid/owned-queue'}, token, 'POST', 409)
+            curl_request('/api/scan', token=token, method='POST', expected=409)
+            post_settings({'library_paths': []}, 409)
+            curl_request(f'/api/media/{media_id}', token=token, method='DELETE', expected=409)
+            (data / 'hold-probe').unlink()
+            deadline = time.monotonic() + 30
+            while True:
+                status = json.loads(curl_request('/api/scan/status'))
+                if status['ingesting'] in ('done', 'failed'):
+                    break
+                assert time.monotonic() < deadline, status
+                time.sleep(0.1)
+            assert status['ingesting'] == 'done', status
+            queued_id = sql("SELECT id FROM media WHERE path='/roots/a/Internet/queued.cbz'")[0][0]
+            assert queued_id in {item['id'] for item in library()}
+            wait_for_scan_idle()
+            print('PASS upstream-ingest: actual scan admission, fake owned downloader, queued indexing, busy409 and indexed-before-done; no network download')
+
+            curl_request('/api/media/999999', token=token, method='DELETE', expected=404)
+            curl_request(f'/api/media/{media_id}?identity=qa-nonadmin', method='DELETE', expected=403)
+            curl_request(f'/api/media/{media_id}', token=token, method='DELETE', expected=409)
+            own_id = sql("SELECT id FROM identities WHERE key='upstream-qa@example.invalid'")[0][0]
+            target = 10001
+            sql("INSERT INTO identities(id,kind,key) VALUES(?,'account','qa-target'),(10002,'account','qa-unrelated')", (target,))
+            sql('INSERT INTO user_perms(identity_id,is_admin) VALUES(?,0),(10002,0)', (target,))
+            sql('INSERT INTO progress(identity_id,media_id,position) VALUES(?,?,2),(10002,?,3)', (target, media_id, media_id))
+            sql("INSERT INTO annotations(identity_id,media_id,kind,spine_idx,cfi) VALUES(?,?,'bookmark',0,'target'),(10002,?,'bookmark',0,'other')", (target, media_id, media_id))
+            sql('INSERT INTO sessions(token,identity_id,expires_at) VALUES(?,?,unixepoch()+1000)', (secrets.token_hex(32), target))
+            curl_request('/api/admin/perms', {'identity_id': target, 'allowed_kinds': ['episode']}, token, 'POST', 204)
+            curl_request('/api/admin/perms', {'identity_id': target, 'allowed_kinds': None}, token, 'POST', 204)
+            assert sql('SELECT allowed_kinds FROM user_perms WHERE identity_id=?', (target,)) == [(None,)]
+            curl_request(f'/api/admin/users/{own_id}', token=token, method='DELETE', expected=409)
+            sql("CREATE TRIGGER qa_user_failure BEFORE DELETE ON identities WHEN OLD.id=10001 BEGIN SELECT RAISE(ABORT,'owned QA'); END")
+            before = [sql(f'SELECT COUNT(*) FROM {table} WHERE identity_id=?', (target,)) for table in ('sessions', 'user_perms', 'progress', 'annotations')]
+            curl_request(f'/api/admin/users/{target}', token=token, method='DELETE', expected=500)
+            assert before == [sql(f'SELECT COUNT(*) FROM {table} WHERE identity_id=?', (target,)) for table in ('sessions', 'user_perms', 'progress', 'annotations')]
+            sql('DROP TRIGGER qa_user_failure')
+            curl_request(f'/api/admin/users/{target}', token=token, method='DELETE', expected=204)
+            assert sql('SELECT id FROM identities WHERE id=?', (target,)) == []
+            assert sql('SELECT position FROM progress WHERE identity_id=10002') == [(3.0,)]
+            assert sql('SELECT cfi FROM annotations WHERE identity_id=10002') == [('other',)]
+            sql('DELETE FROM annotations WHERE media_id=?', (media_id,))
+            sql('DELETE FROM progress WHERE media_id=?', (media_id,))
+            thumbnail = data / 'thumbs' / f'{media_id}.jpg'
+            thumbnail_bytes = thumbnail.read_bytes()
+            sql("CREATE TRIGGER qa_media_failure BEFORE DELETE ON media BEGIN SELECT RAISE(ABORT,'owned QA'); END")
+            curl_request(f'/api/media/{media_id}', token=token, method='DELETE', expected=500)
+            assert sql('SELECT path FROM media WHERE id=?', (media_id,)) == [('/roots/a/first.cbz',)]
+            assert (roots / 'a/first.cbz').read_bytes() == source_bytes
+            assert thumbnail.read_bytes() == thumbnail_bytes
+            sql('DROP TRIGGER qa_media_failure')
+            curl_request(f'/api/media/{media_id}', token=token, method='DELETE', expected=204)
+            assert sql('SELECT id FROM media WHERE id=?', (media_id,)) == []
+            for source in (roots / 'a/first.cbz', roots / 'b/second.cbz'):
+                assert source.read_bytes() == source_bytes
+            print('PASS upstream-admin: explicit-null permission clear, self409, user DB500 rollback and target-only cleanup, media refs/busy409/admin403/missing404/DB500/success204; original sources preserved')
+            # An already configured removable/NAS root becoming unavailable must not
+            # destroy HTTP/admin access or turn the stored snapshot into an empty list.
+            # New writes still use the strict missing-path400 oracle above.
+            # Normalize the expected rediscovery of the source-preserving deletion
+            # before taking the separate unavailable-root snapshot.
+            curl_request('/api/scan', token=token, method='POST', expected=202)
+            wait_for_scan_idle()
+            offline_id = ids['/roots/b/second.cbz']
+            curl_request('/api/progress', {'media_id': offline_id, 'position': 0.75}, token, 'POST', 204)
+            curl_request('/api/annotations', {'media_id': offline_id, 'kind': 'bookmark', 'spine_idx': 0,
+                                             'cfi': 'qa-offline-root'}, token, 'POST', 201)
+            before_offline = sql('SELECT id,path,title FROM media ORDER BY id')
+            offline = roots / 'b-offline'
+            (roots / 'b').rename(offline)
+            try:
+                compose('restart', 'app'); ready(); wait_for_scan_idle()
+                assert json.loads(curl_request('/api/health')) == {'status': 'ok'}
+                assert settings()['effective_library_paths'] == ['/roots/a', '/roots/b']
+                status = json.loads(curl_request('/api/scan/status'))
+                assert status['library_configured'] is True and status['library_count'] == 2
+                assert sql('SELECT id,path,title FROM media ORDER BY id') == before_offline
+                assert offline_id in {item['id'] for item in library()}
+                assert json.loads(curl_request(f'/api/progress/{offline_id}', token=token))['position'] == 0.75
+                assert len(json.loads(curl_request(f'/api/annotations/{offline_id}', token=token))) == 1
+                assert curl_request(f'/api/stream/{queued_id}') == source_bytes
+                assert not (roots / 'b').exists(), 'startup silently recreated unavailable root'
+                assert (offline / 'second.cbz').read_bytes() == source_bytes
+                before_offline_write = settings()
+                post_settings({'library_paths': ['/roots/a', '/roots/b'], 'site_name': 'must-not-commit'}, 400)
+                assert settings() == before_offline_write
+            finally:
+                offline.rename(roots / 'b')
+            curl_request('/api/scan', token=token, method='POST', expected=202)
+            wait_for_scan_idle()
+            compose('restart', 'app'); ready(); wait_for_scan_idle()
+            assert curl_request(f'/api/stream/{offline_id}') == source_bytes
+            assert json.loads(curl_request(f'/api/progress/{offline_id}', token=token))['position'] == 0.75
+            assert sql('SELECT id,path,title FROM media ORDER BY id') == before_offline
+            print('PASS upstream-startup: unavailable stored root preserves healthy HTTP/admin/configured count, rows/progress/annotations/bytes; no root creation; return/rescan/restart recovers')
+    assert_project_removed(project)
+    print(f'PASS upstream cleanup: {project} containers/networks/volumes removed')
+
+
 def main():
     """Exercise isolated container HTTP, persistence, DNS and read-only media paths."""
     global base
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--app-image', default='frayd-qa:local')
     parser.add_argument('--proxy-image', default='frayd-proxy-qa:local')
+    parser.add_argument('--upstream-only', action='store_true', help='Run only the fresh multi-root/admin/queued-ingest contract; default retains all historical scenarios too')
     args = parser.parse_args()
+    if args.upstream_only:
+        upstream_contract_qualification(args)
+        return
     project = 'frayd-qa-' + secrets.token_hex(4)
     print(f'QA project: {project}')
     config = json.loads(docker('compose', '-f', str(ROOT / 'compose.yaml'), 'config', '--format', 'json').stdout)
@@ -689,6 +954,7 @@ def main():
 
     assert_project_removed(project)
     print(f'PASS: task-owned {project} containers, networks and volume removed')
+    upstream_contract_qualification(args)
 
 
 if __name__ == '__main__':

@@ -29,6 +29,20 @@
     check(response.ok, `Fixture ${path}: ${response.status}`);
     return response.json();
   }
+  const logoutReceipt = sessionStorage.getItem('frayd-qa-logout');
+  if (logoutReceipt) {
+    sessionStorage.removeItem('frayd-qa-logout');
+    const packet = JSON.parse(logoutReceipt);
+    await until(() => document.getElementById('login').style.display !== 'none', 'logout returns to login');
+    check(settingsPoll === null && !document.getElementById('settings-modal').classList.contains('on'), 'new document owns no old settings poll or modal');
+    packet.cases.push({ name: 'settings logout reload discards the previous document and poll', status: 'PASS',
+      observed: { actualReload: true, loginVisible: true, settingsPoll: null, previousDocumentGeneration: packet.logoutGeneration } });
+    delete packet.logoutGeneration;
+    packet.passed++;
+    packet.errors.push(...errors);
+    packet.mediaDiagnostics.push(...mediaDiagnostics);
+    return api('result', packet);
+  }
   const frame = document.getElementById('em-frame');
   let sequence = 0;
   function probe(action = 'inspect', details = {}) {
@@ -814,10 +828,296 @@
   Object.defineProperty(mediaPrototype, 'paused', originalPaused);
   await run('native decoded movie resume after production party end',
     () => nativeResume('after prior party lifecycle', true));
-  await api('result', { cases, errors, mediaDiagnostics, nativeMedia, passed: cases.filter(item => item.status === 'PASS').length,
+  // Actual DOM and trusted browser keyboard, with explicitly modeled API responses.
+  const qaFetch = window.fetch;
+  const qaAccount = account;
+  const qaIdentity = IDENTITY;
+  const requests = [];
+  let responder;
+  const reply = (value, status = 200) => new Response(status === 204 ? null : JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });
+  window.fetch = async (url, options = {}) => {
+    if (String(url).startsWith('/__fixture/')) return qaFetch(url, options);
+    requests.push({ url: String(url), method: options.method || 'GET', body: options.body ? JSON.parse(options.body) : null });
+    return responder(String(url), options);
+  };
+  account = { name: 'Disposable admin', isAdmin: true };
+  IDENTITY = 'qa-owned-admin';
+  document.body.classList.remove('auth');
+  document.getElementById('login').style.display = 'none';
+  document.getElementById('app').classList.add('on');
+  document.getElementById('ebook-modal').classList.remove('on');
+  document.getElementById('settings-modal').classList.remove('on');
+  const baseSettings = { library_paths: [], library_path: '/obsolete', library_locked: false, server_version: 'fixture' };
+  let settingsValue = baseSettings;
+  const defaultResponder = async (url) => url === '/api/admin/perms'
+    ? reply([{ identity_id: 4, key: 'fixture-user', is_admin: true, allowed_kinds: null }])
+    : url === '/api/admin/settings' ? reply(settingsValue)
+      : url === '/api/library' ? reply([]) : reply(null);
+  responder = defaultResponder;
+  const key = (key, accept = false) => api('key', { key, accept });
+  const movie = { id: 9, title: 'Owned delete fixture', kind: 'movie', duration_secs: 120 };
+  await run('admin DOM survives markup and trusted Tab Enter Space isolate card deletion', async () => {
+    let deleteStatus = 409;
+    responder = async (url, options) => options.method === 'DELETE' ? reply(null, deleteStatus) : defaultResponder(url);
+    LIBRARY = [movie];
+    await filterKind('movie', '');
+    const button = document.querySelector('#main .card-del');
+    check(button && button.type === 'button', 'Delete survives card innerHTML');
+    document.querySelector('#main .row-head button').focus();
+    await key('Tab');
+    check(document.activeElement === button, 'Trusted Tab reaches delete button');
+    check(button.matches(':focus-visible') && getComputedStyle(button).outlineStyle !== 'none', 'Keyboard focus is visible');
+    const before = requests.length;
+    const enter = await key('Enter');
+    const space = await key(' ');
+    equal(enter.dialogs.length, 1, 'Enter opens native confirmation once');
+    equal(space.dialogs.length, 1, 'Space opens native confirmation once');
+    check(enter.dialogs[0].message.includes('source file remains') && space.dialogs[0].accepted === false, 'Native cancel describes preserved source');
+    equal(requests.slice(before).filter(r => r.method === 'DELETE'), [], 'Cancel sends no DELETE');
+    check(LIBRARY.length === 1 && !document.getElementById('video-modal').classList.contains('on'), 'Cancel retains row without player');
+    await key('Enter', true);
+    await delay(20);
+    check(LIBRARY.length === 1 && document.getElementById('toast-host').textContent.includes('referenced'), '409 retains item and explains refusal');
+    deleteStatus = 204;
+    await key(' ', true);
+    await until(() => LIBRARY.length === 0, '204 removes modeled row');
+    check(!document.querySelector('#main .card-del') && !document.getElementById('video-modal').classList.contains('on'), 'Success removes card without opening player');
+    return { trustedTabEnterSpace: true, nativeConfirmations: 4, cancelledRequests: 0, modeledHttpStatuses: [409, 204], actualBackendDeletion: false };
+  });
+  await run('actual settings DOM scopes seven kind permissions and authoritative locked roots', async () => {
+    responder = defaultResponder;
+    await openSettings();
+    const stage = document.getElementById('settings-stage');
+    check(!stage.textContent.includes('/obsolete') && stage.textContent.includes('No folders configured'), 'Empty array beats obsolete legacy root');
+    const row = stage.querySelector('[data-id="4"]');
+    const inputs = [...row.querySelectorAll('.p-kinds-box input')];
+    equal(inputs.map(i => i.value), ['movie', 'episode', 'music', 'audiobook', 'ebook', 'comic', 'manga'], 'Seven kinds rendered');
+    const bodies = [];
+    responder = async (url, options) => {
+      if (url === '/api/admin/perms' && options.method === 'POST') { bodies.push(JSON.parse(options.body)); return reply(null, 204); }
+      return defaultResponder(url);
+    };
+    row.querySelector('.p-save').click(); await delay(0);
+    inputs.forEach(i => { i.checked = false; });
+    row.querySelector('.p-save').click(); await delay(0);
+    inputs.find(i => i.value === 'episode').checked = true;
+    row.querySelector('.p-save').click(); await delay(0);
+    equal(bodies.map(b => b.allowed_kinds), [null, [], ['episode']], 'All, none and episode payloads are distinct');
+    check(bodies.every(b => b.is_admin === true), 'Admin checkbox never becomes a kind');
+    row.querySelector('.p-remove').focus();
+    const count = requests.filter(r => r.method === 'DELETE').length;
+    const cancellation = await key('Enter');
+    equal(cancellation.dialogs.length, 1, 'Native user removal confirmation');
+    equal(requests.filter(r => r.method === 'DELETE').length, count, 'Cancelled user removal sends nothing');
+    settingsValue = { ...baseSettings, library_locked: true, library_paths: ['/db'], effective_library_paths: ['/env/a', '/env/b'] };
+    await openSettings();
+    check(stage.textContent.includes('/env/a') && stage.textContent.includes('/env/b') && !stage.textContent.includes('/db'), 'Effective environment roots displayed');
+    check([...stage.querySelectorAll('.lib-add,.lib-remove')].every(b => b.disabled), 'All locked root controls disabled');
+    settingsValue = baseSettings;
+    document.getElementById('settings-close').click();
+    return { payloads: bodies, authoritativeEmpty: true, environmentControlsDisabled: true, modeledAPI: true };
+  });
+  await run('actual settings scan and save controls report bounded modeled failures', async () => {
+    const observations = [];
+    for (const status of [202, 409, 501, 500, 'network']) {
+      responder = defaultResponder;
+      await openSettings();
+      responder = async (url, options) => {
+        if (url === '/api/scan') { if (status === 'network') throw Error('server unreachable'); return reply(null, status); }
+        return defaultResponder(url, options);
+      };
+      const button = document.querySelector('.p-scan');
+      button.click(); await delay(0);
+      check(status === 202 ? button.disabled && settingsPoll !== null : !button.disabled && settingsPoll === null, 'Only accepted scan polls');
+      check(status === 202 ? button.textContent === 'Scanning…' : status === 409 ? button.textContent.includes('already running') : status === 501 ? button.textContent.includes('No library folder') : status === 500 ? button.textContent.includes('500') : button.textContent.includes('unreachable'), 'Truthful status feedback');
+      observations.push({ status, text: button.textContent, disabled: button.disabled });
+      document.getElementById('settings-close').click();
+      equal(settingsPoll, null, 'Closing clears accepted scan poll');
+    }
+    for (const status of [409, 'network']) {
+      responder = defaultResponder; await openSettings();
+      responder = async (url, options) => {
+        if (url === '/api/admin/settings' && options.method === 'POST') { if (status === 'network') throw Error('server unreachable'); return reply(null, status); }
+        return defaultResponder(url, options);
+      };
+      const button = document.getElementById('s-site-save');
+      button.click(); await delay(0);
+      check(button.textContent !== 'Saved', 'Refused save cannot claim success');
+      document.getElementById('settings-close').click();
+    }
+    return { observations, failedSettingsSaves: [409, 'network'], modeledAPI: true };
+  });
+  await run('settings ingest waits through indexing and close reopen rejects late status', async () => {
+    const states = [];
+    for (const terminal of ['failed', 'done']) {
+      responder = defaultResponder; await openSettings();
+      const button = document.querySelector('.p-ingest');
+      document.querySelector('.s-ingest').value = 'https://example.invalid/owned';
+      let state = 'downloading';
+      let reads = 0;
+      responder = async (url, options) => {
+        if (url === '/api/ingest') return reply(null, 202);
+        if (url === '/api/scan/status') { reads++; return reply({ scanning: state === 'indexing', ingesting: state }); }
+        return defaultResponder(url, options);
+      };
+      button.click(); await until(() => settingsPoll !== null, 'ingest starts poll');
+      await until(() => reads >= 1, 'downloading status read');
+      equal(button.textContent, 'Downloading…', 'Downloading remains active');
+      state = 'indexing';
+      await until(() => button.textContent === 'Indexing…', 'indexing status read');
+      check(button.disabled && settingsPoll !== null, 'Indexing is still busy');
+      state = terminal;
+      await until(() => settingsPoll === null, 'terminal status ends poll');
+      equal(button.textContent, terminal === 'done' ? 'Download complete' : 'Download failed', 'Terminal feedback');
+      states.push({ terminal, reads, text: button.textContent });
+      document.getElementById('settings-close').click();
+    }
+    responder = defaultResponder; await openSettings();
+    let release;
+    const button = document.querySelector('.p-scan');
+    responder = async (url, options) => url === '/api/scan' ? reply(null, 202)
+      : url === '/api/scan/status' ? new Promise(resolve => { release = resolve; }) : defaultResponder(url, options);
+    button.click();
+    await until(() => release, 'held status fetch');
+    document.getElementById('settings-close').click();
+    responder = defaultResponder; await openSettings();
+    const stageHTML = document.getElementById('settings-stage').innerHTML;
+    const libraryReads = requests.filter(r => r.url === '/api/library').length;
+    release(reply({ scanning: false, ingesting: 'done' })); await delay(30);
+    equal(document.getElementById('settings-stage').innerHTML, stageHTML, 'Old generation cannot repaint reopened settings');
+    equal(requests.filter(r => r.url === '/api/library').length, libraryReads, 'Late status cannot refresh library');
+    equal(settingsPoll, null, 'No surviving settings poll');
+    document.getElementById('settings-close').click();
+    let releaseSettings;
+    responder = async (url, options) => url === '/api/admin/settings'
+      ? new Promise(resolve => { releaseSettings = resolve; }) : defaultResponder(url, options);
+    const oldOpen = openSettings();
+    await until(() => releaseSettings, 'held settings load');
+    document.getElementById('settings-close').click();
+    responder = defaultResponder; await openSettings();
+    const currentHTML = document.getElementById('settings-stage').innerHTML;
+    releaseSettings(reply({ ...baseSettings, site_name: 'Retired settings response' }));
+    await oldOpen;
+    equal(document.getElementById('settings-stage').innerHTML, currentHTML, 'Late settings load cannot replace current markup');
+    let releaseSave;
+    responder = async (url, options) => url === '/api/admin/settings' && options.method === 'POST'
+      ? new Promise(resolve => { releaseSave = resolve; }) : defaultResponder(url, options);
+    const oldSaveButton = document.getElementById('s-site-save');
+    oldSaveButton.click(); await until(() => releaseSave, 'held settings save');
+    document.getElementById('settings-close').click();
+    responder = defaultResponder; await openSettings();
+    releaseSave(reply(null, 204)); await delay(20);
+    check(oldSaveButton.textContent !== 'Saved' && document.getElementById('s-site-save').textContent === 'Save', 'Retired save cannot publish success');
+    document.getElementById('settings-close').click();
+    return { states, lateStatusIgnored: true, lateSettingsLoadIgnored: true, lateSaveIgnored: true, modeledAPI: true, pollingUsesRealTimers: true };
+  });
+  await run('late library and progress responses cannot resurrect deleted DOM or filter sort', async () => {
+    const other = { ...movie, id: 10, title: 'Remaining movie', created_at: 2 };
+    let releaseLibrary;
+    let releaseSearch;
+    const progressReleases = [];
+    responder = async (url, options) => url.startsWith('/api/library?q=') ? new Promise(resolve => { releaseSearch = resolve; })
+      : url === '/api/library' ? new Promise(resolve => { releaseLibrary = resolve; })
+      : url.startsWith('/api/progress/') ? new Promise(resolve => progressReleases.push(resolve))
+        : options.method === 'DELETE' ? reply(null, 204) : defaultResponder(url, options);
+    LIBRARY = [movie, other];
+    await filterKind('movie', '');
+    const retiredCard = document.querySelector('#main .media-card');
+    const pending = loadLibrary();
+    document.querySelector('#main .row-head button').click();
+    const sort = rowSort.get('Movies');
+    const search = document.querySelector('#search input');
+    search.value = 'Owned'; search.dispatchEvent(new Event('input', { bubbles: true }));
+    await until(() => releaseSearch, 'real debounced search starts held request');
+    await filterKind('movie', '');
+    document.querySelector('#main .card-del').focus();
+    await key('Enter', true);
+    await until(() => LIBRARY.length === 1, 'modeled delete completes');
+    const deletedId = requests.filter(r => r.method === 'DELETE').at(-1).url.split('/media/')[1].split('?')[0];
+    releaseLibrary(reply([movie, other]));
+    await pending;
+    releaseSearch(reply([movie, other]));
+    progressReleases.forEach(resolve => resolve(reply({ position: 45 })));
+    await delay(40);
+    check(!LIBRARY.some(i => i.id === +deletedId), 'Held older load cannot resurrect removed item');
+    equal(activeKind, 'movie', 'Filter retained'); equal(rowSort.get('Movies'), sort, 'Sort retained');
+    equal(activeQuery, '', 'Late search cannot restore its retired query'); search.value = '';
+    equal(retiredCard.querySelector('.progress-strip').style.display, 'none', 'Detached progress never paints');
+    check(!document.querySelector('#main').textContent.includes('Continue watching'), 'Filtered view has no stale continue row');
+    return { deletedId: +deletedId, libraryIds: LIBRARY.map(i => i.id), activeKind, sort, detachedProgressIgnored: true, modeledAPI: true };
+  });
+  await run('trusted ebook keys preserve editable inactive settings and button focus', async () => {
+    responder = defaultResponder;
+    await api('configure', { body: '<p>Reader shortcut fixture</p>', annotations: [] });
+    ebook = { it: { id: 7 }, spine: ['one.xhtml', 'two.xhtml'], chunk: 0, annots: [], toc: [] };
+    document.getElementById('ebook-modal').classList.add('on');
+    // Reader transport remains the original loopback fixture for current opaque WindowProxy.
+    window.fetch = qaFetch;
+    await load();
+    const initialGeneration = ebook.document.generation;
+    const outsiderOrigins = [];
+    for (const opaque of [true, false]) {
+      const outsider = document.createElement('iframe');
+      if (opaque) outsider.setAttribute('sandbox', 'allow-scripts');
+      let delivered = false;
+      const observe = event => {
+        if (event.source === outsider.contentWindow) { delivered = true; outsiderOrigins.push(event.origin); }
+      };
+      window.addEventListener('message', observe);
+      try {
+        outsider.srcdoc = '<script>parent.postMessage(' + JSON.stringify({ type: 'chapter', dir: 1, generation: initialGeneration }) + ',"*")</script>';
+        document.body.appendChild(outsider);
+        await until(() => delivered, 'unrelated frame delivers its actual postMessage');
+        equal(ebook.chunk, 0, 'Unrelated actual WindowProxy cannot advance current reader');
+        equal(ebook.document.generation, initialGeneration, 'Unrelated sender cannot replace reader document');
+      } finally { window.removeEventListener('message', observe); outsider.remove(); }
+    }
+    equal(outsiderOrigins, ['null', location.origin], 'Both opaque and same-origin negative controls actually delivered');
+    const targets = [document.querySelector('#search input'), document.getElementById('em-search')];
+    for (const tag of ['textarea', 'select', 'div', 'button']) {
+      const target = document.createElement(tag);
+      if (tag === 'div') target.contentEditable = 'true';
+      document.getElementById('ebook-modal').appendChild(target);
+      targets.push(target);
+    }
+    for (const target of targets) {
+      target.focus();
+      for (const press of ['ArrowRight', ' ', 't']) await key(press);
+      equal(ebook.chunk, 0, 'Editable/button target cannot flip chapter');
+      equal(ebook.document.generation, initialGeneration, 'Editable/button target cannot replace reader document');
+    }
+    document.getElementById('settings-modal').classList.add('on');
+    document.body.tabIndex = -1; document.body.focus();
+    await key('ArrowRight'); equal(ebook.chunk, 0, 'Settings guard blocks body key');
+    document.getElementById('settings-modal').classList.remove('on');
+    document.getElementById('ebook-modal').classList.remove('on');
+    await key('ArrowRight'); equal(ebook.chunk, 0, 'Inactive reader ignores key');
+    document.getElementById('ebook-modal').classList.add('on');
+    document.body.focus(); await key('ArrowRight');
+    await until(() => ebook.chunk === 1 && ebook.document?.ready, 'active body flips once');
+    equal(ebook.chunk, 1, 'Positive key flips exactly once');
+    check((await probe()).opaqueOrigin === 'null', 'Current opaque WindowProxy remains functional');
+    document.getElementById('em-close').click();
+    targets.slice(2).forEach(target => target.remove());
+    return { trustedKeyboard: true, targets: ['search INPUT', 'reader INPUT', 'TEXTAREA', 'SELECT', 'contenteditable', 'BUTTON'], positiveChapter: 1, opaqueOrigin: 'null', outsiderOrigins };
+  });
+  window.fetch = qaFetch;
+  account = qaAccount; IDENTITY = qaIdentity;
+  disposeSettings();
+  // Actual production logout reload is the seventh new case. Carry response proof only
+  // through this fresh profile's sessionStorage; no credentials or owner state exist.
+  const packet = { cases, errors, mediaDiagnostics, nativeMedia,
+    passed: cases.filter(item => item.status === 'PASS').length,
     failed: cases.filter(item => item.status === 'FAIL').length,
-    limits: ['IDs9/10/11 use synthetic media events; native20/21/22 decode the owned H264 fixture. Other codecs, physical output and two-client synchronization remain untested.',
-      'Vendored Plyr retains synthetic event forwarding from detached media; no naturally occurring late event user path is established.',
-      'Disposable loopback API; no deployed service, user profile, account, or existing browser session accessed.'] });
+    logoutGeneration: settingsGeneration,
+    limits: ['32 retained cases include six decoded H264 cases; HTTP204 IDs9/10/11 remain modeled.',
+      'New admin/settings APIs are Response fixtures; backend transactions, filesystem preservation and external YouTube are not qualified.',
+      'Fresh owned headless browser and loopback fixture only; physical output and owner deployment are untested.'] };
+  // Leave a real pending interval to prove production logout disposes it.
+  pollSettings(settingsGeneration, 'scan', document.createElement('button'));
+  sessionStorage.setItem('frayd-qa-logout', JSON.stringify(packet));
+  document.getElementById('logout').click();
+  return;
+
 })().catch(error => fetch('/__fixture/result', { method: 'POST', headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({ cases: [], errors: [error.stack], failed: 1, passed: 0 }) }));

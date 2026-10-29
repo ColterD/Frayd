@@ -27,7 +27,39 @@ docker compose config --quiet
 docker compose up -d --wait
 ```
 
-The app sees `/data/library`, not the host path. The image's `FRAYD_LIBRARY=/data/library` overrides the library path saved in Settings. Change the mount source to select a different host folder, then choose **Scan library** after adding or changing media.
+The app sees `/data/library`, not the host path. The image's nonempty `FRAYD_LIBRARY=/data/library` selects that single exclusive root and locks library changes in Settings. Change the mount source to select a different host folder, then choose **Scan library** after adding or changing media.
+
+### Configure multiple roots
+
+There is one effective ordered root array shared by scanning, ingestion and cache checks. With an absent or empty `FRAYD_LIBRARY`, administrator Settings reads database `library_paths`. An existing legacy `library_path` is used only when the array is absent; a successful root update migrates it to the array. An explicit `[]` disables the library, without a hidden fallback. Existing directories are canonicalized and deduplicated while preserving first occurrence order. A nonempty `FRAYD_LIBRARY` exclusively selects one root; it does not append to database roots, and root edits return 409 while that override is active.
+
+Docker's image default selects `/data/library`. To use database-managed roots, explicitly clear it in the destination configuration. For example, add these read-only mounts in `compose.override.yaml`, then select `/media/books` and `/media/music` in administrator Settings:
+
+```yaml
+services:
+  app:
+    environment:
+      FRAYD_LIBRARY: ''
+    volumes:
+      - type: bind
+        source: /absolute/path/to/books
+        target: /media/books
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /absolute/path/to/music
+        target: /media/music
+        read_only: true
+        bind:
+          create_host_path: false
+```
+
+Paths entered in Settings are container paths. Sources must already exist and be readable/traversable by UID/GID 10001. If URL ingestion is enabled in a separately qualified environment, its landing directory is `Internet/` under the first root, which must be writable. Choose a separate writable landing root first; keep original read-only media mounts read-only.
+
+Removing a configured root preserves indexed IDs, progress, annotations, thumbnails and source bytes. A previously valid root temporarily unavailable at startup remains configured: health and administrator settings/status remain available, configuration count and metadata remain intact, while scan/cache work is held and ingestion returns 503 when its media tools are available. The server does not recreate missing media roots. A newly submitted missing root returns 400. Whole settings changes validate before an atomic database transaction; locked roots or active scan, conversion or ingestion jobs return 409, and database failures return 500 without publishing partial settings.
+
+Scan admission uses one compare-and-set worker owner with scope-bound cleanup. Successful downloads queue indexing through that worker and become `done` only after indexing completes; an abandoned download becomes `failed`. Status exposes `scanning`, `library_configured`, `library_count` and `ingesting` (`null`, `downloading`, `indexing`, `done` or `failed`). Public `/api/health` returns exactly `{"status":"ok"}` without root paths. Server version and effective paths belong to administrator settings metadata.
 
 Alternatively, copy regular files and directories into a new subdirectory of the default library volume, using additional disk space. Symlinks, including any source path component, and special files are rejected without following them. Keep the source unchanged throughout the preflight and copy: these steps are not atomic. Run this block in Bash with GNU `find` and GNU `tar`, set the absolute source directory, and choose a new import name using only letters, digits, underscores or hyphens:
 
@@ -84,7 +116,13 @@ Compose publishes `127.0.0.1:3100`. If that port is occupied, prefix Compose com
 
 The Compose `data` volume persists database, thumbnails, conversions and any copied media across container recreation. A host library mount has its own storage lifecycle. Runtime services use read-only root filesystems, dropped capabilities, resource limits and temporary `/tmp` storage. Only the proxy publishes a port; the app's internal network has no external routing. See [compose.yaml](../compose.yaml) for exact limits.
 
-Environment overrides are `FRAYD_DB`, `FRAYD_LIBRARY`, `FRAYD_THUMBS`, `FRAYD_TRANSCODES`, `FRAYD_PORT`, `FRAYD_UPNP`, and optional PEM paths `FRAYD_CERT`/`FRAYD_KEY` for native TLS. Container paths must exist inside the container and have the required access. Compose reads the host `FRAYD_PORT` for publishing; other host variables are not automatically passed to the app. The [Dockerfile](../Dockerfile) sets its defaults. Native defaults and checks are in [Development](development.md#native-server).
+Environment overrides are `FRAYD_DB`, `FRAYD_LIBRARY`, `FRAYD_THUMBS`, `FRAYD_TRANSCODES`, `FRAYD_PORT`, `FRAYD_BIND`, `FRAYD_CLIENT_DIR`, `FRAYD_UPNP`, and optional PEM paths `FRAYD_CERT`/`FRAYD_KEY` for native TLS. Container paths must exist inside the container and have the required access. Compose reads the host `FRAYD_PORT` for publishing; other host variables are not automatically passed to the app. The [Dockerfile](../Dockerfile) sets its defaults. Native defaults and checks are in [Development](development.md#native-server).
+
+### Administrator deletion
+
+Administrator media deletion returns 204 only for an unreferenced database row with no retained history, conversion reference/provenance or active conversion job. Conflicting references or history return 409. Deletion leaves original source bytes intact; a later scan can index that source again. Optional owned-thumbnail cleanup has its own conservative boundary and does not authorize source removal.
+
+Administrator account deletion removes the target account and its dependent records in one transaction, preserving other users' data. Self-deletion and deletion of the last administrator return 409. Database failures return 500; a failed transaction leaves the account and children intact.
 
 ### Conversion cache limits
 
@@ -177,7 +215,7 @@ test "$(stat -c '%a' "$BACKUP_DIR/data.tar.sha256")" = 600
 
 Require a successful archive command; a nonempty partial archive is not a backup. Keep `data.tar.sha256` beside `data.tar`, with the same private access. Move both together if relocating the backup. The restore block verifies the checksum before extraction.
 
-4. Prepare a **distinct Compose project** with the same immutable app image and data paths. Create its containers without starting the app (`docker compose … create --pull never` for that project's exact configuration). This initializes a separate volume with image-owned directory scaffolding. Inspect the destination app's `/data` mount as above, set `DEST_VOLUME` to its exact name, and require a named volume different from `SOURCE_VOLUME`. Inspect the destination before extraction: it must contain directory scaffolding only, with no existing files. Stop if it has existing data. Never restore over a running or populated volume.
+4. Prepare a **distinct Compose project** with the same immutable app image and data paths. From the directory containing that destination configuration, run `docker compose --project-name frayd-restore create --pull never --no-build`. The command creates containers without starting the app, pulling an image or rebuilding it; the destination configuration must already select the recorded immutable image. This initializes a separate volume with image-owned directory scaffolding. Inspect the destination app's `/data` mount using the same `--project-name frayd-restore`, set `DEST_VOLUME` to its exact name, and require a named volume different from `SOURCE_VOLUME`. Inspect the destination before extraction: it must contain directory scaffolding only, with no existing files. Stop if it has existing data. Never restore over a running or populated volume.
 
 5. Restore into that confirmed empty destination, preserving numeric ownership (the app uses UID/GID 10001). The `-i` flag is required to pass archive bytes on stdin:
 
@@ -219,7 +257,7 @@ downgrade, legacy-schema restore and original-volume rollback remain **unqualifi
 ## Troubleshooting
 
 - **Page unavailable:** check `docker compose ps` and `docker compose logs --tail=100`. Confirm the loopback URL and chosen published port. The first build downloads images and Rust dependencies and runs tests, Clippy and a release build, so startup can take several minutes. Do not publish the app to solve a local connection failure.
-- **Empty library:** confirm the mount's host source exists and UID/GID 10001 can read/traverse it, then choose **Scan library**. Docker's `FRAYD_LIBRARY` overrides Settings.
+- **Empty library:** confirm the mount's host source exists and UID/GID 10001 can read/traverse it, then choose **Scan library**. A nonempty `FRAYD_LIBRARY` locks Settings; clear it explicitly for database-managed roots. A temporarily unavailable configured root is retained, so check the mount before rescanning.
 - **Conversion or thumbnail failure:** check writable space/access in `/data`, including thumbnails and transcodes. Preserve the read-only source mount. Missing online artwork is expected with the app's isolated network.
 - **Missing data after recreation:** check the Compose directory/project identity and its volume before creating accounts or rescanning. A different project can select a different volume.
 - **A format or URL feature fails:** check the limits below; image tools and browser support differ.
@@ -231,8 +269,8 @@ downgrade, legacy-schema restore and original-volume rollback remain **unqualifi
 - Automatic router port mapping needs optional `upnpc`. It is not included, and the image defaults `FRAYD_UPNP=0`. The Compose example supplies neither TLS nor automatic network exposure.
 - Outside the isolated Docker network, audio thumbnail fallback can send filename-derived search terms to Apple's iTunes Search API and download artwork. Local metadata/embedded artwork extraction runs first. The supplied Compose app has no external routing, so online artwork lookup is unavailable and a missing thumbnail is expected.
 - YouTube watch parties load the YouTube iframe API in each participant's browser. Each browser needs access to YouTube; the app's isolated Docker network does not block browser-side requests. This feature has not been verified by the [disposable integration checks](development.md#disposable-qa-scope).
-- **Add from URL** uses an optional server-side `yt-dlp` executable to download into the library. The supplied image does not include it, and the Compose app has no external routing, so URL ingestion is unavailable in this setup. Native use additionally requires network access and a writable library; the read-only media mount above cannot receive downloads.
+- **Add from URL** uses an optional server-side `yt-dlp` executable to download into the library. The supplied image does not include it, and the Compose app has no external routing, so URL ingestion is unavailable in this setup. Native use additionally requires network access and a writable first library root; the read-only media mounts above cannot receive downloads.
 - Videos are currently classified as movies; season/episode organization is not implemented.
-- The browser installer pages and bootstrap scripts are experimental; the [Docker quick start](../README.md#run-with-docker) is the reproducible startup route documented here.
+- The [private native bundle](verification/native-bundle.md) is experimental, with explicit ownership and removal gates; raw browser/bootstrap installers remain separate and experimental; the [Docker quick start](../README.md#run-with-docker) is the reproducible startup route documented here.
 - ZIP readers support stored and deflate archives. Container isolation does not establish that arbitrary media is safe.
 - No license file is currently present in the repository. Do not assume redistribution terms from the public repository alone.

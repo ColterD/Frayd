@@ -5,7 +5,11 @@
 This records bounded manual acceptance using an isolated library and database.
 It does not authorize deployment or qualify arbitrary media, browsers or public hosting.
 
-## Current review follow-up
+## Upstream and native integration boundary
+
+The working integration combines upstream v0.1.1 (`fe320ba`, through fork main `62dc`) with the fork corrections and experimental [native bundle](native-bundle.md). Current commands, measured counts and source hashes belong to the [PR description](https://github.com/ColterD/Frayd/pull/2), since concurrent integration changes can invalidate a working-tree receipt. The multi-root/settings, unavailable-root, queued-ingestion and administrator-deletion checks are HTTP/storage proof; they do not establish interactive browser acceptance. Client checks include six actual decoded-video controls alongside synthetic cases. Final commit/image qualification and actual macOS execution remain held until their gates pass; Linux results do not transfer to either Mac architecture.
+
+## Historical review follow-up
 
 Full review [5690203516](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5690203516)
 and incremental review [5690407263](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5690407263)
@@ -19,9 +23,14 @@ YouTube API. That suite does not qualify actual external playback by itself;
 the real-player checkpoint below is separate.
 
 Party updates clamp captured timestamps under the state lock, preventing stale
-updates from counting elapsed playback twice. The Rust target contains 65 tests. CI requires locked tests, Clippy and release
-compilation; warnings in unchanged code remain.
-The frozen client/harness passes 144 Node tests and 32 actual-DOM cases, including
+updates from counting elapsed playback twice. At pre-upstream commit
+`7e3a7ee6eefbbbd7c9f19223d2c9c84a19670c62`, the Docker build stage's
+`cargo test --locked` passed 59 server unit tests and six archive tests (65 total)
+with normal parallel execution. That historical count excludes the later upstream
+and native integration. CI also requires Clippy and release compilation; warnings
+in unchanged code remain. Current revision-bound commands and results are in the
+[draft PR](https://github.com/ColterD/Frayd/pull/2).
+That checkpoint's client/harness passes 144 Node tests and 32 actual-DOM cases, including
 real native decoding, parser-gated reader restoration and real protocol setup
 after an injected initial transport failure. Owned HTTP nonresponse and early
 exit controls verify bounded failure and cleanup. The effective-stream regression waits
