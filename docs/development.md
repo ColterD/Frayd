@@ -167,7 +167,7 @@ bounds, not an archive, concurrency or RSS budget.
 
 The browser reader waits for fonts and a positive layout before reporting a
 page or saving resume; resize can wake an unmeasurable document. Rejected chapter
-responses publish a visible unavailable state without a false save. Run the
+responses publish a visible unavailable state without a false save. Closing also requires the current ready document, generation and frame identity; pending or failed chapters cannot replace a saved bookmark. Run the
 canonical Rust/Clippy/audit commands and `node --test tests/epub-message.test.cjs`
 plus the real-DOM regression. Those checks do not prove actual first-open
 behavior on a new image or explain Chromium's earlier empty-frame trigger.

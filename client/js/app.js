@@ -1418,6 +1418,7 @@ window.addEventListener('message', async (e) => {
   if (e.data.type === 'reader-ready') {
     if (readerDocument.ready) return;
     readerDocument.ready = true;
+    readerDocument.frameWindow = frameWindow;
     frameWindow.postMessage({ type: 'resume', col: readerDocument.want, generation: readerDocument.generation }, '*');
     if (readerDocument.items.length) frameWindow.postMessage({ type: 'inject-hl', generation: readerDocument.generation, items: readerDocument.items }, '*');
     return;
@@ -1572,7 +1573,13 @@ function closeEbook() {
   ++ebookOpenGeneration;
   clearTimeout(ebookResizeT);
   $('#ebook-modal').classList.remove('on');
-  if (ebook?.chunk != null) syncProgress(ebook.it.id, ebook.chunk + (ebook.lastFrac ?? 0));
+  const readerDocument = ebook?.document;
+  // Pending and failed chapters have no rendered position to save.
+  if (ebook?.chunk != null && readerDocument?.ready
+    && readerDocument.generation === ebookDocumentGeneration
+    && readerDocument.frameWindow === $('#em-frame').contentWindow) {
+    syncProgress(ebook.it.id, ebook.chunk + (ebook.lastFrac ?? 0));
+  }
   ebook = null;
   $('#em-frame').srcdoc = '';
   $('#em-frame').src = 'about:blank';

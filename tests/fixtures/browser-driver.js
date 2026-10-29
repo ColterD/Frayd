@@ -2329,10 +2329,11 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       await until(() => releaseChapter && ebook.chunk === 2, 'EPUB reopens at saved chapter before its body loads');
       check(Math.abs(ebook.lastFrac - 0.3) < 1e-9, 'Known resume fraction is retained before layout');
       document.getElementById('em-close').click();
-      equal(savedPosition, 2.3, 'Known EPUB chapter close preserves saved fractional bookmark');
+      equal(savedPosition, 2.3, 'Closing a known but unrendered chapter preserves the existing fractional bookmark');
       releaseChapter(); await reopening; await delay(20);
-      equal(writes, [2.3], 'Only known EPUB position was saved');
-      epubReadiness.push({ boundary, pendingCloseWrites: 0, resizeAndKeysIgnored: true, reopenedChapter: 2, knownClosePosition: savedPosition });
+      equal(writes, [], 'Closing while the chapter body is held never saves an unrendered position');
+      equal(savedPosition, 2.3, 'Retired chapter body cannot change the existing bookmark');
+      epubReadiness.push({ boundary, pendingCloseWrites: 0, resizeAndKeysIgnored: true, reopenedChapter: 2, pendingChapterCloseWrites: 0, preservedPosition: savedPosition });
     }
     const readerBookmarkReadiness = { comic: { pendingCloseWrites: 0, reopenedPage: comicSaved.get(90), lateOtherComicUnchanged: true, readyNavigation: true }, epub: epubReadiness, actualDOM: true, modeledProgressResponses: true, originalHeldBodiesPreserved: true };
     responder = defaultResponder;

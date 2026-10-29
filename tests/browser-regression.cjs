@@ -228,9 +228,9 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser, diagno
   try {
     while (true) {
       if (browser.exitCode !== null || browser.signalCode !== null) throw new Error('Owned browser exited before cache setup');
-      // A stalled readiness probe must not monopolize the shared startup deadline.
-      // Abort both headers and body before retry; target validation still fails closed.
-      const signal = AbortSignal.any([AbortSignal.timeout(Math.min(1000, remainingStartupBudget())), browserExited.signal]);
+      // Allow a slow valid response to finish within the one startup deadline.
+      // The same signal bounds headers and body and aborts immediately on browser exit.
+      const signal = AbortSignal.any([AbortSignal.timeout(remainingStartupBudget()), browserExited.signal]);
       diagnostics.attempts++;
       phase('http-headers');
       let response;

@@ -2,7 +2,7 @@
 
 [Documentation index](../README.md) · [Review dispositions](coderabbit-follow-up.md) · [Canonical checks](../development.md#canonical-checks) · [Draft PR #2](https://github.com/ColterD/Frayd/pull/2)
 
-Net change from synced fork main `21b2e9b6bf4cff26254f5dfcec9deecd02453718` to head `e7bee5fae9f985f1341c61b4416e4c9942d047d4` (2026-10-29): 63 files. The historical ledger has 129 dispositions, not 129 reproduced bugs; historical claims stay source-bound and PR checks qualify final source.
+Net inventory against synced fork main `21b2e9b6bf4cff26254f5dfcec9deecd02453718`: 63 files (2026-10-29). `e7bee5f` is an implementation checkpoint; reviewed `82f8a34` adds five documentation changes. Later fixes appear below; the PR identifies the final head. The historical 129 dispositions are not 129 reproduced bugs; checks remain source-bound.
 
 Pending, held and staged statuses describe their named **2026-10-29 pre-cutover source checkpoint**, initially `8d87905`. Later deployment, sample-import and acceptance outcomes belong to the [current PR #2 status](https://github.com/ColterD/Frayd/pull/2); this source-bound snapshot does not predict them.
 
@@ -124,9 +124,13 @@ At `f339352`, the owner fixture restored bookmark 2.333 to page 2/4 with its hig
 
 The browser harness now records version/revision through its owned CDP session rather than a separate `--version` subprocess that timed out before any hosted cases. A fault-injected old run blocks; the repaired runner reaches its expected lifecycle sentinel and cleans up. Error-layout checks retain their four-second deadline and visibility assertion, waiting for first measurable layout instead of sampling zero geometry at load. Fresh full Chrome passes 47/47 (56.792 s cases); Node passes 368/368. The hosted runner hang cause remains unknown; final CI is separate.
 
+`5cfc14b` normalizes NCX/nav labels with one bounded XML text collector; entities, nested tags, CDATA and Unicode retain plain text without reparsing decoded markup. Old NCX entity output fails its fixture; twelve archive combinations and full Rust 135/Clippy pass. Close-time bookmark saving now requires a ready, current-generation frame; failed/loading closes preserve the previous position. Fresh Node 372 and full Chrome DOM 47 pass. Existing readiness fixtures now expect no pending-chapter write while retaining legitimate ready-close saves. DevTools discovery accepts a slow valid response within the original shared 30-second deadline; stalled headers/body and malformed responses retain bounded failure. Hosted startup cause remains unproven.
+
 ## Current review follow-ups after `76ac314`
 
-Current eight, separate from historical 129: [4415914938](https://github.com/ColterD/Frayd/pull/2#discussion_r4415914938), [4416459818](https://github.com/ColterD/Frayd/pull/2#discussion_r4416459818), [4416459826](https://github.com/ColterD/Frayd/pull/2#discussion_r4416459826), [4416459837](https://github.com/ColterD/Frayd/pull/2#discussion_r4416459837), [4416511292](https://github.com/ColterD/Frayd/pull/2#discussion_r4416511292), [4416511305](https://github.com/ColterD/Frayd/pull/2#discussion_r4416511305), and [review 5703121917](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5703121917) markers `67ee7ababd5141bc6a286816` (synopsis), `d1a7c43f2c105412d2290116` (lazy art). Final hosted status belongs to the PR.
+The first eight, separate from historical 129: [4415914938](https://github.com/ColterD/Frayd/pull/2#discussion_r4415914938), [4416459818](https://github.com/ColterD/Frayd/pull/2#discussion_r4416459818), [4416459826](https://github.com/ColterD/Frayd/pull/2#discussion_r4416459826), [4416459837](https://github.com/ColterD/Frayd/pull/2#discussion_r4416459837), [4416511292](https://github.com/ColterD/Frayd/pull/2#discussion_r4416511292), [4416511305](https://github.com/ColterD/Frayd/pull/2#discussion_r4416511305), and [review 5703121917](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5703121917) markers `67ee7ababd5141bc6a286816` (synopsis), `d1a7c43f2c105412d2290116` (lazy art). Final hosted status belongs to the PR.
+
+Later review [5703812614](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5703812614) adds three: [4416990098](https://github.com/ColterD/Frayd/pull/2#discussion_r4416990098) (close-time reader readiness), [4416990104](https://github.com/ColterD/Frayd/pull/2#discussion_r4416990104) (checkpoint wording), [4416990117](https://github.com/ColterD/Frayd/pull/2#discussion_r4416990117) (TOC text normalization). Dispositions and current checks belong to the PR.
 
 ## Verification and evidence boundaries
 

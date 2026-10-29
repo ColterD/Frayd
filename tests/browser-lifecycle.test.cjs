@@ -388,7 +388,7 @@ test('browser setup shares its remaining startup budget across port and HTTP dis
     const configure = vm.runInNewContext(source.slice(start, end) + '\nconfigureOwnedBrowserCache;', context);
     await assert.rejects(configure({ profile: '/owned/profile', fixtureUrl: 'unused', browser: Object.assign(new EventEmitter(), { exitCode: null, signalCode: null }) }),
       expireAfterHttp ? /startup deadline exceeded/ : /HTTP boundary reached/);
-    assert.equal(httpBudget, 1000, 'One HTTP attempt is bounded within the remaining shared startup budget');
+    assert.equal(httpBudget, 26000, 'Discovery uses only the startup budget remaining after port readiness');
   }
 });
 
@@ -396,7 +396,7 @@ test('browser setup shares its remaining startup budget across port and HTTP dis
 test('page discovery retries temporary HTTP failures and empty lists but rejects unsafe targets', async () => {
   const source = readFileSync(join(__dirname, 'browser-regression.cjs'), 'utf8');
   const setupSource = source.slice(source.indexOf('async function bounded('), source.indexOf('async function main('));
-  for (const scenario of ['transient', 'multiple', 'nonblank', 'foreign']) {
+  for (const scenario of ['transient', 'multiple', 'nonblank', 'foreign', 'status', 'json']) {
     let calls = 0;
     const page = { type: 'page', url: 'about:blank', webSocketDebuggerUrl: 'ws://127.0.0.1:32123/devtools/page/owned-test' };
     const browser = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
@@ -405,6 +405,8 @@ test('page discovery retries temporary HTTP failures and empty lists but rejects
       existsSync: () => true, readFileSync: () => '32123\n/unused',
       async fetch() {
         calls++;
+        if (scenario === 'status') return { ok: false, status: 403 };
+        if (scenario === 'json') return { ok: true, json: async () => { throw new SyntaxError('Invalid JSON sentinel'); } };
         if (scenario === 'transient' && calls === 1) throw new TypeError('fetch failed');
         if (scenario === 'transient' && calls === 2) return { ok: false, status: 503 };
         const pages = scenario === 'transient' && calls === 3 ? []
@@ -416,7 +418,8 @@ test('page discovery retries temporary HTTP failures and empty lists but rejects
       WebSocket: class { constructor() { throw new Error('Validated owned protocol boundary reached'); } },
     });
     await assert.rejects(configure({ profile: '/owned/profile', fixtureUrl: 'unused', browser }),
-      scenario === 'transient' ? /Validated owned protocol boundary reached/ : scenario === 'foreign' ? /Unexpected owned browser page endpoint/ : /exactly one blank page/);
+      scenario === 'status' ? /page discovery failed/ : scenario === 'json' ? /Invalid JSON sentinel/
+        : scenario === 'transient' ? /Validated owned protocol boundary reached/ : scenario === 'foreign' ? /Unexpected owned browser page endpoint/ : /exactly one blank page/);
     assert.equal(calls, scenario === 'transient' ? 4 : 1);
     assert.equal(browser.listenerCount('exit'), 0, 'Discovery releases its exit listener');
   }
@@ -425,7 +428,7 @@ test('page discovery retries temporary HTTP failures and empty lists but rejects
 test('unresponsive owned discovery stops at the shared deadline or browser exit and cleans up', { timeout: 20000 }, async () => {
   const source = readFileSync(join(__dirname, 'browser-regression.cjs'), 'utf8');
   const setupSource = source.slice(source.indexOf('async function bounded('), source.indexOf('async function main('));
-  for (const scenario of ['deadline', 'exit']) {
+  for (const scenario of ['deadline', 'body-deadline', 'exit', 'body-exit']) {
     const profile = mkdtempSync(join(tmpdir(), 'frayd-discovery-never-'));
     const browser = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
     let requested = false;
@@ -433,7 +436,8 @@ test('unresponsive owned discovery stops at the shared deadline or browser exit 
     const server = createServer((request, response) => {
       assert.equal(request.url, '/json/list');
       requested = true; // Keep the actual HTTP response open until discovery aborts.
-      if (scenario === 'exit') exitTimer = setTimeout(() => {
+      if (scenario.startsWith('body-')) { response.writeHead(200, { 'Content-Type': 'application/json' }); response.write('['); }
+      if (scenario.endsWith('exit')) exitTimer = setTimeout(() => {
         browser.exitCode = 7;
         browser.emit('exit', 7, null);
       }, 20);
@@ -448,10 +452,10 @@ test('unresponsive owned discovery stops at the shared deadline or browser exit 
     const startedAt = Date.now();
     try {
       await assert.rejects(configure({ profile, fixtureUrl: 'unused', browser, budgetMs: 200 }),
-        scenario === 'deadline' ? /startup deadline exceeded/ : /exited before cache setup/);
+        scenario.endsWith('deadline') ? /startup deadline exceeded/ : /exited before cache setup/);
       const elapsed = Date.now() - startedAt;
       assert.equal(requested, true, 'The real owned HTTP endpoint received discovery');
-      if (scenario === 'deadline') assert.ok(elapsed >= 180 && elapsed < 1500, `Shared deadline elapsed ${elapsed}ms`);
+      if (scenario.endsWith('deadline')) assert.ok(elapsed >= 180 && elapsed < 1500, `Shared deadline elapsed ${elapsed}ms`);
       else assert.ok(elapsed < 3000, `Browser exit must abort the pending request: ${elapsed}ms`);
       assert.equal(browser.listenerCount('exit'), 0);
     } finally {
@@ -466,21 +470,23 @@ test('unresponsive owned discovery stops at the shared deadline or browser exit 
 });
 
 
-test('owned discovery retries a stalled HTTP attempt within the shared startup budget', { timeout: 8000 }, async () => {
+test('owned discovery accepts slow valid HTTP headers and body within the remaining startup budget', { timeout: 8000 }, async () => {
   const source = readFileSync(join(__dirname, 'browser-regression.cjs'), 'utf8');
   const setupSource = source.slice(source.indexOf('async function bounded('), source.indexOf('async function main('));
   for (const scenario of ['headers', 'body']) {
     let attempts = 0;
     const browser = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
-    const server = createServer((request, response) => {
+    const server = createServer(async (request, response) => {
       assert.equal(request.url, '/json/list');
       attempts++;
-      if (attempts === 1) {
-        if (scenario === 'body') { response.writeHead(200, { 'Content-Type': 'application/json' }); response.write('['); }
-        return;
+      const bytes = JSON.stringify([{ type: 'page', url: 'about:blank',
+        webSocketDebuggerUrl: `ws://127.0.0.1:${server.address().port}/devtools/page/owned-test` }]);
+      if (scenario === 'body') {
+        response.writeHead(200, { 'Content-Type': 'application/json' });
+        response.write(bytes.slice(0, 1));
       }
-      response.end(JSON.stringify([{ type: 'page', url: 'about:blank',
-        webSocketDebuggerUrl: `ws://127.0.0.1:${server.address().port}/devtools/page/owned-test` }]));
+      await delay(1200);
+      if (!response.destroyed) response.end(scenario === 'body' ? bytes.slice(1) : bytes);
     });
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
     const configure = vm.runInNewContext(setupSource + '\nconfigureOwnedBrowserCache;', {
@@ -489,22 +495,17 @@ test('owned discovery retries a stalled HTTP attempt within the shared startup b
       WebSocket: class { constructor() { throw new Error('Validated owned protocol boundary reached'); } },
     });
     const diagnostics = {};
-    // Bound the baseline failure too: release its stuck response without leaving sockets.
-    const failSafe = setTimeout(() => server.closeAllConnections(), 2500);
     const startedAt = Date.now();
     try {
-      await assert.rejects(configure({ profile: '/owned/profile', fixtureUrl: 'unused', browser, diagnostics }),
+      await assert.rejects(configure({ profile: '/owned/profile', fixtureUrl: 'unused', browser, diagnostics, budgetMs: 2800 }),
         /Validated owned protocol boundary reached/);
-      assert.equal(attempts, 2);
-      assert.equal(diagnostics.attempts, 2);
-      assert.equal(diagnostics.transientFailures, 1);
-      assert.equal(diagnostics.budgetMs, 30000);
+      assert.equal(attempts, 1, 'A valid slow response is not discarded and restarted');
+      assert.equal(diagnostics.attempts, 1);
+      assert.equal(diagnostics.transientFailures, 0);
       assert.equal(diagnostics.phase, 'socket-open');
-      assert.doesNotMatch(JSON.stringify(diagnostics), /127\.0\.0\.1|devtools|unused/);
-      assert.ok(Date.now() - startedAt < 2000, 'A stalled attempt must leave time for subsequent readiness probes');
+      assert.ok(Date.now() - startedAt >= 1200);
       assert.equal(browser.listenerCount('exit'), 0);
     } finally {
-      clearTimeout(failSafe);
       server.closeAllConnections();
       await new Promise(resolve => server.close(resolve));
     }

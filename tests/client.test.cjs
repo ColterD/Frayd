@@ -14,7 +14,8 @@ function progress(browser) {
 
 test('closing an ebook preserves the last reported fractional chapter position', () => {
   const b = browser();
-  b.run('ebook = { it: { id: 7 }, chunk: 2, spine: ["a", "b", "c"], document: { generation: 1, ready: true } }');
+  b.run('ebookDocumentGeneration = 1; ebook = { it: { id: 7 }, chunk: 2, spine: ["a", "b", "c"], document: { generation: 1, ready: false, want: 0, items: [] } }');
+  b.message({ type: 'reader-ready' });
   b.page(3, 5);
   b.nodes.get('#em-close').onclick();
   assert.deepEqual(progress(b), [2.5, 2.5]);
@@ -23,7 +24,8 @@ test('closing an ebook preserves the last reported fractional chapter position',
 
 test('closing before any page report saves a finite chapter position', () => {
   const b = browser();
-  b.run('ebook = { it: { id: 7 }, chunk: 0, spine: ["a"], document: { generation: 1, ready: true } }');
+  b.run('ebookDocumentGeneration = 1; ebook = { it: { id: 7 }, chunk: 0, spine: ["a"], document: { generation: 1, ready: false, want: 0, items: [] } }');
+  b.message({ type: 'reader-ready' });
   b.nodes.get('#em-close').onclick();
   assert.deepEqual(progress(b), [0]);
 });
@@ -31,33 +33,39 @@ test('closing before any page report saves a finite chapter position', () => {
 test('changing chapters resets the previous fractional position before layout reports', async () => {
   const b = browser();
   b.respond(async () => ({ ok: true, text: async () => '<html><head></head><body>Chapter</body></html>' }));
-  b.run('ebook = { it: { id: 7 }, chunk: 0, spine: ["a", "b"], document: { generation: 1, ready: true } }');
+  b.run('ebookDocumentGeneration = 1; ebook = { it: { id: 7 }, chunk: 0, spine: ["a", "b"], document: { generation: 1, ready: false, want: 0, items: [] } }');
+  b.message({ type: 'reader-ready' });
   b.page(3, 5);
   await b.run('showChunk(1)');
+  b.message({ type: 'reader-ready' });
   b.nodes.get('#em-close').onclick();
   assert.deepEqual(progress(b), [0.5, 1]);
 });
 
-test('closing while the next chapter fetch is pending saves the new chapter position', async () => {
+test('closing while the next chapter fetch is pending preserves the last rendered chapter position', async () => {
   const b = browser();
   let finishFetch;
   b.respond(url => url.includes('/chunk/')
     ? new Promise(resolve => { finishFetch = resolve; })
     : Promise.resolve({ ok: true }));
-  b.run('ebook = { it: { id: 7 }, chunk: 0, spine: ["a", "b"], document: { generation: 1, ready: true } }');
+  b.run('ebookDocumentGeneration = 1; ebook = { it: { id: 7 }, chunk: 0, spine: ["a", "b"], document: { generation: 1, ready: false, want: 0, items: [] } }');
+  b.message({ type: 'reader-ready' });
   b.page(3, 5);
   const loading = b.run('showChunk(1)');
   b.nodes.get('#em-close').onclick();
-  assert.deepEqual(progress(b), [0.5, 1]);
+  assert.deepEqual(progress(b), [0.5]);
   finishFetch({ ok: true, text: async () => '<html><head></head><body>Chapter</body></html>' });
   await loading;
+  assert.deepEqual(progress(b), [0.5]);
+  assert.equal(b.run('ebook'), null);
 });
 
-test('closing a resumed chapter before layout preserves the requested fraction', async () => {
+test('closing a resumed ready chapter before its first page report preserves the requested fraction', async () => {
   const b = browser();
   b.respond(async () => ({ ok: true, text: async () => '<html><head></head><body>Chapter</body></html>' }));
-  b.run('ebook = { it: { id: 7 }, chunk: 0, spine: ["a", "b"], document: { generation: 1, ready: true } }');
+  b.run('ebookDocumentGeneration = 1; ebook = { it: { id: 7 }, chunk: 0, spine: ["a", "b"], document: { generation: 1, ready: false, want: 0, items: [] } }');
   await b.run('showChunk(1, { frac: 0.75 })');
+  b.message({ type: 'reader-ready' });
   b.nodes.get('#em-close').onclick();
   assert.deepEqual(progress(b), [1.75]);
 });
@@ -2742,6 +2750,7 @@ for (const boundary of ['toc', 'progress']) {
     await b.run('openEbook({ id: 7, title: "Owned EPUB" })'); await settle();
     assert.equal(b.run('ebook.chunk'), 2);
     assert.ok(Math.abs(b.run('ebook.lastFrac') - 0.3) < 1e-9);
+    b.message({ type: 'reader-ready' });
     b.nodes.get('#em-close').onclick();
     assert.equal(writes.at(-1), 2.3);
     assert.equal(saved(), 2.3);

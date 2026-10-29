@@ -5,7 +5,7 @@ const { browser } = require('./fixtures/client-browser.cjs');
 const highlight = { type: 'highlight', cfi: 'char:0:5', text: 'Hello' };
 function reader() {
   const b = browser();
-  b.run('ebook = { it: { id: 7 }, chunk: 1, spine: ["a", "b", "c"], document: { generation: 1, ready: true, items: [] } }');
+  b.run('ebookDocumentGeneration = 1; ebook = { it: { id: 7 }, chunk: 1, spine: ["a", "b", "c"], document: { generation: 1, ready: true, frameWindow: $("#em-frame").contentWindow, items: [] } }');
   b.send = (data, overrides = {}) => b.dispatchMessage({
     data: data && typeof data === "object" && !Array.isArray(data) ? { generation: b.run("ebook?.document?.generation"), ...data } : data, origin: 'null', source: b.nodes.get('#em-frame').contentWindow, ...overrides,
   });
@@ -350,3 +350,36 @@ test('HTTP 200 chapter with a head publishes its bridge and awaits the normal re
   assert.equal(b.nodes.get('#em-pageinfo').textContent, '2 · p4/5');
   assert.equal(b.run('ebook.lastFrac'), 0.75);
 });
+
+
+for (const phase of ['pending', 'failed']) {
+  test(`closing a ${phase} chapter cannot save its unrendered requested position`, async () => {
+    const b = reader();
+    b.run('ebook.lastFrac = 1 / 3');
+    let resolveChapter;
+    b.respond(() => new Promise(resolve => { resolveChapter = resolve; }));
+    const opening = b.run('showChunk(2, { frac: 0.75 })');
+    if (phase === 'failed') {
+      resolveChapter({ ok: false, status: 404 });
+      await opening;
+    }
+    b.nodes.get('#em-close').onclick();
+    assert.deepEqual(b.requests.filter(request => request.options?.method === 'POST'), []);
+    if (phase === 'pending') {
+      resolveChapter({ ok: true, text: async () => '<html><head></head><body>Retired request</body></html>' });
+      await opening;
+      assert.equal(b.run('ebook'), null);
+      assert.equal(b.nodes.get('#em-frame').srcdoc, '');
+    }
+  });
+}
+
+for (const stale of ['generation', 'frame']) {
+  test(`closing a ready chapter with a retired ${stale} cannot save progress`, () => {
+    const b = reader();
+    if (stale === 'generation') b.run('ebookDocumentGeneration += 1');
+    else b.nodes.get('#em-frame').contentWindow = { postMessage() {} };
+    b.nodes.get('#em-close').onclick();
+    assert.deepEqual(b.requests.filter(request => request.options?.method === 'POST'), []);
+  });
+}
