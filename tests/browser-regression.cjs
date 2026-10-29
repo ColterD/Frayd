@@ -396,10 +396,11 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser, diagno
       await rpc('Input.dispatchKeyEvent', { type: 'keyUp', key, windowsVirtualKeyCode: codes[key] });
       return { key, dialogs: dialogs.slice(before), trustedBrowserInput: true };
     }
-    async function viewport(width) {
+    async function viewport(width, height = 1000) {
       if (![320, 768, 1024, 1440].includes(width)) throw new Error('Unknown fixture viewport');
-      await rpc('Emulation.setDeviceMetricsOverride', { width, height: 1000, deviceScaleFactor: 1, mobile: false });
-      return { width, height: 1000, cssPixels: true };
+      if (height !== 1000 && !(width === 320 && height === 568) && !(width === 768 && height === 600)) throw new Error('Unknown fixture viewport height');
+      await rpc('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
+      return { width, height, cssPixels: true };
     }
     async function click(x, y) {
       if (![x, y].every(Number.isFinite) || x < 0 || x > 1440 || y < 0 || y > 1000) throw new Error('Invalid owned fixture click coordinates');
@@ -486,7 +487,10 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
         input += chunk;
         if (input.length > 1024 * 1024) throw new Error('Fixture request exceeds size bound');
       }
-      if (path === '/__fixture/viewport' && request.method === 'POST') return json(await cacheSession.viewport(JSON.parse(input).width));
+      if (path === '/__fixture/viewport' && request.method === 'POST') {
+        const viewport = JSON.parse(input);
+        return json(await cacheSession.viewport(viewport.width, viewport.height));
+      }
       if (path === '/__fixture/click' && request.method === 'POST') { const point = JSON.parse(input); return json(await cacheSession.click(point.x, point.y)); }
       if (path === '/__fixture/responsive' || path === '/__fixture/toolbar-retry') {
         const width = Number(new URL(request.url, 'http://fixture.invalid').searchParams.get('width'));

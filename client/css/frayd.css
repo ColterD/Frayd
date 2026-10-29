@@ -26,12 +26,11 @@ input { font: inherit; }
 
 /* ===== LOGIN SCREEN ===== */
 body.auth {
-  display: flex; align-items: center; justify-content: center;
+  display: flex; align-items: center; justify-content: center; padding: 32px 12px;
   background: radial-gradient(ellipse at 50% 20%, #221f3a 0%, #14131f 40%, #060608 100%);
 }
-.auth-brand {
-  position: absolute; top: 40px; left: 0; right: 0; text-align: center;
-}
+body.auth #login { flex-direction: column; align-items: center; gap: 24px; width: 100%; }
+body.auth .auth-brand { text-align: center; }
 .auth-brand h1 {
   font-size: 34px; font-weight: 800; letter-spacing: 2px;
   background: linear-gradient(90deg, var(--accent), var(--accent-2));
@@ -80,7 +79,7 @@ body.auth {
 }
 .btn-social:hover { border-color: var(--fg-muted); }
 .social-row { display: flex; gap: 12px; }
-.auth-footer { position: absolute; bottom: 32px; left: 0; right:0; text-align: center; color: var(--fg-muted); font-size: 13px; }
+body.auth .auth-footer { text-align: center; color: var(--fg-muted); font-size: 13px; }
 .auth-error { color: #ff6b6b; font-size: 13px; margin-bottom: 12px; display: none; }
 
 /* ===== APP SHELL ===== */

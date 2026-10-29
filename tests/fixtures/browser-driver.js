@@ -48,13 +48,51 @@ async function isolatedResponsiveCase(width) {
       const rect = node => { const r = node.getBoundingClientRect(); return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height }; };
       const contains = (outer, inner) => inner.left >= outer.left - 1 && inner.right <= outer.right + 1 && inner.top >= outer.top - 1 && inner.bottom <= outer.bottom + 1;
       try {
-        app.classList.remove('on'); login.style.display = 'block'; document.body.classList.add('auth');
+        app.classList.remove('on'); login.style.display = 'flex'; document.body.classList.add('auth');
         const card = rect(document.querySelector('.auth-card'));
         measured.loginGeometry = ['email', 'password', 'pw-toggle'].map(id => ({ id, ...rect(document.getElementById(id)) }));
         check(document.documentElement.scrollWidth <= innerWidth + 1, 'Sign-in document fits viewport without hiding overflow');
         measured.loginGeometry.forEach(field => check(field.width > 0 && contains(card, field), 'Sign-in input/reveal fits auth card: ' + field.id));
         const reveal = document.getElementById('pw-toggle'), r = rect(reveal);
         check(reveal.contains(document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2)), 'Password reveal accepts pointer hit');
+        // Use the exact production boot display, then shrink the real iframe viewport.
+        const height = width === 320 ? 568 : width === 768 ? 600 : 1000;
+        try {
+          await api('viewport', { width, height });
+          await until(() => innerHeight === height, 'short authentication viewport settles');
+          scrollTo(0, 0);
+          const brandRect = rect(login.querySelector('.auth-brand')), cardRect = rect(login.querySelector('.auth-card')), footerRect = rect(login.querySelector('.auth-footer'));
+          measured.authFlowGeometry = { width, height, brand: brandRect, card: cardRect, footer: footerRect, controls: [] };
+          check(brandRect.top >= 0 && brandRect.bottom <= cardRect.top && cardRect.bottom <= footerRect.top, 'Authentication brand, form and guest footer never overlap at short height');
+          check(document.documentElement.scrollWidth <= innerWidth + 1, 'Short authentication document stays within viewport width');
+          const controls = [...login.querySelectorAll('input,button,a')];
+          for (const control of controls) {
+            control.scrollIntoView({ block: 'center', inline: 'nearest' });
+            control.focus();
+            const bounds = rect(control), hit = document.elementFromPoint(bounds.left + bounds.width / 2, bounds.top + bounds.height / 2);
+            check(bounds.width > 0 && bounds.top >= -1 && bounds.bottom <= innerHeight + 1 && bounds.left >= -1 && bounds.right <= innerWidth + 1, 'Authentication control stays reachable through natural document scrolling');
+            check((hit === control || control.contains(hit)) && document.activeElement === control, 'Authentication control accepts pointer hit and keyboard focus');
+            if (control.id === 'pw-toggle') {
+              const password = document.getElementById('password'), beforeType = password.type;
+              const point = { x: bounds.left + bounds.width / 2, y: bounds.top + bounds.height / 2 };
+              measured.authFlowGeometry.revealClick = await api('click', point);
+              check(password.type !== beforeType, 'Trusted pointer click activates password reveal after scrolling');
+              await api('click', point);
+              check(password.type === beforeType, 'Second pointer click restores password masking');
+            }
+            measured.authFlowGeometry.controls.push({ id: control.id || control.textContent.trim(), bounds, scrollY });
+          }
+          const guest = document.getElementById('guest');
+          controls[controls.indexOf(guest) - 1].focus();
+          await key('Tab');
+          check(document.activeElement === guest, 'Native Tab reaches guest link after social controls');
+          check(height === 1000 || measured.authFlowGeometry.controls.some(control => control.scrollY > 0), 'Short sign-in page scrolls to controls below fold');
+        } finally {
+          await api('viewport', { width, height: 1000 });
+          await until(() => innerHeight === 1000, 'original viewport height restored');
+          scrollTo(0, 0);
+        }
+
       } finally {
         if (loginStyle === null) login.removeAttribute('style'); else login.setAttribute('style', loginStyle);
         app.className = appClass; document.body.className = bodyClass;
@@ -192,7 +230,7 @@ async function isolatedResponsiveCase(width) {
         modal.classList.remove('yt');
         check(rect(iframe).width === 0 && rect(wrapper).width === innerWidth, 'Returning native mode hides external iframe and restores Plyr');
       } finally { iframe.replaceWith(external); modal.classList.remove('yt'); document.getElementById('vm-back').click(); }
-      return { viewport: { width: innerWidth, height: innerHeight }, sizes, grids, ratios, layoutGeometry: { login: measured.loginGeometry, hero: measured.heroGeometry, native: measured.videoGeometry, youtubeModel: measured.youtubeLayoutModel }, navigationLabels: nav.map(n => n.textContent.trim()), adminAndPlayerControlsReachable: true, realMediaControl: true, audioPauseUi: measured.audioPauseUi, deletionCancellation: true, nativeDiagnostics: fixture, overflowInventory: measured.overflowInventory };
+      return { viewport: { width: innerWidth, height: innerHeight }, sizes, grids, ratios, layoutGeometry: { login: measured.loginGeometry, authFlow: measured.authFlowGeometry, hero: measured.heroGeometry, native: measured.videoGeometry, youtubeModel: measured.youtubeLayoutModel }, navigationLabels: nav.map(n => n.textContent.trim()), adminAndPlayerControlsReachable: true, realMediaControl: true, audioPauseUi: measured.audioPauseUi, deletionCancellation: true, nativeDiagnostics: fixture, overflowInventory: measured.overflowInventory };
     } catch (error) {
       error.observed = { ...measured, audio: { readyState: pbAudio.readyState, paused: pbAudio.paused,
         duration: pbAudio.duration, currentTime: pbAudio.currentTime, mediaError: pbAudio.error?.code || null }, nativeDiagnostics: fixture };
