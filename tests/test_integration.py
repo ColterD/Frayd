@@ -1,10 +1,14 @@
 """Failure-boundary regressions for the disposable Docker integration runner."""
 import contextlib
+import base64
+import hashlib
 import http.client
 import http.server
 import importlib.util
 import io
+import json
 import os
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -50,6 +54,66 @@ class CurlHttpTests(unittest.TestCase):
                                          b'{"library_paths": []}')])
             self.assertNotIn(capability, output.getvalue())
             self.assertIn('HTTP curl-i POST /owned-settings: 409 expected 409', output.getvalue())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+
+
+class WebSocketIdentityWireTests(unittest.TestCase):
+    """Check actual upgrade bytes against an independent creator-account wire oracle."""
+
+    def test_wrong_device_refused_then_creator_account_and_protocol_accept_verified(self):
+        token = secrets.token_hex(32)
+        proof = secrets.token_hex(16)
+        observations = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+
+            def do_GET(self):
+                canonical_account = self.headers.get('Authorization') == 'Bearer ' + token
+                proof_matches = self.headers.get('Sec-WebSocket-Protocol') == 'frayd-party, frayd-host.' + proof
+                observations.append({'canonicalAccount': canonical_account, 'proofMatches': proof_matches})
+                if not canonical_account:
+                    self.send_response(403)
+                    self.send_header('Content-Length', '0')
+                    self.end_headers()
+                    return
+                accept = base64.b64encode(hashlib.sha1(
+                    (self.headers['Sec-WebSocket-Key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode(),
+                    usedforsecurity=False).digest()).decode()
+                self.send_response(101)
+                self.send_header('Upgrade', 'websocket')
+                self.send_header('Connection', 'Upgrade')
+                self.send_header('Sec-WebSocket-Accept', accept)
+                self.send_header('Sec-WebSocket-Protocol', 'frayd-party')
+                self.end_headers()
+                self.close_connection = True
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        output = io.StringIO()
+
+        def create_party(path, data, supplied_token):
+            self.assertEqual((path, data), ('/api/party', {'identity': 'qa-host'}))
+            self.assertTrue(supplied_token == token, 'Party creation uses the same in-memory account capability')
+            return json.dumps({'code': 'ABCD', 'host_capability': proof}).encode()
+
+        try:
+            with (patch.object(integration, 'base', f'http://127.0.0.1:{server.server_port}'),
+                  patch.object(integration, 'request', side_effect=create_party),
+                  contextlib.redirect_stdout(output)):
+                integration.websocket_upgrade(token)
+            self.assertEqual(observations, [{'canonicalAccount': False, 'proofMatches': True},
+                                            {'canonicalAccount': True, 'proofMatches': True}])
+            self.assertTrue(token not in output.getvalue() and proof not in output.getvalue(),
+                            'Credential and proof stay out of public diagnostics')
         finally:
             server.shutdown()
             server.server_close()

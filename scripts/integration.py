@@ -92,19 +92,29 @@ def websocket_upgrade(token):
     code = party['code']
     host_capability = party['host_capability']
     address = urlsplit(base)
-    key = base64.b64encode(secrets.token_bytes(16)).decode()
-    handshake = (f'GET /api/party/{code}/ws?identity=qa-host HTTP/1.1\r\n'
-                 f'Host: {address.netloc}\r\n'
-                 'Upgrade: websocket\r\nConnection: Upgrade\r\n'
-                 f'Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n'
-                 f'Sec-WebSocket-Protocol: frayd-party, frayd-host.{host_capability}\r\n\r\n')
-    with socket.create_connection((address.hostname, address.port), timeout=2) as connection:
-        connection.sendall(handshake.encode())
-        response = b''
-        while b'\r\n\r\n' not in response:
-            chunk = connection.recv(4096)
-            assert chunk and len(response) < 16384, 'incomplete WebSocket handshake'
-            response += chunk
+    def upgrade(authenticated):
+        """Keep credentials/proof in memory; print only public status observations."""
+        key = base64.b64encode(secrets.token_bytes(16)).decode()
+        authorization = f'Authorization: Bearer {token}\r\n' if authenticated else ''
+        handshake = (f'GET /api/party/{code}/ws?identity=qa-host HTTP/1.1\r\n'
+                     f'Host: {address.netloc}\r\n'
+                     'Upgrade: websocket\r\nConnection: Upgrade\r\n'
+                     f'Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n'
+                     f'{authorization}'
+                     f'Sec-WebSocket-Protocol: frayd-party, frayd-host.{host_capability}\r\n\r\n')
+        with socket.create_connection((address.hostname, address.port), timeout=2) as connection:
+            connection.sendall(handshake.encode())
+            response = b''
+            while b'\r\n\r\n' not in response:
+                chunk = connection.recv(4096)
+                assert chunk and len(response) < 16384, 'incomplete WebSocket handshake'
+                response += chunk
+        return key, response
+
+    _, rejected = upgrade(False)
+    assert rejected.startswith(b'HTTP/1.1 403 '), rejected.split(b'\r\n', 1)[0]
+    print('PASS: WebSocket host proof with a different device identity is refused403')
+    key, response = upgrade(True)
     assert response.startswith(b'HTTP/1.1 101 '), response.split(b'\r\n', 1)[0]
     accept = base64.b64encode(hashlib.sha1(
         (key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode(), usedforsecurity=False).digest())
@@ -265,7 +275,8 @@ def upstream_contract_qualification(args):
         data, roots, tools = (folder / key for key in ('data', 'roots', 'tools'))
         for path in (data, roots, tools, roots / 'a', roots / 'b',
                      data / 'thumbs', data / 'transcodes', roots / 'a/Internet'):
-            path.mkdir(); path.chmod(0o2770)
+            path.mkdir()
+            path.chmod(0o2770)
         # This owned synthetic DB is shared with the image's actual uid10001.
         # Precreating it fixes both host SQL access and inherited WAL/SHM modes.
         (data / 'frayd.sqlite').touch(mode=0o660)
@@ -344,7 +355,9 @@ def upstream_contract_qualification(args):
             assert settings() == before_settings
             sql('DROP TRIGGER qa_settings_failure')
             post_settings({'library_paths': ['/roots/b']})
-            compose('restart', 'app'); ready(); wait_for_scan_idle()
+            compose('restart', 'app')
+            ready()
+            wait_for_scan_idle()
             assert dict(sql('SELECT path,id FROM media')) == ids
             assert {item['id'] for item in library()} == set(ids.values())
             assert json.loads(curl_request(f'/api/progress/{media_id}', token=token))['position'] == 0.5
@@ -353,19 +366,25 @@ def upstream_contract_qualification(args):
             assert settings()['effective_library_paths'] == ['/roots/b']
             post_settings({'library_path': '/roots/a'})
             post_settings({'library_paths': []})
-            compose('restart', 'app'); ready(); wait_for_scan_idle()
+            compose('restart', 'app')
+            ready()
+            wait_for_scan_idle()
             assert settings()['effective_library_paths'] == []
             assert sql("SELECT key FROM settings WHERE key='library_path'") == []
             print('PASS upstream-roots: two-root IDs, root removal, restart, progress, annotations, original bytes, legacy clear, missing-path400 and atomic DB500')
 
             app['environment']['FRAYD_LIBRARY'] = '/roots/b'
-            compose('up', '-d', '--no-deps', 'app'); ready(); wait_for_scan_idle()
+            compose('up', '-d', '--no-deps', 'app')
+            ready()
+            wait_for_scan_idle()
             assert settings()['library_locked'] is True
             assert settings()['library_paths'] == []
             assert settings()['effective_library_paths'] == ['/roots/b']
             post_settings({'library_paths': ['/roots/a']}, 409)
             app['environment']['FRAYD_LIBRARY'] = ''
-            compose('up', '-d', '--no-deps', 'app'); ready(); wait_for_scan_idle()
+            compose('up', '-d', '--no-deps', 'app')
+            ready()
+            wait_for_scan_idle()
             post_settings({'library_paths': ['/roots/a', '/roots/b']})
 
             # An actual scan blocks in our owned probe while the fake downloader exits.
@@ -457,7 +476,9 @@ def upstream_contract_qualification(args):
             offline = roots / 'b-offline'
             (roots / 'b').rename(offline)
             try:
-                compose('restart', 'app'); ready(); wait_for_scan_idle()
+                compose('restart', 'app')
+                ready()
+                wait_for_scan_idle()
                 assert json.loads(curl_request('/api/health')) == {'status': 'ok'}
                 assert settings()['effective_library_paths'] == ['/roots/a', '/roots/b']
                 status = json.loads(curl_request('/api/scan/status'))
@@ -476,7 +497,9 @@ def upstream_contract_qualification(args):
                 offline.rename(roots / 'b')
             curl_request('/api/scan', token=token, method='POST', expected=202)
             wait_for_scan_idle()
-            compose('restart', 'app'); ready(); wait_for_scan_idle()
+            compose('restart', 'app')
+            ready()
+            wait_for_scan_idle()
             assert curl_request(f'/api/stream/{offline_id}') == source_bytes
             assert json.loads(curl_request(f'/api/progress/{offline_id}', token=token))['position'] == 0.75
             assert sql('SELECT id,path,title FROM media ORDER BY id') == before_offline
