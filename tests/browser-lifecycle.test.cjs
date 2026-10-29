@@ -857,7 +857,7 @@ if (process.argv.includes('--version')) {
   invocation.stdout.on('data', bytes => { stdout += bytes; });
   invocation.stderr.on('data', bytes => { stderr += bytes; });
   try {
-    const [code] = await once(invocation, 'exit');
+    const [code] = await once(invocation, 'close');
     assert.equal(code, 1, stderr);
     const result = JSON.parse(stdout);
     assert.match(result.runnerError, /Browser exited before result: 7\/null; original browser exit sentinel/);

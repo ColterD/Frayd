@@ -132,6 +132,8 @@ The first eight, separate from historical 129: [4415914938](https://github.com/C
 
 Later review [5703812614](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5703812614) adds three: [4416990098](https://github.com/ColterD/Frayd/pull/2#discussion_r4416990098) (close-time reader readiness), [4416990104](https://github.com/ColterD/Frayd/pull/2#discussion_r4416990104) (checkpoint wording), [4416990117](https://github.com/ColterD/Frayd/pull/2#discussion_r4416990117) (TOC text normalization). Dispositions and current checks belong to the PR.
 
+[4417077464](https://github.com/ColterD/Frayd/pull/2#discussion_r4417077464) adds the twelfth later observation: the identity fixture now awaits child `close` before parsing stdout. A controlled child demonstrates incomplete JSON at `exit` and complete output at `close`; focused and full Node 372 pass. No DOM input changes.
+
 ## Verification and evidence boundaries
 
 The maintained invocations are in [Development](../development.md#canonical-checks), with [Checks CI](../../.github/workflows/checks.yml), [macOS qualification](../../.github/workflows/release-mac.yml), [browser acceptance](browser-acceptance.md), [native qualification](native-bundle.md#reproducible-checks) and [public checkpoints](acceptance-checkpoints.json). The changelog itself does not rerun those product scenarios. Historical ledger claims are not promoted to fresh final-head execution.
