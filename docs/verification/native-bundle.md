@@ -37,7 +37,7 @@ bytes and atomically renames the complete stage over its own empty reservation.
 Installation creates prefix and data ownership receipts. Existing data can be
 reused only with the private Frayd data marker. No existing unknown files are
 adopted. Failed staging rolls back only exact newly created paths and reports
-anything retained; application data is never removed. A failed removal preserves
+anything retained; application data is never removed. Marked or uncertain newly created data directories are reported explicitly. Metadata failures during rollback do not replace the original error or skip later cleanup. Five real-filesystem Rust fault controls exercise this path; packaged native qualification remains separate. A failed removal preserves
 the receipt until its payload has been removed, and missing owned payload entries
 are accepted on retry using an extracted helper. Do not manually change receipt
 contents to force acceptance.
