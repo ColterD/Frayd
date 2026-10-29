@@ -623,6 +623,9 @@ function libraryKind(kind) {
  * @returns {Promise<void>}
  */
 function filterKind(kind, query = activeQuery) {
+  // Mobile uses document scrolling; desktop retains the library scroll container.
+  window.scrollTo(0, 0);
+  $('#main').scrollTop = 0;
   ++searchGeneration;
   activeKind = libraryKind(kind);
   activeQuery = query || '';
@@ -675,13 +678,9 @@ function resumeFor(id) {
 function card(it, progressFor = resumeFor) {
   const portrait = ['ebook', 'comic', 'manga', 'audiobook'].includes(it.kind);
   const c = el('div', 'media-card ' + (portrait ? 'portrait' : 'landscape'));
-  const isVideo = it.kind === 'movie' || it.kind === 'episode';
-  const isPaged = it.kind === 'comic' || it.kind === 'manga';
   c.title = `${it.title}${it.author ? ' — ' + it.author : ''}`;
   c.innerHTML = `
-    ${isVideo
-      ? `<img class="thumb" loading="lazy" src="/api/thumb/${it.id}" onerror="this.outerHTML='<div class=&quot;thumb-fallback${portrait?' portrait':''}&quot;>▶</div>'">`
-      : `<div class="thumb-fallback${portrait ? ' portrait' : ''}">${it.kind === 'music' ? '♪' : it.kind === 'audiobook' ? '🎙' : isPaged ? '📄' : '📖'}</div>`}
+    ${artwork(it, portrait)}
     <div class="card-body">
       <div class="title">${esc(it.title)}</div>
       <div class="sub">${esc(it.author || it.kind)}</div>
@@ -709,32 +708,61 @@ function card(it, progressFor = resumeFor) {
   return c;
 }
 
-/**
- * Build a sortable media row from a title and item snapshot.
- * @param {string} title
- * @param {Object[]} items
- * @param {function(number): Promise<Object|null>} [progressFor=resumeFor]
- * @returns {HTMLElement}
- */
-function section(title, items, progressFor = resumeFor) {
+/** Use the thumbnail API only; cache filesystem paths never become browser URLs. */
+function artwork(item, portrait = false, memberOnly = false) {
+  const symbol = ['movie', 'episode'].includes(item.kind) ? '▶' : item.kind === 'music' ? '♪' : item.kind === 'audiobook' ? '🎙' : ['comic', 'manga'].includes(item.kind) ? '📄' : '📖';
+  const fallback = `<div class="thumb-fallback${portrait ? ' portrait' : ''}">${symbol}</div>`;
+  if (!item.thumb_path && (memberOnly || !['movie', 'episode'].includes(item.kind))) return fallback;
+  const basename = typeof item.thumb_path === 'string' ? item.thumb_path.split(/[\\/]/).pop() : '';
+  const version = basename ? '?v=' + encodeURIComponent(basename) : '';
+  return `<img class="thumb" loading="lazy" src="/api/thumb/${item.id}${version}" alt="${esc(memberOnly ? 'Artwork from ' + item.title : '')}"
+    onerror="this.outerHTML='${fallback.replaceAll('"', '&quot;')}'">`;
+}
+
+const categoryLabels = { movie: 'Movies', episode: 'TV Shows', music: 'Music', audiobook: 'Audiobooks', ebook: 'Ebooks', comic: 'Comics', manga: 'Manga' };
+
+/** One current-state sort control per canonical category; member extremes order folders. */
+function categoryShelf(kind, entries, renderEntry, gridClass = 'cards') {
   const wrap = el('section');
-  const cards = el('div', 'cards');
-  const sortItems = () => [...items].sort((a,b) => (rowSort.get(title) ? 1 : -1) * ((a.created_at || 0) - (b.created_at || 0)) || a.id - b.id);
-  let shown = sortItems();
-  const head = el('div', 'row-head', `<h3>${esc(title)}</h3>`);
-  const sortBtn = el('button', 'link', rowSort.get(title) ? 'newest first' : 'oldest first');
-  sortBtn.onclick = () => {
-    const oldest = sortBtn.textContent === 'oldest first';
-    rowSort.set(title, oldest);
-    shown = sortItems();
-    sortBtn.textContent = oldest ? 'newest first' : 'oldest first';
-    cards.innerHTML = '';
-    shown.forEach(it => cards.appendChild(card(it, progressFor)));
+  const head = el('div', 'row-head', `<h3>Recently Added ${categoryLabels[kind]}</h3>`);
+  const button = el('button', 'link');
+  button.type = 'button';
+  const grid = el('div', gridClass);
+  const paint = () => {
+    const oldest = rowSort.get(kind) === true;
+    button.textContent = oldest ? 'Oldest first' : 'Newest first';
+    button.setAttribute('aria-pressed', String(oldest));
+    button.setAttribute('aria-label', `${categoryLabels[kind]} order: ${button.textContent}. Switch to ${oldest ? 'newest' : 'oldest'} first`);
+    const date = entry => entry.items
+      ? entry.items.reduce((value, item) => oldest ? Math.min(value, item.created_at || 0) : Math.max(value, item.created_at || 0), oldest ? Infinity : -Infinity)
+      : entry.created_at || 0;
+    const ordered = [...entries].sort((a, b) => (oldest ? 1 : -1) * (date(a) - date(b))
+      || (a.name === undefined ? a.id - b.id : a.name.localeCompare(b.name)));
+    grid.innerHTML = '';
+    ordered.forEach(entry => grid.appendChild(renderEntry(entry)));
   };
-  head.appendChild(sortBtn);
-  shown.forEach(it => cards.appendChild(card(it, progressFor)));
-  wrap.append(head, cards);
+  button.onclick = () => { rowSort.set(kind, !rowSort.get(kind)); paint(); };
+  head.appendChild(button);
+  paint();
+  wrap.append(head, grid);
   return wrap;
+}
+
+/** Flat categories share the same heading, ordering and render-owned progress reader. */
+function section(kind, items, progressFor = resumeFor) {
+  return categoryShelf(kind, items, item => card(item, progressFor));
+}
+
+/** Folder art comes from an available member, with its provenance visible to assistive readers. */
+function mediaFolder(name, items, kind, label, open) {
+  const folder = el('div', 'media-card landscape');
+  folder.title = name;
+  const member = items.find(item => item.thumb_path);
+  folder.innerHTML = `${artwork(member || {kind}, false, true)}
+    <div class="card-body"><div class="title">${esc(name)}</div>
+      <div class="sub">${label} · ${items.length} ${kind === 'episode' ? 'episode' : 'item'}${items.length === 1 ? '' : 's'}</div></div>`;
+  folder.onclick = open;
+  return folder;
 }
 
 /**
@@ -783,27 +811,15 @@ function episodeNumbers(title) {
 /** Render series folders or the selected series using this render's progress reader. */
 function groupedByShow(items, progressFor = resumeFor) {
   if (showsDrill) return showDetail(showsDrill, items.filter(item => (item.series || 'Unknown series') === showsDrill), progressFor);
-  const wrap = el('section');
-  wrap.appendChild(el('div', 'row-head', '<h3>TV Shows</h3>'));
   const bySeries = new Map();
   items.forEach(item => {
     const name = item.series || 'Unknown series';
     if (!bySeries.has(name)) bySeries.set(name, []);
     bySeries.get(name).push(item);
   });
-  const grid = el('div', 'cards show-grid');
-  for (const [show, episodes] of bySeries) {
-    const folder = el('div', 'media-card landscape');
-    folder.innerHTML = `
-      <img class="thumb" loading="lazy" src="/api/thumb/${episodes[0].id}" alt=""
-           onerror="this.outerHTML='<div class=&quot;thumb-fallback&quot;>${esc(show[0] || '?')}</div>'">
-      <div class="card-body"><div class="title">${esc(show)}</div>
-        <div class="sub">${episodes.length} episode${episodes.length === 1 ? '' : 's'}</div></div>`;
-    folder.onclick = () => { showsDrill = show; return filterKind('show'); };
-    grid.appendChild(folder);
-  }
-  wrap.appendChild(grid);
-  return wrap;
+  const folders = [...bySeries].map(([name, items]) => ({ name, items }));
+  return categoryShelf('episode', folders, folder => mediaFolder(folder.name, folder.items, 'episode', 'Series',
+    () => { showsDrill = folder.name; return filterKind('show'); }), 'cards show-grid');
 }
 
 /** Group known season numbers and retain unparseable titles in a truthful final bucket. */
@@ -872,7 +888,7 @@ async function renderRows(items) {
     } else if (kind === 'audiobook' || kind === 'ebook' || kind === 'music') {
       main.appendChild(groupedByAuthor(kind, kindItems, progressFor));
     } else {
-      main.appendChild(section(kind[0].toUpperCase() + kind.slice(1) + 's', kindItems, progressFor));
+      main.appendChild(section(kind, kindItems, progressFor));
     }
   }
   if (filtering && !items.length) { $('#hero').style.display = 'none'; }
@@ -893,7 +909,7 @@ const authorDrill = { audiobook: null, ebook: null, music: null };
 
 /** Render authors, named series and loose items without dropping either path. */
 function groupedByAuthor(kind, items, progressFor = resumeFor) {
-  const label = kind[0].toUpperCase() + kind.slice(1) + 's';
+  const label = categoryLabels[kind];
   const wrap = el('section');
   const drill = authorDrill[kind];
   if (!drill) {
@@ -903,17 +919,9 @@ function groupedByAuthor(kind, items, progressFor = resumeFor) {
       if (!authors.has(name)) authors.set(name, []);
       authors.get(name).push(item);
     });
-    const grid = el('div', 'cards');
-    for (const [author, entries] of authors) {
-      const folder = el('div', 'media-card landscape');
-      folder.innerHTML = `<div class="thumb-fallback folder-fallback">${esc(author[0] || '?')}</div>
-        <div class="card-body"><div class="title">${esc(author)}</div>
-          <div class="sub">${entries.length} item${entries.length === 1 ? '' : 's'}</div></div>`;
-      folder.onclick = () => { authorDrill[kind] = { author }; return filterKind(kind); };
-      grid.appendChild(folder);
-    }
-    wrap.appendChild(grid);
-    return wrap;
+    const folders = [...authors].map(([name, items]) => ({ name, items }));
+    return categoryShelf(kind, folders, folder => mediaFolder(folder.name, folder.items, kind, kind === 'music' ? 'Artist' : 'Author',
+      () => { authorDrill[kind] = { author: folder.name }; return filterKind(kind); }));
   }
   const authorItems = items.filter(item => (item.author || 'Unknown') === drill.author);
   const back = el('button', 'link back-row', `← All ${label.toLowerCase()}`);
@@ -937,11 +945,8 @@ function groupedByAuthor(kind, items, progressFor = resumeFor) {
   if (bySeries.size) {
     const grid = el('div', 'cards');
     for (const [series, entries] of bySeries) {
-      const folder = el('div', 'media-card landscape');
-      folder.innerHTML = `<div class="thumb-fallback folder-fallback">${esc(series[0])}</div>
-        <div class="card-body"><div class="title">${esc(series)}</div>
-          <div class="sub">${entries.length} item${entries.length === 1 ? '' : 's'}</div></div>`;
-      folder.onclick = () => { authorDrill[kind] = { author: drill.author, series }; return filterKind(kind); };
+      const folder = mediaFolder(series, entries, kind, kind === 'music' ? 'Album' : 'Series',
+        () => { authorDrill[kind] = { author: drill.author, series }; return filterKind(kind); });
       grid.appendChild(folder);
     }
     wrap.appendChild(grid);

@@ -3,135 +3,121 @@ use std::path::Path;
 use std::process::Command;
 use walkdir::WalkDir;
 
-/// Extract a poster/cover for one media file into thumbs_dir. Best-effort:
-/// failure is non-fatal (item just has no thumbnail). Returns thumb path.
-fn extract_thumb(src: &Path, kind: &str, media_id: i64, thumbs_dir: &Path) -> Option<String> {
-    let out = thumbs_dir.join(format!("{media_id}.jpg"));
-    if out.exists() {
-        return Some(out.to_string_lossy().into_owned());
-    }
-    // comic: first page is the cover
-    if matches!(kind, "comic" | "manga") {
-        if let Some(pages) = crate::comic::comic_pages(src) {
-            if let Some(first) = pages.first() {
-                if let Some(bytes) = crate::comic::read_zip_entry(src, &first.0) {
-                    let _ = std::fs::write(&out, &bytes);
-                    return Some(out.to_string_lossy().into_owned());
-                }
-            }
-        }
-        return None;
-    }
-    // ebook: cover.jpg/jpeg/png at archive root, else first image
-    if matches!(kind, "ebook") {
-        if let Some(bytes) = crate::comic::read_zip_entry(src, "cover.jpeg")
-            .or_else(|| crate::comic::read_zip_entry(src, "cover.jpg"))
-            .or_else(|| crate::comic::read_zip_entry(src, "cover.png"))
-            .or_else(|| {
-                // fallback: first image entry in the epub
-                crate::comic::comic_pages(src)
-                    .and_then(|p| p.first().and_then(|f| crate::comic::read_zip_entry(src, &f.0)))
-            })
-        {
-            let _ = std::fs::write(&out, &bytes);
-            return Some(out.to_string_lossy().into_owned());
-        }
-        return None;
-    }
-    let src = src.to_str()?;
-    let status = if matches!(kind, "movie" | "episode") {
-        // poster frame at 10% in (seeking to 0 often hits black/logos)
-        let dur = ffprobe_duration(src)?;
-        let at = (dur * 0.1).max(1.0);
-        Command::new("ffmpeg")
-            .args(["-y", "-ss", &format!("{at:.1}"), "-i", src, "-frames:v", "1",
-                   "-vf", "scale=480:-2", "-q:v", "4"])
-            .arg(&out)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
+/// Extract local artwork only. UNWIRED: filename/iTunes first-result lookup was removed;
+/// recovery: 44d1ed7 extract_thumb/fetch_online_thumb/itunes_artwork. Reactivation requires
+/// verified artist/album matching and explicit provider opt-in, never an arbitrary first hit.
+fn extract_thumb(src: &Path, kind: &str, media_id: i64, thumbs: &Path) -> Result<Option<String>, String> {
+    use std::io::Write;
+    let bytes = if matches!(kind, "comic" | "manga" | "ebook") {
+        let cover = if kind == "ebook" { crate::epub::epub_cover(src) } else { None };
+        let cover = cover.or_else(|| {
+            crate::comic::comic_pages(src)
+                .and_then(|pages| pages.first().and_then(|page| crate::comic::read_zip_entry(src, &page.0)))
+        });
+        let Some(cover) = cover else { return Ok(None); };
+        let mut child = Command::new("ffmpeg")
+            .args(["-v", "error", "-i", "pipe:0", "-frames:v", "1", "-vf", "scale=480:-2", "-q:v", "4", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"])
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null()).spawn().map_err(|error| error.to_string())?;
+        // Feed while wait_with_output drains stdout; larger archive covers cannot deadlock the pipes.
+        let mut input = child.stdin.take().ok_or("missing thumbnail input pipe")?;
+        let writer = std::thread::spawn(move || input.write_all(&cover));
+        let output = child.wait_with_output().map_err(|error| error.to_string())?;
+        let _ = writer.join();
+        if !output.status.success() { return Ok(None); }
+        output.stdout
     } else {
-        // audio: embedded cover art
-        Command::new("ffmpeg")
-            .args(["-y", "-i", src, "-an", "-map", "0:v:0", "-frames:v", "1",
-                   "-vf", "scale=480:-2", "-q:v", "4"])
-            .arg(&out)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
+        let mut command = Command::new("ffmpeg");
+        command.args(["-v", "error"]);
+        if matches!(kind, "movie" | "episode") {
+            let Some(duration) = ffprobe_duration(&src.to_string_lossy()) else { return Ok(None); };
+            command.args(["-ss", &format!("{:.3}", duration * 0.1)]);
+        }
+        let output = command.arg("-i").arg(src)
+            .args(["-an", "-map", "0:v:0", "-frames:v", "1", "-vf", "scale=480:-2", "-q:v", "4", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"])
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null())
+            .output().map_err(|error| error.to_string())?;
+        if !output.status.success() { return Ok(None); }
+        output.stdout
     };
-    match status {
-        Ok(s) if s.success() && out.exists() => Some(out.to_string_lossy().into_owned()),
-        _ => {
-            let _ = std::fs::remove_file(&out); // no partial files
-            // online fallback: iTunes Search API (no key) for audio kinds
-            if matches!(kind, "music" | "audiobook") {
-                fetch_online_thumb(title_of(Path::new(src)), kind, &out)
-            } else {
-                None
-            }
+    if !bytes.starts_with(&[0xff, 0xd8, 0xff]) || !bytes.ends_with(&[0xff, 0xd9]) { return Ok(None); }
+    let out = thumbs.join(format!("{media_id}-{}.jpg", uuid::Uuid::new_v4()));
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&out).map_err(|error| error.to_string())?;
+    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+        let _ = std::fs::remove_file(&out);
+        return Err(error.to_string());
+    }
+    Ok(Some(out.to_string_lossy().into_owned()))
+}
+
+/// Recognize only exact generated names, keeping legacy and unknown cache files out of retirement.
+pub(crate) fn generated_thumbnail_name(id: i64, path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(&format!("{id}-")))
+        .and_then(|name| name.strip_suffix(".jpg"))
+        .is_some_and(|token| uuid::Uuid::parse_str(token).is_ok_and(|parsed| parsed.to_string() == token))
+}
+
+/// Retire one exact generated file only when no source, playback, or thumbnail still references it.
+fn retire_thumbnail(db: &Connection, id: i64, saved: &str, thumbs: &Path, roots: &[std::path::PathBuf]) -> Result<(), String> {
+    let path = Path::new(saved);
+    if !generated_thumbnail_name(id, path) { return Ok(()); }
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() { return Err("thumbnail is not a regular owned file".into()); }
+    let cache = thumbs.canonicalize().map_err(|error| error.to_string())?;
+    let owned = path.canonicalize().map_err(|error| error.to_string())?;
+    if owned.parent() != Some(cache.as_path()) { return Err("thumbnail outside configured cache".into()); }
+    for root in roots {
+        if owned.starts_with(root.canonicalize().map_err(|error| error.to_string())?) { return Err("thumbnail overlaps source root".into()); }
+    }
+    let mut statement = db.prepare("SELECT path FROM media UNION ALL SELECT thumb_path FROM media WHERE thumb_path IS NOT NULL
+        UNION ALL SELECT transcode_path FROM media WHERE transcode_path IS NOT NULL
+        UNION ALL SELECT path FROM transcode_artifacts UNION ALL SELECT owner_source_path FROM transcode_artifacts").map_err(|error| error.to_string())?;
+    for reference in statement.query_map([], |row| row.get::<_, String>(0)).map_err(|error| error.to_string())? {
+        let reference = reference.map_err(|error| error.to_string())?;
+        if Path::new(&reference).canonicalize().ok().as_ref() == Some(&owned) { return Err("thumbnail retains a database reference".into()); }
+    }
+    std::fs::remove_file(&owned).map_err(|error| error.to_string())
+}
+
+/// Artwork is optional, but a completed image is published only against its observed source and row.
+fn ensure_thumbnail(db: &Connection, path: &Path, kind: &str, meta: &std::fs::Metadata, thumbs: &Path) -> Result<(), String> {
+    let mtime = meta.modified().map_err(|error| error.to_string())?;
+    let seconds = mtime.duration_since(std::time::UNIX_EPOCH).map_err(|error| error.to_string())?.as_secs() as i64;
+    let (id, observed): (i64, Option<String>) = db.query_row("SELECT id,thumb_path FROM media WHERE path=?1 AND kind=?2 AND mtime_secs=?3 AND size_bytes=?4",
+        rusqlite::params![path.to_string_lossy(), kind, seconds, meta.len() as i64], |row| Ok((row.get(0)?, row.get(1)?))).map_err(|error| error.to_string())?;
+    if observed.as_ref().is_some_and(|saved| Path::new(saved).is_file()) { return Ok(()); }
+    let Some(created) = extract_thumb(path, kind, id, thumbs)? else { return Ok(()); };
+    publish_thumbnail(db,path,kind,meta,(id,observed),&created)
+}
+
+/// The transaction is the publication boundary; all expensive extraction precedes it.
+fn publish_thumbnail(db: &Connection, path: &Path, kind: &str, meta: &std::fs::Metadata,
+    expected: (i64,Option<String>), created: &str) -> Result<(),String> {
+    let (id,observed)=expected;
+    let mtime=meta.modified().map_err(|error| error.to_string())?;
+    let seconds=mtime.duration_since(std::time::UNIX_EPOCH).map_err(|error| error.to_string())?.as_secs() as i64;
+    let published = (|| -> rusqlite::Result<bool> {
+        let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)?;
+        let same_source = std::fs::metadata(path).ok().is_some_and(|current| current.len() == meta.len() && current.modified().ok() == Some(mtime));
+        if !same_source { return Ok(false); }
+        let changed = tx.execute("UPDATE media SET thumb_path=?1 WHERE id=?2 AND path=?3 AND kind=?4
+            AND mtime_secs=?5 AND size_bytes=?6 AND thumb_path IS ?7",
+            rusqlite::params![created,id,path.to_string_lossy(),kind,seconds,meta.len() as i64,observed])?;
+        tx.commit()?;
+        Ok(changed == 1)
+    })();
+    match published {
+        Ok(true) => Ok(()),
+        result => {
+            std::fs::remove_file(created).map_err(|error| error.to_string())?;
+            result.map(|_| ()).map_err(|error| error.to_string())
         }
     }
-}
-
-/// Derive search terms from filename: strip leading track numbers/extension,
-/// split on hyphens into artist/title segments, plus the whole cleaned name.
-fn title_of(src: &Path) -> Vec<String> {
-    let stem = src
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let stem = stem
-        .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ' ')
-        .to_string();
-    let mut terms = vec![stem.replace(['-', '_'], " ")];
-    if let Some((a, b)) = stem.split_once('-') {
-        terms.push(format!("{b} {a}")); // title + artist
-        terms.push(b.to_string());
-    }
-    terms
-}
-
-/// Fetch cover art from iTunes Search API. Best-effort, short timeout, no key.
-/// Tries each candidate search term until one yields artwork.
-fn fetch_online_thumb(terms: Vec<String>, kind: &str, out: &Path) -> Option<String> {
-    let entity = if kind == "audiobook" { "audiobook" } else { "album" };
-    for term in terms.iter().filter(|t| !t.trim().is_empty()) {
-        if let Some(art) = itunes_artwork(term, entity) {
-            let mut img = ureq::get(&art)
-                .timeout(std::time::Duration::from_secs(8))
-                .call()
-                .ok()?
-                .into_reader();
-            let mut bytes = Vec::new();
-            img.read_to_end(&mut bytes).ok()?;
-            if bytes.len() < 1024 {
-                continue;
-            }
-            std::fs::write(out, &bytes).ok()?;
-            tracing::info!("online thumb ok for {term:?}");
-            return Some(out.to_string_lossy().into_owned());
-        }
-    }
-    None
-}
-
-/// One iTunes Search lookup → artwork URL at 600x600, if any result.
-fn itunes_artwork(term: &str, entity: &str) -> Option<String> {
-    let url = format!(
-        "https://itunes.apple.com/search?term={}&entity={entity}&limit=1",
-        urlencoding::encode(term),
-    );
-    let body: serde_json::Value = serde_json::from_str(
-        &ureq::get(&url)
-            .timeout(std::time::Duration::from_secs(8))
-            .call()
-            .ok()?
-            .into_string()
-            .ok()?,
-    )
-    .ok()?;
-    Some(body["results"][0]["artworkUrl100"].as_str()?.replace("100x100", "600x600"))
 }
 
 /// Filename heuristics: "Author - Series 03 - Title" / "Author - Title" → (author, series).
@@ -333,6 +319,14 @@ fn upsert_item(
     upsert_item_with_roots(db,db_path,path,kind,thumbs_dir,&[library_root.to_path_buf()])
 }
 
+struct ScanRefresh {
+    updated: usize,
+    is_new: bool,
+    metadata_only: bool,
+    classification_only: bool,
+    prior_thumb: Option<(i64,String)>,
+}
+
 /// Refresh source fingerprints through the existing guarded path, or atomically change only a stale kind.
 /// Known unchanged fingerprints permit only kind changes and NULL episode-series backfill, without media work.
 fn upsert_item_with_roots(db: &Connection, db_path: String, path: &Path, kind: &str, thumbs_dir: Option<&Path>, roots: &[std::path::PathBuf]) -> usize {
@@ -352,7 +346,7 @@ fn upsert_item_with_roots(db: &Connection, db_path: String, path: &Path, kind: &
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
 
-    let refreshed=(|| -> rusqlite::Result<(usize,bool,bool)> {
+    let refreshed=(|| -> rusqlite::Result<ScanRefresh> {
         let tx=rusqlite::Transaction::new_unchecked(db,rusqlite::TransactionBehavior::Immediate)?;
         let existing=tx.query_row("SELECT kind,mtime_secs,size_bytes FROM media WHERE path=?1",[&path_str],
             |row|Ok((row.get::<_,String>(0)?,row.get::<_,Option<i64>>(1)?,row.get::<_,Option<i64>>(2)?))).optional()?;
@@ -374,13 +368,17 @@ fn upsert_item_with_roots(db: &Connection, db_path: String, path: &Path, kind: &
                 } else {0}
             } else {0};
             tx.commit()?;
-            return Ok((changed.max(backfilled),false,true));
+            return Ok(ScanRefresh {updated: changed.max(backfilled),is_new:false,metadata_only:true,classification_only:kind_only,prior_thumb:None});
         }
         // Capture the exact prior pointer only when both fingerprint components were known.
         let prior:Option<(i64,String)>=tx.query_row("SELECT id,transcode_path FROM media WHERE path=?1
             AND mtime_secs IS NOT NULL AND size_bytes IS NOT NULL AND transcode_path IS NOT NULL
             AND (mtime_secs IS NOT ?2 OR size_bytes IS NOT ?3)",
             rusqlite::params![path_str,mtime,meta.len() as i64],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+        let prior_thumb: Option<(i64,String)> = tx.query_row("SELECT id,thumb_path FROM media WHERE path=?1
+            AND mtime_secs IS NOT NULL AND size_bytes IS NOT NULL AND thumb_path IS NOT NULL
+            AND (mtime_secs IS NOT ?2 OR size_bytes IS NOT ?3)",
+            rusqlite::params![path_str,mtime,meta.len() as i64],|row| Ok((row.get(0)?,row.get(1)?))).optional()?;
         let updated = tx.execute(
             "INSERT INTO media (kind, path, title, size_bytes, mtime_secs)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -389,6 +387,8 @@ fn upsert_item_with_roots(db: &Connection, db_path: String, path: &Path, kind: &
                duration_secs = CASE WHEN ?1 IN ('movie','episode')
                    AND media.mtime_secs IS NOT NULL AND media.size_bytes IS NOT NULL
                    THEN NULL ELSE media.duration_secs END,
+               thumb_path = CASE WHEN media.mtime_secs IS NOT NULL AND media.size_bytes IS NOT NULL
+                   THEN NULL ELSE media.thumb_path END,
                transcode_path = CASE WHEN media.mtime_secs IS NOT NULL AND media.size_bytes IS NOT NULL
                    THEN NULL ELSE media.transcode_path END,
                meta_json = CASE WHEN ?1 IN ('comic','manga') AND json_valid(media.meta_json)
@@ -404,17 +404,33 @@ fn upsert_item_with_roots(db: &Connection, db_path: String, path: &Path, kind: &
         } else { None };
         tx.commit()?;
         drop(lease);
-        Ok((updated,is_new,false))
+        Ok(ScanRefresh {updated,is_new,metadata_only:false,classification_only:false,prior_thumb:prior_thumb.filter(|_| updated==1)})
     })();
-    let (updated,is_new,kind_only)=match refreshed {
+    let ScanRefresh {updated,is_new,metadata_only,classification_only,prior_thumb}=match refreshed {
         Ok(result)=>result,
         Err(error)=>{tracing::warn!(%error,"scan refresh held: source and artifact state retained");return 0;}
     };
 
-    // Classification/NULL-series backfills grant no probing, conversion, source-version or cache authority.
-    if kind_only {return updated;}
+    if let Some(thumbs) = thumbs_dir {
+        if let Some((id,previous)) = prior_thumb {
+            // Invalidation already committed. A cleanup failure retains the optional cache file.
+            let retired = (|| -> Result<(),String> {
+                let tx = rusqlite::Transaction::new_unchecked(db,rusqlite::TransactionBehavior::Immediate).map_err(|error| error.to_string())?;
+                retire_thumbnail(&tx,id,&previous,thumbs,roots)?;
+                tx.commit().map_err(|error| error.to_string())
+            })();
+            if let Err(error) = retired { tracing::warn!(id,%error,"obsolete thumbnail cleanup held"); }
+        }
+        if !classification_only {
+            if let Err(error) = ensure_thumbnail(db,path,kind,&meta,thumbs) {
+                tracing::warn!(path=%path.display(),%error,"thumbnail publication held");
+            }
+        }
+    }
+    // Classification remains probe-free; unchanged episode artwork repair is separate from metadata.
+    if metadata_only {return updated;}
 
-    // metadata + thumbnails: for new items
+    // Optional tag metadata is read only for new items; artwork is handled above.
     if updated > 0 && is_new {
         let id = db.last_insert_rowid();
         let path_pb = path.to_path_buf();
@@ -467,18 +483,7 @@ fn upsert_item_with_roots(db: &Connection, db_path: String, path: &Path, kind: &
         // A replaced video can queue its current version without waiting for another scan.
         crate::transcode::maybe_enqueue_for_existing_with_roots(db_path,path.to_path_buf(),roots.to_vec());
     } else if updated == 0 {
-        // Existing unchanged items still need thumbnails and possibly a conversion.
-        if let Some(thumbs) = thumbs_dir {
-            let media_id: Option<i64> = db
-                .query_row("SELECT id FROM media WHERE path = ?1", [&path_str], |r| r.get(0))
-                .ok();
-            if let Some(t) = media_id.and_then(|mid| extract_thumb(path, kind, mid, thumbs)) {
-                let _ = db.execute(
-                    "UPDATE media SET thumb_path = ?1 WHERE path = ?2",
-                    rusqlite::params![t, path_str],
-                );
-            }
-        }
+        // Existing unchanged videos may still need conversion.
         if matches!(kind, "movie" | "episode") {
             let has: Option<String> = db
                 .query_row("SELECT transcode_path FROM media WHERE path = ?1", [&path_str], |r| r.get(0))
@@ -629,6 +634,167 @@ mod tests {
     fn p(s: impl Into<std::path::PathBuf>) -> std::path::PathBuf { s.into() }
 
     /// Retain every upstream ea29 nested-folder, six-extension, m4b, chapter-name and default-music case.
+    #[test]
+    fn artwork_publication_rejects_source_database_and_pointer_races() {
+        for race in ["source","source-mtime","database","pointer"] {
+            let fixture=Library::new(&[]);let library=fixture.0.join("library");std::fs::create_dir(&library).unwrap();
+            let thumbs=fixture.0.join("thumbs");std::fs::create_dir(&thumbs).unwrap();let db=open(":memory:");
+            let image=artwork_fixture_image(&fixture.0,"red");let source=library.join("book.cbz");artwork_fixture_archive(&source,&image,false);
+            upsert_item(&db,String::new(),&source,"comic",None,&library);
+            let metadata=std::fs::metadata(&source).unwrap();
+            let created=extract_thumb(&source,"comic",1,&thumbs).unwrap().unwrap();
+            let other=thumbs.join("other.jpg");std::fs::write(&other,b"owner pointer bytes").unwrap();
+            match race {
+                "source" => std::fs::write(&source,b"replacement after extraction").unwrap(),
+                "source-mtime" => std::fs::File::open(&source).unwrap().set_times(std::fs::FileTimes::new().set_modified(metadata.modified().unwrap()+std::time::Duration::from_nanos(1))).unwrap(),
+                "database" => {db.execute("UPDATE media SET size_bytes=size_bytes+1 WHERE id=1",[]).unwrap();},
+                _ => {db.execute("UPDATE media SET thumb_path=?1 WHERE id=1",[other.to_string_lossy()]).unwrap();},
+            }
+            publish_thumbnail(&db,&source,"comic",&metadata,(1,None),&created).unwrap();
+            assert!(!Path::new(&created).exists(),"{race}");
+            let saved:Option<String>=db.query_row("SELECT thumb_path FROM media WHERE id=1",[],|row|row.get(0)).unwrap();
+            assert_eq!(saved,if race=="pointer" {Some(other.to_string_lossy().into_owned())}else{None});
+            assert_eq!(std::fs::read(other).unwrap(),b"owner pointer bytes");
+        }
+        println!("publication_races=4 stale_art_rejected=true only_own_output_removed=true");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artwork_retirement_holds_every_reference_symlinks_and_outside_cache() {
+        for guard in ["source","thumb","playback","artifact","owner-source","symlink","outside","library"] {
+            let fixture=Library::new(&[]);let library=fixture.0.join("library");std::fs::create_dir(&library).unwrap();
+            let thumbs=fixture.0.join("thumbs");std::fs::create_dir(&thumbs).unwrap();let db=open(":memory:");
+            let name=format!("1-{}.jpg",uuid::Uuid::new_v4());
+            let owned=if guard=="outside" {fixture.0.join(&name)}else{thumbs.join(&name)};
+            std::fs::write(&owned,b"retained bytes").unwrap();
+            db.execute("INSERT INTO media(id,kind,path,title) VALUES(1,'music',?1,'owner')",[library.join("source.mp3").to_string_lossy()]).unwrap();
+            match guard {
+                "source" => {db.execute("UPDATE media SET path=?1 WHERE id=1",[owned.to_string_lossy()]).unwrap();},
+                "thumb" => {db.execute("UPDATE media SET thumb_path=?1 WHERE id=1",[owned.to_string_lossy()]).unwrap();},
+                "playback" => {db.execute("UPDATE media SET transcode_path=?1 WHERE id=1",[owned.to_string_lossy()]).unwrap();},
+                "artifact"|"owner-source" => {db.execute("INSERT INTO transcode_artifacts(path,owner_media_id,owner_source_path,role,provenance,lifecycle) VALUES(?1,1,?2,'final','generated','completed')",
+                    rusqlite::params![if guard=="artifact" {owned.to_string_lossy().into_owned()}else{"other".into()},if guard=="owner-source" {owned.to_string_lossy().into_owned()}else{"source".into()}]).unwrap();},
+                "symlink" => {std::fs::remove_file(&owned).unwrap();let target=library.join("original.jpg");std::fs::write(&target,b"retained bytes").unwrap();std::os::unix::fs::symlink(target,&owned).unwrap();},
+                _ => (),
+            }
+            let roots=if guard=="library" {vec![library.clone(),thumbs.clone()]}else{vec![library]};
+            assert!(retire_thumbnail(&db,1,&owned.to_string_lossy(),&thumbs,&roots).is_err(),"{guard}");
+            assert_eq!(std::fs::read(&owned).unwrap(),b"retained bytes","{guard}");
+        }
+        println!("retirement_negative_guards=8 retained_source_playback_artifacts_symlinks_outside_cache=true");
+    }
+
+    fn artwork_fixture_image(directory: &Path, color: &str) -> std::path::PathBuf {
+        let image = directory.join(format!("{color}.png"));
+        assert!(Command::new("ffmpeg").args(["-v","error","-f","lavfi","-i",&format!("color=c={color}:s=32x32"),"-frames:v","1","-threads","1","-y"]).arg(&image).status().unwrap().success());
+        image
+    }
+
+    fn artwork_fixture_archive(path: &Path, image: &Path, epub: bool) {
+        use std::io::Write;
+        let mut archive = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        if epub {
+            archive.start_file("META-INF/container.xml",options).unwrap();
+            archive.write_all(b"<container><rootfile full-path=\"OEBPS/book.opf\"/></container>").unwrap();
+            archive.start_file("OEBPS/book.opf",options).unwrap();
+            archive.write_all(b"<package><manifest><item id=\"cover\" href=\"images/real.png\" properties=\"cover-image\"/></manifest></package>").unwrap();
+            archive.start_file("000-decoy.png",options).unwrap();
+            archive.write_all(b"not an image; declared cover must win").unwrap();
+        }
+        archive.start_file(if epub {"OEBPS/images/real.png"}else{"page1.png"},options).unwrap();
+        archive.write_all(&std::fs::read(image).unwrap()).unwrap();
+        archive.finish().unwrap();
+    }
+
+    /// Exercise the first-import call path for every media kind with real decodable local art.
+    #[test]
+    fn artwork_first_import_all_kinds_and_unchanged_episode() {
+        // Video admission uses a process-global gate; keep these scans out of unrelated parallel tests.
+        if std::env::var_os("FRAYD_TEST_ARTWORK_CHILD").is_none() {
+            let output=Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","scanner::tests::artwork_first_import_all_kinds_and_unchanged_episode","--nocapture"])
+                .env("FRAYD_TEST_ARTWORK_CHILD","1").output().unwrap();
+            assert!(output.status.success(),"{}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+            print!("{}",String::from_utf8_lossy(&output.stdout));return;
+        }
+        let fixture=Library::new(&[]);let root=&fixture.0;
+        let thumbs=root.join("thumbs");std::fs::create_dir(&thumbs).unwrap();
+        let library=root.join("library");std::fs::create_dir(&library).unwrap();
+        let image=artwork_fixture_image(root,"red");
+        let database=root.join("db.sqlite");let db=open(database.to_str().unwrap());
+        for kind in ["movie","episode","music","audiobook","ebook","comic","manga"] {
+            let source=library.join(match kind {"movie"=>"film.mp4","episode"=>"Show.S01E01.mp4","music"=>"song.mp3","audiobook"=>"book.mp3","ebook"=>"book.epub","comic"=>"book.cbz",_=>"manga"});
+            if matches!(kind,"ebook"|"comic") { artwork_fixture_archive(&source,&image,kind=="ebook"); }
+            else if kind=="manga" {std::fs::create_dir(&source).unwrap();std::fs::copy(&image,source.join("page1.png")).unwrap();}
+            else {
+                let mut command=Command::new("ffmpeg");command.args(["-v","error","-f","lavfi","-i","sine=frequency=440:duration=0.5"]);
+                if matches!(kind,"movie"|"episode") {command.args(["-f","lavfi","-i","color=c=red:s=32x32:d=0.5","-c:v","libx264","-c:a","aac","-shortest"]);}
+                else {command.arg("-i").arg(&image).args(["-map","0:a","-map","1:v","-c:a","libmp3lame","-c:v","copy","-disposition:v","attached_pic"]);}
+                assert!(command.arg(&source).status().unwrap().success());
+            }
+            assert_eq!(upsert_item(&db,database.to_string_lossy().into_owned(),&source,kind,Some(&thumbs),&library),1);
+            let (id,saved):(i64,String)=db.query_row("SELECT id,thumb_path FROM media WHERE path=?1",[source.to_string_lossy()],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+            assert!(generated_thumbnail_name(id,Path::new(&saved)),"{kind}");
+            let bytes=std::fs::read(&saved).unwrap();assert!(bytes.starts_with(&[0xff,0xd8,0xff]));assert!(bytes.ends_with(&[0xff,0xd9]));
+            assert!(Command::new("ffmpeg").args(["-v","error","-i",&saved,"-f","null","-"]).status().unwrap().success(),"{kind}");
+            if kind=="episode" {
+                std::fs::remove_file(&saved).unwrap();
+                assert_eq!(upsert_item(&db,database.to_string_lossy().into_owned(),&source,kind,Some(&thumbs),&library),0);
+                let repaired:String=db.query_row("SELECT thumb_path FROM media WHERE id=?1",[id],|row|row.get(0)).unwrap();
+                assert_ne!(repaired,saved);assert!(Path::new(&repaired).is_file());
+            }
+        }
+        println!("first_import_kinds=7 jpeg_decode=7 unchanged_episode_missing_repaired=true");
+    }
+
+    #[test]
+    fn artwork_replacement_retires_only_owned_versions_and_preserves_user_state() {
+        let fixture=Library::new(&[]);let library=fixture.0.join("library");std::fs::create_dir(&library).unwrap();
+        let thumbs=fixture.0.join("thumbs");std::fs::create_dir(&thumbs).unwrap();
+        let red=artwork_fixture_image(&fixture.0,"red");let blue=artwork_fixture_image(&fixture.0,"blue");
+        let source=library.join("book.cbz");artwork_fixture_archive(&source,&red,false);
+        let database=fixture.0.join("db.sqlite");let db=open(database.to_str().unwrap());
+        upsert_item(&db,database.to_string_lossy().into_owned(),&source,"comic",Some(&thumbs),&library);
+        let saved=||db.query_row("SELECT thumb_path FROM media WHERE id=1",[],|row|row.get::<_,Option<String>>(0)).unwrap();
+        let first=saved().unwrap();let first_bytes=std::fs::read(&first).unwrap();
+        let legacy=thumbs.join("1.jpg");std::fs::write(&legacy,b"legacy unknown bytes").unwrap();
+        db.execute_batch("UPDATE media SET title='owner',author='owner author',meta_json='{\"synopsis\":\"keep\"}'; INSERT INTO identities(id,kind,key) VALUES(1,'device','artwork'); INSERT INTO progress(identity_id,media_id,position) VALUES(1,1,23);").unwrap();
+        artwork_fixture_archive(&source,&blue,false);
+        // Size is part of the existing fingerprint; force a distinct size even on a coarse filesystem clock.
+        use std::io::Write;std::fs::OpenOptions::new().append(true).open(&source).unwrap().write_all(b"replacement-version").unwrap();
+        assert_eq!(upsert_item(&db,database.to_string_lossy().into_owned(),&source,"comic",Some(&thumbs),&library),1);
+        let second=saved().unwrap();assert_ne!(first,second);assert_ne!(first_bytes,std::fs::read(&second).unwrap());assert!(!Path::new(&first).exists());assert_eq!(std::fs::read(&legacy).unwrap(),b"legacy unknown bytes");
+        assert_eq!(db.query_row("SELECT title,author,json_extract(meta_json,'$.synopsis') FROM media WHERE id=1",[],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?))).unwrap(),("owner".into(),"owner author".into(),"keep".into()));
+        assert_eq!(db.query_row("SELECT position FROM progress WHERE media_id=1",[],|row|row.get::<_,f64>(0)).unwrap(),23.0);
+        // A source reference denies even exact UUID-name retirement.
+        let protected=thumbs.join(format!("1-{}.jpg",uuid::Uuid::new_v4()));std::fs::write(&protected,b"source bytes").unwrap();
+        db.execute("INSERT INTO media(kind,path,title) VALUES('music',?1,'protected')",[protected.to_string_lossy()]).unwrap();
+        assert!(retire_thumbnail(&db,1,&protected.to_string_lossy(),&thumbs,std::slice::from_ref(&library)).is_err());assert_eq!(std::fs::read(protected).unwrap(),b"source bytes");
+        // Absent replacement artwork invalidates and retires the prior version without adopting legacy bytes.
+        std::fs::write(&source,b"not a comic").unwrap();upsert_item(&db,database.to_string_lossy().into_owned(),&source,"comic",Some(&thumbs),&library);
+        assert_eq!(saved(),None);assert!(!Path::new(&second).exists());assert!(legacy.is_file());
+        println!("replacement_distinct_jpeg=true prior_uuid_retired=true absent_art_pointer_null=true legacy_and_referenced_sources_retained=true progress_metadata_preserved=true");
+    }
+
+    #[test]
+    fn artwork_absent_output_failure_and_rejected_publication() {
+        let fixture=Library::new(&[]);let library=fixture.0.join("library");std::fs::create_dir(&library).unwrap();
+        let thumbs=fixture.0.join("thumbs");std::fs::create_dir(&thumbs).unwrap();let db=open(":memory:");
+        let audio=library.join("no-art.wav");assert!(Command::new("ffmpeg").args(["-v","error","-f","lavfi","-i","sine=duration=0.1"]).arg(&audio).status().unwrap().success());
+        assert_eq!(extract_thumb(&audio,"music",1,&thumbs).unwrap(),None);
+        let image=artwork_fixture_image(&fixture.0,"red");let source=library.join("book.cbz");artwork_fixture_archive(&source,&image,false);
+        let blocking=fixture.0.join("blocker");std::fs::write(&blocking,b"keep").unwrap();
+        assert!(extract_thumb(&source,"comic",1,&blocking).is_err());assert_eq!(std::fs::read(blocking).unwrap(),b"keep");
+        upsert_item(&db,String::new(),&source,"comic",None,&library);
+        db.execute_batch("CREATE TRIGGER reject_art BEFORE UPDATE OF thumb_path ON media BEGIN SELECT RAISE(ABORT,'reject artwork'); END;").unwrap();
+        assert!(ensure_thumbnail(&db,&source,"comic",&std::fs::metadata(&source).unwrap(),&thumbs).is_err());
+        assert_eq!(std::fs::read_dir(&thumbs).unwrap().count(),0);
+        assert_eq!(db.query_row("SELECT thumb_path FROM media WHERE id=1",[],|row|row.get::<_,Option<String>>(0)).unwrap(),None);
+        println!("absent_audio_art_none=true output_failure_reported=true rejected_publication_own_output_removed=true");
+    }
+
     #[test]
     fn classify_audio_music_vs_audiobook() {
         let audio_exts = ["mp3", "flac", "m4a", "m4b", "opus", "ogg"];
@@ -1181,7 +1347,8 @@ exit "$probe_status"
         assert_eq!(db.query_row("SELECT size_bytes FROM media WHERE id=2",[],|r|r.get::<_,i64>(0)).unwrap(),new_bytes.len() as i64);
         assert_eq!(changed,1);
         assert_eq!(scan(&db,String::new(),library.0.clone(),Some(&thumbs)),0);
-        assert_eq!(db.query_row("SELECT thumb_path FROM media WHERE id=2",[],|r|r.get::<_,String>(0)).unwrap(),thumbs.join("2.jpg").to_string_lossy());
+        assert_eq!(db.query_row("SELECT thumb_path FROM media WHERE id=2",[],|r|r.get::<_,Option<String>>(0)).unwrap(),None);
+        assert_eq!(std::fs::read(thumbs.join("2.jpg")).unwrap(),b"fixture thumbnail","unowned legacy cache must not be adopted or overwritten");
         assert_eq!(db.query_row("SELECT size_bytes FROM media WHERE id=3",[],|r|r.get::<_,i64>(0)).unwrap(),8);
         assert_eq!(db.query_row("SELECT thumb_path FROM media WHERE id=3",[],|r|r.get::<_,Option<String>>(0)).unwrap(),None);
         assert_eq!(db.query_row("SELECT COUNT(*) FROM media",[],|r|r.get::<_,i64>(0)).unwrap(),4);

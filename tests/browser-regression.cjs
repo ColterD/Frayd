@@ -37,6 +37,7 @@ function responsivePreload(width) {
   const originalFetch = window.fetch.bind(window);
   const fixture = window.__responsiveFixture = { width, progressResponses: [], mediaEvents: [], cardClicks: [], requests: [] };
   fixture.items = [
+    ...Array.from({ length: 8 }, (_, n) => ({ id: 200 + n, kind: 'episode', title: `Show ${n} S01E01`, series: `Fixture show ${n}`, created_at: [4, 1, 8, 2, 7, 3, 6, 5][n] })),
     ...Array.from({ length: 6 }, (_, n) => ({ id: 60 + n, kind: 'movie', title: n ? `Movie ${n}` : 'Date With Your Family, A - http://www.archive.org/details/DateWith1950', author: n ? '' : 'UnbrokenAuthor'.repeat(15), created_at: n })),
     ...Array.from({ length: 8 }, (_, n) => ({ id: 23 + n, kind: 'music', title: n ? `Audio ${n}` : 'Long player title '.repeat(8), author: 'Fixture artist', created_at: n })),
     ...['ebook', 'comic', 'manga', 'audiobook'].flatMap((kind, k) => Array.from({ length: 8 }, (_, n) => ({
@@ -597,7 +598,7 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
       if (path === '/api/progress') return json({});
       if (path === '/api/library') return json([]);
       if (path === '/api/auth/logout' && request.method === 'POST') { response.writeHead(204); return response.end(); }
-      if (path === '/api/thumb/9' || path === '/api/thumb/10' || /^\/api\/thumb\/(6[0-9]|7[0-9])$/.test(path)) {
+      if (path === '/api/thumb/9' || path === '/api/thumb/10' || /^\/api\/thumb\/(6[0-9]|7[0-9]|20[0-7])$/.test(path)) {
         response.writeHead(200, { 'Content-Type': 'image/png' });
         return response.end(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII=', 'base64'));
       }

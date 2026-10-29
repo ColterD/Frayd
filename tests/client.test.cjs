@@ -2236,7 +2236,6 @@ test('one render shares progress reads across continue cards, library cards and 
   assert.deepEqual(continuing.map(card => card.querySelector('.progress-strip').firstElementChild.style.width), ['80.0%', '20.0%']);
   const movieSection = sections[1];
   const beforeSort = reads().length;
-  movieSection.children[0].children[0].textContent = 'oldest first';
   movieSection.children[0].children[0].onclick();
   await settle();
   assert.equal(reads().length, beforeSort, 'Sorting reuses this render snapshot');
@@ -2494,7 +2493,7 @@ for (const kind of ['music', 'ebook', 'audiobook']) {
       await b.run(`filterKind(${JSON.stringify(kind)}, "")`);
       const shelf = b.nodes.get('#main').children.at(-1);
       b.nodes.get('#main').children.length = 0;
-      await shelf.children[0].children[0].onclick();
+      await shelf.children[1].children[0].onclick();
       let detail = b.nodes.get('#main').children.at(-1);
       assert.equal(b.run(`authorDrill[${JSON.stringify(kind)}].author`), 'Author');
       const nodes = detail.children.flatMap(node => node.children);
@@ -2908,4 +2907,92 @@ test('YouTube entry reveals idle native chrome and keeps exit controls visible w
   idle(); assert.equal(overlay.classList.contains('hidden'), false, 'Iframe playback cannot rely on parent mousemove to reveal controls');
   b.run('document.querySelector("#video-modal").classList.remove("yt"); startChromeAutoHide()');
   idle(); assert.equal(overlay.classList.contains('hidden'), true, 'Native chrome retains idle hide');
+});
+
+test('seven category shelves have named headings and current-state sort controls', async () => {
+  const b = browser();
+  b.respond(async () => ({ ok: true, json: async () => null }));
+  b.run(`LIBRARY = ['movie','episode','music','audiobook','ebook','comic','manga'].map((kind,id) => ({id,kind,title:kind})); filtering = true`);
+  await b.run('renderRows(LIBRARY)');
+  const sections = b.nodes.get('#main').children;
+  assert.equal(sections.length, 7);
+  assert.deepEqual(sections.map(s => s.children[0].innerHTML), ['Movies','TV Shows','Music','Audiobooks','Ebooks','Comics','Manga'].map(name => `<h3>Recently Added ${name}</h3>`));
+  for (const section of sections) {
+    const button = section.children[0].children[0];
+    assert.equal(button.textContent, 'Newest first');
+    assert.equal(button.getAttribute('aria-pressed'), 'false');
+    button.onclick();
+    assert.equal(button.textContent, 'Oldest first');
+    assert.equal(button.getAttribute('aria-pressed'), 'true');
+    button.onclick();
+    assert.equal(button.textContent, 'Newest first');
+    assert.equal(button.getAttribute('aria-pressed'), 'false');
+  }
+  assert.deepEqual(Array.from(b.run('rowSort.keys()')), ['movie','episode','music','audiobook','ebook','comic','manga']);
+});
+
+test('folder dates use member extremes with stable ties and preserve input and detail order', () => {
+  const b = browser();
+  b.run(`folderItems = [
+    {id:1,kind:'episode',title:'A S02E01',series:'A',created_at:40},
+    {id:2,kind:'episode',title:'B S01E01',series:'B',created_at:90},
+    {id:3,kind:'episode',title:'A S01E02',series:'A',created_at:10},
+    {id:4,kind:'episode',title:'C S01E01',series:'C',created_at:90},
+    {id:5,kind:'episode',title:'B S01E03',series:'B',created_at:20}
+  ];`);
+  const titles = shelf => Array.from(shelf.children[1].children, c => c.title);
+  const show = b.run('groupedByShow(folderItems)');
+  assert.deepEqual(titles(show), ['B','C','A']);
+  show.children[0].children[0].onclick();
+  assert.deepEqual(titles(b.run('groupedByShow(folderItems)')), ['A','B','C']);
+  assert.deepEqual(Array.from(b.run('folderItems.map(i => i.id)')), [1,2,3,4,5]);
+  b.run(`authorItems = folderItems.map(i => ({...i,kind:'music',author:i.series}));`);
+  assert.deepEqual(titles(b.run(`groupedByAuthor('music',authorItems)`)), ['B','C','A']);
+  b.run(`rowSort.set('music',true)`);
+  assert.deepEqual(titles(b.run(`groupedByAuthor('music',authorItems)`)), ['A','B','C']);
+});
+
+test('available artwork renders for every media kind and folders choose a member with artwork', () => {
+  const b = browser();
+  for (const kind of ['movie','episode','music','audiobook','ebook','comic','manga']) {
+    const withCover = b.run(`card({id:42,kind:'${kind}',title:'Covered',thumb_path:'/cache/42.jpg'})`);
+    assert.match(withCover.innerHTML, /src="\/api\/thumb\/42\?v=42.jpg"/);
+    assert.doesNotMatch(withCover.innerHTML, /src="\/cache/);
+    if (!['movie','episode'].includes(kind)) {
+      const noCover = b.run(`card({id:43,kind:'${kind}',title:'Uncovered'})`);
+      assert.doesNotMatch(noCover.innerHTML, /<img/);
+      assert.match(noCover.innerHTML, /thumb-fallback/);
+    }
+  }
+  const shelf = b.run(`groupedByAuthor('music', [{id:1,title:'Uncovered',author:'Artist'}, {id:2,title:'Covered song',author:'Artist',thumb_path:'/cache/2.jpg'}])`);
+  assert.match(shelf.children[1].children[0].innerHTML, /src="\/api\/thumb\/2\?v=2.jpg"/);
+  assert.match(shelf.children[1].children[0].innerHTML, /Artwork from Covered song/);
+  const imageUrl = html => new URL(html.match(/src="([^"]+)"/)[1], 'https://fixture.invalid');
+  const first = imageUrl(b.run(`card({id:42,kind:'music',title:'Track',thumb_path:'/operator/cache/42-old cover.jpg'})`).innerHTML);
+  const replacement = imageUrl(b.run(`card({id:42,kind:'music',title:'Track',thumb_path:'/operator/cache/42-new-cover.jpg'})`).innerHTML);
+  assert.equal(first.pathname, replacement.pathname);
+  assert.equal(first.searchParams.get('v'), '42-old cover.jpg');
+  assert.equal(replacement.searchParams.get('v'), '42-new-cover.jpg');
+  assert.notEqual(first.href, replacement.href, 'Replacing a cover changes its browser cache key without changing media identity');
+  assert.doesNotMatch(first.href, /operator|cache/);
+  assert.match(first.search, /old%20cover/);
+  const noPath = imageUrl(b.run(`card({id:42,kind:'movie',title:'Video',thumb_path: true})`).innerHTML);
+  assert.equal(noPath.search, '', 'Nonstring metadata cannot become a version or disclose a path');
+  const folderReplacement = b.run(`groupedByAuthor('music', [{id:2,kind:'music',title:'Track',author:'Artist',thumb_path:'/operator/cache/2-replacement.jpg'}])`);
+  assert.equal(imageUrl(folderReplacement.children[1].children[0].innerHTML).searchParams.get('v'), '2-replacement.jpg');
+});
+
+
+test('a retired category sort control cannot fetch progress for a replacement identity', async () => {
+  const { b, reads } = progressRenderFixture();
+  await b.run('renderRows(LIBRARY)');
+  await settle();
+  const retiredButton = b.nodes.get('#main').children[1].children[0].children[0];
+  const before = reads().length;
+  b.run('++accountGeneration; IDENTITY = "replacement-identity"');
+  b.nodes.get('#main').innerHTML = 'replacement account view';
+  retiredButton.onclick();
+  await settle();
+  assert.equal(reads().length, before);
+  assert.equal(b.nodes.get('#main').innerHTML, 'replacement account view');
 });

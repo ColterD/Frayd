@@ -105,6 +105,25 @@ async function isolatedResponsiveCase(width) {
         if (loginStyle === null) login.removeAttribute('style'); else login.setAttribute('style', loginStyle);
         app.className = appClass; document.body.className = bodyClass;
       }
+      // Measure folder shelves independently before entering the real item drill paths.
+      LIBRARY = items.map((item, index) => ['music', 'ebook', 'audiobook'].includes(item.kind)
+        ? { ...item, author: `Folder author ${index % 4}` } : item);
+      showsDrill = null;
+      authorDrill.music = authorDrill.ebook = authorDrill.audiobook = null;
+      await filterKind('all', '');
+      const shelves = [...document.querySelectorAll('#main > section')];
+      equal(shelves.map(shelf => shelf.querySelector('h3')?.textContent),
+        ['Movies', 'TV Shows', 'Music', 'Audiobooks', 'Ebooks', 'Comics', 'Manga'].map(name => 'Recently Added ' + name), 'Seven separately headed dashboard siblings');
+      measured.folderGrids = shelves.filter(shelf => /TV Shows|Music|Audiobooks|Ebooks/.test(shelf.querySelector('h3').textContent)).map(shelf => {
+        const grid = shelf.querySelector('.cards');
+        const boxes = [...grid.children].map(node => node.getBoundingClientRect());
+        const columns = getComputedStyle(grid).gridTemplateColumns;
+        check(boxes.length >= 4 && getComputedStyle(grid).display === 'grid', 'Multiple folders use actual production grid');
+        check(grid.scrollWidth <= grid.clientWidth + 1, 'Folder grid fits available width');
+        if (width >= 768) check(boxes[1].left > boxes[0].left && Math.abs(boxes[1].top - boxes[0].top) < 1, 'Multiple TV/author folders lay out horizontally');
+        return { heading: shelf.querySelector('h3').textContent, columns, count: boxes.length, boxes: boxes.map(box => ({left: box.left, top: box.top, width: box.width})) };
+      });
+      LIBRARY = items;
       authorDrill.music = { author: 'Fixture artist' };
       authorDrill.ebook = { author: 'Fixture author' };
       authorDrill.audiobook = { author: 'Fixture author' };
@@ -165,6 +184,53 @@ async function isolatedResponsiveCase(width) {
       });
       measured.grids = grids; measured.ratios = ratios;
       equal(ratios.length, portraitItems.length, 'Every normal production book/comic/manga/audiobook portrait measured');
+      if (width === 320) {
+        await api('viewport', { width, height: 568 });
+        await until(() => innerHeight === 568, 'short active-audio viewport settles');
+        try {
+          const main = document.getElementById('main');
+          const lastCard = [...main.querySelectorAll('.media-card')].at(-1);
+          const title = lastCard.querySelector('.title');
+          const bar = document.getElementById('playerbar');
+          main.scrollTop = main.scrollHeight;
+          window.scrollTo(0, document.documentElement.scrollHeight);
+          const pointHit = node => {
+            const box = rect(node);
+            const hit = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+            return { box, hit: hit?.id || hit?.className || hit?.tagName, reachable: hit === node || node.contains(hit) };
+          };
+          measured.shortAudioFooter = { viewport: { width: innerWidth, height: innerHeight }, main: rect(main),
+            paddingBottom: getComputedStyle(main).paddingBottom, maxScroll: main.scrollTop, documentScroll: scrollY, documentHeight: document.documentElement.scrollHeight, card: rect(lastCard),
+            title: pointHit(title), bar: rect(bar), audioControls: ['pb-play', 'pb-close'].map(id => ({id, ...pointHit(document.getElementById(id))})) };
+          check(rect(lastCard).bottom <= rect(bar).top, 'Last library card clears the active wrapped player at maximum scroll');
+          check(measured.shortAudioFooter.title.reachable, 'Last library card title center accepts a pointer hit above the player');
+          let trustedTitleClick = false;
+          title.addEventListener('click', event => { trustedTitleClick = event.isTrusted; event.stopImmediatePropagation(); }, { capture: true, once: true });
+          const titleBox = rect(title);
+          await api('click', { x: titleBox.left + titleBox.width / 2, y: titleBox.top + titleBox.height / 2 });
+          check(trustedTitleClick, 'Trusted pointer input reaches the last library title');
+          measured.shortAudioFooter.trustedTitleClick = trustedTitleClick;
+          measured.shortAudioFooter.titleClickActionIntercepted = true;
+          check(measured.shortAudioFooter.audioControls.every(control => control.reachable), 'Both active audio buttons remain hit-testable');
+          lastCard.scrollIntoView({ block: 'center' });
+          measured.shortAudioFooter.centeredCard = pointHit(lastCard);
+          check(measured.shortAudioFooter.centeredCard.reachable, 'Last library card center is reachable by scrolling');
+          equal([...bar.querySelectorAll('button')].map(button => button.id), ['pb-play', 'pb-close'], 'Default audio player retains exactly its two implemented buttons');
+          await filterKind('episode', '');
+          equal(scrollY, 0, 'Category filtering resets document scroll');
+          window.scrollTo(0, document.documentElement.scrollHeight);
+          document.querySelector('#main .show-grid .media-card').click();
+          equal(scrollY, 0, 'Folder opening resets document scroll');
+          window.scrollTo(0, document.documentElement.scrollHeight);
+          document.querySelector('#main .back-row').click();
+          equal(scrollY, 0, 'Folder back resets document scroll');
+          measured.shortAudioFooter.categoryAndBackResetScroll = true;
+          await filterKind('all', '');
+        } finally {
+          await api('viewport', { width, height: 1000 });
+          await until(() => innerHeight === 1000, 'short active-audio viewport restores');
+        }
+      }
       function reachable(node) {
         node.scrollIntoView({ block: 'center', inline: 'nearest' });
         const r = node.getBoundingClientRect(); const style = getComputedStyle(node);
@@ -343,8 +409,9 @@ async function isolatedResponsiveCase(width) {
       const wrapper = document.querySelector('#video-modal .plyr');
       const nativeControls = document.querySelector('.plyr__controls');
       await until(() => contains(rect(wrapper), rect(nativeControls)), 'revealed native controls settle inside wrapper');
-      measured.videoGeometry = { wrapper: rect(wrapper), controls: rect(nativeControls), decodedFrames: plyr.media.getVideoPlaybackQuality().totalVideoFrames };
-      check(rect(wrapper).width === innerWidth && rect(wrapper).height === innerHeight, 'Native Plyr fills viewport');
+      const viewportWidth = document.documentElement.clientWidth;
+      measured.videoGeometry = { viewportWidth, wrapper: rect(wrapper), controls: rect(nativeControls), decodedFrames: plyr.media.getVideoPlaybackQuality().totalVideoFrames };
+      check(rect(wrapper).width === viewportWidth && rect(wrapper).height === innerHeight, 'Native Plyr fills viewport');
       check(getComputedStyle(document.getElementById('yt-party')).display === 'none', 'Native mode hides inactive external surface');
       reachable(document.querySelector('.plyr__controls [data-plyr="play"]'));
       // Model only the external-provider layout state; no YouTube playback claim.
@@ -353,15 +420,15 @@ async function isolatedResponsiveCase(width) {
       await headerAtHeights('.vm-overlay', 'vm-title', nativeTitle, true);
       measured.youtubeLayoutModel = { wrapper: rect(wrapper), placeholder: rect(external) };
       check(rect(wrapper).width === 0 && rect(nativeControls).width === 0, 'YouTube mode hides native wrapper and controls');
-      check(rect(external).width === innerWidth && rect(external).height === innerHeight, 'External placeholder fills viewport');
+      check(rect(external).width === viewportWidth && rect(external).height === innerHeight, 'External placeholder fills viewport');
       const iframe = document.createElement('iframe'); iframe.id = 'yt-party'; iframe.title = 'Modeled YouTube surface';
       external.replaceWith(iframe);
       try {
-        check(rect(iframe).width === innerWidth && rect(iframe).height === innerHeight, 'YouTube replacement iframe fills viewport');
+        check(rect(iframe).width === viewportWidth && rect(iframe).height === innerHeight, 'YouTube replacement iframe fills viewport');
         modal.classList.remove('yt');
-        check(rect(iframe).width === 0 && rect(wrapper).width === innerWidth, 'Returning native mode hides external iframe and restores Plyr');
+        check(rect(iframe).width === 0 && rect(wrapper).width === viewportWidth, 'Returning native mode hides external iframe and restores Plyr');
       } finally { iframe.replaceWith(external); modal.classList.remove('yt'); document.getElementById('vm-back').click(); }
-      return { viewport: { width: innerWidth, height: innerHeight }, sizes, grids, ratios, layoutGeometry: { login: measured.loginGeometry, authFlow: measured.authFlowGeometry, settings: measured.settingsGeometry, party: measured.partyGeometry, modalHeaders: measured.modalHeaders, hero: measured.heroGeometry, native: measured.videoGeometry, youtubeModel: measured.youtubeLayoutModel }, navigationLabels: nav.map(n => n.textContent.trim()), adminAndPlayerControlsReachable: true, realMediaControl: true, audioPauseUi: measured.audioPauseUi, deletionCancellation: true, nativeDiagnostics: fixture, overflowInventory: measured.overflowInventory };
+      return { viewport: { width: innerWidth, height: innerHeight }, sizes, grids, ratios, folderGrids: measured.folderGrids, shortAudioFooter: measured.shortAudioFooter, layoutGeometry: { login: measured.loginGeometry, authFlow: measured.authFlowGeometry, settings: measured.settingsGeometry, party: measured.partyGeometry, modalHeaders: measured.modalHeaders, hero: measured.heroGeometry, native: measured.videoGeometry, youtubeModel: measured.youtubeLayoutModel }, navigationLabels: nav.map(n => n.textContent.trim()), adminAndPlayerControlsReachable: true, realMediaControl: true, audioPauseUi: measured.audioPauseUi, deletionCancellation: true, nativeDiagnostics: fixture, overflowInventory: measured.overflowInventory };
     } catch (error) {
       error.observed = { ...measured, audio: { readyState: pbAudio.readyState, paused: pbAudio.paused,
         duration: pbAudio.duration, currentTime: pbAudio.currentTime, mediaError: pbAudio.error?.code || null }, nativeDiagnostics: fixture };
@@ -1828,7 +1895,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     const retiredCard = document.querySelector('#main .media-card');
     const pending = loadLibrary();
     document.querySelector('#main .row-head button').click();
-    const sort = rowSort.get('Movies');
+    const sort = rowSort.get('movie');
     const search = document.querySelector('#search input');
     search.value = 'Owned'; search.dispatchEvent(new Event('input', { bubbles: true }));
     await until(() => releaseSearch, 'real debounced search starts held request');
@@ -1843,23 +1910,27 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     progressReleases.forEach(resolve => resolve(reply({ position: 45 })));
     await delay(40);
     check(!LIBRARY.some(i => i.id === +deletedId), 'Held older load cannot resurrect removed item');
-    equal(activeKind, 'movie', 'Filter retained'); equal(rowSort.get('Movies'), sort, 'Sort retained');
+    equal(activeKind, 'movie', 'Filter retained'); equal(rowSort.get('movie'), sort, 'Sort retained');
     equal(activeQuery, '', 'Late search cannot restore its retired query'); search.value = '';
     equal(retiredCard.querySelector('.progress-strip').style.display, 'none', 'Detached progress never paints');
     check(!document.querySelector('#main').textContent.includes('Continue watching'), 'Filtered view has no stale continue row');
     const retainedLibrary = LIBRARY, retainedKind = activeKind, retainedQuery = activeQuery;
-    const priorMovieSort = rowSort.get('Movies');
+    const priorSort = new Map(rowSort);
     const retainedShowsDrill = showsDrill;
     const retainedAuthorDrill = { ...authorDrill };
     const tvAndAuthorItems = [
-      { id: 9, kind: 'episode', title: '日本語.Show.S01E02', series: 'Unicode show' },
-      { id: 10, kind: 'episode', title: 'Unicode 1x01', series: 'Unicode show' },
+      { id: 9, kind: 'episode', title: '日本語.Show.S01E02', series: 'Unicode show', created_at: 30, thumb_path: '/fixture/9.png' },
+      { id: 10, kind: 'episode', title: 'Unicode 1x01', series: 'Unicode show', created_at: 10 },
       { id: 60, kind: 'episode', title: 'Unicode bonus', series: 'Unicode show' },
       { id: 61, kind: 'movie', title: 'Unicode movie' },
       { id: 62, kind: 'music', title: 'Loose song', author: 'Mixed artist' },
-      { id: 63, kind: 'music', title: 'Album song', author: 'Mixed artist', series: 'Named album' },
-      { id: 64, kind: 'ebook', title: 'Series book', author: 'Book author', series: 'Named books' },
-      { id: 65, kind: 'audiobook', title: 'Loose audiobook', author: 'Audio author' },
+      { id: 63, kind: 'music', title: 'Album song', author: 'Mixed artist', series: 'Named album', thumb_path: '/fixture/63.png' },
+      { id: 64, kind: 'ebook', title: 'Series book', author: 'Book author', series: 'Named books', thumb_path: '/fixture/64.png' },
+      { id: 65, kind: 'audiobook', title: 'Loose audiobook', author: 'Audio author', thumb_path: '/fixture/65.png' },
+      { id: 66, kind: 'music', title: 'Second song', author: 'Second artist', created_at: 20 },
+      { id: 67, kind: 'episode', title: 'Second S01E01', series: 'Second show', created_at: 20 },
+      { id: 68, kind: 'comic', title: 'Covered comic', thumb_path: '/fixture/68.png' },
+      { id: 69, kind: 'manga', title: 'Covered manga', thumb_path: '/fixture/69.png' },
     ];
     let tvSearchMode = 'success';
     responder = async (url, options) => {
@@ -1875,6 +1946,28 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     };
     LIBRARY = tvAndAuthorItems;
     showsDrill = null;
+    Object.keys(authorDrill).forEach(kind => { authorDrill[kind] = null; });
+    rowSort.clear();
+    await filterKind('all', '');
+    const categoryShelves = [...document.querySelectorAll('#main > section')];
+    equal(categoryShelves.map(shelf => shelf.querySelector('h3')?.textContent),
+      ['Movies','TV Shows','Music','Audiobooks','Ebooks','Comics','Manga'].map(label => 'Recently Added ' + label), 'Seven dashboard siblings use category headings');
+    for (const shelf of categoryShelves) {
+      const button = shelf.querySelector('.row-head button');
+      equal(button.textContent, 'Newest first', 'Default control states current newest order');
+      button.click();
+      equal(button.textContent, 'Oldest first', 'Toggle states current oldest order');
+      equal(button.getAttribute('aria-pressed'), 'true', 'Oldest order is accessible');
+      button.click();
+      equal(button.textContent, 'Newest first', 'Second toggle returns to newest');
+    }
+    const dashboardImages = [...document.querySelectorAll('#main > section img.thumb')];
+    await until(() => dashboardImages.length === 7 && dashboardImages.every(img => img.complete && img.naturalWidth > 0), 'All seven categories load available thumbnail API artwork');
+    const tvShelf = categoryShelves[1];
+    equal([...tvShelf.querySelectorAll('.title')].map(node => node.textContent), ['Unicode show', 'Second show'], 'TV folders start by maximum member date');
+    tvShelf.querySelector('button').click();
+    equal([...tvShelf.querySelectorAll('.title')].map(node => node.textContent), ['Unicode show', 'Second show'], 'TV oldest uses minimum member date including undated bonus');
+    tvShelf.querySelector('button').click();
     const tvNav = document.querySelector('#sidebar [data-kind="show"]');
     check(tvNav, 'Upstream TV navigation exists');
     tvNav.focus(); await key('Enter');
@@ -1902,6 +1995,8 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     document.querySelector('#sidebar [data-kind="music"]').click(); await delay(0);
     byTitle('Mixed artist').click(); await delay(0);
     check(byTitle('Loose song') && byTitle('Named album'), 'Mixed author retains loose song beside album folder');
+    check(byTitle('Named album').querySelector('.sub').textContent.includes('Album'), 'Music series folder is labeled as an album');
+    check(byTitle('Named album').querySelector('img')?.getAttribute('src') === '/api/thumb/63?v=63.png', 'Album uses verified member artwork');
     byTitle('Named album').click(); await delay(0);
     check(byTitle('Album song') && !byTitle('Loose song'), 'Album drill shows its own songs');
     document.querySelectorAll('#main .back-row')[1].click(); await delay(0);
@@ -1963,7 +2058,8 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     LIBRARY = retainedLibrary;
     showsDrill = retainedShowsDrill;
     Object.assign(authorDrill, retainedAuthorDrill);
-    if (priorMovieSort === undefined) rowSort.delete('Movies'); else rowSort.set('Movies', priorMovieSort);
+    rowSort.clear();
+    priorSort.forEach((value, kind) => rowSort.set(kind, value));
     await filterKind(retainedKind, retainedQuery);
     return { deletedId: +deletedId, libraryIds: LIBRARY.map(i => i.id), activeKind, sort, detachedProgressIgnored: true, modeledAPI: true, tvAuthorWorkflows,
       progressReadReuse: { libraryItems: 4, initialGets, sortAdditionalGets: 0, nextRenderGets: 4, freshResumeAdditionalGets: 1, failedRenderGets: failedGets.length,

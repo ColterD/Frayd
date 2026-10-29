@@ -479,6 +479,14 @@ fn thumbs_dir_for(db_path: &str) -> PathBuf {
         .join("thumbs")
 }
 
+fn thumbnail_mime(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") { "image/png" }
+    else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") { "image/gif" }
+    else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") { "image/webp" }
+    else if bytes.starts_with(&[0xff,0xd8,0xff]) { "image/jpeg" }
+    else { "application/octet-stream" }
+}
+
 /// Serve extracted thumbnail. 204 when none (client falls back gracefully).
 async fn thumb(
     State(app): State<std::sync::Arc<App>>,
@@ -492,8 +500,8 @@ async fn thumb(
     let Some(path) = path else { return StatusCode::NO_CONTENT.into_response() };
     match tokio::fs::read(&path).await {
         Ok(bytes) => (
-            [(header::CONTENT_TYPE, "image/jpeg"),
-             (header::CACHE_CONTROL, "public, max-age=86400, immutable")],
+            [(header::CONTENT_TYPE, thumbnail_mime(&bytes)),
+             (header::CACHE_CONTROL, "no-cache")],
             bytes,
         )
             .into_response(),
@@ -1081,7 +1089,12 @@ async fn remove_user(
 fn cleanup_owned_thumbnail(db: &mut Connection, thumbs: &StdPath, roots: &[PathBuf], id:i64,
     source:&str, thumbnail:Option<&str>) -> Result<(),String> {
     let Some(thumbnail)=thumbnail else {return Ok(());};
-    let expected=thumbs.join(format!("{id}.jpg"));
+    let saved=StdPath::new(thumbnail);
+    let basename=saved.file_name().ok_or("thumbnail has no basename")?;
+    if basename != std::ffi::OsStr::new(&format!("{id}.jpg")) && !scanner::generated_thumbnail_name(id,saved) {
+        return Err("thumbnail name does not prove media ownership".into());
+    }
+    let expected=thumbs.join(basename);
     let metadata=match std::fs::symlink_metadata(&expected) {
         Ok(metadata)=>metadata,
         Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(()),
@@ -1090,10 +1103,9 @@ fn cleanup_owned_thumbnail(db: &mut Connection, thumbs: &StdPath, roots: &[PathB
     if !metadata.is_file() || metadata.file_type().is_symlink() {return Err("thumbnail is not an owned regular file".into());}
     let directory=thumbs.canonicalize().map_err(|e|e.to_string())?;
     let owned=expected.canonicalize().map_err(|e|e.to_string())?;
-    let saved=StdPath::new(thumbnail);
     let saved_metadata=std::fs::symlink_metadata(saved).map_err(|e|e.to_string())?;
     if saved_metadata.file_type().is_symlink() || !saved_metadata.is_file()
-        || owned!=directory.join(format!("{id}.jpg")) || saved.canonicalize().map_err(|e|e.to_string())?!=owned {
+        || owned!=directory.join(basename) || saved.canonicalize().map_err(|e|e.to_string())?!=owned {
         return Err("thumbnail path does not prove configured cache ownership".into());
     }
     if StdPath::new(source).canonicalize().ok().as_ref()==Some(&owned) {return Err("thumbnail is the original source".into());}
@@ -1662,6 +1674,22 @@ async fn auth_me(
 #[cfg(test)]
 mod backend_regressions {
     use super::*;
+    #[tokio::test]
+    async fn artwork_http_serves_legacy_png_and_revalidates_replacement_url() {
+        let directory=std::env::temp_dir().join(format!("frayd-artwork-http-{}",uuid::Uuid::new_v4()));std::fs::create_dir(&directory).unwrap();
+        let app=app_for("fixture.epub");
+        let image=directory.join("legacy.jpg");std::fs::write(&image,b"\x89PNG\r\n\x1a\nlegacy").unwrap();
+        app.db.lock().unwrap().execute("UPDATE media SET kind='ebook',thumb_path=?1 WHERE id=1",[image.to_string_lossy()]).unwrap();
+        let response=thumb(State(app.clone()),Path(1)).await.into_response();
+        assert_eq!(response.status(),StatusCode::OK);assert_eq!(response.headers()[header::CONTENT_TYPE],"image/png");assert_eq!(response.headers()[header::CACHE_CONTROL],"no-cache");
+        let replacement=directory.join("new.jpg");std::fs::write(&replacement,[0xff,0xd8,0xff,0xd9]).unwrap();
+        app.db.lock().unwrap().execute("UPDATE media SET thumb_path=?1 WHERE id=1",[replacement.to_string_lossy()]).unwrap();
+        let response=thumb(State(app.clone()),Path(1)).await.into_response();assert_eq!(response.headers()[header::CONTENT_TYPE],"image/jpeg");
+        app.db.lock().unwrap().execute("UPDATE media SET thumb_path=NULL WHERE id=1",[]).unwrap();
+        assert_eq!(thumb(State(app),Path(1)).await.into_response().status(),StatusCode::NO_CONTENT);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     /// Isolate legacy metadata and saved progress without using an operator database.
     fn app_for(path: &str) -> Arc<App> {
         let db = store::open(":memory:");
@@ -2461,6 +2489,17 @@ mod integration_regressions {
         let app=Arc::new(App{db:Mutex::new(db),db_path:root.join("db.sqlite").to_string_lossy().into_owned(),library:std::sync::RwLock::new(LibraryConfig{roots:vec![root.join("library")],locked:false}),scan_queue:Mutex::new(ScanQueue::default()),scanning:std::sync::atomic::AtomicBool::new(false),scan_error:Mutex::new(None),auth_rl:auth::RateLimiter::new(300,10),party:Arc::new(party::Party::new()),ingest_status:Mutex::new(None)});
         (root,app)
     }
+    #[tokio::test]
+    async fn artwork_media_delete_retires_current_uuid_and_retains_original_and_legacy() {
+        let (root,app)=fixture();seed_media(&root,&app);
+        let generated=root.join("thumbs").join(format!("1-{}.jpg",uuid::Uuid::new_v4()));std::fs::write(&generated,b"generated artwork").unwrap();
+        app.db.lock().unwrap().execute("UPDATE media SET thumb_path=?1 WHERE id=1",[generated.to_string_lossy()]).unwrap();
+        assert_eq!(media(&app,1).await,StatusCode::NO_CONTENT);
+        assert!(!generated.exists());assert_eq!(std::fs::read(root.join("thumbs/1.jpg")).unwrap(),b"thumbnail");
+        assert_eq!(std::fs::read(root.join("library/source.cbz")).unwrap(),b"original");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// Supply the existing fixture device administrator without creating an account-name fallback.
     fn query() -> Query<std::collections::HashMap<String,String>> {Query(std::collections::HashMap::from([("identity".into(),"fixture-admin".into())]))}
     /// Exercise the real media deletion handler with the fixture administrator and target ID.

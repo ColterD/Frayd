@@ -35,6 +35,34 @@ pub fn epub_spine(path: &Path) -> Option<Vec<String>> {
     if spine.is_empty() { None } else { Some(spine) }
 }
 
+/// Declared EPUB3 cover-image or EPUB2 cover metadata, then conventional root names.
+/// Uses the existing container/manifest conventions rather than a new XML parser.
+pub fn epub_cover(path: &Path) -> Option<Vec<u8>> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut zip = zip::ZipArchive::new(file).ok()?;
+    let declared = (|| {
+        let container = read(&mut zip, "META-INF/container.xml")?;
+        let opf_path = between(&container, "full-path=\"", "\"")?;
+        let opf = read(&mut zip, &opf_path)?;
+        let cover_id = opf.split("<meta ").skip(1).map(|part| part.split('>').next().unwrap_or(part))
+            .find(|part| attr(part,"name").as_deref() == Some("cover")).and_then(|part| attr(part,"content"));
+        let href = opf.split("<item ").skip(1).map(|part| part.split('>').next().unwrap_or(part))
+            .find(|part| attr(part,"properties").is_some_and(|value| value.split_whitespace().any(|token| token == "cover-image"))
+                || cover_id.as_ref().is_some_and(|id| attr(part,"id").as_ref() == Some(id)))
+            .and_then(|part| attr(part,"href"))?;
+        let joined = match opf_path.rsplit_once('/') { Some((directory,_)) => format!("{directory}/{href}"), None => href };
+        let mut parts = Vec::new();
+        for part in joined.split('/') {
+            match part { "." => (), ".." => { parts.pop()?; }, value => parts.push(value) }
+        }
+        let mut entry = zip.by_name(&parts.join("/")).ok()?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry,&mut bytes).ok()?;
+        Some(bytes)
+    })();
+    declared.or_else(|| ["cover.jpeg","cover.jpg","cover.png"].iter().find_map(|name| read_zip_entry(path,name)))
+}
+
 /// TOC entries: (title, spine index). From toc.ncx (epub2) or nav.xhtml (epub3).
 /// Resolved via spine hrefs → first spine chunk containing the target file.
 pub fn epub_toc(path: &Path) -> Option<Vec<(String, usize)>> {

@@ -200,14 +200,13 @@ test('late progress does not paint detached or superseded cards; row sorting is 
   await new Promise(resolve=>setImmediate(resolve));
   assert.equal(strip.style.display,undefined);
   b.respond(async()=>({ok:true,json:async()=>null}));
-  b.run('sortItems=[{id:2,title:"B",kind:"movie",created_at:1},{id:1,title:"A",kind:"movie",created_at:1},{id:3,title:"C",kind:"movie",created_at:2}];testSection=section("Movies",sortItems)');
+  b.run('sortItems=[{id:2,title:"B",kind:"movie",created_at:1},{id:1,title:"A",kind:"movie",created_at:1},{id:3,title:"C",kind:"movie",created_at:2}];testSection=section("movie",sortItems)');
   const section=b.run('testSection');
   const cards=section.children[1];
   assert.deepEqual(Array.from(cards.children,item=>item.title),['C','A','B']);
-  section.children[0].children[0].textContent='oldest first';
   section.children[0].children[0].onclick();
   // The boundary double does not parse innerHTML; use a fresh section to observe persisted ordering.
-  const refreshed=b.run('section("Movies",sortItems)');
+  const refreshed=b.run('section("movie",sortItems)');
   assert.deepEqual(Array.from(refreshed.children[1].children,item=>item.title),['A','B','C']);
 });
 

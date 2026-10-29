@@ -79,6 +79,7 @@ function browser({ now, storage = {}, initialResponse } = {}) {
     console: { log() {}, warn() {} }, innerWidth: 1000, innerHeight: 800,
     fetch: async (url, options) => { requests.push({ url, options }); return response(url, options); },
     addEventListener: (name, fn) => listeners.set(name, fn),
+    scrollTo() {},
     setTimeout() {}, clearTimeout() {},
     setInterval: fn => { const id = ++nextIntervalId; intervals.set(id, fn); return id; },
     clearInterval: id => intervals.delete(id),

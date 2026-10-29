@@ -38,6 +38,7 @@ fn invalid_archives_return_none() {
     assert_eq!(comic::read_zip_entry(&path, "page2.png"), None);
     assert_eq!(epub::epub_spine(&path), None);
     assert_eq!(epub::epub_toc(&path), None);
+    assert_eq!(epub::epub_cover(&path), None);
     assert_eq!(epub::read_zip_entry(&path, "one.xhtml"), None);
 }
 
