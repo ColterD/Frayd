@@ -511,7 +511,7 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
       }
       if (path === '/__fixture/hold-media' && request.method === 'POST') {
         const target = JSON.parse(input).path;
-        if (!/^\/api\/stream\/(20|22)$/.test(target)) return json({ error: 'Unknown requested native stream' }, 400);
+        if (!/^\/api\/stream\/(20|22|23)$/.test(target)) return json({ error: 'Unknown requested native stream' }, 400);
         if (heldMedia) return json({ error: 'Previous native stream hold still active' }, 409);
         let release;
         const promise = new Promise(resolve => { release = resolve; });

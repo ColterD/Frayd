@@ -1,6 +1,7 @@
 FROM rust:bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8 AS build
 WORKDIR /app/server
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+RUN timeout --kill-after=10s 180s apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=2 -o APT::Update::Error-Mode=any update \
+    && DEBIAN_FRONTEND=noninteractive timeout --kill-after=10s 360s apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=2 install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 COPY server/ ./
 ENV CARGO_BUILD_JOBS=2
@@ -13,7 +14,8 @@ COPY --from=build /app/server/target/release/frayd-native /frayd-native
 COPY --from=build /app/server/rustc-version.txt /rustc-version.txt
 
 FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg \
+RUN timeout --kill-after=10s 180s apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=2 -o APT::Update::Error-Mode=any update \
+    && DEBIAN_FRONTEND=noninteractive timeout --kill-after=10s 360s apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=2 install -y --no-install-recommends ca-certificates curl ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 frayd && useradd --uid 10001 --gid frayd --no-create-home frayd \
     && mkdir -p /data/library /data/thumbs /data/transcodes && chown -R frayd:frayd /data

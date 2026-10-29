@@ -84,6 +84,8 @@ async function tryResume() {
 /** Enter the dashboard for the current account generation and start loading the library. */
 function enterApp() {
   ++accountGeneration;
+  stopSettingsMonitor();
+  disposeSettings();
   document.body.classList.remove('auth');
   $('#login').style.display = 'none';
   $('#app').classList.add('on');
@@ -99,11 +101,16 @@ function enterApp() {
 const KINDS = ['movie', 'episode', 'music', 'audiobook', 'ebook', 'comic', 'manga'];
 let settingsGeneration = 0;
 let settingsPoll = null;
-/** Invalidate settings callbacks and stop the active status poll. */
+let settingsMonitor = null;
+/** Retire panel callbacks without abandoning an admitted account-owned job. */
 function disposeSettings() {
   ++settingsGeneration;
+}
+/** Stop the account's job observer; retired callbacks cannot clear its successor. */
+function stopSettingsMonitor() {
   clearInterval(settingsPoll);
   settingsPoll = null;
+  settingsMonitor = null;
 }
 /**
  * Return effective locked roots or editable persisted roots, including the legacy single path.
@@ -134,67 +141,69 @@ function scanFailure(status) {
     ? 'No library folder configured — set it in settings' : `Scan failed (${status})`;
 }
 /**
- * Poll the admitted scan or ingest until completion; ignore callbacks from retired settings panels.
+ * Observe one admitted job for this account; only its current panel may publish UI.
  * @param {number} generation
  * @param {string} mode
  * @param {HTMLButtonElement} button
  */
 function pollSettings(generation, mode, button) {
-  clearInterval(settingsPoll);
+  stopSettingsMonitor();
+  const monitor = settingsMonitor = { account: accountGeneration, identity: IDENTITY };
+  const current = () => settingsMonitor === monitor
+    && monitor.account === accountGeneration && monitor.identity === IDENTITY;
+  const panelCurrent = () => generation === settingsGeneration;
   let pending = false;
   settingsPoll = setInterval(async () => {
-    if (pending || generation !== settingsGeneration) return;
+    if (pending || !current()) return;
     pending = true;
     try {
       const response = await fetch('/api/scan/status');
       if (!response.ok) throw new Error(`Status failed (${response.status})`);
       const status = await response.json();
-      if (generation !== settingsGeneration) return;
+      if (!current()) return;
       const ingest = status.ingesting;
       if (mode === 'ingest' && (ingest === 'downloading' || ingest === 'indexing')) {
-        button.textContent = ingest === 'indexing' ? 'Indexing…' : 'Downloading…';
+        if (panelCurrent()) button.textContent = ingest === 'indexing' ? 'Indexing…' : 'Downloading…';
         return;
       }
       if (mode === 'scan' && status.scanning) return;
-      clearInterval(settingsPoll); settingsPoll = null;
-      button.disabled = false;
-      if (mode === 'scan' && status.scan_error) {
-        button.textContent = 'Scan failed';
-        toast(`Scan failed — ${status.scan_error}`, true);
-        return;
+      stopSettingsMonitor();
+      const failure = mode === 'scan' ? status.scan_error : ingest !== 'done';
+      if (panelCurrent()) {
+        button.disabled = false;
+        button.textContent = failure ? (mode === 'scan' ? 'Scan failed' : 'Download failed')
+          : mode === 'scan' ? 'Scan complete' : 'Download complete';
+        if (failure) toast(mode === 'scan' ? `Scan failed — ${status.scan_error}` : 'Download or indexing failed', true);
       }
-      if (mode === 'ingest' && ingest !== 'done') {
-        button.textContent = 'Download failed';
-        toast('Download or indexing failed', true);
-        return;
-      }
-      button.textContent = mode === 'scan' ? 'Scan complete' : 'Download complete';
-      await loadLibrary();
+      if (!failure) await loadLibrary();
     } catch (error) {
-      if (generation !== settingsGeneration) return;
-      clearInterval(settingsPoll); settingsPoll = null;
-      button.disabled = false;
-      button.textContent = 'Status unavailable';
-      toast(error.message || 'Status unavailable', true);
+      if (!current()) return;
+      stopSettingsMonitor();
+      if (panelCurrent()) {
+        button.disabled = false;
+        button.textContent = 'Status unavailable';
+        toast(error.message || 'Status unavailable', true);
+      }
     } finally { pending = false; }
   }, 1000);
 }
 /**
- * Request a scan and start status polling only for the current settings generation.
+ * Request a scan for this account; completion monitoring survives panel retirement.
  * @param {number} generation
  * @param {HTMLButtonElement} button
  */
 async function startSettingsScan(generation, button) {
+  const owner = accountGeneration, identity = IDENTITY;
   button.disabled = true;
   button.textContent = 'Starting scan…';
   try {
     const response = await fetch('/api/scan', { method: 'POST', headers: authHeaders() });
-    if (generation !== settingsGeneration) return;
+    if (owner !== accountGeneration || identity !== IDENTITY) return;
     if (response.status !== 202) throw new Error(scanFailure(response.status));
-    button.textContent = 'Scanning…';
+    if (generation === settingsGeneration) button.textContent = 'Scanning…';
     pollSettings(generation, 'scan', button);
   } catch (error) {
-    if (generation !== settingsGeneration) return;
+    if (owner !== accountGeneration || identity !== IDENTITY || generation !== settingsGeneration) return;
     button.disabled = false;
     button.textContent = error.message || 'Scan failed — server unreachable';
     toast(button.textContent, true);
@@ -359,11 +368,12 @@ async function openSettings() {
       const url = stage.querySelector('.s-ingest').value.trim();
       if (!/^https?:\/\//.test(url)) { ingestBtn.textContent = 'Invalid URL'; return; }
       ingestBtn.disabled = true;
+      const owner = accountGeneration, identity = IDENTITY;
       try {
         const response = await fetch('/api/ingest', { method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ url }) });
-        if (!current()) return;
+        if (owner !== accountGeneration || identity !== IDENTITY) return;
         if (response.status !== 202) throw new Error(response.status === 409 ? 'Download already active' : response.status === 501 ? 'Download unavailable: configure a folder and yt-dlp' : `Download failed (${response.status})`);
-        ingestBtn.textContent = 'Downloading…';
+        if (current()) ingestBtn.textContent = 'Downloading…';
         pollSettings(generation, 'ingest', ingestBtn);
       } catch (error) {
         if (!current()) return;
@@ -417,6 +427,7 @@ $('#pw-toggle').onclick = () => {
 };
 $('#logout')?.addEventListener('click', () => {
   ++accountGeneration;
+  stopSettingsMonitor();
   disposeSettings();
   ++libraryRequestGeneration;
   ++renderGeneration;
@@ -844,6 +855,8 @@ function renderHero(it) {
 const pbAudio = $('#pb-audio');
 let partyPlaybackKind = null;
 let nativeLoadGeneration = 0;
+// Local audio intent remains identifiable while its progress response precedes src.
+let localAudioLoad = null;
 
 /**
  * Open the reader or player matching a library item kind.
@@ -1362,7 +1375,7 @@ function closeEbook() {
 /**
  * Give native playback ownership before pausing a ready external player, so its
  * pause callback cannot publish a stale party command. Return the prior owner so
- * party follow can preserve only a video that was already active locally.
+ * party follow can preserve a native player that was already active locally.
  * @param {'audio'|'video'} kind Native player taking ownership.
  * @returns {string|null} Playback owner before this transition.
  */
@@ -1409,6 +1422,7 @@ function ownsNativeLoad(media, kind, id, generation) {
 function playAudio(it) {
   beginNativePlayback('audio');
   const generation = ++nativeLoadGeneration;
+  const load = localAudioLoad = { id: it.id, generation, pendingResume: true };
   $('#video-modal').classList.remove('on', 'yt');
   $('#playerbar').classList.add('on');
   if (window.partySend) { partyLoadPending = true; partyLoadId = it.id; partyLoadTitle = it.title; }
@@ -1417,6 +1431,7 @@ function playAudio(it) {
   resumeFor(it.id).then(p => {
     if (nativeLoadGeneration !== generation || partyPlaybackKind !== 'audio') return;
     pbAudio.src = `/api/stream/${it.id}`;
+    load.pendingResume = false;
     const seek = (p && p.position > 5) ? p.position : 0;
     const onMeta = () => {
       if (!ownsNativeLoad(pbAudio, 'audio', it.id, generation)) return;
@@ -1581,15 +1596,15 @@ window.partyFollowExternal = (vid, title, position, playing, updatedAt, isHostOw
 
 /**
  * Transfer party playback to native media and apply the host's authoritative clock.
- * A host's first echo may preserve its already active matching video, including local
- * resume and pause state; guests and inactive players follow the received state.
+ * A host's first echo preserves its matching native owner, including local resume,
+ * pause and close state; guests and other playback owners follow the received state.
  * External pause callbacks run only after ownership changes to avoid a stale broadcast.
  * @param {number} mediaId Library item whose kind selects native audio or video.
  * @param {string} title Display title for the active native stream.
  * @param {number} position Host position at updatedAt, in seconds.
  * @param {boolean} playing Whether playback should advance after synchronization.
  * @param {number} updatedAt Unix timestamp used to compensate for transit.
- * @param {{preserveActiveVideo?: boolean}} options Host-only active-video preservation.
+ * @param {{preserveActiveVideo?: boolean}} options Legacy host-only native preservation flag.
  */
 window.partyFollow = (mediaId, title, position, playing, updatedAt, options = {}) => {
   const expected = () => position + (playing ? Math.max(0, Date.now() / 1000 - updatedAt) : 0);
@@ -1598,9 +1613,10 @@ window.partyFollow = (mediaId, title, position, playing, updatedAt, options = {}
   // video: load into Plyr modal, mirror play/pause/seek on the <video> element
   if (isVideoId(mediaId)) {
     const video = plyr.media;
-    // A host's first state echoes their local load; Plyr may use a source child.
+    // A host's first state echoes their local load, even after a local close.
+    // Visibility is UI state; the matching native owner retains close/seek authority.
     if (options.preserveActiveVideo && priorPlaybackKind === 'video'
-      && $('#video-modal').classList.contains('on') && hasNativeStream(video, mediaId)) {
+      && hasNativeStream(video, mediaId)) {
       partyFollowId = mediaId;
       return;
     }
@@ -1626,6 +1642,15 @@ window.partyFollow = (mediaId, title, position, playing, updatedAt, options = {}
     };
     if (video.readyState >= 1) onMeta();
     else video.addEventListener('loadedmetadata', onMeta, { once: true });
+    return;
+  }
+  // The host's first load echo carries zero, before local resume or metadata may
+  // finish. Preserve the pending local intent as well as an already loaded stream.
+  const pendingLocalAudio = localAudioLoad?.id === mediaId
+    && localAudioLoad.generation === nativeLoadGeneration && localAudioLoad.pendingResume;
+  if (options.preserveActiveVideo && priorPlaybackKind === 'audio'
+    && (pendingLocalAudio || hasNativeStream(pbAudio, mediaId))) {
+    partyFollowId = mediaId;
     return;
   }
   const generation = ++nativeLoadGeneration;

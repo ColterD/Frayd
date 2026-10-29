@@ -727,7 +727,7 @@ for (const [name, src, child, currentSrc, preserve] of [
 }
 
 for (const useHostHandler of [false, true]) {
-  for (const inactiveState of ['audio', 'closed video', 'audio with video modal open']) {
+  for (const inactiveState of ['audio', 'audio with video modal open']) {
     test(`${useHostHandler ? 'host state handler' : 'direct follow'} reactivates a retained video from ${inactiveState}`, async () => {
       const b = browser();
       b.respond(async () => ({ ok: true, json: async () => ({ position: 203 }) }));
@@ -751,7 +751,6 @@ for (const useHostHandler of [false, true]) {
         : b.run(`partyFollow(${id}, "Fixture", 0, true, Date.now()/1000, { preserveActiveVideo: true })`);
       follow(10);
       await settle();
-      if (inactiveState === 'closed video') b.run('partyPlaybackKind = "video"');
       if (inactiveState === 'audio with video modal open') b.nodes.get('#video-modal').classList.add('on');
       assert.equal(b.nodes.get('#pb-audio').paused, false);
       follow(9);
@@ -1816,3 +1815,95 @@ test('toolbar scan never overlaps pending status or completion refresh requests'
   await pending;
   assert.equal(b.intervals.size, 0);
 });
+
+for (const phase of ['resume', 'metadata', 'playing']) {
+  test(`host audio first echo preserves local ${phase} ownership`, async () => {
+    const b = browser();
+    b.run('LIBRARY=[{id:23,kind:"music",title:"Local audio"}]');
+    let release;
+    b.respond(url => url.startsWith('/api/progress/23?')
+      ? new Promise(resolve => { release = () => resolve({ok:true,json:async()=>({position:64})}); })
+      : Promise.resolve({ok:true,json:async()=>null}));
+    const media = b.nodes.get('#pb-audio');
+    media.readyState = 0;
+    b.run('playAudio(LIBRARY[0])');
+    if (phase !== 'resume') { release(); await settle(); }
+    if (phase === 'playing') { media.readyState = 1; media.emit('loadedmetadata'); await settle(); media.currentTime = 41; }
+    vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), b.context);
+    b.nodes.get('#party-code-input').value = 'ABCD';
+    b.run('PartyUI.open()');
+    b.nodes.get('#pt-join').onclick();
+    b.sockets[0].onmessage({data:JSON.stringify({type:'state',is_host:true,
+      state:{media_id:23,title:'Local audio',queue:[],position:0,playing:true,updated_at:Date.now()/1000}})});
+    if (phase === 'resume') { release(); await settle(); }
+    if (phase !== 'playing') { media.readyState = 1; media.emit('loadedmetadata'); await settle(); }
+    assert.equal(media.currentTime, phase === 'playing' ? 41 : 64);
+    assert.equal(media.paused, false);
+    assert.match(media.src, /stream\/23$/);
+  });
+}
+
+test('audio host changed source and guest same source still follow the received clock', async () => {
+  for (const host of [false, true]) {
+    const b = browser();
+    b.run('LIBRARY=[{id:23,kind:"music",title:"Old"},{id:24,kind:"music",title:"New"}]; playAudio(LIBRARY[0])');
+    await settle();
+    b.nodes.get('#pb-audio').currentTime = 64;
+    b.run(`partyFollow(${host ? 24 : 23},"Follow",17,false,Date.now()/1000,{preserveActiveVideo:${host}})`);
+    assert.equal(b.nodes.get('#pb-audio').currentTime, 17);
+    assert.equal(b.nodes.get('#pb-audio').paused, true);
+    assert.match(b.nodes.get('#pb-audio').src, host ? /stream\/24$/ : /stream\/23$/);
+  }
+});
+
+for (const kind of ['audio', 'video']) {
+  for (const scenario of ['own closed echo', 'guest closed follow', 'host changed media', 'host inactive owner']) {
+    test(`${kind} first party state after local close: ${scenario}`, async () => {
+      const b = browser();
+      const entry = kind === 'audio' ? 'playAudio' : 'openVideo';
+      const other = kind === 'audio' ? 'openVideo' : 'playAudio';
+      const mediaKind = kind === 'audio' ? 'music' : 'movie';
+      b.respond(async () => ({ok:true,json:async()=>({position:64})}));
+      b.run(`LIBRARY=[{id:9,kind:"${mediaKind}",title:"Local"},
+        {id:10,kind:"${mediaKind}",title:"Changed"},
+        {id:11,kind:"${kind === 'audio' ? 'movie' : 'music'}",title:"Other owner"}];
+        ${entry}(LIBRARY[0])`);
+      await settle();
+      const media = b.run(kind === 'audio' ? 'pbAudio' : 'plyr.media');
+      if (kind === 'video') b.run('plyr.duration=120;plyr.emit("loadedmetadata")');
+      media.duration = 120;
+      media.currentTime = 41;
+      b.nodes.get(kind === 'audio' ? '#pb-close' : '#vm-back').onclick();
+      await settle();
+      assert.equal(media.paused, true, 'local close pauses the native player');
+      const panel = b.nodes.get(kind === 'audio' ? '#playerbar' : '#video-modal');
+      assert.equal(panel.classList.contains('on'), false);
+      if (scenario === 'host inactive owner') {
+        b.run(`${other}(LIBRARY[2])`);
+        await settle();
+        if (kind === 'audio') b.run('plyr.duration=120;plyr.emit("loadedmetadata")');
+      }
+      vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), b.context);
+      b.nodes.get('#party-code-input').value = 'ABCD';
+      b.run('PartyUI.open()');
+      b.nodes.get('#pt-join').onclick();
+      const isHost = scenario !== 'guest closed follow';
+      const id = scenario === 'host changed media' ? 10 : 9;
+      b.sockets[0].onmessage({data:JSON.stringify({type:'state',is_host:isHost,
+        state:{media_id:id,title:'First load echo',queue:[],position:isHost ? 0 : 24,
+          playing:true,updated_at:Date.now()/1000}})});
+      await settle();
+      if (scenario === 'own closed echo') {
+        assert.equal(panel.classList.contains('on'), false, 'late own echo cannot reopen locally closed UI');
+        assert.equal(media.paused, true, 'late own echo cannot restart locally closed playback');
+        assert.equal(media.currentTime, 41, 'late own echo cannot reset close position');
+      } else {
+        assert.equal(panel.classList.contains('on'), true, 'authoritative follow activates target UI');
+        assert.equal(media.paused, false, 'authoritative follow plays the target');
+        assert.ok(media.currentTime >= (isHost ? 0 : 24) && media.currentTime < (isHost ? 2 : 26));
+        assert.equal(b.run(`hasNativeStream(${kind === 'audio' ? 'pbAudio' : 'plyr.media'},${id})`), true);
+        assert.equal(b.run('partyPlaybackKind'), kind);
+      }
+    });
+  }
+}

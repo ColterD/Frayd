@@ -7,7 +7,27 @@ It does not authorize deployment or qualify arbitrary media, browsers or public 
 
 ## Upstream and native integration boundary
 
-The working integration combines upstream v0.1.1 (`fe320ba`, through fork main `62dc`) with the fork corrections and experimental [native bundle](native-bundle.md). Current commands, measured counts and source hashes belong to the [PR description](https://github.com/ColterD/Frayd/pull/2), since concurrent integration changes can invalidate a working-tree receipt. The multi-root/settings, unavailable-root, queued-ingestion and administrator-deletion checks are HTTP/storage proof; they do not establish interactive browser acceptance. Client checks include six actual decoded-video controls alongside synthetic cases. Final commit/image qualification and actual macOS execution remain held until their gates pass; Linux results do not transfer to either Mac architecture.
+The working integration combines upstream v0.1.1 (`fe320ba`, through fork main `62dc`) with the fork corrections and experimental [native bundle](native-bundle.md). Current commands, measured counts and source hashes belong to the [PR description](https://github.com/ColterD/Frayd/pull/2), since concurrent integration changes can invalidate a working-tree receipt. The multi-root/settings, unavailable-root, queued-ingestion and administrator-deletion checks are HTTP/storage proof; they do not establish interactive browser acceptance. Client checks include six actual decoded-video controls alongside synthetic cases. Later working-tree changes require a new committed image and platform qualification; Linux results do not transfer to either Mac architecture.
+
+## Post-591 native audio fixture checkpoint
+
+The [browser regression](../../tests/browser-regression.cjs) uses actual decoded
+native audio and modeled party state. A focused working-tree run before the final
+host-close guard adjustment passed 49/49 Chrome for Testing cases with cleanup.
+After a trusted visible browser gesture,
+the native audio player retained approximately 64.044 seconds on host resume,
+64.042 after metadata and 41.043 after a later seek; the production host state
+handler produced no extra seek. The corresponding Settings close/reopen and
+successor-monitor controls pass in the later 230-test Node suite. Those Settings API
+responses are modeled, and the browser run does not prove live scan ingestion.
+
+Earlier attempts failed because autoplay blocked playback and the test's audio
+target was hidden. The fixture corrected those prerequisites before recording
+the trusted-input pass; those attempts do not establish a product defect.
+The final host-close adjustment corrects a VM baseline with two failures and
+six passing controls; the combined 230-test Node suite passes. It has no new real-browser execution in
+this checkpoint. Physical audio, owner browser/session, distinct live clients,
+a fresh image and hosted acceptance for the combined changes remain unqualified.
 
 ## Historical review follow-up
 

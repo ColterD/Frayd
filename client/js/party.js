@@ -6,6 +6,7 @@ const PartyUI = (() => {
   const YT_RE = /(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/)|youtu\.be\/)([\w-]{11})/;
   let ws = null;
   let isHost = false;
+  let selfLabel = null;
   let state = null;
   let partyCode = null;
   let pendingStart = null;
@@ -24,7 +25,7 @@ const PartyUI = (() => {
   /** Retire the socket identity, role, requests and loaded-media markers before stale callbacks run. */
   function resetSession() {
     pendingStart = null;
-    ws = null; partyCode = null; isHost = false; state = null; pending = []; members = [];
+    ws = null; partyCode = null; isHost = false; selfLabel = null; state = null; pending = []; members = [];
     hostLoadedMedia = null; hostLoadedExt = null;
     window.partySend = null;
   }
@@ -129,6 +130,7 @@ const PartyUI = (() => {
   function handle(msg) {
     if (msg.type === 'state') {
       if (typeof msg.is_host === 'boolean') isHost = msg.is_host;
+      if (typeof msg.self_label === 'string') selfLabel = msg.self_label;
       state = msg.state;
       if (isHost) { hookHost(); followMediaChangeOnly(); } else followState();
       render();
@@ -242,12 +244,11 @@ const PartyUI = (() => {
    * @returns {string}
    */
   function membersHtml() {
-    const me = identity();
-    const list = isHost ? [me + ' (host)', ...members.filter(m => !m.endsWith('(host)'))] : members;
+    const list = members;
     if (!list.length) return '';
     return `<div class="party-sec">Members · ${list.length}</div><ul class="party-queue">` +
       list.map(m => {
-        const isMe = m === me || (isHost && m === me + ' (host)');
+        const isMe = selfLabel !== null && (m === selfLabel || (isHost && m === selfLabel + ' (host)'));
         return `<li class="${isMe ? 'me' : ''}">${esc(m)}${isMe ? ' <span class="s">(you)</span>' : ''}</li>`;
       }).join('') + '</ul>';
   }

@@ -23,10 +23,12 @@ struct Session {
     host_capability: Option<uuid::Uuid>,
     state: PlaybackState,
     members: Vec<Member>,
+    guest_ordinal: u64,
 }
 
 struct Member {
     key: String,
+    public_label: String,
     socket: Arc<()>,
     tx: Tx,
 }
@@ -41,6 +43,7 @@ struct Connection {
     admission: Admission,
     key: String,
     is_host: bool,
+    public_label: String,
     socket: Arc<()>,
 }
 
@@ -127,19 +130,28 @@ impl Party {
     fn register(&self, admission: Admission, key: String, tx: Tx) -> Option<Connection> {
         let mut session = self.session.lock().unwrap();
         let is_host = session.role(&admission, &key)?;
+        // Labels are display-only and never participate in role or ownership checks.
+        let public_label = if is_host {
+            "Host".to_string()
+        } else {
+            session.guest_ordinal = session.guest_ordinal.checked_add(1)?;
+            format!("Guest {}", session.guest_ordinal)
+        };
         let connection = Connection {
             admission,
             is_host,
+            public_label,
             key,
             socket: Arc::new(()),
         };
         // Only proven hosts or retired guests can be replaced; older callbacks lose authority.
         session.members.retain(|m| m.key != connection.key);
         session.members.push(Member {
-            key: connection.key.clone(), socket: connection.socket.clone(), tx: tx.clone(),
+            key: connection.key.clone(), public_label: connection.public_label.clone(), socket: connection.socket.clone(), tx: tx.clone(),
         });
         let _ = tx.send(Message::Text(serde_json::json!({
             "type": "state", "state": session.state, "is_host": connection.is_host,
+            "self_label": connection.public_label,
         }).to_string()));
         session.broadcast_members();
         Some(connection)
@@ -158,7 +170,7 @@ impl Party {
         } else if value["type"] == "request" {
             session.broadcast(&serde_json::json!({
                 "type": "request", "media_id": value["media_id"],
-                "by": connection.key, "title": value["title"],
+                "by": connection.public_label, "title": value["title"],
             }));
         }
     }
@@ -215,11 +227,26 @@ impl Session {
         }
     }
 
-    /// Derives names from current sockets, avoiding a second guest registry to retire.
+    /// Public labels are independent of the canonical keys used for authorization.
     fn broadcast_members(&self) {
-        let mut names = vec![format!("{} (host)", self.host.as_deref().unwrap_or("host"))];
-        names.extend(self.members.iter().filter(|m| Some(&m.key) != self.host.as_ref()).map(|m| m.key.clone()));
+        let mut names = vec!["Host (host)".to_string()];
+        names.extend(self.members.iter().filter(|m| Some(&m.key) != self.host.as_ref()).map(|m| m.public_label.clone()));
         self.broadcast(&serde_json::json!({"type": "members", "members": names}));
+    }
+
+    /// Keep departed request attribution without retaining retired identity keys.
+    /// Only labels issued in this generation can be echoed into state snapshots.
+    fn approval_label<'a>(&self, value: &'a Value) -> &'a str {
+        let label = value.as_str().unwrap_or("");
+        if label == "Host" {
+            return label;
+        }
+        if let Some(ordinal) = label.strip_prefix("Guest ").and_then(|n| n.parse::<u64>().ok()) {
+            if ordinal > 0 && ordinal <= self.guest_ordinal && label == format!("Guest {ordinal}") {
+                return label;
+            }
+        }
+        "Guest"
     }
 
     /// Applies a host command while preserving the existing monotonic playback timeline.
@@ -232,6 +259,7 @@ impl Session {
             return false;
         }
         let position = msg["position"].as_f64().filter(|p| p.is_finite() && *p >= 0.0);
+        let requested_by = self.approval_label(&msg["by"]);
         let st = &mut self.state;
         // Clamp out-of-order timestamps to the current timeline reference.
         let timestamp = timestamp.max(st.updated_at);
@@ -270,7 +298,7 @@ impl Session {
                         media_id: msg["media_id"].as_i64(),
                         external_url: msg["external_url"].as_str().map(String::from),
                         title: title.to_string(),
-                        requested_by: msg["by"].as_str().unwrap_or("guest").to_string(),
+                        requested_by: requested_by.to_string(),
                     });
                 }
             }
@@ -496,6 +524,88 @@ mod tests {
     }
 
     #[test]
+    fn public_labels_cover_members_requests_queue_and_late_join_without_identity_keys() {
+        let party = Party::new();
+        let private_keys = ["fixture-host-key@example.invalid", "fixture-guest-key@example.invalid", "fixture-late-key@example.invalid"];
+        let (code, _) = party.create(private_keys[0]);
+        let (host, mut host_rx) = connect(&party, &code, private_keys[0]);
+        let (guest, mut guest_rx) = connect(&party, &code, private_keys[1]);
+        let mut outbound = drain(&mut host_rx);
+        assert!(outbound.iter().any(|v| v["self_label"] == "Host"));
+        let initial = drain(&mut guest_rx);
+        assert!(initial.iter().any(|v| v["self_label"] == "Guest 1"));
+        assert!(initial.iter().any(|v| v["members"] == json!(["Host (host)", "Guest 1"])));
+        outbound.extend(initial);
+        party.receive(&guest, &json!({"type":"request", "media_id":2, "title":"Next", "by": private_keys[0]}));
+        for rx in [&mut host_rx, &mut guest_rx] {
+            let messages = drain(rx);
+            assert!(messages.iter().any(|v| v["type"] == "request" && v["by"] == "Guest 1"));
+            outbound.extend(messages);
+        }
+        party.disconnect(&guest);
+        party.receive(&host, &json!({"type":"approve", "media_id":2, "title":"Next", "by":"Guest 1"}));
+        outbound.extend(drain(&mut host_rx));
+        let (_late, mut late_rx) = connect(&party, &code, private_keys[2]);
+        let initial = drain(&mut late_rx);
+        assert!(initial.iter().any(|v| v["self_label"] == "Guest 2" && v["state"]["queue"][0]["requested_by"] == "Guest 1"));
+        outbound.extend(initial);
+        outbound.extend(drain(&mut host_rx));
+        let serialized = serde_json::to_string(&outbound).unwrap();
+        for key in private_keys {
+            assert!(!serialized.contains(key), "outbound protocol exposed a canonical identity");
+        }
+    }
+
+    #[test]
+    fn approval_attribution_accepts_only_canonical_issued_display_labels() {
+        let party = Party::new();
+        let (code, _) = party.create("fixture-host-key@example.invalid");
+        let (host, mut host_rx) = connect(&party, &code, "fixture-host-key@example.invalid");
+        let (guest, _guest_rx) = connect(&party, &code, "fixture-guest-key@example.invalid");
+        party.disconnect(&guest);
+        for by in [json!("Host"), json!("Guest 1"), json!("Guest 0"), json!("Guest 2"),
+            json!("Guest 01"), json!("Guest +1"), json!("Guest 1 "), json!("guest 1"),
+            json!("fixture-guest-key@example.invalid"), json!("fixture-host-key@example.invalid"),
+            json!("Guest 18446744073709551616"), json!(1), Value::Null] {
+            party.receive(&host, &json!({"type":"approve", "title":"Next", "by":by}));
+        }
+        let messages = drain(&mut host_rx);
+        let queue = messages.last().unwrap()["state"]["queue"].as_array().unwrap();
+        assert_eq!(queue.len(), 13);
+        assert!(queue[0]["requested_by"] == "Host");
+        assert!(queue[1]["requested_by"] == "Guest 1");
+        assert!(queue[2..].iter().all(|item| item["requested_by"] == "Guest"));
+    }
+
+    #[test]
+    fn labels_follow_registration_lifecycle_without_changing_private_authority() {
+        let party = Party::new();
+        let (code, _) = party.create("private-host");
+        let (old_host, mut old_host_rx) = connect(&party, &code, "private-host");
+        let (_old_guest, old_guest_rx) = connect(&party, &code, "private-guest");
+        drop(old_guest_rx);
+        let (_guest, mut guest_rx) = connect(&party, &code, "private-guest");
+        assert!(drain(&mut guest_rx).iter().any(|v| v["self_label"] == "Guest 2"));
+        let (host, mut host_rx) = connect(&party, &code, "private-host");
+        assert!(drain(&mut host_rx).iter().any(|v| v["self_label"] == "Host"));
+        party.disconnect(&old_host);
+        assert!(party.session.lock().unwrap().contains(&host));
+        for label in ["Host", "Guest 1", "Guest 2"] {
+            let admission = party.authorize(&code, None).unwrap();
+            assert!(party.can_register(&admission, label));
+        }
+        party.disconnect(&host);
+        assert!(drain(&mut guest_rx).iter().any(|v| v["type"] == "ended"));
+        drain(&mut old_host_rx);
+        let (next_code, _) = party.create("private-host");
+        let (_next, mut next_rx) = connect(&party, &next_code, "private-guest");
+        assert!(drain(&mut next_rx).iter().any(|v| v["self_label"] == "Guest 1"));
+        let (replacement_code, _) = party.create("private-host");
+        let (_replacement, mut replacement_rx) = connect(&party, &replacement_code, "private-guest");
+        assert!(drain(&mut replacement_rx).iter().any(|v| v["self_label"] == "Guest 1"));
+    }
+
+    #[test]
     fn replacement_rejects_stale_registration_even_when_code_and_host_are_reused() {
         let party = Party::new();
         let (code, _) = party.create("host");
@@ -680,7 +790,7 @@ mod tests {
         assert!(drain(&mut victim_rx).iter().any(|v| v["state"]["title"] == "current host"));
         party.receive(&victim, &json!({"type":"request", "title":"original victim"}));
         for rx in [&mut host_rx, &mut observer_rx] {
-            assert!(drain(rx).iter().any(|v| v["type"] == "request" && v["by"] == "victim" && v["title"] == "original victim"));
+            assert!(drain(rx).iter().any(|v| v["type"] == "request" && v["by"] == "Guest 1" && v["title"] == "original victim"));
         }
     }
 

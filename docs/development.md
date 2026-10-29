@@ -55,6 +55,15 @@ python3 tests/test_dns_recovery.py
 python3 scripts/audit-dependencies.py
 ```
 
+The pinned Debian stages in the [Dockerfile](../Dockerfile) bound package update
+to 180 seconds and install to 360 seconds, each with a ten-second kill grace.
+APT uses 30-second HTTP/HTTPS transport timeouts, two retries and strict update
+errors. The [offline package controls](../tests/test_build_packages.py) exercise
+bounded stall and partial-index behavior during Python test discovery. These
+bounds make package acquisition fail within a known limit; they do not guarantee
+network recovery. Source-bound PR job outcomes remain in the
+[verification ledger](verification/coderabbit-follow-up.md) and PR description.
+
 The [Dockerfile](../Dockerfile) runs locked Rust tests, Clippy and the release build. [Checks CI](../.github/workflows/checks.yml) runs client syntax/tests, real browser DOM regressions, locked Python lint, Compose validation, both image builds, context/integration and controlled DNS-failure checks, Python tests and the live dependency audit. Linux CI also exports both native binaries and actual compiler metadata from the Docker build and runs the native ownership/runtime suite with `FRAYD_NATIVE_REQUIRE_QUALIFICATION=1`; missing inputs fail instead of silently skipping. Default Python discovery in the dependency-audit job still checks packaging/static policy and explicitly skips helper or actual-server scenarios when their inputs are absent. See [native reproducible checks](verification/native-bundle.md#reproducible-checks) for the required inputs. Native Cargo commands, `git diff --check` and the standalone nginx configuration probe are additional local checks; the workflow does not invoke them separately. [CodeQL](../.github/workflows/codeql.yml) provides separate source/workflow analysis. Remote reviews, coverage and check conclusions must be read for the actual PR head; this guide does not reproduce their hosted results.
 
 The manual [macOS qualification workflow](../.github/workflows/release-mac.yml) uses standard `macos-15` ARM64 and `macos-15-intel` Intel runners, each bounded to 35 minutes. It checks actual architecture and executes each platform's native lifecycle suite. It has no tag trigger, publication or artifact upload, and introduces no new action. The proposed upload action remains rejected pending a qualified dependency check. Actual Mac execution is held until the coordinator accepts the final source and local gates; workflow configuration is not a Mac pass. Keep final source/image and architecture results in the [PR description](https://github.com/ColterD/Frayd/pull/2).
@@ -116,6 +125,12 @@ registration requires that proof plus the creator identity in the current
 session generation. The client offers `frayd-party` and `frayd-host.<proof>` as
 WebSocket protocols; the server selects only `frayd-party`. Do not put the proof
 in URLs, storage, public messages or logs. Ordinary guest joins carry no proof.
+
+Party messages show public `Host` and `Guest N` display labels and carry a
+separate `self_label` for the current client's UI. Canonical membership and
+authorization identity remains separate from those labels. Refresh open tabs
+after upgrading both client and server; mixed-version compatibility is not
+qualified by the focused label tests.
 
 Preflight and post-upgrade registration share the same role predicate before
 membership changes. Tests cover first-slot and connected-host impersonation,

@@ -348,3 +348,50 @@ for (const malformed of [undefined, '', 'invalid']) {
     assert.match(p.nodes.get('#party-stage').innerHTML, /Could not start party/);
   });
 }
+
+
+test('server display label marks self without rendering the stored identity, and stale labels retire', () => {
+  const p = panel();
+  const old = p.joinParty('ABCD', true);
+  const snapshot = (socket, label, host = false) => socket.onmessage({ data: JSON.stringify({
+    type: 'state', is_host: host, self_label: label,
+    state: { title: 'Song', queue: [] },
+  }) });
+  const members = socket => socket.onmessage({ data: JSON.stringify({ type: 'members', members: ['Host (host)', 'Guest 1', 'Guest 2'] }) });
+  snapshot(old, 'Host', true);
+  members(old);
+  assert.match(p.nodes.get('#party-stage').innerHTML, /Host \(host\) <span class="s">\(you\)/);
+  assert.equal(p.nodes.get('#party-stage').innerHTML.includes(p.context.localStorage.frayd_identity), false);
+  p.run('PartyUI.close()');
+  const current = p.joinParty('EFGH');
+  members(current);
+  assert.doesNotMatch(p.nodes.get('#party-stage').innerHTML, /\(you\)/);
+  snapshot(current, 'Guest 2');
+  members(current);
+  snapshot(old, 'Guest 1');
+  assert.match(p.nodes.get('#party-stage').innerHTML, /Guest 2 <span class="s">\(you\)/);
+  assert.doesNotMatch(p.nodes.get('#party-stage').innerHTML, /Guest 1 <span class="s">\(you\)/);
+  current.onmessage({ data: JSON.stringify({ type: 'state', state: { title: 'Broadcast', queue: [] } }) });
+  assert.match(p.nodes.get('#party-stage').innerHTML, /Guest 2 <span class="s">\(you\)/);
+  current.onmessage({ data: JSON.stringify({ type: 'ended' }) });
+  const next = p.joinParty('IJKL');
+  members(next);
+  assert.doesNotMatch(p.nodes.get('#party-stage').innerHTML, /\(you\)/);
+});
+
+for (const retire of ['Leave', 'remote close', 'ended', 'replacement']) {
+  test(`self label retires on ${retire} and old string membership still renders`, () => {
+    const p = panel();
+    const old = p.joinParty('ABCD');
+    old.onmessage({ data: JSON.stringify({ type: 'state', self_label: 'Guest 1', state: { queue: [] } }) });
+    if (retire === 'Leave') p.run('PartyUI.close()');
+    if (retire === 'remote close') old.onclose();
+    if (retire === 'ended') old.onmessage({ data: JSON.stringify({ type: 'ended' }) });
+    const current = p.joinParty('EFGH');
+    current.onmessage({ data: JSON.stringify({ type: 'members', members: ['Host (host)', 'Guest 1', 'legacy guest'] }) });
+    const html = p.nodes.get('#party-stage').innerHTML;
+    assert.match(html, /legacy guest/);
+    assert.doesNotMatch(html, /\(you\)/);
+    assert.equal(html.includes(p.context.localStorage.frayd_identity), false);
+  });
+}

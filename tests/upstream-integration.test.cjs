@@ -51,18 +51,19 @@ test('deletion invalidates pending loads and retains rows on refusal or cancel',
   assert.equal(b.run('LIBRARY.length'),0);
 });
 
-test('settings disposal cancels timer and rejects late status publication', async () => {
+test('settings account retirement cancels timer and rejects late status publication', async () => {
   const b=browser();
   let release;
-  b.respond(()=>new Promise(resolve=>{release=resolve;}));
+  b.respond(url => url === '/api/scan/status' ? new Promise(resolve=>{release=resolve;}) : Promise.resolve({ok:true,json:async()=>null}));
   b.run('settingsGeneration=1; pollSettings(1, "scan", {textContent:"waiting",disabled:true})');
   const poll=[...b.intervals.values()][0];
   const pending=poll();
-  b.run('disposeSettings()');
+  b.context.location.reload = () => {};
+  b.nodes.get('#logout').emit('click');
   release({ok:true,json:async()=>({scanning:false})});
   await pending;
   assert.equal(b.intervals.size,0);
-  assert.equal(b.requests.length,1);
+  assert.equal(b.requests.filter(request => request.url === "/api/library").length,0);
 });
 
 test('settings scan refusal reports failure without refreshing the library', async () => {
@@ -245,3 +246,59 @@ test('continue row derives audiobook portrait while retaining playable music/vid
   assert.equal(cards.length,3);
   for(const card of cards) assert.equal(card.className,card.title==='audiobook'?'media-card portrait':'media-card landscape',card.title);
 });
+
+for (const closeBeforeAdmission of [false, true]) {
+  test(`admitted settings scan refresh survives close and reopen (beforeAdmission=${closeBeforeAdmission})`, async () => {
+    const b = browser();
+    b.context.button = { textContent: '', disabled: false };
+    let release;
+    b.respond(url => url === '/api/scan' ? new Promise(resolve => { release = resolve; })
+      : Promise.resolve({ ok: true, json: async () => url === '/api/scan/status' ? { scanning: false } : [] }));
+    const admission = b.run('startSettingsScan(settingsGeneration, button)');
+    if (closeBeforeAdmission) b.run('disposeSettings()');
+    release({ status: 202 });
+    await admission;
+    if (!closeBeforeAdmission) b.run('disposeSettings()');
+    await b.run('openSettings()');
+    assert.equal(b.intervals.size, 1, 'one account-owned completion observer survives');
+    await [...b.intervals.values()][0]();
+    assert.equal(b.requests.filter(request => request.url === '/api/library').length, 1);
+    assert.equal(b.context.button.disabled, true, 'retired button is untouched');
+    assert.equal(b.intervals.size, 0);
+  });
+}
+
+test('retired settings status cannot clear a replacement monitor', async () => {
+  const b = browser();
+  let release;
+  b.respond(url => url === '/api/scan/status' ? new Promise(resolve => { release = resolve; }) : Promise.resolve({ok:true,json:async()=>[]}));
+  b.run('pollSettings(settingsGeneration,"scan",{})');
+  const old = [...b.intervals.values()][0]();
+  b.run('pollSettings(settingsGeneration,"scan",{})');
+  const replacement = b.run('settingsPoll');
+  release({ok:true,json:async()=>({scanning:false})});
+  await old;
+  assert.equal(b.intervals.has(replacement), true);
+  assert.equal(b.run('settingsPoll'), replacement);
+});
+
+for (const phase of ['admission', 'status']) {
+  test(`account switch rejects old settings scan ${phase} and stops monitoring`, async () => {
+    const b = browser();
+    let release;
+    b.context.button = {textContent:'',disabled:false};
+    b.respond(url => url === (phase === 'admission' ? '/api/scan' : '/api/scan/status')
+      ? new Promise(resolve => { release = resolve; })
+      : Promise.resolve({status:202,ok:true,json:async()=>[]}));
+    const admission = b.run('startSettingsScan(settingsGeneration, button)');
+    let pending;
+    if (phase === 'status') { await admission; pending = [...b.intervals.values()][0](); }
+    b.run('IDENTITY="new-account";enterApp()');
+    b.requests.length = 0;
+    release({status:202,ok:true,json:async()=>({scanning:false})});
+    await (pending || admission);
+    assert.equal(b.intervals.size, 0);
+    assert.equal(b.requests.filter(request => request.url === '/api/library').length, 0);
+    assert.notEqual(b.context.button.textContent, 'Scan complete');
+  });
+}

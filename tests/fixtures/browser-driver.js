@@ -1135,8 +1135,106 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
   mediaPrototype.play = originalPlay;
   mediaPrototype.pause = originalPause;
   Object.defineProperty(mediaPrototype, 'paused', originalPaused);
-  await run('native decoded movie resume after production party end',
-    () => nativeResume('after prior party lifecycle', true));
+  await run('native decoded movie resume after production party end', async () => {
+    const video = await nativeResume('after prior party lifecycle', true);
+    // Retire the reader fixture overlay before targeting visible native audio controls.
+    document.getElementById('em-close').click();
+    const originalFetch = window.fetch;
+    const audioEchoes = [];
+    const audioMuted = pbAudio.muted;
+    const priorLibrary = LIBRARY;
+    const priorFollowId = partyFollowId;
+    const app = document.getElementById('app');
+    const login = document.getElementById('login');
+    const priorAppVisible = app.classList.contains('on');
+    const priorBodyAuth = document.body.classList.contains('auth');
+    const priorLoginStyle = login.getAttribute('style');
+    const fixtureWebSocket = socket.constructor;
+    window.WebSocket = fixtureWebSocket;
+    const metadata = [];
+    const observe = event => metadata.push({trusted:event.isTrusted, time:pbAudio.currentTime});
+    pbAudio.addEventListener('loadedmetadata', observe);
+    try {
+      // This case precedes the modeled sign-in setup used by the later DOM cases.
+      // Expose the production player shell before sending trusted browser input.
+      app.classList.add('on');
+      document.body.classList.remove('auth');
+      login.style.display = 'none';
+      for (const phase of ['resume', 'metadata', 'playing']) {
+        PartyUI.close();
+        document.getElementById('pb-close').click();
+        pbAudio.removeAttribute('src'); pbAudio.load();
+        await until(() => pbAudio.readyState === 0, 'native audio reset');
+        let releaseResume;
+        window.fetch = (url, options) => String(url).startsWith('/api/progress/23?')
+          ? new Promise(resolve => { releaseResume = () => resolve(new Response(JSON.stringify({position:64}),
+            {status:200,headers:{'Content-Type':'application/json'}})); }) : originalFetch(url, options);
+        LIBRARY = [{id:23,kind:'music',title:'Native host audio'}];
+        await api('hold-media', {path:'/api/stream/23'});
+        playAudio(LIBRARY[0]);
+        await until(() => releaseResume, 'typed progress response held');
+        const title = document.getElementById('pb-title');
+        let trustedGesture = false;
+        const observeGesture = event => { trustedGesture = event.isTrusted && event.target === title; };
+        title.addEventListener('click', observeGesture);
+        let gesture;
+        try {
+          const rect = title.getBoundingClientRect();
+          const point = {x:rect.left + rect.width/2, y:rect.top + rect.height/2};
+          const hit = document.elementFromPoint(point.x, point.y);
+          check(rect.width > 0 && rect.height > 0 && hit === title,
+            `Visible audio title receives the owned browser gesture: ${JSON.stringify({point, hit:hit?.id || hit?.tagName})}`);
+          gesture = await api('click', point);
+          check(trustedGesture && gesture.trustedBrowserInput && navigator.userActivation.hasBeenActive,
+            'Trusted document gesture precedes progress response release');
+        } finally { title.removeEventListener('click', observeGesture); }
+        if (phase !== 'resume') {
+          releaseResume();
+          await until(async () => (await api('media-gate')).pending > 0, 'native PCM metadata bytes held');
+        }
+        if (phase === 'playing') {
+          await api('release-media', {});
+          await until(() => pbAudio.readyState >= 2 && !pbAudio.paused && pbAudio.currentTime >= 64, 'native audio resumes64');
+          pbAudio.currentTime = 41;
+          await until(() => !pbAudio.seeking && pbAudio.currentTime >= 41, 'native user seek41');
+        }
+        PartyUI.open();
+        document.getElementById('party-code-input').value = 'ABCD';
+        document.getElementById('pt-join').click();
+        socket.onmessage({data:JSON.stringify({type:'state',is_host:true,
+          state:{media_id:23,title:'Own host echo',queue:[],position:0,playing:true,updated_at:Date.now()/1000}})});
+        if (phase === 'resume') {
+          releaseResume();
+          await until(async () => (await api('media-gate')).pending > 0, 'resume PCM bytes held');
+        }
+        if (phase !== 'playing') await api('release-media', {});
+        const expected = phase === 'playing' ? 41 : 64;
+        await until(() => pbAudio.readyState >= 2 && !pbAudio.paused && pbAudio.currentTime >= expected, 'host echo retains native position');
+        check(pbAudio.currentTime < expected + 3, 'Zero echo preserves local resume or seek');
+        const before = pbAudio.currentTime;
+        await until(() => pbAudio.currentTime > before + 0.03, 'actual PCM playback advances');
+        audioEchoes.push({phase, expected, actual:pbAudio.currentTime, readyState:pbAudio.readyState,
+          paused:pbAudio.paused, trustedGesture, gesture, hostStateHandler:true, source:pbAudio.currentSrc,
+          duration:pbAudio.duration, muted:pbAudio.muted});
+      }
+      check(metadata.length === 3 && metadata.every(event => event.trusted), 'All audio phases use actual trusted native metadata');
+      return {...video, audioEchoes, audioMetadata:metadata, typedResponse:true, productionHostStateHandler:true};
+    } finally {
+      window.fetch = originalFetch;
+      await api('release-media', {});
+      pbAudio.removeEventListener('loadedmetadata', observe);
+      PartyUI.close();
+      document.getElementById('pb-close').click();
+      pbAudio.muted = audioMuted;
+      window.WebSocket = originalWebSocket;
+      LIBRARY = priorLibrary;
+      partyFollowId = priorFollowId;
+      app.classList.toggle('on', priorAppVisible);
+      document.body.classList.toggle('auth', priorBodyAuth);
+      if (priorLoginStyle === null) login.removeAttribute('style');
+      else login.setAttribute('style', priorLoginStyle);
+    }
+  });
   // Actual DOM and trusted browser keyboard, with explicitly modeled API responses.
   const qaFetch = window.fetch;
   const qaAccount = account;
@@ -1304,7 +1402,11 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       check(status === 202 ? button.textContent === 'Scanning…' : status === 409 ? button.textContent.includes('already running') : status === 501 ? button.textContent.includes('No library folder') : status === 500 ? button.textContent.includes('500') : button.textContent.includes('unreachable'), 'Truthful status feedback');
       observations.push({ status, text: button.textContent, disabled: button.disabled });
       document.getElementById('settings-close').click();
-      equal(settingsPoll, null, 'Closing clears accepted scan poll');
+      if (status === 202) {
+        check(settingsPoll !== null, 'Closing retains account-owned scan completion');
+        await until(() => settingsPoll === null, 'closed scan completes and retires observer');
+        equal(button.textContent, 'Scanning…', 'Retired scan control is untouched');
+      } else equal(settingsPoll, null, 'Refused scan has no observer');
     }
     for (const status of [409, 'network']) {
       responder = defaultResponder; await openSettings();
@@ -1357,7 +1459,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     const libraryReads = requests.filter(r => r.url === '/api/library').length;
     release(reply({ scanning: false, ingesting: 'done' })); await delay(30);
     equal(document.getElementById('settings-stage').innerHTML, stageHTML, 'Old generation cannot repaint reopened settings');
-    equal(requests.filter(r => r.url === '/api/library').length, libraryReads, 'Late status cannot refresh library');
+    equal(requests.filter(r => r.url === '/api/library').length, libraryReads + 1, 'Admitted scan refresh survives panel retirement');
     equal(settingsPoll, null, 'No surviving settings poll');
     document.getElementById('settings-close').click();
     let releaseSettings;
@@ -1381,7 +1483,22 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     releaseSave(reply(null, 204)); await delay(20);
     check(oldSaveButton.textContent !== 'Saved' && document.getElementById('s-site-save').textContent === 'Save', 'Retired save cannot publish success');
     document.getElementById('settings-close').click();
-    return { states, lateStatusIgnored: true, lateSettingsLoadIgnored: true, lateSaveIgnored: true, modeledAPI: true, pollingUsesRealTimers: true };
+    // A late old callback must not retire a newer account-owned observer.
+    await openSettings();
+    let releaseOld;
+    responder = async (url, options) => url === '/api/scan/status'
+      ? new Promise(resolve => { releaseOld = resolve; }) : defaultResponder(url, options);
+    pollSettings(settingsGeneration, 'scan', document.querySelector('.p-scan'));
+    await until(() => releaseOld, 'old observer status pending');
+    pollSettings(settingsGeneration, 'scan', document.querySelector('.p-scan'));
+    const replacement = settingsPoll;
+    responder = defaultResponder;
+    releaseOld(reply({scanning:false})); await delay(20);
+    equal(settingsPoll, replacement, 'Old callback cannot clear replacement observer');
+    await until(() => settingsPoll === null, 'replacement observer completes');
+    document.getElementById('settings-close').click();
+    return { states, retiredPanelUntouched: true, scanRefreshAfterClose: true, replacementObserverPreserved: true,
+      lateSettingsLoadIgnored: true, lateSaveIgnored: true, modeledAPI: true, pollingUsesRealTimers: true };
   });
   await run('late library and progress responses cannot resurrect deleted DOM or filter sort', async () => {
     const other = { ...movie, id: 10, title: 'Remaining movie', created_at: 2 };
