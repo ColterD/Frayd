@@ -1636,6 +1636,8 @@ window.partyFollow = (mediaId, title, position, playing, updatedAt, options = {}
       partyFollowId = mediaId;
       return;
     }
+    // Party takeover retires the local load; its pending gate cannot suppress host play.
+    videoLoadPending = false;
     const generation = ++nativeLoadGeneration;
     const changed = !hasNativeStream(video, mediaId);
     const item = LIBRARY.find(entry => entry.id === mediaId);

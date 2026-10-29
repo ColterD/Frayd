@@ -2002,5 +2002,67 @@ test('metadata-ready audio publishes its resumed host load once before play', as
   assert.deepEqual(socket.sent[0], { type: 'load', media_id: 10, title: 'Next', position: 64 });
   assert.ok(socket.sent.slice(1).every(command => command.type !== 'load' && command.position === 64));
   b.nodes.get('#pb-audio').emit('loadedmetadata');
+  await settle();
   assert.equal(socket.sent.filter(command => command.type === 'load').length, 1);
+});
+
+for (const mediaId of [10, 11]) {
+  for (const playing of [false, true]) {
+    test(`party video ${mediaId === 10 ? 'same stream' : 'changed stream'} takeover retires pending local load before ${playing ? 'autoplay' : 'host Play'}`, async () => {
+      const { b, socket } = await hostedNativeBrowser('video');
+      youtubePlayerFixture(b);
+      b.run('LIBRARY.push({id:11,kind:"movie",title:"Takeover"})');
+      b.respond(async () => ({ ok: true, json: async () => ({ position: 64 }) }));
+      b.run('openVideo(LIBRARY[1])');
+      await settle();
+      const media = b.run('plyr.media');
+      assert.equal(b.run('videoLoadPending'), true);
+      const state = (value) => socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: true,
+        state: { title: 'Party takeover', queue: [], position: 0, playing: false, updated_at: Date.now()/1000, ...value } }) });
+      state({ media_id: null, external_url: 'abcdefghijk' });
+      await settle();
+      assert.equal(b.run('partyPlaybackKind'), 'external');
+      assert.equal(media.paused, true);
+      socket.sent.length = 0;
+      state({ media_id: mediaId, playing });
+      await settle();
+      assert.equal(b.run('partyPlaybackKind'), 'video');
+      assert.equal(b.run(`hasNativeStream(plyr.media, ${mediaId})`), true);
+      if (!playing) b.nodes.get('#pt-play').onclick();
+      await settle();
+      assert.equal(media.paused, false);
+      assert.deepEqual(socket.sent.filter(command => command.type === 'play'), [{ type: 'play', position: 0 }],
+        'The current party-owned video must publish its native play event');
+      assert.equal(b.run('videoLoadPending'), false);
+      media.readyState = 1;
+      b.run('plyr.duration = 120');
+      media.emit('loadedmetadata');
+      await settle();
+      assert.equal(media.currentTime, 0, 'Retired local metadata cannot restore the old saved64');
+      assert.equal(socket.sent.filter(command => command.type === 'load').length, 0,
+        'Party takeover cannot publish the retired local load');
+    });
+  }
+}
+
+test('own video echo preserves the pending local resume gate until its saved64 load', async () => {
+  const { b, socket } = await hostedNativeBrowser('video');
+  b.respond(async () => ({ ok: true, json: async () => ({ position: 64 }) }));
+  b.run('openVideo(LIBRARY[1])');
+  await settle();
+  const media = b.run('plyr.media');
+  media.readyState = 0;
+  socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: true,
+    state: { media_id: 10, title: 'Own pending echo', queue: [], position: 0, playing: true, updated_at: Date.now()/1000 } }) });
+  await settle();
+  assert.equal(b.run('videoLoadPending'), true, 'A matching local echo must retain local resume authority');
+  assert.deepEqual(socket.sent, [], 'A matching echo cannot publish initial play0');
+  media.readyState = 1;
+  b.run('plyr.duration = 120');
+  media.emit('loadedmetadata');
+  await settle();
+  assert.equal(media.currentTime, 64);
+  assert.deepEqual(socket.sent.filter(command => command.type === 'load'),
+    [{ type: 'load', media_id: 10, title: 'Next', position: 64 }]);
+  assert.equal(b.run('videoLoadPending'), false);
 });
