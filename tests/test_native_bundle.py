@@ -83,6 +83,39 @@ class NativeSourceContract(unittest.TestCase):
         self.assertNotIn('location.href = liveBase', page)
         self.assertNotIn("r.type === 'opaque' || r.ok", page)
 
+    def test_runtime_discovery_requires_both_inputs(self):
+        """Partial runtime inputs skip discovery; complete inputs reach archive validation."""
+        with tempfile.TemporaryDirectory(prefix='frayd discovery ', dir=TEMP_ROOT) as directory:
+            archive = Path(directory) / 'fixture.tar.gz'
+            build_source = Path(directory) / 'absent-source/server'
+            for have_archive, have_source in [(False, False), (True, False), (False, True), (True, True)]:
+                with self.subTest(archive=have_archive, build_source=have_source):
+                    environment = os.environ.copy()
+                    for name in ['FRAYD_NATIVE_ARCHIVE', 'FRAYD_NATIVE_BUILD_SOURCE', 'FRAYD_NATIVE_REQUIRE_QUALIFICATION']:
+                        environment.pop(name, None)
+                    if have_archive:
+                        environment['FRAYD_NATIVE_ARCHIVE'] = str(archive)
+                    if have_source:
+                        environment['FRAYD_NATIVE_BUILD_SOURCE'] = str(build_source)
+                    result = run_bounded(
+                        [sys.executable, '-m', 'unittest', 'discover', '-s', str(ROOT / 'tests'),
+                         '-p', 'test_native_bundle.py', '-k', 'NativeRuntime', '-v'],
+                        env=environment, capture_output=True, text=True,
+                    )
+                    self.assertIn('Ran 1 test', result.stderr)
+                    self.assertNotIn('KeyError', result.stderr)
+                    if have_archive and have_source:
+                        # Complete inputs must admit the real case, which rejects
+                        # this deliberately absent synthetic archive checksum.
+                        self.assertEqual(result.returncode, 1, result.stderr)
+                        self.assertIn('FileNotFoundError', result.stderr)
+                        self.assertIn('fixture.tar.gz.sha256', result.stderr)
+                        self.assertNotIn('skipped', result.stderr)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertIn('OK (skipped=1)', result.stderr)
+                        self.assertIn('requires FRAYD_NATIVE_ARCHIVE and FRAYD_NATIVE_BUILD_SOURCE', result.stderr)
+
 
 class NativeOwnership(unittest.TestCase):
     @classmethod
@@ -605,7 +638,10 @@ class NativeOwnership(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
 
 
-@unittest.skipUnless(os.environ.get('FRAYD_NATIVE_ARCHIVE'), 'actual server qualification requires FRAYD_NATIVE_ARCHIVE and FRAYD_NATIVE_BUILD_SOURCE')
+@unittest.skipUnless(
+    os.environ.get('FRAYD_NATIVE_ARCHIVE') and os.environ.get('FRAYD_NATIVE_BUILD_SOURCE'),
+    'actual server qualification requires FRAYD_NATIVE_ARCHIVE and FRAYD_NATIVE_BUILD_SOURCE',
+)
 class NativeRuntime(unittest.TestCase):
     def test_relocated_real_server_reader_and_persistence(self):
         """Relocated archive serves real HTTP assets and retains reader state across restart."""
