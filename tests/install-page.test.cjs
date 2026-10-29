@@ -3,6 +3,7 @@ const { readFileSync } = require('node:fs');
 const { join } = require('node:path');
 const { test } = require('node:test');
 const vm = require('node:vm');
+const { spawnSync } = require('node:child_process');
 const page = readFileSync(process.env.FRAYD_INSTALL_PAGE_SOURCE || join(__dirname, '../client/install/index.html'), 'utf8');
 const scriptOpening = '<script>';
 const scriptStart = page.indexOf(scriptOpening);
@@ -98,11 +99,49 @@ test('download command links remain available for Linux, macOS and Windows',()=>
   const commands = {
     linux: shellCommand,
     mac: shellCommand,
-    win: 'cd $env:TEMP; irm "https://raw.githubusercontent.com/kattiest/Frayd/main/client/install/bootstrap.ps1?$(q(l))" | iex; # or:\n# irm "https://raw.githubusercontent.com/kattiest/Frayd/main/client/install/bootstrap.ps1" -OutFile frayd-install.ps1; .\\frayd-install.ps1',
+    win: 'cd $env:TEMP; irm "https://raw.githubusercontent.com/kattiest/Frayd/main/client/install/bootstrap.ps1" -OutFile frayd-install.ps1; & .\\frayd-install.ps1',
   };
   for(const os of ['linux','mac','win']){
     b.run(`os=${JSON.stringify(os)};gen()`);
     assert.equal(b.nodes.get('#cmd').textContent, commands[os]);
     assert.equal(b.nodes.get('#copy').style.display,'block');
+  }
+});
+
+test('configured commands pass quoted library and tunnel arguments for each platform',()=>{
+  const b=installer();
+  const base='https://raw.githubusercontent.com/kattiest/Frayd/main/client/install';
+  const cases=[
+    {lib:'Media with spaces',tunnel:'tailscale',posixLib:"'Media with spaces'",posixTunnel:"'tailscale'",windowsLib:"'Media with spaces'",windowsTunnel:"'tailscale'"},
+    {lib:"Owner's $Library with spaces",tunnel:"cloud'flare$Tunnel",posixLib:String.raw`'Owner'\''s $Library with spaces'`,posixTunnel:String.raw`'cloud'\''flare$Tunnel'`,windowsLib:"'Owner''s $Library with spaces'",windowsTunnel:"'cloud''flare$Tunnel'"},
+  ];
+  for(const fixture of cases){
+    b.nodes.get('#lib').value=fixture.lib;
+    b.nodes.get('#tunnel-cb').checked=true;
+    b.nodes.get('#tunnel').value=fixture.tunnel;
+    for(const os of ['linux','mac','win']){
+      b.run(`os=${JSON.stringify(os)};gen()`);
+      const expected=os==='win'
+        ? `cd $env:TEMP; irm "${base}/bootstrap.ps1" -OutFile frayd-install.ps1; & .\\frayd-install.ps1 -Lib ${fixture.windowsLib} -Tunnel ${fixture.windowsTunnel}`
+        : `curl -fsSL "${base}/bootstrap.sh" -o frayd-install.sh && bash frayd-install.sh ${fixture.posixLib} --tunnel ${fixture.posixTunnel}`;
+      assert.equal(b.nodes.get('#cmd').textContent,expected);
+    }
+  }
+});
+
+test('POSIX generated commands preserve configured values at the actual shell argument boundary',()=>{
+  const b=installer();
+  const library="Owner's $Library with spaces";
+  const tunnel="cloud'flare$Tunnel";
+  b.nodes.get('#lib').value=library;
+  b.nodes.get('#tunnel-cb').checked=true;
+  b.nodes.get('#tunnel').value=tunnel;
+  for(const os of ['linux','mac']){
+    b.run(`os=${JSON.stringify(os)};gen()`);
+    // Owned shell functions replace both commands; no downloader or installer executes.
+    const stubs='curl() { return 0; }\nbash() { printf "%s\\0" "$@"; }\n';
+    const result=spawnSync('/bin/sh',['-c',stubs+b.nodes.get('#cmd').textContent],{encoding:'utf8',env:{Library:'must-not-expand',Tunnel:'must-not-expand'}});
+    assert.equal(result.status,0,result.stderr);
+    assert.deepEqual(result.stdout.split('\0'),['frayd-install.sh',library,'--tunnel',tunnel,'']);
   }
 });

@@ -95,7 +95,8 @@ document.querySelectorAll('.os button').forEach(b => b.onclick = () => {
 
 const lib = () => $('#lib').value.trim() || '';
 const tunnel = () => $('#tunnel-cb').checked ? $('#tunnel').value : '';
-const q = (s) => new URLSearchParams({ os, lib: s, tunnel: tunnel() }).toString();
+const quotePowerShellArgument = value => "'" + value.replaceAll("'", "''") + "'";
+const quotePosixArgument = value => "'" + value.replaceAll("'", "'\\''") + "'";
 
 function gen() {
   if (!os) return;
@@ -104,14 +105,14 @@ function gen() {
   let cmd;
   if (os === 'win') {
     const args = [];
-    if (l) args.push(`-Lib "${l}"`);
-    if (tunnel()) args.push(`-Tunnel ${tunnel()}`);
+    if (l) args.push(`-Lib ${quotePowerShellArgument(l)}`);
+    if (tunnel()) args.push(`-Tunnel ${quotePowerShellArgument(tunnel())}`);
     const argStr = args.length ? ' ' + args.join(' ') : '';
-    cmd = `cd $env:TEMP; irm "${base}/bootstrap.ps1?$(q(l))" | iex; # or:\n# irm "${base}/bootstrap.ps1" -OutFile frayd-install.ps1; .\\frayd-install.ps1${argStr}`;
+    cmd = `cd $env:TEMP; irm "${base}/bootstrap.ps1" -OutFile frayd-install.ps1; & .\\frayd-install.ps1${argStr}`;
   } else {
     const args = [];
-    if (l) args.push(`'${l}'`);
-    if (tunnel()) args.push(`--tunnel ${tunnel()}`);
+    if (l) args.push(quotePosixArgument(l));
+    if (tunnel()) args.push(`--tunnel ${quotePosixArgument(tunnel())}`);
     const argStr = args.length ? ' ' + args.join(' ') : '';
     cmd = `curl -fsSL "${base}/bootstrap.sh" -o frayd-install.sh && bash frayd-install.sh${argStr}`;
   }
