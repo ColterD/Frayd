@@ -102,9 +102,24 @@ test('remote close while hidden clears host state and permits a new session', ()
   p.nodes.get('#party-modal').classList.remove('on');
   socket.onclose();
   assert.equal(p.context.partySend, null);
+  assert.match(p.nodes.get('#party-stage').innerHTML, /Party ended/);
   p.run('PartyUI.open()');
   assert.match(p.nodes.get('#party-stage').innerHTML, /Start a party/);
   assert.doesNotMatch(p.nodes.get('#party-stage').innerHTML, /ABCD|Song/);
+});
+
+test('error followed by close before admission keeps the join rejection visible', () => {
+  const p = panel();
+  p.run('PartyUI.open()');
+  p.nodes.get('#party-code-input').value = 'ABCD';
+  p.nodes.get('#pt-join').onclick();
+  const socket = p.sockets[0];
+  socket.onerror();
+  assert.match(p.nodes.get('#party-stage').innerHTML, /Party not found or rejected/);
+  socket.onclose();
+  assert.match(p.nodes.get('#party-stage').innerHTML, /Start a party/);
+  assert.match(p.nodes.get('#party-stage').innerHTML, /Party not found or rejected/);
+  assert.doesNotMatch(p.nodes.get('#party-stage').innerHTML, /Party ended/);
 });
 
 test('old socket callbacks cannot clear or change a replacement connection', () => {

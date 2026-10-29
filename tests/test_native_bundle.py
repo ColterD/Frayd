@@ -54,6 +54,7 @@ def run_bounded(arguments, *, timeout=60, **options):
 
 
 def setUpModule():
+    """Require explicit native build inputs only when full qualification is requested."""
     if os.environ.get('FRAYD_NATIVE_REQUIRE_QUALIFICATION') == '1':
         required = ['FRAYD_NATIVE_HELPER', 'FRAYD_NATIVE_ARCHIVE', 'FRAYD_NATIVE_BUILD_SOURCE']
         missing = [name for name in required if not os.environ.get(name)]
@@ -63,11 +64,13 @@ def setUpModule():
 
 class NativeSourceContract(unittest.TestCase):
     def test_no_legacy_destructive_paths(self):
+        """Keep the legacy uninstall shim free of broad process and filesystem deletion."""
         script = (ROOT / 'scripts/uninstall.sh').read_text()
         for forbidden in ['pkill', 'rm -rf', 'systemctl', 'launchctl', 'PURGE_LIB', 'PURGE_DEPS']:
             self.assertNotIn(forbidden, script)
 
     def test_manual_nonpublishing_workflow(self):
+        """Require manual macOS packaging without publication permissions or floating actions."""
         workflow = (ROOT / '.github/workflows/release-mac.yml').read_text()
         for forbidden in ['contents: write', 'softprops/', 'lipo ', 'tags:', '@v4', 'brew install']:
             self.assertNotIn(forbidden, workflow)
@@ -75,6 +78,7 @@ class NativeSourceContract(unittest.TestCase):
             self.assertIn(required, workflow)
 
     def test_install_page_has_no_opaque_redirect(self):
+        """Reject opaque redirect and response handling in the install page."""
         page = (ROOT / 'client/install/index.html').read_text()
         self.assertNotIn('location.href = liveBase', page)
         self.assertNotIn("r.type === 'opaque' || r.ok", page)
@@ -83,12 +87,14 @@ class NativeSourceContract(unittest.TestCase):
 class NativeOwnership(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        """Skip ownership cases unless a freshly built helper path is supplied."""
         if not os.environ.get('FRAYD_NATIVE_HELPER'):
             raise unittest.SkipTest('Supply a freshly built FRAYD_NATIVE_HELPER explicitly; generic Python discovery does not install/build Rust')
         if not HELPER.is_file():
             raise RuntimeError('Explicit native helper is unavailable')
 
     def setUp(self):
+        """Create a private bundle, install/data paths and protected sentinels for each case."""
         self.temp = tempfile.TemporaryDirectory(prefix='frayd native ', dir=TEMP_ROOT)
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
@@ -111,6 +117,7 @@ class NativeOwnership(unittest.TestCase):
             (self.base / name).write_bytes(b'NONSECRET protected fixture sentinel')
 
     def manifest(self):
+        """Write a manifest covering each bundle entry with mode, size and content digest."""
         entries = []
         for p in sorted(self.bundle.rglob('*')):
             if p.name == 'manifest.json':
@@ -119,17 +126,21 @@ class NativeOwnership(unittest.TestCase):
         (self.bundle / 'manifest.json').write_text(json.dumps({'schema': 1, 'version': '0.1.1', 'source': 'a' * 40, 'target': 'fixture', 'toolchain': 'fixture', 'entries': entries}))
 
     def run_helper(self, command, *args, code=0, answer='', environment=None):
+        """Invoke the native helper with this fixture prefix and assert its exit status."""
         result = run_bounded([str(HELPER), command, '--prefix', str(self.prefix), *args], input=answer, text=True, capture_output=True, env=environment)
         self.assertEqual(result.returncode, code, result.stderr)
         return result
 
     def install(self, *args, **kw):
+        """Install the fixture bundle into its private prefix and data directory."""
         return self.run_helper('install', '--bundle', str(self.bundle), '--data-dir', str(self.data), *args, **kw)
 
     def snapshot(self):
+        """Capture names, modes and bytes or symlink targets across the private fixture."""
         return [(str(p.relative_to(self.base)), p.lstat().st_mode, os.readlink(p) if p.is_symlink() else p.read_bytes() if p.is_file() else None) for p in sorted(self.base.rglob('*'))]
 
     def test_timeout_reaps_owned_descendants(self):
+        """On timeout, reap a descendant proven to hold a file lease."""
         import fcntl
         lease = self.base / 'timeout child lease'
         ready = self.base / 'timeout child ready'
@@ -140,6 +151,7 @@ class NativeOwnership(unittest.TestCase):
         awaiting_readiness = True
 
         def communicate_after_ready(process, input_data=None, timeout=None):
+            """Wait for the descendant lease before allowing the bounded runner to time out."""
             nonlocal awaiting_readiness
             if awaiting_readiness:
                 # Patch only this test's first communicate call. run_bounded has
@@ -172,6 +184,7 @@ class NativeOwnership(unittest.TestCase):
                     pass
 
     def test_package_complete_manifest_and_architecture(self):
+        """Package real helper binaries and reject a mismatched target without fixture writes."""
         architecture = 'aarch64' if os.uname().machine in ['arm64', 'aarch64'] else 'x86_64'
         target = architecture + ('-apple-darwin' if os.uname().sysname == 'Darwin' else '-unknown-linux-gnu')
         output = self.base / 'package output'
@@ -203,6 +216,7 @@ class NativeOwnership(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
 
     def test_tar_preserved_modes_under_restrictive_umask(self):
+        """Require preserved archive modes for installation under a restrictive umask."""
         architecture = 'aarch64' if os.uname().machine in ['arm64', 'aarch64'] else 'x86_64'
         target = architecture + ('-apple-darwin' if os.uname().sysname == 'Darwin' else '-unknown-linux-gnu')
         output = self.base / 'umask package'
@@ -231,6 +245,7 @@ class NativeOwnership(unittest.TestCase):
         self.assertTrue((self.data / '.frayd-data.json').is_file())
 
     def test_decline_zero_effects(self):
+        """Declining install or uninstall leaves the fixture byte-for-byte unchanged."""
         before = self.snapshot()
         self.install(answer='n\n')
         self.assertEqual(self.snapshot(), before)
@@ -240,6 +255,7 @@ class NativeOwnership(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
 
     def test_install_start_remove_preserves_data_and_reinstall(self):
+        """Starting uses private data; uninstall preserves it and permits reinstall."""
         self.install('--yes')
         result = self.run_helper('start', '--port', '28484')
         self.assertEqual(result.stdout.splitlines(), ['127.0.0.1', str(self.data / 'frayd.db'), str(self.prefix / 'client')])
@@ -252,6 +268,7 @@ class NativeOwnership(unittest.TestCase):
         self.run_helper('uninstall', '--yes')
 
     def test_removal_without_data_authority_preserves_all_remaining_data(self):
+        """Missing data authority permits prefix removal while retaining remaining data."""
         for state in ['moved directory', 'deleted directory', 'missing marker', 'malformed marker']:
             with self.subTest(state=state):
                 self.prefix = self.base / ('installed ' + state)
@@ -279,6 +296,7 @@ class NativeOwnership(unittest.TestCase):
                 self.assertEqual(self.data.exists(), state in ['missing marker', 'malformed marker'])
 
     def test_missing_data_marker_does_not_weaken_removal_guards(self):
+        """A missing data marker cannot bypass modified payload or overlap guards."""
         for guard in ['modified payload', 'unknown payload', 'uncertain child', 'data alias overlap']:
             with self.subTest(guard=guard):
                 self.prefix = self.base / ('installed ' + guard)
@@ -312,6 +330,7 @@ class NativeOwnership(unittest.TestCase):
                 self.run_helper('uninstall', '--yes')
 
     def test_missing_absolute_library_keeps_installed_lifecycle_available(self):
+        """An unavailable absolute library allows lifecycle actions without creating roots."""
         self.install('--yes')
         sentinel = self.data / 'frayd.db'
         sentinel.write_bytes(b'NONSECRET preserved offline fixture database')
@@ -334,6 +353,7 @@ class NativeOwnership(unittest.TestCase):
         self.assertFalse(missing.exists())
 
     def test_prospective_missing_library_overlap_refuses_without_writes(self):
+        """Refuse missing library paths that may overlap owned or aliased locations."""
         for parent in [self.prefix, self.data, self.bundle]:
             with self.subTest(operation='install', parent=parent.name):
                 missing = parent / 'offline media' / 'nested root'
@@ -362,6 +382,7 @@ class NativeOwnership(unittest.TestCase):
                 self.assertFalse(missing.exists())
 
     def test_incomplete_bundle_refuses_before_writes(self):
+        """An incomplete bundle is refused before any installation write."""
         (self.bundle / 'start.sh').unlink()
         self.manifest()
         before = self.snapshot()
@@ -369,6 +390,7 @@ class NativeOwnership(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
 
     def test_corrupt_or_extra_bundle_zero_effects(self):
+        """Checksum, extra-entry, traversal and symlink corruption leave no effects."""
         for mutation in ['checksum', 'extra', 'traversal', 'symlink']:
             with self.subTest(mutation=mutation):
                 index = self.bundle / 'client/index.html'
@@ -395,6 +417,7 @@ class NativeOwnership(unittest.TestCase):
                 (self.bundle / 'manifest.json').write_bytes(manifest)
 
     def test_permissive_umask_and_unknown_existing_data(self):
+        """Unknown existing data is refused and permissive umask still yields private modes."""
         self.data.mkdir(mode=0o700)
         (self.data / '.env').write_bytes(b'NONSECRET fixture configuration')
         (self.data / 'frayd.db').write_bytes(b'NONSECRET fixture database')
@@ -412,6 +435,7 @@ class NativeOwnership(unittest.TestCase):
         self.assertEqual(stat.S_IMODE((self.data / '.frayd-data.json').stat().st_mode), 0o600)
 
     def test_unknown_modified_and_extra_prefix_refused(self):
+        """Existing unknown or modified prefix content blocks install and removal."""
         self.prefix.mkdir()
         (self.prefix / '.env').write_text('preserve')
         before = self.snapshot()
@@ -434,6 +458,7 @@ class NativeOwnership(unittest.TestCase):
                 path.write_bytes(original)
 
     def test_filesystem_failure_preserves_receipt_for_retry(self):
+        """A filesystem removal failure keeps the receipt available for a later retry."""
         self.install('--yes')
         self.base.chmod(0o500)
         self.addCleanup(self.base.chmod, 0o700)
@@ -446,6 +471,7 @@ class NativeOwnership(unittest.TestCase):
         self.assertFalse(self.prefix.exists())
 
     def test_partial_removal_retry_and_data_redirect_refusal(self):
+        """Reject redirected data; tolerate a previously removed owned file on retry."""
         self.install('--yes')
         redirect = self.data / 'thumbs'
         redirect.symlink_to(self.base, target_is_directory=True)
@@ -460,6 +486,7 @@ class NativeOwnership(unittest.TestCase):
         self.assertTrue((self.data / '.frayd-data.json').exists())
 
     def test_foreground_interrupt_cleans_child_and_allows_removal(self):
+        """Foreground signals reap the owned child and clear its uncertainty marker."""
         (self.bundle / 'frayd-server').write_text('#!/bin/sh\nexec sleep 60\n')
         self.manifest()
         for interrupt in [signal.SIGINT, signal.SIGTERM]:
@@ -485,6 +512,7 @@ class NativeOwnership(unittest.TestCase):
                         process.wait(timeout=10)
 
     def test_orphan_receipt_and_active_installation_refusal(self):
+        """Active or uncertain child receipts block start and uninstall without writes."""
         (self.bundle / 'frayd-server').write_text('#!/bin/sh\nexec sleep 60\n')
         self.manifest()
         self.install('--yes')
@@ -519,6 +547,7 @@ class NativeOwnership(unittest.TestCase):
                 process.wait(timeout=10)
 
     def test_invalid_targets_and_flags_zero_effects(self):
+        """Invalid target paths and destructive flags leave all fixture paths unchanged."""
         before = self.snapshot()
         for target in ['relative', '/', '/usr/frayd', str(ROOT / 'native-test-prefix'), str(self.base) + '/./unsafe', str(self.base) + '//unsafe', str(self.base / '.cargo/new'), str(self.base / '.rustup/new'), str(self.base / 'original checkout/new')]:
             result = run_bounded([str(HELPER), 'install', '--bundle', str(self.bundle), '--prefix', target, '--data-dir', str(self.data), '--yes'], capture_output=True)
@@ -536,6 +565,7 @@ class NativeOwnership(unittest.TestCase):
 @unittest.skipUnless(os.environ.get('FRAYD_NATIVE_ARCHIVE'), 'actual server qualification requires FRAYD_NATIVE_ARCHIVE and FRAYD_NATIVE_BUILD_SOURCE')
 class NativeRuntime(unittest.TestCase):
     def test_relocated_real_server_reader_and_persistence(self):
+        """Relocated archive serves real HTTP assets and retains reader state across restart."""
         build_source = Path(os.environ['FRAYD_NATIVE_BUILD_SOURCE'])
         self.assertTrue(build_source.is_absolute())
         self.assertFalse(any(build_source.iterdir()) if build_source.exists() else False, 'compile-time source must be absent or empty in an isolated namespace')
@@ -598,6 +628,7 @@ class NativeRuntime(unittest.TestCase):
             process = None
 
             def request(path, payload=None, token=None, expected=200):
+                """Issue a loopback JSON request and assert its expected HTTP status."""
                 headers = {'Content-Type': 'application/json'}
                 if token:
                     headers['Authorization'] = 'Bearer ' + token
@@ -608,6 +639,7 @@ class NativeRuntime(unittest.TestCase):
                     return response.read()
 
             def start():
+                """Start the relocated server and wait up to twenty seconds for health."""
                 nonlocal process
                 process = subprocess.Popen([str(prefix / 'start.sh'), '--prefix', str(prefix), '--port', str(port)], env=environment, cwd=base, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
                 deadline = time.monotonic() + 20
@@ -621,6 +653,7 @@ class NativeRuntime(unittest.TestCase):
                 self.fail('native HTTP readiness timed out')
 
             def stop(group_interrupt=False):
+                """Stop the server by group interrupt or child signal and clear its receipt."""
                 nonlocal process
                 if process is None or process.poll() is not None:
                     return

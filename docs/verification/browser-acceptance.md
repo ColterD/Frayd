@@ -141,16 +141,24 @@ The diagnostic retained a failed verdict, observed only file existence and proce
 liveness, and never opened that late endpoint. It did not establish a policy or
 DBus failure. Another matched run passed the browser cases.
 
-The corrected harness uses one 15-second deadline for port discovery, the HTTP
-target-list response, WebSocket opening and bootstrap commands. It keeps the
-overall 60-second guard and requires loopback endpoint validation and successful
-protocol setup before navigation. Bounded, redacted startup stderr remains available on
-failure. The temporary late-file observer is removed after establishing the
+The historical correction used one 15-second deadline for port discovery, the
+HTTP target-list response, WebSocket opening and bootstrap commands, with a shared
+60-second guard. It required loopback endpoint validation and successful protocol
+setup before navigation. Bounded, redacted startup stderr remained available on
+failure. The temporary late-file observer was removed after establishing the
 insufficient startup budget. A controlled 8.7-second delay before launching the
-same real browser distinguishes the old and corrected discovery budgets. A separate
-controlled 3.2-second delay on the real target-list fetch fails under the old
-three-second phase timeout and passes all 29 cases with the shared startup
-deadline. These are separate controlled delays, not one combined-delay test.
+same real browser distinguished the old and 15-second discovery budgets. A separate
+controlled 3.2-second delay on the real target-list fetch failed under the old
+three-second phase timeout and passed all 29 cases with that historical startup
+deadline. These were separate controlled delays, not one combined-delay test.
+
+The current harness gives startup 30 seconds for discovery, target-list response,
+socket opening and bootstrap. After setup and navigation acknowledgment, the
+browser case phase has a separate 60-second budget. Loopback endpoint validation,
+protocol setup and bounded cleanup remain required. Local timeout controls and
+49 actual-browser cases pass on the corrected working tree; the next hosted run
+has not yet qualified this source. The 15-second values above describe only the
+earlier source and hosted attempts.
 
 Earlier verification head `f16897334b55e5d6c3da201a00791c9bd4855662` had
 [one complete hosted pass](https://github.com/ColterD/Frayd/actions/runs/40747689066/job/123025739721)

@@ -10,16 +10,25 @@ const PartyUI = (() => {
   let partyCode = null;
   let pendingStart = null;
 
+  /**
+   * Return the first party DOM node matching a selector.
+   * @param {string} s
+   * @returns {Element|null}
+   */
   const $ = (s) => document.querySelector(s);
 
+  /** Show the party panel and render its current session without disconnecting. */
   function open() { $('#party-modal').classList.add('on'); render(); }
+  /** Hide the party panel while retaining the active socket and state. */
   function hide() { $('#party-modal').classList.remove('on'); }
+  /** Retire the socket identity, role, requests and loaded-media markers before stale callbacks run. */
   function resetSession() {
     pendingStart = null;
     ws = null; partyCode = null; isHost = false; state = null; pending = []; members = [];
     hostLoadedMedia = null; hostLoadedExt = null;
     window.partySend = null;
   }
+  /** Leave the current party, close its socket and hide the panel. */
   function close() {
     const socket = ws;
     resetSession();
@@ -27,6 +36,10 @@ const PartyUI = (() => {
     if (socket) socket.close();
   }
 
+  /**
+   * Use the persisted device identity or make a temporary guest identity for this call.
+   * @returns {string}
+   */
   function identity() {
     return localStorage.frayd_identity || 'guest-' + Math.random().toString(36).slice(2, 8);
   }
@@ -60,6 +73,7 @@ const PartyUI = (() => {
     }
   }
 
+  /** Validate the entered four-character code and connect as a guest. */
   function join() {
     const code = $('#party-code-input').value.trim().toUpperCase();
     if (!/^[A-Z0-9]{4}$/.test(code)) return renderError('Enter the 4-character code');
@@ -85,9 +99,22 @@ const PartyUI = (() => {
     const protocols = capability ? ['frayd-party', 'frayd-host.' + capability] : ['frayd-party'];
     const socket = new WebSocket(url, protocols);
     ws = socket;
-    socket.onerror = () => { if (ws === socket) renderError('Party not found or rejected'); };
-    socket.onclose = () => { if (ws === socket) renderEnded(); };
-    socket.onmessage = (e) => { if (ws === socket) handle(JSON.parse(e.data)); };
+    let admitted = false;
+    let rejectedBeforeAdmission = false;
+    socket.onerror = () => {
+      if (ws !== socket) return;
+      rejectedBeforeAdmission = !admitted;
+      renderError('Party not found or rejected');
+    };
+    socket.onclose = () => {
+      if (ws === socket) renderEnded(rejectedBeforeAdmission ? 'Party not found or rejected' : 'Party ended');
+    };
+    socket.onmessage = (e) => {
+      if (ws !== socket) return;
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'state') admitted = true;
+      handle(msg);
+    };
     renderConnecting(code);
   }
 
@@ -118,12 +145,17 @@ const PartyUI = (() => {
   let pending = [];
   let members = [];
 
+  /**
+   * Send a JSON party command only while the current socket is open.
+   * @param {Object} obj
+   */
   function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
 
   // ---- guest follow: drive local audio player from host state ----
   let hostLoadedMedia = null;
   const DRIFT = 1.5; // seconds — resync beyond this
 
+  /** Apply authoritative host playback to a guest player when a supported callback exists. */
   function followState() {
     if (state && state.external_url) {
       if (typeof window.partyFollowExternal === 'function')
@@ -162,6 +194,10 @@ const PartyUI = (() => {
   let hostLoadedExt = null;
 
   // ---- host hooks: local player actions become party state ----
+  /**
+   * Publish a local player command only while this session has host authority.
+   * @param {Object} obj
+   */
   function sendHost(obj) { if (isHost) send(obj); }
 
   /**
@@ -177,6 +213,10 @@ const PartyUI = (() => {
     if (typeof window.partyHostHook === 'function') window.partyHostHook(sendHost);
   }
 
+  /**
+   * Render escaped playback details and host controls, or an empty state.
+   * @returns {string}
+   */
   function nowPlaying() {
     if (!state) return '<div class="party-empty">Nothing playing.</div>';
     let html = `<div class="party-now">
@@ -197,6 +237,10 @@ const PartyUI = (() => {
     return html + '</div>';
   }
 
+  /**
+   * Render escaped party membership with the local participant marked.
+   * @returns {string}
+   */
   function membersHtml() {
     const me = identity();
     const list = isHost ? [me + ' (host)', ...members.filter(m => !m.endsWith('(host)'))] : members;
@@ -208,6 +252,10 @@ const PartyUI = (() => {
       }).join('') + '</ul>';
   }
 
+  /**
+   * Render the current queued requests, or empty markup when there are none.
+   * @returns {string}
+   */
   function queueHtml() {
     const q = state?.queue || [];
     if (!q.length) return '';
@@ -216,6 +264,10 @@ const PartyUI = (() => {
       '</ul>';
   }
 
+  /**
+   * Render pending approval controls for hosts only.
+   * @returns {string}
+   */
   function requestsHtml() {
     if (!isHost || !pending.length) return '';
     return '<div class="party-sec">Requests</div><ul class="party-queue">' +
@@ -293,9 +345,17 @@ const PartyUI = (() => {
     $('#pt-yt')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#pt-yt-go').click(); });
   }
 
+  /**
+   * Show the code for a socket awaiting admission.
+   * @param {string} code
+   */
   function renderConnecting(code) {
     $('#party-stage').innerHTML = `<div class="party-code">Connecting to <b>${esc(code)}</b>…</div>`;
   }
+  /**
+   * Prepend an escaped party error to the current panel.
+   * @param {string} msg
+   */
   function renderError(msg) {
     $('#party-stage').insertAdjacentHTML('afterbegin', `<div class="party-error">${esc(msg)}</div>`);
   }
@@ -305,12 +365,12 @@ const PartyUI = (() => {
    * markers, then show entry controls with an ended notice. Preserve visibility
    * so a remotely ended hidden panel stays hidden until the user reopens it.
    */
-  function renderEnded() {
+  function renderEnded(message = 'Party ended') {
     const socket = ws;
     resetSession();
     if (socket && socket.readyState < 2) socket.close();
     render();
-    renderError('Party ended');
+    renderError(message);
   }
 
   return { open, hide, close };

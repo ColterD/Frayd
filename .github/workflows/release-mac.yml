@@ -58,6 +58,7 @@ jobs:
         shell: bash
         run: |
           cargo +1.99.1 test --locked --manifest-path "$RUNNER_TEMP/frayd-build-source/server/Cargo.toml" --bin frayd-native --target '${{ matrix.target }}'
+          cargo +1.99.1 test --locked --manifest-path "$RUNNER_TEMP/frayd-build-source/server/Cargo.toml" --bin frayd-server --target '${{ matrix.target }}' -- transcode::retained_job_tests::unqualified_rescans_hold_one_job_and_preserve_other_media --exact --nocapture
           cargo +1.99.1 clippy --locked --manifest-path "$RUNNER_TEMP/frayd-build-source/server/Cargo.toml" --bin frayd-native --target '${{ matrix.target }}' -- -D warnings
           cargo +1.99.1 build --locked --release --manifest-path "$RUNNER_TEMP/frayd-build-source/server/Cargo.toml" --bin frayd-server --bin frayd-native --target '${{ matrix.target }}'
 

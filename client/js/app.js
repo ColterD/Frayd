@@ -2,17 +2,39 @@
 'use strict';
 console.log('frayd app.js v4');
 
+/**
+ * Return the first DOM node matching a selector.
+ * @param {string} s
+ * @returns {Element|null}
+ */
 const $ = (s) => document.querySelector(s);
+/**
+ * Create an element with optional class and trusted HTML.
+ * @param {string} tag
+ * @param {string} cls
+ * @param {string} html
+ * @returns {HTMLElement}
+ */
 const el = (tag, cls, html) => {
   const e = document.createElement(tag);
   if (cls) e.className = cls;
   if (html != null) e.innerHTML = html;
   return e;
 };
+/**
+ * Escape untrusted text before inserting it into HTML templates.
+ * @param {*} s
+ * @returns {string}
+ */
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c =>
   ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
 
 // ---------- toast ----------
+/**
+ * Show an escaped transient message; errors remain visible longer.
+ * @param {string} msg
+ * @param {boolean} [err=false]
+ */
 function toast(msg, err = false) {
   let host = $('#toast-host');
   if (!host) { host = el('div'); host.id = 'toast-host'; document.body.appendChild(host); }
@@ -24,6 +46,11 @@ function toast(msg, err = false) {
 
 // ---------- identity / auth ----------
 let IDENTITY = localStorage.frayd_identity;
+/**
+ * Copy extra HTTP headers and add the current bearer token when present.
+ * @param {Object} [extra={}]
+ * @returns {Object}
+ */
 function authHeaders(extra = {}) {
   const h = { ...extra };
   if (localStorage.frayd_token) h['Authorization'] = 'Bearer ' + localStorage.frayd_token;
@@ -32,6 +59,10 @@ function authHeaders(extra = {}) {
 let account = null;
 let accountGeneration = 0;
 
+/**
+ * Restore a stored LAN identity and optional account state if the library endpoint accepts it.
+ * @returns {Promise<boolean>}
+ */
 async function tryResume() {
   if (IDENTITY) {
     const r = await fetch('/api/library');
@@ -50,6 +81,7 @@ async function tryResume() {
   return false;
 }
 
+/** Enter the dashboard for the current account generation and start loading the library. */
 function enterApp() {
   ++accountGeneration;
   document.body.classList.remove('auth');
@@ -67,24 +99,46 @@ function enterApp() {
 const KINDS = ['movie', 'episode', 'music', 'audiobook', 'ebook', 'comic', 'manga'];
 let settingsGeneration = 0;
 let settingsPoll = null;
+/** Invalidate settings callbacks and stop the active status poll. */
 function disposeSettings() {
   ++settingsGeneration;
   clearInterval(settingsPoll);
   settingsPoll = null;
 }
+/**
+ * Return effective locked roots or editable persisted roots, including the legacy single path.
+ * @param {Object} settings
+ * @returns {string[]}
+ */
 function settingsRoots(settings) {
   if (settings.library_locked && Array.isArray(settings.effective_library_paths)) return [...settings.effective_library_paths];
   return Array.isArray(settings.library_paths) ? [...settings.library_paths]
     : settings.library_path ? [settings.library_path] : [];
 }
+/**
+ * Read allowed media kinds from one permission row; null means unrestricted.
+ * @param {Element} row
+ * @returns {string[]|null}
+ */
 function permissionKinds(row) {
   const checked = [...row.querySelectorAll('.p-kinds-box input:checked')].map(input => input.value);
   return KINDS.every(kind => checked.includes(kind)) ? null : checked;
 }
+/**
+ * Translate a scan HTTP status into a message for the settings panel.
+ * @param {number} status
+ * @returns {string}
+ */
 function scanFailure(status) {
   return status === 409 ? 'Scan already running' : status === 501
     ? 'No library folder configured — set it in settings' : `Scan failed (${status})`;
 }
+/**
+ * Poll the admitted scan or ingest until completion; ignore callbacks from retired settings panels.
+ * @param {number} generation
+ * @param {string} mode
+ * @param {HTMLButtonElement} button
+ */
 function pollSettings(generation, mode, button) {
   clearInterval(settingsPoll);
   let pending = false;
@@ -120,6 +174,11 @@ function pollSettings(generation, mode, button) {
     } finally { pending = false; }
   }, 1000);
 }
+/**
+ * Request a scan and start status polling only for the current settings generation.
+ * @param {number} generation
+ * @param {HTMLButtonElement} button
+ */
 async function startSettingsScan(generation, button) {
   button.disabled = true;
   button.textContent = 'Starting scan…';
@@ -136,6 +195,12 @@ async function startSettingsScan(generation, button) {
     toast(button.textContent, true);
   }
 }
+/**
+ * Persist an admin settings payload; reject HTTP failure and report whether its panel still owns the result.
+ * @param {Object} payload
+ * @param {number} generation
+ * @returns {Promise<boolean>}
+ */
 async function saveSettings(payload, generation) {
   const response = await fetch('/api/admin/settings', {
     method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(payload),
@@ -144,7 +209,15 @@ async function saveSettings(payload, generation) {
     ? 'Settings refused: library override or active job' : `Settings failed (${response.status})`);
   return generation === settingsGeneration;
 }
+/**
+ * Reload the settings panel after a successful change.
+ * @returns {Promise<void>}
+ */
 function reopenSettings() { return openSettings(); }
+/**
+ * Fetch permissions and library settings, then render controls guarded by a panel generation.
+ * @returns {Promise<void>}
+ */
 async function openSettings() {
   disposeSettings();
   const generation = settingsGeneration;
@@ -303,6 +376,10 @@ async function openSettings() {
 $('#settings-btn')?.addEventListener('click', openSettings);
 $('#settings-close')?.addEventListener('click', () => { disposeSettings(); $('#settings-modal').classList.remove('on'); });
 
+/**
+ * Submit the login form, store its bearer token and identity, or show the returned error.
+ * @param {SubmitEvent} ev
+ */
 async function doLogin(ev) {
   ev.preventDefault();
   const email = $('#email').value.trim();
@@ -430,6 +507,10 @@ $('#search input').addEventListener('input', (e) => {
   searchTimer = setTimeout(() => serverSearch(e.target.value), 250);
 });
 
+/**
+ * Search the server for a query, discarding stale responses and falling back to local filtering on failure.
+ * @param {string} q
+ */
 async function serverSearch(q) {
   activeQuery = q;
   filtering = activeKind !== 'all' || !!q;
@@ -446,6 +527,10 @@ async function serverSearch(q) {
   } catch { if (generation === searchGeneration) filterKind(activeKind, q); }
 }
 
+/**
+ * Read the active navigation kind, defaulting to all.
+ * @returns {string}
+ */
 function currentKind() {
   const active = document.querySelector('.nav-item.active');
   return active ? active.dataset.kind : 'all';
@@ -462,6 +547,10 @@ const rowSort = new Map();
 let filtering = false; // suppress continue-watching row while a nav filter/search is active
 window.getLibrary = () => LIBRARY;
 
+/**
+ * Replace the library only if this fetch is still current; propagate HTTP errors.
+ * @returns {Promise<void>}
+ */
 async function loadLibrary() {
   const generation = ++libraryRequestGeneration;
   const response = await fetch('/api/library');
@@ -472,6 +561,12 @@ async function loadLibrary() {
   filterKind(activeKind, activeQuery);
 }
 
+/**
+ * Apply the selected kind and text filter to the current library and render its rows.
+ * @param {string} kind
+ * @param {string} [query]
+ * @returns {Promise<void>}
+ */
 function filterKind(kind, query = activeQuery) {
   ++searchGeneration;
   activeKind = kind || 'all';
@@ -486,6 +581,10 @@ function filterKind(kind, query = activeQuery) {
   return renderRows(items);
 }
 
+/**
+ * Confirm and delete one indexed media row; the source file remains and the library view refreshes on success.
+ * @param {Object} it
+ */
 async function deleteMedia(it) {
   if (!confirm(`Remove "${it.title}" from the library? The source file remains on disk and may return after a later scan.`)) return;
   try {
@@ -501,12 +600,22 @@ async function deleteMedia(it) {
   } catch { toast('Remove failed — server unreachable', true); }
 }
 
+/**
+ * Fetch identity-scoped progress for one media ID, returning null on HTTP or network failure.
+ * @param {number} id
+ * @returns {Promise<Object|null>}
+ */
 function resumeFor(id) {
   // identity query needed for guest/LAN mode (no token); server auto-creates it
   return fetch(`/api/progress/${id}?identity=${encodeURIComponent(IDENTITY)}`, { headers: authHeaders() })
     .then(r => r.ok ? r.json() : null).catch(() => null);
 }
 
+/**
+ * Build a media card and attach progress only while its render generation and DOM node remain current.
+ * @param {Object} it
+ * @returns {HTMLElement}
+ */
 function card(it) {
   const portrait = ['ebook', 'comic', 'manga', 'audiobook'].includes(it.kind);
   const c = el('div', 'media-card ' + (portrait ? 'portrait' : 'landscape'));
@@ -544,6 +653,12 @@ function card(it) {
   return c;
 }
 
+/**
+ * Build a sortable media row from a title and item snapshot.
+ * @param {string} title
+ * @param {Object[]} items
+ * @returns {HTMLElement}
+ */
 function section(title, items) {
   const wrap = el('section');
   const cards = el('div', 'cards');
@@ -565,6 +680,12 @@ function section(title, items) {
   return wrap;
 }
 
+/**
+ * Build the in-progress row from a library snapshot; return null when empty or superseded.
+ * @param {Object[]} [snapshot]
+ * @param {number} [generation]
+ * @returns {Promise<HTMLElement|null>}
+ */
 async function continueRow(snapshot = LIBRARY, generation = renderGeneration) {
   // in-progress items, most recently touched first
   const items = snapshot.filter(i => i.kind !== 'ebook' && i.kind !== 'comic' && i.kind !== 'manga');
@@ -590,6 +711,11 @@ async function continueRow(snapshot = LIBRARY, generation = renderGeneration) {
   return wrap;
 }
 
+/**
+ * Render hero and grouped library rows; discard asynchronous continuation work after a newer render.
+ * @param {Object[]} items
+ * @returns {Promise<void>}
+ */
 async function renderRows(items) {
   const generation = ++renderGeneration;
   const snapshot = [...LIBRARY];
@@ -630,6 +756,12 @@ async function renderRows(items) {
 }
 
 // author → series → books: one section per author, sub-rows per series
+/**
+ * Group media cards by author and then series within one kind.
+ * @param {string} kind
+ * @param {Object[]} items
+ * @returns {HTMLElement}
+ */
 function groupedByAuthor(kind, items) {
   const label = kind[0].toUpperCase() + kind.slice(1) + 's';
   const wrap = el('section');
@@ -653,6 +785,11 @@ function groupedByAuthor(kind, items) {
   return wrap;
 }
 
+/**
+ * Format duration seconds as rounded minutes or hours; return empty text for missing duration.
+ * @param {number} s
+ * @returns {string}
+ */
 function fmtDuration(s) {
   if (!s) return '';
   const m = Math.round(s / 60);
@@ -660,6 +797,10 @@ function fmtDuration(s) {
   return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 
+/**
+ * Render the selected item summary and load its backdrop only for the current render.
+ * @param {Object} it
+ */
 function renderHero(it) {
   const hero = $('#hero');
   hero.style.display = 'block';
@@ -692,6 +833,10 @@ const pbAudio = $('#pb-audio');
 let partyPlaybackKind = null;
 let nativeLoadGeneration = 0;
 
+/**
+ * Open the reader or player matching a library item kind.
+ * @param {Object} it
+ */
 function openItem(it) {
   if (it.kind === 'movie' || it.kind === 'show') openVideo(it);
   else if (it.kind === 'music' || it.kind === 'audiobook') playAudio(it);
@@ -702,6 +847,11 @@ function openItem(it) {
 // ---------- comic reader ----------
 let comic = null; // { it, pages, page }
 
+/**
+ * Load page names, open the comic reader and restore saved page progress when available.
+ * @param {Object} it
+ * @returns {Promise<void>}
+ */
 async function openComic(it) {
   const pages = await (await fetch(`/api/comic/${it.id}/pages`)).json();
   if (!Array.isArray(pages) || !pages.length) return;
@@ -711,6 +861,10 @@ async function openComic(it) {
   resumeFor(it.id).then(p => { if (p) showComicPage(Math.min(Math.floor(p.position), pages.length - 1)); else showComicPage(0); });
 }
 
+/**
+ * Clamp a zero-based page index, update controls and save that page as progress.
+ * @param {number} n
+ */
 function showComicPage(n) {
   if (!comic) return;
   comic.page = Math.max(0, Math.min(n, comic.pages.length - 1));
@@ -730,6 +884,7 @@ document.addEventListener('keydown', e => {
   else if (e.key === 'ArrowLeft') { e.preventDefault(); comic && showComicPage(comic.page - 1); }
   else if (e.key === 'Escape') closeComic();
 });
+/** Persist the current page, release comic state and close the reader. */
 function closeComic() {
   $('#comic-modal').classList.remove('on');
   if (comic) { syncProgress(comic.it.id, comic.page); comic = null; }
@@ -741,6 +896,11 @@ let ebook = null; // { it, spine, chunk }
 let ebookOpenGeneration = 0;
 let ebookDocumentGeneration = 0;
 
+/**
+ * Load an EPUB spine and annotations, then open the current book only if its generation still owns the result.
+ * @param {Object} it
+ * @returns {Promise<void>}
+ */
 async function openEbook(it) {
   const opening = ++ebookOpenGeneration;
   ebook = null;
@@ -764,6 +924,12 @@ async function openEbook(it) {
   });
 }
 
+/**
+ * Load and paginate an EPUB chapter in a sandboxed frame; stale book/document generations cannot publish it.
+ * @param {number} n
+ * @param {{atEnd?: boolean, frac?: number}} [opts]
+ * @returns {Promise<void>}
+ */
 async function showChunk(n, opts = {}) {
   if (!ebook) return;
   const book = ebook;
@@ -991,7 +1157,15 @@ async function showChunk(n, opts = {}) {
 }
 
 // page-flip: injected iframe script reports page state via postMessage
+/**
+ * Return the current EPUB frame width, or a viewport-based fallback before it exists.
+ * @returns {number}
+ */
 function ebookPageW() { const f = document.getElementById("em-frame"); return Math.round(f ? f.clientWidth : Math.min(window.innerWidth * 0.85, 760)); }
+/**
+ * Ask the sandboxed reader to move one page in the signed direction.
+ * @param {number} dir
+ */
 function ebookFlip(dir) {
   if (!ebook) return;
   $('#em-frame').contentWindow?.postMessage(dir > 0 ? 'next' : 'prev', '*');
@@ -1097,6 +1271,10 @@ window.addEventListener('message', async (e) => {
 });
 
 // ebook search UI
+/**
+ * Send a query to the active EPUB frame and remember it for repeat searches.
+ * @param {string} q
+ */
 function ebookSearch(q) {
   if (!ebook) return;
   ebook.searchQuery = q;
@@ -1111,6 +1289,7 @@ $('#em-search').addEventListener('keydown', (e) => {
   // same query: jump to next hit in current chapter, else next chapter
   ebookSearchNext();
 });
+/** Advance to the next search hit in the current EPUB frame. */
 function ebookSearchNext() {
   const w = $('#em-frame').contentWindow;
   w?.postMessage({ type: 'search-next' }, '*');
@@ -1118,6 +1297,11 @@ function ebookSearchNext() {
 
 $('#em-prev').onclick = () => ebookFlip(-1);
 $('#em-next').onclick = () => ebookFlip(1);
+/**
+ * Allow reader shortcuts only while the reader owns focus outside editable controls and settings.
+ * @param {KeyboardEvent} event
+ * @returns {boolean}
+ */
 function ebookShortcutAllowed(event) {
   const target = event.target;
   return !!ebook && $('#ebook-modal').classList.contains('on')
@@ -1140,6 +1324,7 @@ $('#em-close').onclick = closeEbook;
 $('#em-toc-btn').onclick = () => { renderToc(); $('#em-toc').classList.toggle('on'); };
 $('#em-prev').ondblclick = $('#em-next').ondblclick = () =>
   $('#em-frame').contentWindow?.postMessage({ type: 'geom' }, '*');
+/** Render the EPUB table of contents and bind chapter navigation. */
 function renderToc() {
   const el = $('#em-toc');
   if (!ebook?.toc?.length) { el.innerHTML = '<h3>No table of contents</h3>'; return; }
@@ -1150,6 +1335,7 @@ function renderToc() {
     $('#em-toc').classList.remove('on');
   });
 }
+/** Retire pending EPUB work, save progress and clear the sandboxed frame. */
 function closeEbook() {
   ++ebookOpenGeneration;
   clearTimeout(ebookResizeT);
@@ -1204,6 +1390,10 @@ function ownsNativeLoad(media, kind, id, generation) {
   return hasNativeStream(media, id);
 }
 
+/**
+ * Open an audio item and resume only if this native load still owns playback.
+ * @param {Object} it
+ */
 function playAudio(it) {
   beginNativePlayback('audio');
   const generation = ++nativeLoadGeneration;
@@ -1264,6 +1454,11 @@ function trackProgress(media, it) {
 
 // ---------- party sync ----------
 // guest: follow host playback state (drives bottom audio bar)
+/**
+ * Check whether an indexed ID belongs to a video item.
+ * @param {number} id
+ * @returns {boolean}
+ */
 const isVideoId = (id) => LIBRARY.some(x => x.id === id && (x.kind === 'movie' || x.kind === 'show'));
 
 // ---- YouTube party playback (guests + host-load mirror) ----
@@ -1483,6 +1678,11 @@ window.partyHostHook = (send) => {
 let partyLoadPending = false, partyLoadId = null, partyLoadTitle = null;
 let videoLoadPending = false;
 
+/**
+ * Send identity-scoped playback or reader progress; failures are logged without interrupting playback.
+ * @param {number} mediaId
+ * @param {number} position
+ */
 function syncProgress(mediaId, position) {
   fetch('/api/progress', {
     method: 'POST',
@@ -1517,6 +1717,11 @@ $('#pb-close').onclick = () => {
   $('#playerbar').classList.remove('on');
 };
 
+/**
+ * Format finite playback seconds as m:ss; nonfinite values display 0:00.
+ * @param {number} s
+ * @returns {string}
+ */
 function fmt(s) {
   if (!isFinite(s)) return '0:00';
   s = Math.floor(s);
@@ -1572,6 +1777,7 @@ function openVideo(it) {
 
 // auto-hide title/back/party when mouse idle over player
 let chromeHideTimer = null;
+/** Reveal the video overlay and restart its idle hide timer. */
 function wakeChrome() {
   const ov = document.querySelector('.vm-overlay');
   if (!ov) return;
@@ -1581,6 +1787,7 @@ function wakeChrome() {
     if ($('#video-modal').classList.contains('on')) ov.classList.add('hidden');
   }, 2500);
 }
+/** Attach mouse activity to the video overlay timer and reveal controls immediately. */
 function startChromeAutoHide() {
   const modal = $('#video-modal');
   modal.onmousemove = wakeChrome;

@@ -166,6 +166,7 @@ fn ffprobe_tag(src: &str, tag: &str) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
+/// Return the positive media duration reported by ffprobe, or None when probing fails.
 fn ffprobe_duration(src: &str) -> Option<f64> {
     let out = Command::new("ffprobe")
         .args(["-v", "quiet", "-show_entries", "format=duration",

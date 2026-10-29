@@ -15,6 +15,49 @@ impl Drop for JobReset {
     fn drop(&mut self) { BUSY.store(false, Ordering::SeqCst); }
 }
 
+#[cfg(test)]
+mod retained_job_tests {
+    use super::*;
+
+    /// A retained uncertain pair bounds repeated reservations even when the source identity changes.
+    #[test]
+    fn unqualified_rescans_hold_one_job_and_preserve_other_media() {
+        let root=std::env::temp_dir().join(format!("frayd-retained-job-{}",uuid::Uuid::new_v4()));
+        let library=root.join("library");let cache=root.join("cache");
+        std::fs::create_dir_all(&library).unwrap();
+        let src=library.join("film.mkv");let replacement=library.join("replaced.mkv");
+        let other=library.join("other.mkv");
+        std::fs::write(&src,b"original").unwrap();
+        std::fs::write(&replacement,b"replacement").unwrap();
+        std::fs::write(&other,b"other original").unwrap();
+        let mut db=crate::store::open(":memory:");
+        for (id,path) in [(1,&src),(2,&other)] {
+            db.execute("INSERT INTO media(id,kind,path,title) VALUES(?1,'movie',?2,'fixture')",
+                rusqlite::params![id,path.to_str().unwrap()]).unwrap();
+        }
+        let roots=[library.clone()];
+        let (tmp,_,lease)=reserve_job_with_roots(&mut db,&cache,&roots,1,&src,false).unwrap();
+        std::fs::write(&tmp,b"retained partial").unwrap();
+        for _ in 0..2 {
+            assert!(reserve_job_with_roots(&mut db,&cache,&roots,1,&src,false).is_none());
+        }
+        drop(lease);
+        db.execute("UPDATE media SET path=?1 WHERE id=1",[replacement.to_str().unwrap()]).unwrap();
+        assert!(reserve_job_with_roots(&mut db,&cache,&roots,1,&replacement,false).is_none());
+        assert_eq!(std::fs::read_dir(cache.join("1")).unwrap().count(),1);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM transcode_artifacts WHERE owner_media_id=1",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+        assert_eq!(std::fs::read(&tmp).unwrap(),b"retained partial");
+        assert_eq!(std::fs::read(&replacement).unwrap(),b"replacement");
+        let (_,_,other_lease)=reserve_job_with_roots(&mut db,&cache,&roots,2,&other,false).unwrap();
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM transcode_artifacts WHERE owner_media_id=2",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+        drop(other_lease);
+        db.execute("UPDATE transcode_artifacts SET lifecycle='completed' WHERE owner_media_id=1",[]).unwrap();
+        assert!(reserve_job_with_roots(&mut db,&cache,&roots,1,&replacement,false).is_some());
+        assert_eq!(std::fs::read(&src).unwrap(),b"original");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 /// Does any audio track use a codec browsers cannot decode?
 pub fn needs_transcode(src: &str) -> bool {
     let Ok(out) = Command::new("ffprobe").args([
@@ -95,6 +138,8 @@ pub(crate) fn validate_cache(cache: &Path, roots: &[PathBuf]) -> Option<PathBuf>
     Some(resolved)
 }
 
+/// Create and canonicalize the cache only after validating it against every admitted root.
+/// Return None when creation or the post-creation boundary check fails.
 fn prepare_cache(cache: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
     let resolved=validate_cache(cache,roots)?;
     std::fs::create_dir_all(&resolved).ok()?;
@@ -124,8 +169,13 @@ fn reserve_job_with_recovery(db: &mut Connection, cache: &Path, library: &Path, 
     reserve_job_with_roots(db,cache,&[library.to_path_buf()],id,src,qualify_recovery)
 }
 
+/// Register unique temporary and completed paths for one source before conversion starts.
+/// Return a lease only after cache and registry admission; unqualified recovery retains
+/// existing unfinished work rather than taking its ownership.
 fn reserve_job_with_roots(db: &mut Connection, cache: &Path, roots: &[PathBuf], id: i64, src: &Path, qualify_recovery: bool) -> Option<(PathBuf,PathBuf,JobLease)> {
     let cache = prepare_cache(cache, roots)?;
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).ok()?;
+    if !qualify_recovery && unfinished_generated_job(&tx,id) { return None; }
     let media = cache.join(id.to_string());
     match std::fs::create_dir(&media) {
         Ok(()) => (),
@@ -150,7 +200,6 @@ fn reserve_job_with_roots(db: &mut Connection, cache: &Path, roots: &[PathBuf], 
         let lifecycle=if reclaimable {"pending"} else {"unknown"};
         let tmp = canonical.join("audio.tmp.mp4");
         let out = canonical.join("audio.mp4");
-        let tx = db.transaction().ok()?;
         for (path,role) in [(&tmp,"temp"),(&out,"final")] {
             let inserted = tx.execute("INSERT INTO transcode_artifacts(path,owner_media_id,owner_source_path,role,provenance,lifecycle)
                 SELECT ?1,id,path,?2,'generated',?5 FROM media WHERE id=?3 AND path=?4",
@@ -374,6 +423,15 @@ fn source_version(src: &Path) -> Option<(std::time::SystemTime,u64)> {
     Some((metadata.modified().ok()?,metadata.len()))
 }
 
+/// A retained generated job without a completed publication must not acquire a second namespace.
+/// The media ID is stable across source replacement; an old source path cannot prove this job inactive.
+fn unfinished_generated_job(db: &Connection, media_id: i64) -> bool {
+    db.query_row("SELECT EXISTS(SELECT 1 FROM transcode_artifacts
+        WHERE owner_media_id=?1 AND provenance='generated'
+        AND lifecycle IN ('unknown','pending','retiring'))",
+        [media_id], |row| row.get::<_,bool>(0)).unwrap_or(true)
+}
+
 /// Publish only the converted file/database snapshot, after acquiring the bounded SQLite write lock.
 /// Checking the actual source inside this transaction also covers time spent waiting for that lock.
 fn publish_completed_job(db: &mut Connection, id: i64, src: &Path, completed: &Path,
@@ -399,6 +457,8 @@ fn run_job(db_path: &str, media_id: i64, src: &Path, library: &Path) {
     run_job_with_roots(db_path,media_id,src,&[library.to_path_buf()]);
 }
 
+/// Reopen the worker database and convert one indexed source under the admitted root snapshot.
+/// Version mismatches, missing leases, or failed publication leave source bytes untouched.
 fn run_job_with_roots(db_path: &str, media_id: i64, src: &Path, roots: &[PathBuf]) {
     recover_pending_jobs_with_roots(db_path,roots);
     let Ok(mut db) = crate::store::connect(db_path) else { return };
@@ -806,7 +866,8 @@ mod tests {
             assert!(!lease.reclaimable);
             let converted=transcode_to_browser_mp4(&src,&tmp,&out,&lease);
             assert_eq!(converted.is_some(),mode=="success");
-            let (other_tmp,other_out,other)=reserve_job_with_recovery(&mut db,&root.join("transcodes"),&root.join("library"),1,&src,false).unwrap();
+            let other_src=root.join("library/other.mkv");std::fs::write(&other_src,b"other source").unwrap();insert(&db,2,&other_src);
+            let (other_tmp,other_out,other)=reserve_job_with_recovery(&mut db,&root.join("transcodes"),&root.join("library"),2,&other_src,false).unwrap();
             assert!(!publish_completed_job(&mut db,1,&src,&out,(None,None),source_version(&src).unwrap(),&other).unwrap(),"reservation token authorized another job");
             if mode=="success" {
                 assert!(publish_completed_job(&mut db,1,&src,&out,(None,None),source_version(&src).unwrap(),&lease).unwrap());

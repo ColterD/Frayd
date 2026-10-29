@@ -387,21 +387,26 @@ def upstream_contract_qualification(args):
                               'PATH': '/qa:/usr/local/bin:/usr/bin:/bin'}
 
         def compose(*commands):
+            """Run each Compose command against this fixture project and its in-memory config."""
             return docker('compose', '-p', project, '-f', '-', *commands, input=json.dumps(config).encode())
 
         def sql(statement, parameters=()):
+            """Execute and commit a fixture SQL statement; return all result rows."""
             with closing(sqlite3.connect(data / 'frayd.sqlite', timeout=10)) as db:
                 result = db.execute(statement, parameters).fetchall()
                 db.commit()
                 return result
 
         def settings():
+            """Read the effective admin settings using the owner capability."""
             return json.loads(curl_request('/api/admin/settings', token=token))
 
         def library():
+            """Read the visible library through the disposable proxy."""
             return json.loads(curl_request('/api/library', token=token))
 
         def post_settings(payload, expected=204):
+            """Post an admin settings change and assert the expected HTTP status."""
             return curl_request('/api/admin/settings', payload, token, 'POST', expected)
 
         with cleanup_project(compose):

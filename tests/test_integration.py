@@ -31,11 +31,13 @@ class CurlHttpTests(unittest.TestCase):
     """Execute the credential-safe curl -i adapter against an owned HTTP server."""
 
     def test_real_http_status_body_and_in_memory_authorization(self):
+        """Prove curl returns a conflict body while keeping the bearer capability out of logs."""
         observed = []
         capability = 'ephemeral-fixture-only'
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
+                """Capture the submitted path, bearer header and body before returning HTTP 409."""
                 observed.append((self.path, self.headers.get('Authorization'),
                                  self.rfile.read(int(self.headers['Content-Length']))))
                 self.send_response(409)
@@ -43,6 +45,7 @@ class CurlHttpTests(unittest.TestCase):
                 self.wfile.write(b'{"reason":"busy"}')
 
             def log_message(self, *args):
+                """Suppress fixture access logs that could expose the test capability."""
                 pass
 
         server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
@@ -69,6 +72,7 @@ class WebSocketIdentityWireTests(unittest.TestCase):
     """Check actual upgrade bytes against an independent creator-account wire oracle."""
 
     def test_wrong_device_refused_then_creator_account_and_protocol_accept_verified(self):
+        """Reject unauthenticated host upgrade and validate the authenticated handshake bytes."""
         token = secrets.token_hex(32)
         proof = secrets.token_hex(16)
         observations = []
@@ -77,6 +81,7 @@ class WebSocketIdentityWireTests(unittest.TestCase):
             protocol_version = 'HTTP/1.1'
 
             def do_GET(self):
+                """Accept only the creator bearer identity and return the matching WebSocket proof."""
                 canonical_account = self.headers.get('Authorization') == 'Bearer ' + token
                 proof_matches = self.headers.get('Sec-WebSocket-Protocol') == 'frayd-party, frayd-host.' + proof
                 observations.append({'canonicalAccount': canonical_account, 'proofMatches': proof_matches})
@@ -97,6 +102,7 @@ class WebSocketIdentityWireTests(unittest.TestCase):
                 self.close_connection = True
 
             def log_message(self, *args):
+                """Suppress fixture access logs containing identity and protocol details."""
                 pass
 
         server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
@@ -105,6 +111,7 @@ class WebSocketIdentityWireTests(unittest.TestCase):
         output = io.StringIO()
 
         def create_party(path, data, supplied_token):
+            """Supply a party code only when the caller uses the in-memory creator capability."""
             self.assertEqual((path, data), ('/api/party', {'identity': 'qa-host'}))
             self.assertTrue(supplied_token == token, 'Party creation uses the same in-memory account capability')
             return json.dumps({'code': 'ABCD', 'host_capability': proof}).encode()
@@ -129,6 +136,7 @@ class DockerTimeoutTests(unittest.TestCase):
     """Prove control/lifecycle/media budgets and timeout descendant ownership."""
 
     def test_operation_budgets_and_unknown_operations(self):
+        """Assign finite budgets to supported Docker verbs and reject unknown operations."""
         cases = [
             (('inspect', 'owned'), ('metadata', 20)),
             (('build', '-t', 'owned-probe', '/owned-context'), ('context-build', 600)),
@@ -155,6 +163,7 @@ class DockerTimeoutTests(unittest.TestCase):
                 integration.docker_timeout(arguments)
 
     def test_context_probe_shared_helper_operations_have_budgets(self):
+        """Cover every Docker call made by the build-context probe with an operation budget."""
         # Inspect the actual importing caller, so an added operation cannot silently
         # escape coverage by changing only this test's representative argv list.
         source = Path(__file__).parents[1] / 'scripts/check-build-context.py'
@@ -169,11 +178,13 @@ class DockerTimeoutTests(unittest.TestCase):
                 self.assertGreater(timeout, 0)
 
     def test_timeout_override_is_finite_and_diagnostics_are_public(self):
+        """Reject zero, negative and non-finite Docker timeout overrides."""
         for timeout in [0, -1, float('inf'), float('nan')]:
             with self.subTest(timeout=timeout), self.assertRaises(ValueError):
                 integration.docker('inspect', 'owned', timeout=timeout)
 
     def test_actual_timeout_stops_child_after_cli_parent_exits(self):
+        """Kill a Compose descendant holding pipes after its CLI parent has exited."""
         # Model a Docker CLI that leaves a Compose plugin holding its captured pipes.
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

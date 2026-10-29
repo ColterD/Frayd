@@ -320,6 +320,7 @@ async fn auth_login(
     )
 }
 
+/// Retire the supplied bearer session and return success even when no session is present.
 async fn auth_logout(
     State(app): State<std::sync::Arc<App>>,
     headers: axum::http::HeaderMap,
@@ -1021,6 +1022,7 @@ fn publish_spine_cache(db: &Connection, id: i64, path: &str,
     }
 }
 
+/// Look up the indexed source path for a media ID; return None for a missing row.
 async fn media_path(app: &std::sync::Arc<App>, id: i64) -> Option<String> {
     let db = app.db.lock().unwrap();
     db.query_row("SELECT path FROM media WHERE id = ?1", [id], |r| r.get(0))
@@ -1150,6 +1152,7 @@ async fn delete_media(
     }
 }
 
+/// List indexed media with optional text search and identity-scoped kind permissions.
 async fn library_handler(
     State(app): State<std::sync::Arc<App>>,
     headers: axum::http::HeaderMap,
@@ -1204,6 +1207,7 @@ async fn library_handler(
     Json(items)
 }
 
+/// Stream the indexed conversion or source with optional byte-range start; missing files return 404.
 async fn stream(
     State(app): State<std::sync::Arc<App>>,
     Path(id): Path<i64>,
@@ -1280,6 +1284,7 @@ async fn stream(
 }
 
 
+/// Map a path suffix to the response MIME type, defaulting to application/octet-stream.
 fn mime_guess(p: &str) -> String {
     match p.rsplit('.').next().unwrap_or("") {
         "mp4" => "video/mp4",
@@ -1309,6 +1314,7 @@ struct ProgressIn {
     position: f64,
 }
 
+/// Resolve the request identity and persist a media position, returning an HTTP status.
 async fn set_progress(
     State(app): State<std::sync::Arc<App>>,
     headers: axum::http::HeaderMap,
@@ -1332,6 +1338,7 @@ async fn set_progress(
     StatusCode::NO_CONTENT
 }
 
+/// Return identity-scoped saved progress for a media item, or an HTTP error.
 async fn get_progress(
     State(app): State<std::sync::Arc<App>>,
     Path(media_id): Path<i64>,
@@ -1388,6 +1395,7 @@ struct AnnotationOut {
     note: Option<String>,
 }
 
+/// List annotations for one media item under the resolved identity.
 async fn list_annotations(
     State(app): State<std::sync::Arc<App>>,
     Path(id): Path<i64>,
@@ -1423,6 +1431,7 @@ async fn list_annotations(
     (StatusCode::OK, serde_json::to_string(&items).unwrap_or_else(|_| "[]".into()))
 }
 
+/// Upsert an annotation for the resolved bearer identity, returning 201 or the auth/database failure status.
 async fn create_annotation(
     State(app): State<std::sync::Arc<App>>,
     headers: axum::http::HeaderMap,
@@ -1457,6 +1466,7 @@ async fn create_annotation(
     }
 }
 
+/// Delete an annotation only under its resolved owning identity.
 async fn delete_annotation(
     State(app): State<std::sync::Arc<App>>,
     headers: axum::http::HeaderMap,
