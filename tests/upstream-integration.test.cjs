@@ -154,7 +154,7 @@ test('stale search and continue rows cannot replace a newer filter', async () =>
 
 test('admin delete survives card markup and stops click and key bubbling', async () => {
   const b=browser();
-  b.run('account={isAdmin:true}; testCard=card({id:9,title:"Movie",kind:"movie"},false)');
+  b.run('account={isAdmin:true}; testCard=card({id:9,title:"Movie",kind:"movie"})');
   const card=b.run('testCard');
   const button=card.children.find(child=>child.className==='card-del');
   assert.ok(button);
@@ -199,7 +199,7 @@ test('late progress does not paint detached or superseded cards; row sorting is 
   const b=browser();
   let release;
   b.respond(()=>new Promise(resolve=>{release=resolve;}));
-  b.run('testCard=card({id:9,title:"Movie",kind:"movie",duration_secs:100},false)');
+  b.run('testCard=card({id:9,title:"Movie",kind:"movie",duration_secs:100})');
   const card=b.run('testCard');
   const strip={style:{},firstElementChild:{style:{}}};
   card.isConnected=true;
@@ -209,14 +209,14 @@ test('late progress does not paint detached or superseded cards; row sorting is 
   await new Promise(resolve=>setImmediate(resolve));
   assert.equal(strip.style.display,undefined);
   b.respond(async()=>({ok:true,json:async()=>null}));
-  b.run('sortItems=[{id:2,title:"B",kind:"movie",created_at:1},{id:1,title:"A",kind:"movie",created_at:1},{id:3,title:"C",kind:"movie",created_at:2}];testSection=section("Movies",sortItems,false)');
+  b.run('sortItems=[{id:2,title:"B",kind:"movie",created_at:1},{id:1,title:"A",kind:"movie",created_at:1},{id:3,title:"C",kind:"movie",created_at:2}];testSection=section("Movies",sortItems)');
   const section=b.run('testSection');
   const cards=section.children[1];
   assert.deepEqual(Array.from(cards.children,item=>item.title),['C','A','B']);
   section.children[0].children[0].textContent='oldest first';
   section.children[0].children[0].onclick();
   // The boundary double does not parse innerHTML; use a fresh section to observe persisted ordering.
-  const refreshed=b.run('section("Movies",sortItems,false)');
+  const refreshed=b.run('section("Movies",sortItems)');
   assert.deepEqual(Array.from(refreshed.children[1].children,item=>item.title),['A','B','C']);
 });
 

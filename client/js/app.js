@@ -660,9 +660,10 @@ function resumeFor(id) {
 /**
  * Build a media card and attach progress only while its render generation and DOM node remain current.
  * @param {Object} it
+ * @param {function(number): Promise<Object|null>} [progressFor=resumeFor]
  * @returns {HTMLElement}
  */
-function card(it) {
+function card(it, progressFor = resumeFor) {
   const portrait = ['ebook', 'comic', 'manga', 'audiobook'].includes(it.kind);
   const c = el('div', 'media-card ' + (portrait ? 'portrait' : 'landscape'));
   const isVideo = it.kind === 'movie' || it.kind === 'episode';
@@ -685,9 +686,9 @@ function card(it) {
     del.onkeydown = event => { event.stopPropagation(); };
     c.appendChild(del);
   }
-  const generation = renderGeneration;
-  resumeFor(it.id).then(p => {
-    if (generation !== renderGeneration || !c.isConnected) return;
+  const generation = renderGeneration, owner = accountGeneration, identity = IDENTITY;
+  progressFor(it.id).then(p => {
+    if (generation !== renderGeneration || owner !== accountGeneration || identity !== IDENTITY || !c.isConnected) return;
     if (p && p.position > 5 && it.duration_secs) {
       const frac = Math.min(1, p.position / it.duration_secs);
       const strip = c.querySelector('.progress-strip');
@@ -703,9 +704,10 @@ function card(it) {
  * Build a sortable media row from a title and item snapshot.
  * @param {string} title
  * @param {Object[]} items
+ * @param {function(number): Promise<Object|null>} [progressFor=resumeFor]
  * @returns {HTMLElement}
  */
-function section(title, items) {
+function section(title, items, progressFor = resumeFor) {
   const wrap = el('section');
   const cards = el('div', 'cards');
   const sortItems = () => [...items].sort((a,b) => (rowSort.get(title) ? 1 : -1) * ((a.created_at || 0) - (b.created_at || 0)) || a.id - b.id);
@@ -718,10 +720,10 @@ function section(title, items) {
     shown = sortItems();
     sortBtn.textContent = oldest ? 'newest first' : 'oldest first';
     cards.innerHTML = '';
-    shown.forEach(it => cards.appendChild(card(it)));
+    shown.forEach(it => cards.appendChild(card(it, progressFor)));
   };
   head.appendChild(sortBtn);
-  shown.forEach(it => cards.appendChild(card(it)));
+  shown.forEach(it => cards.appendChild(card(it, progressFor)));
   wrap.append(head, cards);
   return wrap;
 }
@@ -730,17 +732,19 @@ function section(title, items) {
  * Build the in-progress row from a library snapshot; return null when empty or superseded.
  * @param {Object[]} [snapshot]
  * @param {number} [generation]
+ * @param {function(number): Promise<Object|null>} [progressFor=resumeFor]
  * @returns {Promise<HTMLElement|null>}
  */
-async function continueRow(snapshot = LIBRARY, generation = renderGeneration) {
+async function continueRow(snapshot = LIBRARY, generation = renderGeneration, progressFor = resumeFor) {
+  const owner = accountGeneration, identity = IDENTITY;
   // Timed media only; eligible items are ordered by greatest completion fraction below.
   const items = snapshot.filter(i => i.kind !== 'ebook' && i.kind !== 'comic' && i.kind !== 'manga');
   const withP = await Promise.all(items.map(async it => {
-    const p = await resumeFor(it.id);
+    const p = await progressFor(it.id);
     return p && p.position > 5 && it.duration_secs && p.position < it.duration_secs * 0.95
       ? { it, frac: Math.min(1, p.position / it.duration_secs) } : null;
   }));
-  if (generation !== renderGeneration) return null;
+  if (generation !== renderGeneration || owner !== accountGeneration || identity !== IDENTITY) return null;
   const inProgress = withP.filter(Boolean);
   if (!inProgress.length) return null;
   inProgress.sort((a, b) => b.frac - a.frac);
@@ -748,7 +752,7 @@ async function continueRow(snapshot = LIBRARY, generation = renderGeneration) {
   wrap.appendChild(el('div', 'row-head', '<h3>Continue watching</h3>'));
   const cards = el('div', 'cards');
   inProgress.forEach(({ it, frac }) => {
-    const c = card(it);
+    const c = card(it, progressFor);
     const strip = c.querySelector('.progress-strip');
     if (strip) { strip.style.display = 'block'; strip.firstElementChild.style.width = (frac * 100).toFixed(1) + '%'; }
     cards.appendChild(c);
@@ -764,6 +768,17 @@ async function continueRow(snapshot = LIBRARY, generation = renderGeneration) {
  */
 async function renderRows(items) {
   const generation = ++renderGeneration;
+  const owner = accountGeneration, identity = IDENTITY;
+  const current = () => generation === renderGeneration && owner === accountGeneration && identity === IDENTITY;
+  // Share only this render's lazy reads; player/reader opens still use fresh resumeFor calls.
+  const progressReads = new Map();
+  const progressFor = id => {
+    if (!current()) return Promise.resolve(null);
+    if (!progressReads.has(id)) {
+      progressReads.set(id, resumeFor(id).then(progress => current() ? progress : null));
+    }
+    return progressReads.get(id);
+  };
   const snapshot = [...LIBRARY];
   const main = $('#main');
   main.innerHTML = '<div id="hero"></div>';
@@ -771,8 +786,8 @@ async function renderRows(items) {
   const heroItem = items.find(i => i.kind === 'movie') || items[0];
   if (heroItem) renderHero(heroItem);
   if (!filtering) {
-    const cont = await continueRow(snapshot, generation);
-    if (generation !== renderGeneration) return;
+    const cont = await continueRow(snapshot, generation, progressFor);
+    if (!current()) return;
     if (cont) main.appendChild(cont);
   }
   const byKind = {};
@@ -783,9 +798,9 @@ async function renderRows(items) {
     if (!kindItems?.length) continue;
     // books/audio: author → series → books grouping
     if (kind === 'audiobook' || kind === 'ebook' || kind === 'music') {
-      main.appendChild(groupedByAuthor(kind, kindItems));
+      main.appendChild(groupedByAuthor(kind, kindItems, progressFor));
     } else {
-      main.appendChild(section(kind[0].toUpperCase() + kind.slice(1) + 's', kindItems));
+      main.appendChild(section(kind[0].toUpperCase() + kind.slice(1) + 's', kindItems, progressFor));
     }
   }
   if (filtering && !items.length) { $('#hero').style.display = 'none'; }
@@ -806,9 +821,10 @@ async function renderRows(items) {
  * Group media cards by author and then series within one kind.
  * @param {string} kind
  * @param {Object[]} items
+ * @param {function(number): Promise<Object|null>} [progressFor=resumeFor]
  * @returns {HTMLElement}
  */
-function groupedByAuthor(kind, items) {
+function groupedByAuthor(kind, items, progressFor = resumeFor) {
   const label = kind[0].toUpperCase() + kind.slice(1) + 's';
   const wrap = el('section');
   const byAuthor = {};
@@ -824,7 +840,7 @@ function groupedByAuthor(kind, items) {
         wrap.appendChild(sh);
       }
       const cards = el('div', 'cards');
-      seriesItems.forEach(it => cards.appendChild(card(it)));
+      seriesItems.forEach(it => cards.appendChild(card(it, progressFor)));
       wrap.appendChild(cards);
     }
   }

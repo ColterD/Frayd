@@ -1215,79 +1215,41 @@ async fn library_handler(
     Json(items)
 }
 
-/// Stream the indexed conversion or source with optional byte-range start; missing files return 404.
+/// Stream the indexed conversion or source using the existing single-range file service.
 async fn stream(
     State(app): State<std::sync::Arc<App>>,
     Path(id): Path<i64>,
-    headers: axum::http::HeaderMap,
+    method: axum::http::Method,
+    mut headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let (path, _size): (String, i64) = {
+    let path: String = {
         let db = app.db.lock().unwrap();
         db.query_row(
-            "SELECT COALESCE(transcode_path, path), size_bytes FROM media WHERE id = ?1",
+            "SELECT COALESCE(transcode_path, path) FROM media WHERE id = ?1",
             [id],
-            |r| -> rusqlite::Result<(String, i64)> {
-                Ok((r.get(0)?, r.get(1)?))
-            },
-        )
-        .unwrap_or_default()
+            |r| r.get(0),
+        ).unwrap_or_default()
     };
-    let p = path;
-    if p.is_empty() { return StatusCode::NOT_FOUND.into_response(); }
-    // fall back to real file size if scan missed it
-    let size = match tokio::fs::metadata(&p).await {
-        Ok(m) => m.len() as i64,
+    if path.is_empty() { return StatusCode::NOT_FOUND.into_response(); }
+    let metadata = match tokio::fs::metadata(&path).await {
+        Ok(metadata) => metadata,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
-
-    let mime = mime_guess(&p);
-
-    // parse "bytes=start-end" (end optional)
-    let range = headers
-        .get(header::RANGE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("bytes="))
-        .and_then(|s| s.split('-').next())
-        .and_then(|s| s.parse::<u64>().ok());
-
-    match range {
-        Some(start) => {
-            let file = match tokio::fs::File::open(&p).await {
-                Ok(f) => f,
-                Err(_) => return StatusCode::NOT_FOUND.into_response(),
-            };
-            let mut file = file;
-            use tokio::io::AsyncSeekExt;
-            if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
-                return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
-            }
-            let len = size - start as i64;
-            use tokio::io::AsyncReadExt;
-            let stream = tokio_util::io::ReaderStream::new(file.take(len as u64));
-            axum::response::Response::builder()
-                .status(StatusCode::PARTIAL_CONTENT)
-                .header(header::CONTENT_TYPE, mime)
-                .header(header::ACCEPT_RANGES, "bytes")
-                .header(header::CONTENT_RANGE, format!("bytes {start}-{}/{size}", size - 1))
-                .header(header::CONTENT_LENGTH, len)
-                .body(axum::body::Body::from_stream(stream))
-                .unwrap()
-                .into_response()
+    // RFC 9110 requires ignoring Range outside GET. Avoid ServeFile 0.5's invalid
+    // empty-file partial response and ignore unsupported multipart ranges.
+    if method != axum::http::Method::GET || metadata.len() == 0 || headers.get(header::RANGE).is_some_and(|value| value.as_bytes().contains(&b',')) {
+        headers.remove(header::RANGE);
+    }
+    let mut request = axum::http::Request::new(axum::body::Body::empty());
+    *request.method_mut() = method;
+    *request.headers_mut() = headers;
+    match tower_http::services::ServeFile::new(&path).try_call(request).await {
+        Ok(response) => {
+            let mut response = response.into_response();
+            response.headers_mut().insert(header::CONTENT_TYPE, mime_guess(&path).parse().unwrap());
+            response
         }
-        None => {
-            let file = match tokio::fs::File::open(&p).await {
-                Ok(f) => f,
-                Err(_) => return StatusCode::NOT_FOUND.into_response(),
-            };
-            let stream = tokio_util::io::ReaderStream::new(file);
-            axum::response::Response::builder()
-                .header(header::CONTENT_TYPE, mime)
-                .header(header::ACCEPT_RANGES, "bytes")
-                .header(header::CONTENT_LENGTH, size)
-                .body(axum::body::Body::from_stream(stream))
-                .unwrap()
-                .into_response()
-        }
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -1915,13 +1877,13 @@ mod backend_regressions {
                     rusqlite::params![genuine.to_str().unwrap(),meta.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64,meta.len() as i64]).unwrap();
                 if known_prior { assert_eq!(scanner::scan(&db,String::new(),library.clone(),None),0); }
             }
-            let response=stream(State(app.clone()),Path(1),axum::http::HeaderMap::new()).await.into_response();
+            let response=stream(State(app.clone()),Path(1),axum::http::Method::GET,axum::http::HeaderMap::new()).await.into_response();
             assert_eq!(response.status(),StatusCode::OK);
             assert_eq!(axum::body::to_bytes(response.into_body(),8192).await.unwrap(),&b"genuine legacy playback"[..]);
             std::fs::write(&src,b"new replacement source bytes").unwrap();
             std::fs::File::open(&src).unwrap().set_times(std::fs::FileTimes::new().set_modified(original.modified().unwrap())).unwrap();
             { let db=app.db.lock().unwrap();scanner::scan(&db,String::new(),library.clone(),None); }
-            let response=stream(State(app.clone()),Path(1),axum::http::HeaderMap::new()).await.into_response();
+            let response=stream(State(app.clone()),Path(1),axum::http::Method::GET,axum::http::HeaderMap::new()).await.into_response();
             assert_eq!(response.status(),StatusCode::OK);
             let want:&[u8]=if known_prior {b"new replacement source bytes"} else {b"genuine legacy playback"};
             assert_eq!(axum::body::to_bytes(response.into_body(),8192).await.unwrap(),want,"stale playback for known_prior={known_prior}");
@@ -2853,4 +2815,68 @@ mod integration_regressions {
         drop(restore);drop(db);std::fs::remove_dir_all(root).unwrap();
     }
 
+}
+
+#[cfg(test)]
+mod stream_range_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn selected_files_obey_byte_range_contracts() {
+        let root=std::env::temp_dir().join(format!("frayd-range-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let source=root.join("source.mp4");
+        let conversion=root.join("conversion.m4b");
+        let empty=root.join("empty.mp4");
+        let bytes:Vec<u8>=(0..=255).cycle().take(1024).collect();
+        std::fs::write(&source,&bytes).unwrap();
+        std::fs::write(&conversion,b"conversion").unwrap();
+        std::fs::write(&empty,[]).unwrap();
+        let db=store::open(":memory:");
+        for (id,path,converted) in [(1,source.clone(),None),(2,root.join("original.mp4"),Some(conversion)),(3,empty,None),(4,root.join("missing.mp4"),None)] {
+            db.execute("INSERT INTO media(id,kind,path,title,size_bytes,transcode_path) VALUES(?1,'movie',?2,'fixture',1,?3)",rusqlite::params![id,path.to_str(),converted.as_ref().and_then(|p|p.to_str())]).unwrap();
+        }
+        let app=Arc::new(App {db:Mutex::new(db),db_path:String::new(),library:std::sync::RwLock::new(LibraryConfig::default()),scan_queue:Mutex::new(ScanQueue::default()),scanning:std::sync::atomic::AtomicBool::new(false),scan_error:Mutex::new(None),auth_rl:auth::RateLimiter::new(300,10),party:Arc::new(party::Party::new()),ingest_status:Mutex::new(None)});
+        for (range,status,content_range,expected) in [
+            (None,200,None,bytes.as_slice()),
+            (Some("bytes=5-9"),206,Some("bytes 5-9/1024"),&bytes[5..10]),
+            (Some("bytes=5-"),206,Some("bytes 5-1023/1024"),&bytes[5..]),
+            (Some("bytes=-5"),206,Some("bytes 1019-1023/1024"),&bytes[1019..]),
+            (Some("bytes=1020-9999"),206,Some("bytes 1020-1023/1024"),&bytes[1020..]),
+            (Some("bytes=1024-"),416,Some("bytes */1024"),&[]),
+            (Some("bytes=99999-"),416,Some("bytes */1024"),&[]),
+            (Some("bytes=bad"),416,Some("bytes */1024"),&[]),
+            (Some("bytes=9-5"),416,Some("bytes */1024"),&[]),
+            (Some("bytes=0-1,4-5"),200,None,bytes.as_slice()),
+        ] {
+            let mut headers=axum::http::HeaderMap::new();
+            if let Some(range)=range {headers.insert(header::RANGE,range.parse().unwrap());}
+            let response=stream(State(app.clone()),Path(1),axum::http::Method::GET,headers).await.into_response();
+            assert_eq!(response.status().as_u16(),status,"{range:?}");
+            assert_eq!(response.headers().get(header::CONTENT_RANGE).map(|v|v.to_str().unwrap()),content_range,"{range:?}");
+            assert_eq!(response.headers()[header::CONTENT_TYPE],"video/mp4");
+            assert_eq!(response.headers()[header::ACCEPT_RANGES],"bytes");
+            if status!=416 {assert_eq!(response.headers()[header::CONTENT_LENGTH],expected.len().to_string());}
+            assert_eq!(axum::body::to_bytes(response.into_body(),4096).await.unwrap().as_ref(),expected,"{range:?}");
+        }
+        for (id,range,status,mime,expected) in [(2,Some("bytes=0-3"),206,Some("audio/mp4"),b"conv".as_slice()),(3,Some("bytes=0-0"),200,Some("video/mp4"),b"".as_slice()),(3,None,200,Some("video/mp4"),b"".as_slice()),(4,None,404,None,b"".as_slice()),(999,None,404,None,b"".as_slice())] {
+            let mut headers=axum::http::HeaderMap::new();
+            if let Some(range)=range {headers.insert(header::RANGE,range.parse().unwrap());}
+            let response=stream(State(app.clone()),Path(id),axum::http::Method::GET,headers).await.into_response();
+            assert_eq!(response.status().as_u16(),status,"id{id}");
+            assert_eq!(response.headers().get(header::CONTENT_TYPE).map(|v|v.to_str().unwrap()),mime);
+            if id==3 {assert_eq!(response.headers()[header::CONTENT_LENGTH],"0");assert!(!response.headers().contains_key(header::CONTENT_RANGE));}
+            assert_eq!(axum::body::to_bytes(response.into_body(),4096).await.unwrap().as_ref(),expected);
+        }
+        for range in [None,Some("bytes=5-9")] {
+            let mut headers=axum::http::HeaderMap::new();
+            if let Some(range)=range {headers.insert(header::RANGE,range.parse().unwrap());}
+            let response=stream(State(app.clone()),Path(1),axum::http::Method::HEAD,headers).await.into_response();
+            assert_eq!(response.status(),StatusCode::OK);
+            assert_eq!(response.headers()[header::CONTENT_LENGTH],"1024");
+            assert!(!response.headers().contains_key(header::CONTENT_RANGE));
+            assert!(axum::body::to_bytes(response.into_body(),4096).await.unwrap().is_empty());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

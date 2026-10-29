@@ -1539,7 +1539,57 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     equal(activeQuery, '', 'Late search cannot restore its retired query'); search.value = '';
     equal(retiredCard.querySelector('.progress-strip').style.display, 'none', 'Detached progress never paints');
     check(!document.querySelector('#main').textContent.includes('Continue watching'), 'Filtered view has no stale continue row');
-    return { deletedId: +deletedId, libraryIds: LIBRARY.map(i => i.id), activeKind, sort, detachedProgressIgnored: true, modeledAPI: true };
+    const retainedLibrary = LIBRARY, retainedKind = activeKind, retainedQuery = activeQuery;
+    const priorMovieSort = rowSort.get('Movies');
+    const progressGets = [];
+    const positions = new Map([[60, 20], [61, 80], [62, 99], [63, 0]]);
+    LIBRARY = [
+      { id: 60, kind: 'movie', title: 'Progress movie', duration_secs: 100 },
+      { id: 61, kind: 'episode', title: 'Progress episode', duration_secs: 100 },
+      { id: 62, kind: 'music', title: 'Progress song', duration_secs: 100 },
+      { id: 63, kind: 'ebook', title: 'Progress book' },
+    ];
+    responder = async (url, options) => {
+      if (url.startsWith('/api/progress/')) {
+        const id = Number(new URL(url, location.origin).pathname.split('/').at(-1));
+        progressGets.push(id);
+        return reply({ position: positions.get(id) });
+      }
+      return defaultResponder(url, options);
+    };
+    await filterKind('all', ''); await delay(0);
+    const initialGets = progressGets.length;
+    equal([...progressGets].sort(), [60, 61, 62, 63], 'Each rendered media ID fetches progress once');
+    const continuationCards = [...document.querySelector('#main section .cards').children];
+    equal(continuationCards.map(card => card.title), ['Progress episode', 'Progress movie'], 'Continue order and eligibility retained');
+    equal(continuationCards.map(card => card.querySelector('.progress-strip > div').style.width), ['80%', '20%'], 'Shared progress preserves both continuation bars');
+    equal(document.querySelectorAll('#main .media-card').length, 6, 'Two continuation cards and four regular cards render');
+    document.querySelector('#main .row-head button').click(); await delay(0);
+    equal(progressGets.length, initialGets, 'Same-render sorting makes no additional progress request');
+    positions.set(60, 60);
+    await filterKind('all', ''); await delay(0);
+    equal(progressGets.length - initialGets, 4, 'Next render reads a fresh snapshot');
+    check([...document.querySelectorAll('#main .media-card')].filter(card => card.title === 'Progress movie')
+      .every(card => card.querySelector('.progress-strip > div').style.width === '60%'), 'Both current movie cards receive updated progress');
+    const beforeFreshResume = progressGets.length;
+    equal((await resumeFor(60)).position, 60, 'Non-render resume stays fresh');
+    equal(progressGets.length, beforeFreshResume + 1, 'Non-render resume makes its own progress GET');
+    const failedGets = [];
+    responder = async (url, options) => {
+      if (url.startsWith('/api/progress/')) { failedGets.push(url); return reply(null, 500); }
+      return defaultResponder(url, options);
+    };
+    await filterKind('all', ''); await delay(0);
+    equal(failedGets.length, 4, 'Failed progress is shared within the render');
+    check(!document.querySelector('#main').textContent.includes('Continue watching'), 'Failed progress creates no continue row');
+    check([...document.querySelectorAll('#main .progress-strip')].every(strip => strip.style.display === 'none'), 'Failed progress leaves every regular bar hidden');
+    responder = defaultResponder;
+    LIBRARY = retainedLibrary;
+    if (priorMovieSort === undefined) rowSort.delete('Movies'); else rowSort.set('Movies', priorMovieSort);
+    await filterKind(retainedKind, retainedQuery);
+    return { deletedId: +deletedId, libraryIds: LIBRARY.map(i => i.id), activeKind, sort, detachedProgressIgnored: true, modeledAPI: true,
+      progressReadReuse: { libraryItems: 4, initialGets, sortAdditionalGets: 0, nextRenderGets: 4, freshResumeAdditionalGets: 1, failedRenderGets: failedGets.length,
+        continuationOrder: ['Progress episode', 'Progress movie'], actualDOM: true, modeledProgressAPI: true } };
   });
   await run('trusted ebook keys preserve editable inactive settings and button focus', async () => {
     responder = defaultResponder;

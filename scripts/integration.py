@@ -692,6 +692,28 @@ def main():
         assert request(f'/api/comic/{media_id}/page/0') == image
         assert request(f'/api/stream/{media_id}') == fixture
         assert request(f'/api/stream/{media_id}', headers={'Range': 'bytes=5-'}, expected=206) == fixture[5:]
+        for byte_range, status, content_range, expected_body in [
+            ('bytes=5-9', 206, f'bytes 5-9/{len(fixture)}', fixture[5:10]),
+            ('bytes=-5', 206, f'bytes {len(fixture)-5}-{len(fixture)-1}/{len(fixture)}', fixture[-5:]),
+            (f'bytes={len(fixture)-3}-99999', 206, f'bytes {len(fixture)-3}-{len(fixture)-1}/{len(fixture)}', fixture[-3:]),
+            (f'bytes={len(fixture)}-', 416, f'bytes */{len(fixture)}', b''),
+            ('bytes=bad', 416, f'bytes */{len(fixture)}', b''),
+            ('bytes=0-1,4-5', 200, None, fixture),
+        ]:
+            range_request = urllib.request.Request(base + f'/api/stream/{media_id}', headers={'Range': byte_range})
+            try:
+                range_response = urllib.request.urlopen(range_request, timeout=15)
+            except urllib.error.HTTPError as error:
+                range_response = error
+            with range_response:
+                assert range_response.status == status, (byte_range, range_response.status)
+                assert range_response.headers.get('Content-Range') == content_range, byte_range
+                assert range_response.headers.get('Accept-Ranges') == 'bytes', byte_range
+                assert range_response.headers.get('Content-Type') == 'application/vnd.comicbook+zip', byte_range
+                assert range_response.read(len(fixture) + 1) == expected_body, byte_range
+                if status != 416:
+                    assert int(range_response.headers['Content-Length']) == len(expected_body), byte_range
+        print('PASS: bounded/open/suffix/clamped byte payloads, unsatisfied/malformed416, multipart complete200 and exact range headers')
         request('/api/progress', {'media_id': media_id, 'position': 0.5}, token, expected=204)
         assert json.loads(request(f'/api/progress/{media_id}', token=token))['position'] == 0.5
         print('PASS: synthetic comic scan, page bytes, full stream, range stream, saved progress')

@@ -155,15 +155,38 @@ fn series_from(s: &str) -> Option<String> {
     if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
 }
 
-/// Read one format-level metadata tag (title, synopsis, description, ...).
-fn ffprobe_tag(src: &str, tag: &str) -> Option<String> {
+#[derive(Default)]
+struct ProbeMetadata {
+    duration: Option<f64>,
+    title: Option<String>,
+    synopsis: Option<String>,
+    author: Option<String>,
+    series: Option<String>,
+}
+
+/// Read new-item duration and decoded, trimmed tags in one process. Unusable output is optional metadata.
+/// Exit status is not a parsing gate; valid JSON may still contain useful format metadata.
+fn ffprobe_metadata(src: &str) -> Option<ProbeMetadata> {
     let out = Command::new("ffprobe")
-        .args(["-v", "quiet", "-show_entries", &format!("format_tags={tag}"),
-               "-of", "csv=p=0", src])
+        .args(["-v", "quiet", "-show_entries",
+               "format=duration:format_tags=title,synopsis,description,artist,album_artist,author,album,series",
+               "-of", "json", src])
         .output()
         .ok()?;
-    let s = std::str::from_utf8(&out.stdout).ok()?.trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
+    let metadata: serde_json::Value = serde_json::from_str(std::str::from_utf8(&out.stdout).ok()?).ok()?;
+    let format = metadata.get("format")?;
+    let tags = format.get("tags").and_then(serde_json::Value::as_object);
+    let tag = |name: &str| -> Option<String> {
+        let value = tags?.iter().find(|(key, _)| key.eq_ignore_ascii_case(name))?.1.as_str()?.trim();
+        if value.is_empty() { None } else { Some(value.to_string()) }
+    };
+    Some(ProbeMetadata {
+        duration: format.get("duration").and_then(serde_json::Value::as_str).and_then(|value| value.trim().parse().ok()),
+        title: tag("title"),
+        synopsis: tag("synopsis").or_else(|| tag("description")),
+        author: tag("artist").or_else(|| tag("album_artist")).or_else(|| tag("author")),
+        series: tag("album").or_else(|| tag("series")),
+    })
 }
 
 /// Return the positive media duration reported by ffprobe, or None when probing fails.
@@ -385,17 +408,9 @@ fn upsert_item_with_roots(db: &Connection, db_path: String, path: &Path, kind: &
     if updated > 0 && is_new {
         let id = db.last_insert_rowid();
         let path_pb = path.to_path_buf();
-        // probing is slow — off the insert path is fine here (scan is already blocking)
-        let dur = ffprobe_duration(&path_str);
-        let title_tag = ffprobe_tag(&path_str, "title");
-        let synopsis = ffprobe_tag(&path_str, "synopsis")
-            .or_else(|| ffprobe_tag(&path_str, "description"));
-        // author/series: tags first, then parent-dir / filename heuristics
-        let tag_author = ffprobe_tag(&path_str, "artist")
-            .or_else(|| ffprobe_tag(&path_str, "album_artist"))
-            .or_else(|| ffprobe_tag(&path_str, "author"));
-        let tag_series = ffprobe_tag(&path_str, "album")
-            .or_else(|| ffprobe_tag(&path_str, "series"));
+        let ProbeMetadata { duration: dur, title: title_tag, synopsis, author: tag_author, series: tag_series } =
+            ffprobe_metadata(&path_str).unwrap_or_default();
+        // Tags take precedence over filename heuristics independently for author and series.
         let (author, series) = match (tag_author, tag_series) {
             (Some(a), Some(s)) => (Some(a), Some(s)),
             (a, s) => {
@@ -559,6 +574,92 @@ mod tests {
         assert_eq!(classify(&p("/media/stuff/Book 01 - Chapter 3.mp3")), Some("audiobook"));
         // plain title defaults to music
         assert_eq!(classify(&p("/media/stuff/delain-virtue-and-vice.mp3")), Some("music"));
+    }
+
+    /// One structured probe persists decoded tags and retains filename fallbacks on unusable output.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn new_item_metadata_uses_one_probe_and_persists_decoded_tags() {
+        if std::env::var_os("FRAYD_TEST_METADATA_CHILD").is_none() {
+            let result=Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","scanner::tests::new_item_metadata_uses_one_probe_and_persists_decoded_tags","--nocapture"])
+                .env("FRAYD_TEST_METADATA_CHILD","1").output().unwrap();
+            print!("{}{}",String::from_utf8_lossy(&result.stdout),String::from_utf8_lossy(&result.stderr));
+            assert!(result.status.success(),"new-item metadata oracle failed: {}",result.status);
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let fixture=Library::new(&[]);
+        let original_path=std::env::var_os("PATH").unwrap();
+        let real_probe=std::env::split_paths(&original_path).map(|directory|directory.join("ffprobe"))
+            .find(|candidate|candidate.is_file()).unwrap().canonicalize().unwrap();
+        let bin=fixture.0.join("bin");std::fs::create_dir(&bin).unwrap();
+        let count=fixture.0.join("count");let arguments=fixture.0.join("arguments");
+        let output=fixture.0.join("output");let wrapper=bin.join("ffprobe");
+        std::fs::write(&wrapper,r#"#!/bin/sh
+printf 'probe\n' >> "$FRAYD_TEST_METADATA_COUNT"
+printf '%s\n' "$@" > "$FRAYD_TEST_METADATA_ARGUMENTS"
+if [ -n "$FRAYD_TEST_METADATA_OUTPUT" ]; then
+    /bin/cat "$FRAYD_TEST_METADATA_OUTPUT"
+    printf 'captured diagnostic' >&2
+    exit "$FRAYD_TEST_METADATA_STATUS"
+fi
+exec "$FRAYD_TEST_METADATA_REAL_PROBE" "$@"
+"#).unwrap();
+        std::fs::set_permissions(&wrapper,std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("FRAYD_TEST_METADATA_COUNT",&count);
+        std::env::set_var("FRAYD_TEST_METADATA_ARGUMENTS",&arguments);
+        std::env::set_var("FRAYD_TEST_METADATA_REAL_PROBE",&real_probe);
+        std::env::remove_var("FRAYD_TEST_METADATA_OUTPUT");
+        std::env::set_var("PATH",std::env::join_paths([bin.clone()].into_iter().chain(std::env::split_paths(&original_path))).unwrap());
+        let db=open(":memory:");
+        let persist=|src: &Path, expected: (Option<f64>, &str, &str, &str, &str), expected_count: usize| {
+            std::fs::write(&count,[]).unwrap();
+            let start=std::time::Instant::now();
+            assert_eq!(upsert_item(&db,String::new(),src,"music",None,&fixture.0),1);
+            let elapsed=start.elapsed();
+            let actual=db.query_row("SELECT duration_secs,title,json_extract(meta_json,'$.synopsis'),author,series FROM media WHERE path=?1",
+                [src.to_str().unwrap()],|row|Ok((row.get::<_,Option<f64>>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?))).unwrap();
+            assert_eq!(actual,(expected.0,expected.1.into(),expected.2.into(),expected.3.into(),expected.4.into()),"{}",src.display());
+            assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(),expected_count,"{}",src.display());
+            if expected_count==1 {
+                assert_eq!(std::fs::read_to_string(&arguments).unwrap(),format!("-v\nquiet\n-show_entries\nformat=duration:format_tags=title,synopsis,description,artist,album_artist,author,album,series\n-of\njson\n{}\n",src.display()));
+            }
+            assert_eq!(upsert_item(&db,String::new(),src,"music",None,&fixture.0),0);
+            assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(),expected_count,"unchanged music must not probe");
+            println!("metadata_case={} probes={expected_count} elapsed_ms={:.3} persisted={actual:?} unchanged_reprobe=false",src.parent().unwrap().file_name().unwrap().to_string_lossy(),elapsed.as_secs_f64()*1000.0);
+        };
+        for (name,tags,expected) in [
+            ("preferred",vec![("title","Preferred"),("synopsis","Synopsis"),("description","Ignored"),("artist","Artist"),("album_artist","Ignored"),("author","Ignored"),("album","Album"),("series","Ignored")],("Preferred","Synopsis","Artist","Album")),
+            ("fallback",vec![("description","Description"),("album_artist","Album artist"),("author","Ignored"),("series","Series")],("Filename Author - Filename Series 03 - Title","Description","Album artist","Series")),
+            ("absent",vec![],("Filename Author - Filename Series 03 - Title","","Filename Author","Filename Series")),
+            ("decoded",vec![("title","  Comma, \"title\"  "),("synopsis","  Line\none  "),("artist","  Artist  "),("album","Back\\slash")],("Comma, \"title\"","Line\none","Artist","Back\\slash")),
+        ] {
+            let directory=fixture.0.join(name);std::fs::create_dir(&directory).unwrap();
+            let src=directory.join("Filename Author - Filename Series 03 - Title.mka");
+            let mut generate=Command::new("ffmpeg");
+            generate.args(["-v","error","-nostdin","-f","lavfi","-i","sine=frequency=440:sample_rate=8000","-t","0.2","-c:a","pcm_s16le","-threads","1"]);
+            for (key,value) in tags { generate.args(["-metadata",&format!("{key}={value}")]); }
+            assert!(generate.arg(&src).output().unwrap().status.success());
+            persist(&src,(Some(0.2),expected.0,expected.1,expected.2,expected.3),1);
+        }
+        std::env::set_var("FRAYD_TEST_METADATA_OUTPUT",&output);
+        for (name,bytes,status,expected) in [
+            ("valid-nonzero",br#"{"format":{"duration":" -2 ","tags":{"TITLE":" Title ","ARTIST":" ","ALBUM_ARTIST":" ","AUTHOR":" Author ","SYNOPSIS":" ","DESCRIPTION":" Description ","ALBUM":" ","SERIES":" Series "}}}"#.as_slice(),"9",(Some(-2.0),"Title","Description","Author","Series")),
+            ("malformed",b"garbage".as_slice(),"0",(None,"Filename Author - Filename Series 03 - Title","","Filename Author","Filename Series")),
+            ("non-utf8",b"\xff".as_slice(),"0",(None,"Filename Author - Filename Series 03 - Title","","Filename Author","Filename Series")),
+            ("empty",b"".as_slice(),"0",(None,"Filename Author - Filename Series 03 - Title","","Filename Author","Filename Series")),
+            ("wrong-types",br#"{"format":{"duration":{},"tags":{"title":42,"artist":[],"synopsis":true,"album":null}}}"#.as_slice(),"0",(None,"Filename Author - Filename Series 03 - Title","","Filename Author","Filename Series")),
+        ] {
+            let directory=fixture.0.join(name);std::fs::create_dir(&directory).unwrap();
+            let src=directory.join("Filename Author - Filename Series 03 - Title.mka");std::fs::write(&src,[]).unwrap();
+            std::fs::write(&output,bytes).unwrap();std::env::set_var("FRAYD_TEST_METADATA_STATUS",status);
+            persist(&src,expected,1);
+        }
+        std::env::set_var("PATH",fixture.0.join("missing-tool"));
+        let directory=fixture.0.join("missing-tool");std::fs::create_dir(&directory).unwrap();
+        let src=directory.join("Filename Author - Filename Series 03 - Title.mka");std::fs::write(&src,[]).unwrap();
+        persist(&src,(None,"Filename Author - Filename Series 03 - Title","","Filename Author","Filename Series"),0);
     }
 
     /// Replacement duration comes from the current media while identity and user state remain stable.

@@ -2307,3 +2307,104 @@ test('failed stale search cannot replace a newer account view with local results
   await pending;
   assert.equal(b.nodes.get('#main').innerHTML, 'new account view');
 });
+
+function progressRenderFixture() {
+  const b = browser();
+  const create = b.context.document.createElement;
+  b.context.document.createElement = (...args) => {
+    const node = create(...args);
+    const strip = { style: {}, firstElementChild: { style: {} } };
+    node.isConnected = true;
+    node.querySelector = selector => selector === '.progress-strip' ? strip : null;
+    return node;
+  };
+  b.run(`IDENTITY = 'owned-render-fixture'; LIBRARY = [
+    { id: 1, kind: 'movie', title: 'Movie', duration_secs: 100 },
+    { id: 2, kind: 'episode', title: 'Episode', duration_secs: 100 },
+    { id: 3, kind: 'music', title: 'Song', duration_secs: 100 },
+    { id: 4, kind: 'ebook', title: 'Book' }
+  ]; filtering = false;`);
+  const positions = new Map([[1, 20], [2, 80], [3, 99], [4, 0]]);
+  b.respond(async url => ({ ok: true, json: async () => new URL(url, 'https://fixture.invalid').pathname === '/api/library' ? b.run('LIBRARY') : ({ position: positions.get(Number(new URL(url, 'https://fixture.invalid').pathname.split('/').at(-1))) }) }));
+  return { b, positions, reads: () => b.requests.filter(request => request.url.startsWith('/api/progress/')) };
+}
+
+test('one render shares progress reads across continue cards, library cards and sorting', async () => {
+  const { b, reads } = progressRenderFixture();
+  await b.run('renderRows(LIBRARY)');
+  await settle();
+  const counts = {};
+  for (const request of reads()) {
+    const id = Number(new URL(request.url, 'https://fixture.invalid').pathname.split('/').at(-1));
+    counts[id] = (counts[id] || 0) + 1;
+  }
+  assert.deepEqual(counts, { 1: 1, 2: 1, 3: 1, 4: 1 }, 'Each media ID is read once within the owned render');
+  const sections = b.nodes.get('#main').children;
+  const continuing = sections[0].children[1].children;
+  assert.deepEqual(continuing.map(card => card.title), ['Episode', 'Movie']);
+  assert.deepEqual(continuing.map(card => card.querySelector('.progress-strip').firstElementChild.style.width), ['80.0%', '20.0%']);
+  const movieSection = sections[1];
+  const beforeSort = reads().length;
+  movieSection.children[0].children[0].textContent = 'oldest first';
+  movieSection.children[0].children[0].onclick();
+  await settle();
+  assert.equal(reads().length, beforeSort, 'Sorting reuses this render snapshot');
+});
+
+test('new render and explicit media opening each fetch fresh progress', async () => {
+  const { b, positions, reads } = progressRenderFixture();
+  await b.run('renderRows(LIBRARY)');
+  await settle();
+  positions.set(1, 60);
+  b.nodes.get('#main').children.length = 0; // The boundary double does not parse innerHTML clearing.
+  b.requests.length = 0;
+  await b.run('loadLibrary()');
+  await settle();
+  assert.equal(reads().length, 4, 'A new render never reuses the previous snapshot');
+  const continuation = b.nodes.get('#main').children[0].children[1].children;
+  assert.equal(continuation.find(card => card.title === 'Movie').querySelector('.progress-strip').firstElementChild.style.width, '60.0%');
+  const beforeOpen = reads().length;
+  b.run('openVideo(LIBRARY[0])');
+  await settle();
+  assert.equal(reads().length, beforeOpen + 1, 'Playback resume does not use the render snapshot');
+});
+
+for (const failure of ['http', 'network', 'json']) {
+  test(`render progress ${failure} failure stays empty and a new render retries`, async () => {
+    const { b, reads } = progressRenderFixture();
+    b.respond(async () => {
+      if (failure === 'network') throw new Error('owned progress failure');
+      return { ok: failure !== 'http', json: async () => {
+        if (failure === 'json') throw new Error('owned JSON failure');
+        return null;
+      } };
+    });
+    await b.run('renderRows(LIBRARY)');
+    await settle();
+    assert.equal(reads().length, 4);
+    assert.doesNotMatch(b.nodes.get('#main').children[0].children[0].innerHTML, /Continue watching/);
+    b.respond(async () => ({ ok: true, json: async () => ({ position: 25 }) }));
+    b.nodes.get('#main').children.length = 0;
+    b.requests.length = 0;
+    await b.run('renderRows(LIBRARY)');
+    await settle();
+    assert.equal(reads().length, 4);
+    assert.match(b.nodes.get('#main').children[0].children[0].innerHTML, /Continue watching/);
+  });
+}
+
+test('retired render progress cannot paint cards or start new reads after an account change', async () => {
+  const { b, reads } = progressRenderFixture();
+  const releases = [];
+  b.respond(() => new Promise(resolve => releases.push(resolve)));
+  const old = b.run('renderRows(LIBRARY)');
+  const oldReadCount = reads().length;
+  b.run('++accountGeneration; IDENTITY = "new-render-fixture"');
+  b.nodes.get('#main').innerHTML = 'new account view';
+  releases.forEach(release => release({ ok: true, json: async () => ({ position: 50 }) }));
+  await old;
+  await settle();
+  assert.equal(reads().length, oldReadCount, 'Old continuation cannot issue card reads in the new account');
+  assert.equal(b.nodes.get('#main').innerHTML, 'new account view');
+  assert.equal(b.nodes.get('#main').children.length, 0);
+});
