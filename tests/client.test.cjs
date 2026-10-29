@@ -7,7 +7,7 @@ const vm = require('node:vm');
 const clientPath = join(__dirname, '..', 'client');
 
 // Only browser boundaries are doubled: the complete application scripts run as-is.
-function browser({ now } = {}) {
+function browser({ now, storage = {}, initialResponse } = {}) {
   const nodes = new Map();
   const listeners = new Map();
   const documentCaptures = new Map();
@@ -39,7 +39,7 @@ function browser({ now } = {}) {
         for (const handler of documentCaptures.get(name) || []) handler({ target: this, type: name });
         const handlers = events.get(name) || [];
         events.set(name, handlers.filter(handler => !handler.once));
-        for (const handler of handlers) handler.callback({ target: this, type: name });
+        for (const handler of handlers) handler.callback({ target: this, type: name, preventDefault() {} });
         this['on' + name]?.();
       },
       appendChild(child) { this.children.push(child); },
@@ -63,7 +63,7 @@ function browser({ now } = {}) {
   const requests = [];
   const intervals = new Map();
   let nextIntervalId = 0;
-  let response = async () => ({ ok: true, status: 200, json: async () => null });
+  let response = initialResponse || (async () => ({ ok: true, status: 200, json: async () => null }));
   const document = {
     removeEventListener(name, callback, capture) {
       if (capture === true) documentCaptures.set(name, (documentCaptures.get(name) || []).filter(handler => handler !== callback));
@@ -77,7 +77,7 @@ function browser({ now } = {}) {
   };
   const sockets = [];
   const context = vm.createContext({
-    document, localStorage: {}, URL, location: { hostname: 'test.invalid', origin: 'https://test.invalid' },
+    document, localStorage: storage, URL, location: { hostname: 'test.invalid', origin: 'https://test.invalid' },
     console: { log() {}, warn() {} }, innerWidth: 1000, innerHeight: 800,
     fetch: async (url, options) => { requests.push({ url, options }); return response(url, options); },
     addEventListener: (name, fn) => listeners.set(name, fn),
@@ -248,7 +248,7 @@ test('party follow detects a video after each library replacement', async () => 
   b.run('partyFollow(9, "Movie", 12, false, 0)');
   assert.equal(b.nodes.get('#plyr-video').src, '/api/stream/9');
   assert.equal(b.nodes.get('#pb-audio').src, '');
-  b.respond(async url => ({ ok: true, json: async () => url === '/api/library' ? [{ id: 10, kind: 'show', title: 'Episode' }] : null }));
+  b.respond(async url => ({ ok: true, json: async () => url === '/api/library' ? [{ id: 10, kind: 'episode', title: 'Episode' }] : null }));
   await b.run('loadLibrary()');
   b.run('partyFollow(10, "Episode", 4, false, 0)');
   assert.equal(b.nodes.get('#plyr-video').src, '/api/stream/10');
@@ -299,9 +299,9 @@ test('party guest picker preserves playable order, escapes titles and limits pla
     { id: 1, kind: 'ebook', title: 'Book' },
     { id: 2, kind: 'manga', title: 'Manga' },
     { id: 3, kind: 'unknown', title: 'Unknown' },
-    { id: 4, kind: 'episode', title: 'Unsupported episode' },
+    { id: 4, kind: 'show', title: 'Unsupported legacy show' },
     { id: 5, kind: 'movie', title: '<Movie> & "title"' },
-    { id: 6, kind: 'show', title: 'Show' },
+    { id: 6, kind: 'episode', title: 'Episode' },
     { id: 7, kind: 'music', title: 'Music' },
     { id: 8, kind: 'audiobook', title: 'Audiobook' },
     ...Array.from({ length: 18 }, (_, index) => ({ id: index + 9, kind: 'music', title: 'Track ' + index })),
@@ -312,11 +312,14 @@ test('party guest picker preserves playable order, escapes titles and limits pla
     [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]);
   assert.match(html, /data-title="&lt;Movie&gt; &amp; &quot;title&quot;"/);
   assert.doesNotMatch(html, /<Movie>/);
+  assert.doesNotMatch(html, /Unsupported legacy show/);
+  b.run('partyFollow(6, "Episode", 6, false, 0)');
+  assert.equal(b.nodes.get('#plyr-video').src, '/api/stream/6');
   b.run('partyFollow(7, "Music", 12, false, 0)');
   assert.equal(b.nodes.get('#pb-audio').src, '/api/stream/7');
   b.run('partyFollow(8, "Audiobook", 4, false, 0)');
   assert.equal(b.nodes.get('#pb-audio').src, '/api/stream/8');
-  assert.equal(b.nodes.get('#plyr-video').src, '');
+  assert.equal(b.nodes.get('#plyr-video').src, '/api/stream/6');
 });
 
 // Plyr's ready event precedes metadata; its seek setter ignores unknown duration.
@@ -672,11 +675,10 @@ test('highlight selection errors require the active opaque reader and use consta
 });
 
 
-for (const [isHost, metadataFirst, priorFollowId] of [
-  [true, true, null], [true, false, null], [false, true, null], [false, false, null],
-  [true, true, 9], [true, false, 9],
+for (const [isHost, metadataFirst] of [
+  [true, true], [true, false], [false, true], [false, false],
 ]) {
-  test(`${isHost ? 'host' : 'guest'} first party state ${metadataFirst ? 'after' : 'before'} metadata with prior follow ID ${priorFollowId} preserves the role's video position`, async () => {
+  test(`${isHost ? 'host' : 'guest'} first party state ${metadataFirst ? 'after' : 'before'} metadata preserves the role's video position`, async () => {
     const b = browser();
     b.respond(async () => ({ ok: true, json: async () => ({ position: 203 }) }));
     b.run('LIBRARY = [{ id: 9, kind: "movie", title: "Movie" }]; openVideo(LIBRARY[0])');
@@ -687,7 +689,6 @@ for (const [isHost, metadataFirst, priorFollowId] of [
     media.src = '';
     media.readyState = metadataFirst ? 1 : 0;
     if (metadataFirst) b.run('plyr.duration = 634; plyr.emit("loadedmetadata")');
-    b.run(`partyFollowId = ${JSON.stringify(priorFollowId)}`);
     vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), b.context);
     b.nodes.get('#party-code-input').value = 'ABCD';
     b.run('PartyUI.open()');
@@ -972,7 +973,6 @@ for (const kind of ['music', 'movie']) {
       b.context.partySend = value => sends.push(value);
       b.context.external = { paused: false, pauses: 0 };
       b.run(`LIBRARY = [{ id: 9, kind: ${JSON.stringify(kind)} }];
-        partyFollowId = ${retained ? 9 : 'null'};
         partyPlaybackKind = 'external';
         ytPlayerReady = true;
         ytPlayer = { pauseVideo() {
@@ -1282,7 +1282,7 @@ test('reused YouTube callbacks cannot send through a departed host or a guest se
 });
 
 for (const kind of ['video', 'audio']) {
-  test(`effective ${kind} stream replaces a local source despite a retained party ID`, async () => {
+  test(`party follow replaces the current local ${kind} stream and records its own progress`, async () => {
     const b = browser();
     const entry = kind === 'video' ? 'openVideo' : 'playAudio';
     b.run(`LIBRARY = [{ id: 9, kind: '${kind === 'video' ? 'movie' : 'music'}', title: 'Party nine' },
@@ -1292,7 +1292,6 @@ for (const kind of ['video', 'audio']) {
     const media = b.nodes.get(kind === 'video' ? '#plyr-video' : '#pb-audio');
     media.currentTime = 203;
     assert.equal(media.src, '/api/stream/10');
-    assert.equal(b.run('partyFollowId'), 9);
     b.run("partyFollow(9, 'Party nine', 24, true, Date.now()/1000)");
     await settle();
     b.requests.length = 0;
@@ -2115,4 +2114,196 @@ test('host audio zero echo preserves106 through progress tick and native pause s
   assert.equal(positionAfterEcho, 106);
   assert.equal(audio.currentTime, 106);
   assert.equal(audio.paused, true);
+});
+
+// A logout reload must choose the sign-in layout before any LAN auto-resume.
+for (const mode of ['guest', 'account']) {
+  test(`${mode} sign-out reload shows only sign-in and permits explicit re-entry`, async () => {
+    const storage = { frayd_identity: 'owned-logout-fixture' };
+    if (mode === 'account') storage.frayd_token = 'nonfunctional-fixture-token';
+    const initialResponse = async url => ({ ok: true, status: 200, json: async () => {
+      if (url === '/api/auth/login') return { name: 'Fixture', token: 'nonfunctional-fixture-token' };
+      if (url === '/api/auth/me') return { name: 'Fixture', is_admin: false };
+      return [];
+    } });
+    const signedIn = browser({ storage, initialResponse });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(signedIn.nodes.get('#app').classList.contains('on'), true);
+    let reloaded = false;
+    signedIn.context.location.reload = () => { reloaded = true; };
+    signedIn.nodes.get('#logout').emit('click');
+    assert.equal(reloaded, true);
+    assert.equal(storage.frayd_token, undefined);
+    assert.equal(storage.frayd_logout, '1');
+    assert.equal(storage.frayd_identity, 'owned-logout-fixture');
+
+    const signedOut = browser({ storage, initialResponse });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(signedOut.nodes.get('#app').classList.contains('on'), false, 'Dashboard stays hidden after explicit sign-out');
+    assert.equal(signedOut.context.document.body.classList.contains('auth'), true);
+    assert.equal(signedOut.nodes.get('#login').style.display, 'flex');
+    assert.equal(signedOut.requests.length, 0, 'Explicit sign-out does not resume or load the library');
+    const refreshedSignedOut = browser({ storage, initialResponse });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(refreshedSignedOut.nodes.get('#app').classList.contains('on'), false, 'Refreshing sign-in must not resume the guest session');
+    assert.equal(refreshedSignedOut.context.document.body.classList.contains('auth'), true);
+    assert.equal(refreshedSignedOut.nodes.get('#login').style.display, 'flex');
+    assert.equal(refreshedSignedOut.requests.length, 0);
+    assert.equal(storage.frayd_logout, '1', 'Sign-out persists until explicit re-entry');
+
+    if (mode === 'guest') refreshedSignedOut.nodes.get('#guest').emit('click');
+    else {
+      refreshedSignedOut.nodes.get('#email').value = 'fixture@example.invalid';
+      refreshedSignedOut.nodes.get('#password').value = 'nonfunctional-fixture-password';
+      await refreshedSignedOut.run('doLogin({ preventDefault() {} })');
+    }
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(refreshedSignedOut.context.document.body.classList.contains('auth'), false);
+    assert.equal(refreshedSignedOut.nodes.get('#login').style.display, 'none');
+    assert.equal(refreshedSignedOut.nodes.get('#app').classList.contains('on'), true);
+    assert.equal(refreshedSignedOut.run('account !== null'), mode === 'account');
+    assert.equal(storage.frayd_logout, undefined, 'Explicit re-entry clears the sign-out marker');
+    assert.equal(refreshedSignedOut.requests.filter(request => new URL(request.url, 'https://fixture.invalid').pathname === '/api/library').length, 1);
+  });
+}
+
+for (const boundary of ['pages', 'resume']) {
+  for (const replacement of ['new comic', 'close']) {
+    test(`comic ${boundary} response cannot reopen or overwrite progress after ${replacement}`, async () => {
+      const b = browser();
+      let release;
+      b.respond(async url => {
+        if (url === (boundary === 'pages' ? '/api/comic/1/pages' : '/api/progress/1?identity=undefined')) {
+          return new Promise(resolve => { release = resolve; });
+        }
+        return { ok: true, json: async () => url.includes('/pages') ? ['0', '1', '2', '3', '4'] : { position: 1 } };
+      });
+      const old = b.run('openComic({ id: 1, title: "Old comic" })');
+      await settle();
+      assert.equal(typeof release, 'function');
+      if (replacement === 'new comic') {
+        await b.run('openComic({ id: 2, title: "New comic" })');
+        await settle();
+        assert.equal(b.nodes.get('#cm-img').src, '/api/comic/2/page/1', 'Current comic restores its own saved page');
+      } else b.nodes.get('#cm-close').onclick();
+      const image = b.nodes.get('#cm-img').src;
+      const title = b.nodes.get('#cm-title').textContent;
+      b.requests.length = 0;
+      release({ ok: true, json: async () => boundary === 'pages' ? ['0', '1', '2', '3', '4'] : { position: 4 } });
+      await old;
+      await settle();
+      assert.equal(b.nodes.get('#cm-img').src, image);
+      assert.equal(b.nodes.get('#cm-title').textContent, title);
+      assert.equal(b.nodes.get('#comic-modal').classList.contains('on'), replacement === 'new comic');
+      assert.deepEqual(b.requests.filter(request => request.url === '/api/progress'), [], 'Retired response cannot write either comic progress');
+      if (replacement === 'new comic') {
+        b.nodes.get('#cm-next').onclick();
+        assert.equal(b.nodes.get('#cm-img').src, '/api/comic/2/page/2', 'Current reader navigation still works');
+        assert.equal(JSON.parse(b.requests.at(-1).options.body).media_id, 2);
+      }
+    });
+  }
+}
+
+for (const mode of ['guest', 'account']) {
+  for (const operation of ['loadLibrary()', 'serverSearch("needle & ?")', 'tryResume()']) {
+    test(`${mode} ${operation} sends the current library identity contract`, async () => {
+      const b = browser();
+      await settle();
+      b.run('IDENTITY = "owned library identity & ?"');
+      if (mode === 'account') b.context.localStorage.frayd_token = 'nonfunctional-fixture-token';
+      b.respond(async url => ({ ok: true, json: async () => url.startsWith('/api/auth/me') ? { name: 'Fixture' } : [] }));
+      await b.run(operation);
+      await settle();
+      const requests = b.requests.filter(request => new URL(request.url, 'https://fixture.invalid').pathname === '/api/library');
+      assert.ok(requests.length > 0);
+      for (const request of requests) {
+        const url = new URL(request.url, 'https://fixture.invalid');
+        assert.equal(url.searchParams.get('identity'), 'owned library identity & ?');
+        assert.equal(request.options?.headers?.Authorization, mode === 'account' ? 'Bearer nonfunctional-fixture-token' : undefined);
+        if (operation.startsWith('serverSearch')) assert.equal(url.searchParams.get('q'), 'needle & ?');
+      }
+    });
+  }
+}
+
+for (const operation of ['loadLibrary()', 'serverSearch("old")', 'tryResume()']) {
+  test(`${operation} cannot publish after the account changes`, async () => {
+    const b = browser();
+    await settle();
+    b.run('IDENTITY = "old-fixture"');
+    let release;
+    b.respond(() => new Promise(resolve => { release = resolve; }));
+    const pending = b.run(operation);
+    b.run('++accountGeneration; IDENTITY = "new-fixture"; account = { name: "New account" }; LIBRARY = [{ id: 2, kind: "music" }]');
+    b.nodes.get('#main').innerHTML = 'new account view';
+    release({ ok: true, json: async () => [] });
+    await pending;
+    await settle();
+    assert.equal(b.run('LIBRARY[0]?.id'), 2);
+    assert.equal(b.run('account.name'), 'New account');
+    assert.equal(b.nodes.get('#main').innerHTML, 'new account view');
+    assert.equal(b.nodes.get('#app').classList.contains('on'), false, 'Old resume cannot enter the new account');
+  });
+}
+
+test('an obsolete boot resume cannot cover a newly entered account with sign-in', async () => {
+  let release;
+  const storage = { frayd_identity: 'old-fixture' };
+  const b = browser({ storage, initialResponse: () => new Promise(resolve => { release = resolve; }) });
+  b.respond(async () => ({ ok: true, json: async () => [] }));
+  b.run('IDENTITY = "new-fixture"; account = { name: "New account" }; enterApp()');
+  release({ ok: true, json: async () => [] });
+  await settle();
+  assert.equal(b.context.document.body.classList.contains('auth'), false);
+  assert.equal(b.nodes.get('#login').style.display, 'none');
+  assert.equal(b.run('account.name'), 'New account');
+});
+
+test('episode renders as video, appears in library rows and opens the video player', async () => {
+  const b = browser();
+  b.respond(async () => ({ ok: true, json: async () => null }));
+  b.run('LIBRARY = [{ id: 12, kind: "episode", title: "Episode" }]; filtering = true');
+  await b.run('renderRows(LIBRARY)');
+  assert.match(b.nodes.get('#hero').innerHTML, /▶ Play/);
+  const section = b.nodes.get('#main').children.at(-1);
+  assert.match(section.children[0].innerHTML, /Episodes/);
+  const card = section.children[1].children[0];
+  assert.match(card.innerHTML, /src="\/api\/thumb\/12"/);
+  card.onclick();
+  await settle();
+  assert.equal(b.nodes.get('#comic-modal').classList.contains('on'), false);
+  assert.equal(b.nodes.get('#video-modal').classList.contains('on'), true);
+  assert.equal(b.nodes.get('#plyr-video').src, '/api/stream/12');
+  assert.equal(b.nodes.get('#pb-audio').src, '');
+});
+
+test('late account details cannot replace a newer account during resume', async () => {
+  const b = browser();
+  await settle();
+  b.run('IDENTITY = "old-fixture"');
+  b.context.localStorage.frayd_token = 'nonfunctional-fixture-token';
+  let release;
+  b.respond(async url => url === '/api/auth/me' ? new Promise(resolve => { release = resolve; }) : { ok: true, json: async () => [] });
+  const pending = b.run('tryResume()');
+  await settle();
+  assert.equal(typeof release, 'function');
+  b.run('++accountGeneration; IDENTITY = "new-fixture"; account = { name: "New account" }');
+  release({ ok: true, json: async () => ({ name: 'Old account', is_admin: true }) });
+  await pending;
+  assert.equal(b.run('account.name'), 'New account');
+  assert.equal(b.nodes.get('#app').classList.contains('on'), false);
+});
+
+test('failed stale search cannot replace a newer account view with local results', async () => {
+  const b = browser();
+  await settle();
+  let reject;
+  b.respond(() => new Promise((resolve, fail) => { reject = fail; }));
+  const pending = b.run('serverSearch("old")');
+  b.run('++accountGeneration; IDENTITY = "new-fixture"');
+  b.nodes.get('#main').innerHTML = 'new account view';
+  reject(new Error('retired request failure'));
+  await pending;
+  assert.equal(b.nodes.get('#main').innerHTML, 'new account view');
 });

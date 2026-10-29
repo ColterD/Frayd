@@ -1,4 +1,4 @@
-"""Native ownership contract. Runtime qualification requires FRAYD_NATIVE_BUNDLE."""
+"""Native ownership contract. Runtime qualification requires FRAYD_NATIVE_ARCHIVE and FRAYD_NATIVE_BUILD_SOURCE."""
 import base64
 import hashlib
 import json

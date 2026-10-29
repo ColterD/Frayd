@@ -176,8 +176,8 @@ fn ffprobe_duration(src: &str) -> Option<f64> {
     std::str::from_utf8(&out.stdout).ok()?.trim().parse().ok()
 }
 
-/// Open an initialized database for standalone scans and fixtures.
-#[allow(dead_code)] // used by ad-hoc scans/tests
+/// Open an initialized database for scan fixtures.
+#[cfg(test)]
 pub fn open(path: &str) -> Connection {
     crate::store::open(path)
 }
@@ -211,7 +211,7 @@ fn manga_directory_has_files(dir: &Path) -> bool {
 }
 
 /// Incremental scan of a library root. Returns number of new/updated items.
-#[allow(dead_code)] // Single-root compatibility API.
+#[cfg(test)]
 pub fn scan(db: &Connection, db_path: String, root: std::path::PathBuf, thumbs_dir: Option<&Path>) -> usize {
     let roots=vec![root.clone()];
     scan_with_roots(db,db_path,root,thumbs_dir,&roots)

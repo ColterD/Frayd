@@ -271,14 +271,6 @@ fn job_state(db: &Connection, id: i64, src: &Path, tmp: &Path, out: &Path, allow
     Some(rows[0].2.clone())
 }
 
-/// Grant recovery authority only to the exact completed pair displaced by a known source replacement.
-/// The caller holds an immediate transaction after clearing the old pointer; retain the returned lease
-/// until commit so a live converter and a partially updated registry cannot acquire retirement authority.
-#[allow(dead_code)]
-pub(crate) fn retire_replaced_job(db: &Connection, db_path: &str, library: &Path, id: i64, src: &Path, out: &Path) -> rusqlite::Result<Option<File>> {
-    retire_replaced_job_with_roots(db,db_path,&[library.to_path_buf()],id,src,out)
-}
-
 /// Check the complete root snapshot before granting retirement of an exact inactive, unreferenced generated pair.
 /// The caller holds its immediate source-replacement transaction and retains the returned lease through commit.
 /// Canonical cache overlap/unavailable roots and unqualified non-Linux recovery retain bytes and registry state.
@@ -340,9 +332,8 @@ fn discard_failed_job(db: &mut Connection, id: i64, src: &Path, tmp: &Path, out:
     retired.is_some()
 }
 
-/// Recover only inactive known pending jobs on Linux; unsupported locks and historical unknown jobs retain provenance.
-/// Startup and explicit scans invoke this path again after a database timeout; no age or PID grants ownership.
-#[allow(dead_code)] // Single-root compatibility API.
+/// Single-root fixture adapter for the guarded recovery path.
+#[cfg(test)]
 pub fn recover_pending_jobs(db_path: &str, library: &Path) { recover_pending_jobs_with_roots(db_path,&[library.to_path_buf()]); }
 
 /// Recover only known pending/retiring generated pairs under qualified Linux leases and the complete root snapshot.
@@ -386,10 +377,6 @@ pub fn recover_pending_jobs_with_roots(db_path: &str, roots: &[PathBuf]) {
     }
 }
 
-/// Queue one source; codec detection and all conversion work use a worker connection.
-#[allow(dead_code)] // Compatibility entrypoint for single-root callers.
-pub fn maybe_enqueue(db_path: String, media_id: i64, src: PathBuf, library: PathBuf) { maybe_enqueue_with_roots(db_path,media_id,src,vec![library]); }
-
 /// Serialize converter admission with root reconfiguration, retaining the worker's complete immutable root snapshot.
 /// The shared BUSY gate admits one worker; cache checks precede registry/filesystem mutation and publication
 /// still requires current file/database source versions plus the exact reservation lease. Non-Linux jobs
@@ -402,10 +389,6 @@ pub fn maybe_enqueue_with_roots(db_path: String, media_id: i64, src: PathBuf, ro
         run_job_with_roots(&db_path, media_id, &src, &roots);
     });
 }
-
-/// Resolve an existing media ID before queueing the same guarded worker path.
-#[allow(dead_code)] // Compatibility entrypoint for single-root callers.
-pub fn maybe_enqueue_for_existing(db_path: String, src: PathBuf, library: PathBuf) { maybe_enqueue_for_existing_with_roots(db_path,src,vec![library]); }
 
 /// Resolve an existing media ID on a dedicated non-migrating connection, then use the same whole-root worker admission.
 /// Passing all roots preserves cache-containment, source-version publication and lease guards for unchanged sources.

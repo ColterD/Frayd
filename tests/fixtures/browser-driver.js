@@ -1,4 +1,4 @@
-/* global ebook, showChunk, LIBRARY, plyr, partyFollowId, partyPlaybackKind, openVideo, PartyUI */
+/* global ebook, showChunk, LIBRARY, plyr, partyPlaybackKind, openVideo, PartyUI */
 'use strict';
 function responsiveOverflowInventory() {
   const main = document.getElementById('main');
@@ -173,7 +173,7 @@ async function isolatedToolbarRetryCase(mode) {
       if (statusReads <= (mode === 'transient' ? 1 : 3)) throw Error('Owned transient status transport failure');
       return reply({ scanning: false });
     }
-    if (url === '/api/library') {
+    if (new URL(String(url), location.origin).pathname === '/api/library') {
       libraryReads++;
       if (mode === 'transient') return new Promise(resolve => { releaseLibrary = () => resolve(reply(initialLibrary)); });
       return reply(initialLibrary);
@@ -292,17 +292,29 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
   if (window.__responsiveDiagnosticOnly) {
     await run('fresh isolated responsive diagnostic at768 CSS pixels', () => freshResponsiveDocument(768));
     return api('result', { cases, errors, mediaDiagnostics, nativeMedia, passed: cases.filter(c => c.status === 'PASS').length,
-      failed: cases.filter(c => c.status !== 'PASS').length, limits: ['Diagnostic only; retained39 and installer cases are not rerun here.'] });
+      failed: cases.filter(c => c.status !== 'PASS').length, limits: ['Diagnostic only; full-suite and installer cases are not rerun here.'] });
   }
   const logoutReceipt = sessionStorage.getItem('frayd-qa-logout');
   if (logoutReceipt) {
-    sessionStorage.removeItem('frayd-qa-logout');
     const packet = JSON.parse(logoutReceipt);
     await until(() => document.getElementById('login').style.display !== 'none', 'logout returns to login');
+    check(!document.getElementById('app').classList.contains('on') && document.body.classList.contains('auth'), 'Signed-out document shows only sign-in');
+    check(localStorage.frayd_logout === '1', 'Sign-out remains explicit until re-entry');
+    if (!packet.logoutRefreshed) {
+      packet.logoutRefreshed = true;
+      sessionStorage.setItem('frayd-qa-logout', JSON.stringify(packet));
+      location.reload();
+      return;
+    }
+    sessionStorage.removeItem('frayd-qa-logout');
     check(settingsPoll === null && !document.getElementById('settings-modal').classList.contains('on'), 'new document owns no old settings poll or modal');
-    packet.cases.push({ name: 'settings logout reload discards the previous document and poll', status: 'PASS',
-      observed: { actualReload: true, loginVisible: true, settingsPoll: null, previousDocumentGeneration: packet.logoutGeneration } });
+    document.getElementById('guest').click();
+    await until(() => document.getElementById('app').classList.contains('on') && document.getElementById('login').style.display === 'none', 'explicit guest re-entry after repeated sign-in refresh');
+    check(localStorage.frayd_logout === undefined, 'Explicit re-entry clears sign-out marker');
+    packet.cases.push({ name: 'settings logout repeated reload retains sign-in until guest re-entry and retires old poll', status: 'PASS',
+      observed: { actualReload: true, repeatedRefreshSignInOnly: true, explicitGuestReentry: true, settingsPoll: null, previousDocumentGeneration: packet.logoutGeneration } });
     delete packet.logoutGeneration;
+    delete packet.logoutRefreshed;
     packet.passed++;
     packet.errors.push(...errors);
     packet.mediaDiagnostics.push(...mediaDiagnostics);
@@ -510,7 +522,6 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       check(media.getVideoPlaybackQuality().totalVideoFrames > 0, 'Queue scenario decodes owned video frames');
       media.addEventListener('pause', observe);
       partyHostHook(command => forwarded.push(command));
-      partyFollowId = 20;
       ytReady = true;
       ytPlayerReady = true;
       ytId = 'native-queued-roundtrip';
@@ -631,7 +642,6 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       active.dispatchEvent(new Event('pause'));
       active.dispatchEvent(new Event('seeked'));
       equal(forwarded.map(message => message.type), ['pause', 'seek'], 'Active host event forwarding respects actual paused state');
-      partyFollowId = null;
       const sourceBeforeFollow = { src: active.getAttribute('src'), child: active.querySelector('source')?.getAttribute('src') };
       window.partyFollow(id, 'Fixture movie', 12, false, Date.now() / 1000);
       equal({ src: active.getAttribute('src'), child: active.querySelector('source')?.getAttribute('src') },
@@ -677,7 +687,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     ? Promise.resolve(new Response(JSON.stringify({ position: 203 }), { headers: { 'Content-Type': 'application/json' } }))
     : originalFetch(url, options);
   for (const kind of ['video', 'audio']) {
-    await run(`effective ${kind} stream replaces local playback despite a retained party ID`, async () => {
+    await run(`party follow replaces the current local ${kind} stream and records its own progress`, async () => {
       delete window.partySend;
       const priorLibrary = LIBRARY;
       LIBRARY = [{ id: 9, kind: kind === 'video' ? 'movie' : 'music', title: 'Party nine' },
@@ -699,7 +709,6 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
         Object.defineProperty(media, 'duration', { configurable: true, value: 634 });
         media.dispatchEvent(new Event('loadedmetadata'));
         media.currentTime = 203;
-        equal(partyFollowId, 9, 'Party ID remains nine while local source is ten');
         const localSource = media.src || media.querySelector('source')?.src || media.currentSrc;
         check(localSource.endsWith('/api/stream/10'), 'Actual local source is ten');
         window.fetch = (url, options) => {
@@ -753,10 +762,9 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     send(data) { this.sent.push(JSON.parse(data)); }
     close() { this.readyState = 3; }
   };
-  async function firstPartyState({ id, isHost, metadataFirst, nextId = id, priorFollowId = null, localPaused = false }) {
+  async function firstPartyState({ id, isHost, metadataFirst, nextId = id, localPaused = false }) {
     PartyUI.close();
     delete window.partySend;
-    partyFollowId = priorFollowId;
     const previous = plyr.media;
     openVideo({ id, kind: 'movie', title: 'Resume fixture' });
     await until(() => plyr.media !== previous, 'openVideo installs real Plyr source');
@@ -797,7 +805,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       equal(media.paused, false, 'Guest same-media update follows host play');
     }
     PartyUI.close();
-    return { isHost, metadataFirst, priorFollowId, loadedMedia: id, partyMedia: nextId, firstPosition: position,
+    return { isHost, metadataFirst, loadedMedia: id, partyMedia: nextId, firstPosition: position,
       sourceBefore, sourceAfter: { src: media.getAttribute('src'), child: media.querySelector('source')?.getAttribute('src') },
       actualVendoredPlyr: true, productionPartyStateHandler: true, syntheticMediaTimingAndTransport: true };
   }
@@ -806,11 +814,6 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     for (const isHost of [true, false]) await run(
       `${isHost ? 'host' : 'guest'} first party echo ${metadataFirst ? 'after' : 'before'} metadata uses correct resume authority`,
       () => firstPartyState({ id, isHost, metadataFirst }));
-  }
-  for (const metadataFirst of [false, true]) {
-    const id = metadataFirst ? 11 : 10;
-    await run(`host with stale same-media follow ID ${metadataFirst ? 'after' : 'before'} metadata preserves saved resume`,
-      () => firstPartyState({ id, isHost: true, metadataFirst, priorFollowId: id }));
   }
   await run('host changed-media first state still loads the party stream',
     () => firstPartyState({ id: 11, nextId: 10, isHost: true, metadataFirst: true }));
@@ -847,7 +850,6 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     const cachedActivations = [];
     for (const transition of ['close', 'local audio']) {
       partyFollow(10, 'Cached movie', 12, true, Date.now() / 1000);
-      equal(partyFollowId, 10, 'Video follow ID remains cached before native transition');
       const sourceMutations = [];
       let audioSourceInstalled = false;
       const observer = new MutationObserver(records => {
@@ -898,7 +900,6 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       PartyUI.close();
       delete window.partySend;
       LIBRARY = [{ id: 10, kind: 'movie' }, { id: 11, kind: 'music' }];
-      partyFollowId = null;
       const audio = document.getElementById('pb-audio');
       audio.pause();
       audio.removeAttribute('src');
@@ -939,7 +940,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     return observations;
   });
   for (const isHost of [true, false]) for (const kind of ['music', 'movie']) {
-    await run(`${isHost ? 'host' : 'guest'} external YouTube to fresh and retained ${kind} stops external playback`, async () => {
+    await run(`${isHost ? 'host' : 'guest'} external YouTube to native ${kind} stops external playback`, async () => {
       const originalYT = window.YT;
       const originalReady = ytReady;
       const observations = [];
@@ -963,12 +964,11 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       } };
       ytReady = true;
       try {
-        for (const retained of [false, true]) for (const readyBeforeTransition of [true, false]) {
+        for (const readyBeforeTransition of [true, false]) {
           PartyUI.close();
           delete window.partySend;
           LIBRARY = [{ id: 10, kind: 'movie' }, { id: 11, kind: 'music' }];
           const id = kind === 'movie' ? 10 : 11;
-          partyFollowId = retained ? id : null;
           const native = kind === 'movie' ? plyr.media : document.getElementById('pb-audio');
           native.src = `/api/stream/${id}`;
           Object.defineProperty(native, 'readyState', { configurable: true, value: 1 });
@@ -979,7 +979,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
           document.getElementById('party-code-input').value = 'ABCD';
           document.getElementById('pt-join').click();
           socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: isHost,
-            state: { external_url: `mock-${kind}-${isHost}-${retained}-${readyBeforeTransition}`, title: 'Mock YouTube',
+            state: { external_url: `mock-${kind}-${isHost}-${readyBeforeTransition}`, title: 'Mock YouTube',
               media_id: null, queue: [], position: 0, playing: true, updated_at: Date.now() / 1000 } }) });
           equal(document.getElementById('pb-audio').paused, true, 'External handoff pauses native audio');
           equal(plyr.paused, true, 'External handoff pauses native video');
@@ -1007,7 +1007,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
           const expectedPosition = isHost ? 0 : 24;
           check(native.currentTime >= expectedPosition && native.currentTime < expectedPosition + 2,
             'Native position follows role authority');
-          observations.push({ retained, readyBeforeTransition, nativePausedForExternal: true, externalPauses: mock.pauses, nativePlaying: !native.paused,
+          observations.push({ readyBeforeTransition, nativePausedForExternal: true, externalPauses: mock.pauses, nativePlaying: !native.paused,
             position: native.currentTime, modalOpen: modal.classList.contains('on'), youtubeClass: false });
         }
         const queuedAudio = document.getElementById('pb-audio');
@@ -1027,7 +1027,6 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
         equal(queueCommands.filter(command => command.type === 'pause').length, 1, 'Legitimate queued audio pause broadcasts once');
         const pendingMedia = plyr.media;
         Object.defineProperty(pendingMedia, 'readyState', { configurable: true, value: 0 });
-        partyFollowId = null;
         partyFollow(10, 'Pending native video', 24, true, Date.now() / 1000);
         partyFollowExternal(`pending-video-${kind}-${isHost}`, 'Mock external', 0, false, Date.now() / 1000, false);
         Object.defineProperty(pendingMedia, 'readyState', { configurable: true, value: 1 });
@@ -1144,7 +1143,6 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     const audioEchoes = [];
     const audioMuted = pbAudio.muted;
     const priorLibrary = LIBRARY;
-    const priorFollowId = partyFollowId;
     const app = document.getElementById('app');
     const login = document.getElementById('login');
     const priorAppVisible = app.classList.contains('on');
@@ -1229,7 +1227,6 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       pbAudio.muted = audioMuted;
       window.WebSocket = originalWebSocket;
       LIBRARY = priorLibrary;
-      partyFollowId = priorFollowId;
       app.classList.toggle('on', priorAppVisible);
       document.body.classList.toggle('auth', priorBodyAuth);
       if (priorLoginStyle === null) login.removeAttribute('style');
@@ -1245,6 +1242,10 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
   const reply = (value, status = 200) => new Response(status === 204 ? null : JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });
   window.fetch = async (url, options = {}) => {
     if (String(url).startsWith('/__fixture/')) return qaFetch(url, options);
+    if (new URL(String(url), location.origin).pathname === '/api/library') {
+      equal(new URL(String(url), location.origin).searchParams.get('identity'), IDENTITY, 'Library request retains current modeled identity');
+      equal(options.headers?.Authorization, localStorage.frayd_token ? 'Bearer ' + localStorage.frayd_token : undefined, 'Library request retains current bearer presence');
+    }
     requests.push({ url: String(url), method: options.method || 'GET', body: options.body ? JSON.parse(options.body) : null });
     return responder(String(url), options);
   };
@@ -1260,7 +1261,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
   const defaultResponder = async (url) => url === '/api/admin/perms'
     ? reply([{ identity_id: 4, key: 'fixture-user', is_admin: true, allowed_kinds: null }])
     : url === '/api/admin/settings' ? reply(settingsValue)
-      : url === '/api/library' ? reply([]) : reply(null);
+      : new URL(String(url), location.origin).pathname === '/api/library' ? reply([]) : reply(null);
   responder = defaultResponder;
   const key = (key, accept = false) => api('key', { key, accept });
   const movie = { id: 9, title: 'Owned delete fixture', kind: 'movie', duration_secs: 120 };
@@ -1299,7 +1300,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     responder = async (url, options) => {
       if (url === '/api/scan') return reply(null, 202);
       if (url === '/api/scan/status') return new Promise(resolve => { releaseStatus = resolve; });
-      if (url === '/api/library') { libraryReads++; return reply([scanned]); }
+      if (new URL(String(url), location.origin).pathname === '/api/library') { libraryReads++; return reply([scanned]); }
       return defaultResponder(url, options);
     };
     const button = document.getElementById('add-media');
@@ -1327,7 +1328,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     responder = async (url, options) => {
       if (url === '/api/scan') return reply(null, 202);
       if (url === '/api/scan/status') return new Promise(resolve => { releaseStatus = resolve; });
-      if (url === '/api/library') { libraryReads++; return reply([]); }
+      if (new URL(String(url), location.origin).pathname === '/api/library') { libraryReads++; return reply([]); }
       return defaultResponder(url, options);
     };
     const button = document.getElementById('add-media');
@@ -1461,10 +1462,10 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     document.getElementById('settings-close').click();
     responder = defaultResponder; await openSettings();
     const stageHTML = document.getElementById('settings-stage').innerHTML;
-    const libraryReads = requests.filter(r => r.url === '/api/library').length;
+    const libraryReads = requests.filter(r => new URL(String(r.url), location.origin).pathname === '/api/library').length;
     release(reply({ scanning: false, ingesting: 'done' })); await delay(30);
     equal(document.getElementById('settings-stage').innerHTML, stageHTML, 'Old generation cannot repaint reopened settings');
-    equal(requests.filter(r => r.url === '/api/library').length, libraryReads + 1, 'Admitted scan refresh survives panel retirement');
+    equal(requests.filter(r => new URL(String(r.url), location.origin).pathname === '/api/library').length, libraryReads + 1, 'Admitted scan refresh survives panel retirement');
     equal(settingsPoll, null, 'No surviving settings poll');
     document.getElementById('settings-close').click();
     let releaseSettings;
@@ -1511,7 +1512,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     let releaseSearch;
     const progressReleases = [];
     responder = async (url, options) => url.startsWith('/api/library?q=') ? new Promise(resolve => { releaseSearch = resolve; })
-      : url === '/api/library' ? new Promise(resolve => { releaseLibrary = resolve; })
+      : new URL(String(url), location.origin).pathname === '/api/library' ? new Promise(resolve => { releaseLibrary = resolve; })
       : url.startsWith('/api/progress/') ? new Promise(resolve => progressReleases.push(resolve))
         : options.method === 'DELETE' ? reply(null, 204) : defaultResponder(url, options);
     LIBRARY = [movie, other];
@@ -1723,7 +1724,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     passed: cases.filter(item => item.status === 'PASS').length,
     failed: cases.filter(item => item.status === 'FAIL').length,
     logoutGeneration: settingsGeneration,
-    limits: ['32 retained cases include six decoded H264 cases; HTTP204 IDs9/10/11 remain modeled.',
+    limits: ['Retained playback cases include six decoded H264 cases; HTTP204 IDs9/10/11 remain modeled.',
       'New admin/settings APIs are Response fixtures; backend transactions, filesystem preservation and external YouTube are not qualified.',
       'Fresh owned headless browser and loopback fixture only; physical output and owner deployment are untested.'] };
   // Leave a real pending interval to prove production logout disposes it.

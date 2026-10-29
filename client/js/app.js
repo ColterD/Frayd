@@ -64,16 +64,21 @@ let accountGeneration = 0;
  * @returns {Promise<boolean>}
  */
 async function tryResume() {
-  if (IDENTITY) {
-    const r = await fetch('/api/library');
+  const owner = accountGeneration, identity = IDENTITY;
+  const current = () => owner === accountGeneration && identity === IDENTITY;
+  if (identity) {
+    const r = await fetch(`/api/library?identity=${encodeURIComponent(identity)}`, { headers: authHeaders() });
+    if (!current()) return false;
     if (r.ok) {
       // restore admin flag from token (button visibility)
       if (localStorage.frayd_token) {
         try {
           const me = await (await fetch('/api/auth/me', { headers: authHeaders() })).json();
+          if (!current()) return false;
           account = { name: me.name, isAdmin: !!me.is_admin };
         } catch {}
       }
+      if (!current()) return false;
       enterApp();
       return true;
     }
@@ -83,6 +88,7 @@ async function tryResume() {
 
 /** Enter the dashboard for the current account generation and start loading the library. */
 function enterApp() {
+  delete localStorage.frayd_logout;
   ++accountGeneration;
   stopSettingsMonitor();
   disposeSettings();
@@ -551,14 +557,17 @@ async function serverSearch(q) {
   const generation = ++searchGeneration;
   if (!q) { filterKind(activeKind, ''); return; }
   const libraryGeneration = libraryRequestGeneration;
+  const owner = accountGeneration, identity = IDENTITY;
+  const current = () => generation === searchGeneration && libraryGeneration === libraryRequestGeneration
+    && owner === accountGeneration && identity === IDENTITY;
   try {
-    const response = await fetch(`/api/library?q=${encodeURIComponent(q)}`);
+    const response = await fetch(`/api/library?q=${encodeURIComponent(q)}${identity ? '&identity=' + encodeURIComponent(identity) : ''}`, { headers: authHeaders() });
     if (!response.ok) throw new Error('Search failed');
     let results = await response.json();
-    if (generation !== searchGeneration || libraryGeneration !== libraryRequestGeneration) return;
+    if (!current()) return;
     if (activeKind !== 'all') results = results.filter(item => item.kind === activeKind);
     renderRows(results);
-  } catch { if (generation === searchGeneration) filterKind(activeKind, q); }
+  } catch { if (current()) filterKind(activeKind, q); }
 }
 
 /**
@@ -587,10 +596,13 @@ window.getLibrary = () => LIBRARY;
  */
 async function loadLibrary() {
   const generation = ++libraryRequestGeneration;
-  const response = await fetch('/api/library');
+  const owner = accountGeneration, identity = IDENTITY;
+  const current = () => generation === libraryRequestGeneration && owner === accountGeneration && identity === IDENTITY;
+  const response = await fetch(`/api/library${identity ? '?identity=' + encodeURIComponent(identity) : ''}`, { headers: authHeaders() });
+  if (!current()) return;
   if (response.ok === false) throw new Error(`Library failed (${response.status})`);
   const items = await response.json();
-  if (generation !== libraryRequestGeneration) return;
+  if (!current()) return;
   LIBRARY = items;
   filterKind(activeKind, activeQuery);
 }
@@ -653,7 +665,7 @@ function resumeFor(id) {
 function card(it) {
   const portrait = ['ebook', 'comic', 'manga', 'audiobook'].includes(it.kind);
   const c = el('div', 'media-card ' + (portrait ? 'portrait' : 'landscape'));
-  const isVideo = it.kind === 'movie' || it.kind === 'show';
+  const isVideo = it.kind === 'movie' || it.kind === 'episode';
   const isPaged = it.kind === 'comic' || it.kind === 'manga';
   c.title = `${it.title}${it.author ? ' — ' + it.author : ''}`;
   c.innerHTML = `
@@ -721,7 +733,7 @@ function section(title, items) {
  * @returns {Promise<HTMLElement|null>}
  */
 async function continueRow(snapshot = LIBRARY, generation = renderGeneration) {
-  // in-progress items, most recently touched first
+  // Timed media only; eligible items are ordered by greatest completion fraction below.
   const items = snapshot.filter(i => i.kind !== 'ebook' && i.kind !== 'comic' && i.kind !== 'manga');
   const withP = await Promise.all(items.map(async it => {
     const p = await resumeFor(it.id);
@@ -765,7 +777,7 @@ async function renderRows(items) {
   }
   const byKind = {};
   items.forEach(i => (byKind[i.kind] ||= []).push(i));
-  const order = ['movie', 'music', 'audiobook', 'ebook', 'comic', 'manga'];
+  const order = ['movie', 'episode', 'music', 'audiobook', 'ebook', 'comic', 'manga'];
   for (const kind of order) {
     const kindItems = byKind[kind];
     if (!kindItems?.length) continue;
@@ -838,7 +850,7 @@ function fmtDuration(s) {
 function renderHero(it) {
   const hero = $('#hero');
   hero.style.display = 'block';
-  const verb = ['movie', 'show'].includes(it.kind) ? 'Play' : ['comic', 'manga', 'ebook'].includes(it.kind) ? 'Read' : 'Listen';
+  const verb = ['movie', 'episode'].includes(it.kind) ? 'Play' : ['comic', 'manga', 'ebook'].includes(it.kind) ? 'Read' : 'Listen';
   const blurb = it.synopsis || `Resume where you left off, or start fresh — progress syncs across your devices.`;
   const tags = [it.kind, fmtDuration(it.duration_secs), it.author].filter(Boolean)
     .map(t => `<span class="tag">${esc(t)}</span>`).join('');
@@ -850,7 +862,6 @@ function renderHero(it) {
       <p>${esc(blurb)}</p>
       <div class="cta-row">
         <button class="btn-play" id="hero-play">▶ ${verb}</button>
-        <button class="btn-ghost" id="hero-info">More info</button>
       </div>
     </div>`;
   // backdrop: full thumb, blurred + darkened behind copy
@@ -874,7 +885,7 @@ let localAudioLoad = null;
  * @param {Object} it
  */
 function openItem(it) {
-  if (it.kind === 'movie' || it.kind === 'show') openVideo(it);
+  if (it.kind === 'movie' || it.kind === 'episode') openVideo(it);
   else if (it.kind === 'music' || it.kind === 'audiobook') playAudio(it);
   else if (it.kind === 'comic' || it.kind === 'manga') openComic(it);
   else if (it.kind === 'ebook') openEbook(it);
@@ -882,6 +893,7 @@ function openItem(it) {
 
 // ---------- comic reader ----------
 let comic = null; // { it, pages, page }
+let comicOpenGeneration = 0;
 
 /**
  * Load page names, open the comic reader and restore saved page progress when available.
@@ -889,12 +901,17 @@ let comic = null; // { it, pages, page }
  * @returns {Promise<void>}
  */
 async function openComic(it) {
+  const opening = ++comicOpenGeneration, owner = accountGeneration;
+  const current = () => opening === comicOpenGeneration && owner === accountGeneration;
   const pages = await (await fetch(`/api/comic/${it.id}/pages`)).json();
-  if (!Array.isArray(pages) || !pages.length) return;
+  if (!current() || !Array.isArray(pages) || !pages.length) return;
   comic = { it, pages, page: 0 };
   $('#cm-title').textContent = it.title;
   $('#comic-modal').classList.add('on');
-  resumeFor(it.id).then(p => { if (p) showComicPage(Math.min(Math.floor(p.position), pages.length - 1)); else showComicPage(0); });
+  resumeFor(it.id).then(p => {
+    if (!current()) return;
+    showComicPage(p ? Math.min(Math.floor(p.position), pages.length - 1) : 0);
+  });
 }
 
 /**
@@ -922,6 +939,7 @@ document.addEventListener('keydown', e => {
 });
 /** Persist the current page, release comic state and close the reader. */
 function closeComic() {
+  ++comicOpenGeneration;
   $('#comic-modal').classList.remove('on');
   if (comic) { syncProgress(comic.it.id, comic.page); comic = null; }
   $('#cm-img').src = '';
@@ -1518,7 +1536,7 @@ function trackProgress(media, it) {
  * @param {number} id
  * @returns {boolean}
  */
-const isVideoId = (id) => LIBRARY.some(x => x.id === id && (x.kind === 'movie' || x.kind === 'show'));
+const isVideoId = (id) => LIBRARY.some(x => x.id === id && (x.kind === 'movie' || x.kind === 'episode'));
 
 // ---- YouTube party playback (guests + host-load mirror) ----
 // loads YT iframe API once; ytPlayer mirrors host state. Looser drift (YT seek latency ~2s).
@@ -1633,7 +1651,6 @@ window.partyFollow = (mediaId, title, position, playing, updatedAt, options = {}
     // Visibility is UI state; the matching native owner retains close/seek authority.
     if (options.preserveActiveVideo && priorPlaybackKind === 'video'
       && hasNativeStream(video, mediaId)) {
-      partyFollowId = mediaId;
       return;
     }
     // Party takeover retires the local load; its pending gate cannot suppress host play.
@@ -1643,7 +1660,6 @@ window.partyFollow = (mediaId, title, position, playing, updatedAt, options = {}
     const item = LIBRARY.find(entry => entry.id === mediaId);
     const activating = priorPlaybackKind !== 'video'
       || !$('#video-modal').classList.contains('on') || videoItem?.id !== mediaId;
-    partyFollowId = mediaId;
     pbAudio.pause();
     $('#video-modal').classList.add('on');
     $('#vm-title').textContent = title || item.title || '—';
@@ -1668,7 +1684,6 @@ window.partyFollow = (mediaId, title, position, playing, updatedAt, options = {}
     && localAudioLoad.generation === nativeLoadGeneration && localAudioLoad.pendingResume;
   if (options.preserveActiveVideo && priorPlaybackKind === 'audio'
     && (pendingLocalAudio || hasNativeStream(pbAudio, mediaId))) {
-    partyFollowId = mediaId;
     return;
   }
   const generation = ++nativeLoadGeneration;
@@ -1676,7 +1691,6 @@ window.partyFollow = (mediaId, title, position, playing, updatedAt, options = {}
   plyr.pause();
   $('#playerbar').classList.add('on');
   const changed = !hasNativeStream(pbAudio, mediaId);
-  partyFollowId = mediaId;
   if (changed) {
     $('#pb-title').textContent = title || '—';
     $('#pb-sub').textContent = 'party';
@@ -1691,7 +1705,6 @@ window.partyFollow = (mediaId, title, position, playing, updatedAt, options = {}
   if (pbAudio.readyState >= 1) onMeta();
   else pbAudio.addEventListener('loadedmetadata', onMeta, { once: true });
 };
-let partyFollowId = null;
 
 // Panel actions use the active player; its native event is the single command.
 window.partyControlPlayback = async (type, state) => {
@@ -1885,9 +1898,10 @@ $('#vm-party').onclick = () => {
 };
 
 // ---------- boot ----------
-tryResume().then(resumed => {
-  if (!resumed || localStorage.frayd_logout) {
-    delete localStorage.frayd_logout;
+// Honor explicit sign-out before a saved LAN identity can mount the dashboard.
+const bootAccountGeneration = accountGeneration;
+(localStorage.frayd_logout ? Promise.resolve(false) : tryResume()).then(resumed => {
+  if (!resumed && bootAccountGeneration === accountGeneration) {
     document.body.classList.add('auth');
     $('#login').style.display = 'flex';
   }

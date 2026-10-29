@@ -675,7 +675,7 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
     recordPhase('cases');
     const observed = await bounded(Promise.race([result, exited]),
       `Browser regression cases exceeded ${caseBudgetMs} milliseconds`, caseBudgetMs);
-    const expectedCases = responsiveDiagnosticOnly ? 1 : 49;
+    const expectedCases = responsiveDiagnosticOnly ? 1 : 47;
     const complete = observed.cases.length === expectedCases
       && new Set(observed.cases.map(item => item.name)).size === expectedCases
       && observed.cases.every(item => item.status === 'PASS')

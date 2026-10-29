@@ -241,9 +241,8 @@ struct LoginReq {
     password: String,
 }
 
-/// v0 auth: single-user household. Accepts any email; stores/verifies password
-/// hash against identities.secret_hash on first login per username.
-/// TODO(M5): argon2id + sessions/tokens.
+/// Household account login: create an Argon2id password hash on first login,
+/// verify the stored hash on subsequent logins, and issue a session token.
 async fn auth_login(
     State(app): State<std::sync::Arc<App>>,
     headers: axum::http::HeaderMap,

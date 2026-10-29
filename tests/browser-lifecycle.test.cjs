@@ -565,8 +565,8 @@ setInterval(() => {}, 1000);
               completed: 1, passed: 1, failed: 0, blocked: 0, currentCase: 2 }) });
             if (${JSON.stringify(scenario)} === 'slow-success') setTimeout(() => {
               fetch(fixtureUrl + '__fixture/result', { method: 'POST', body: JSON.stringify({
-                cases: Array.from({ length: 49 }, (_, n) => ({ name: 'controlled ' + n, status: 'PASS' })),
-                passed: 49, failed: 0, errors: [] }) }).catch(() => {});
+                cases: Array.from({ length: 47 }, (_, n) => ({ name: 'controlled ' + n, status: 'PASS' })),
+                passed: 47, failed: 0, errors: [] }) }).catch(() => {});
             }, 650);
             return { receipt: { injectedTestDouble: true }, close: async () => {} };
           }
@@ -586,7 +586,7 @@ setInterval(() => {}, 1000);
       assert.deepEqual(result.cleanupErrors, []);
       if (scenario === 'slow-success') {
         assert.ok(result.phaseTimeline[2].elapsedMs > 900, 'Combined work exceeds the case budget yet passes');
-        assert.equal(result.cases.length, 49);
+        assert.equal(result.cases.length, 47);
       } else {
         assert.match(result.runnerError, scenario === 'startup-timeout' ? /startup exceeded 600 milliseconds/ : /cases exceeded 900 milliseconds/);
         assert.equal(result.cases.length, 0, 'Progress never substitutes for terminal case evidence');

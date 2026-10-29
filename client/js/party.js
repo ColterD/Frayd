@@ -282,7 +282,7 @@ const PartyUI = (() => {
     if (isHost) return '';
     const library = window.getLibrary?.() || [];
     return '<div class="party-sec">Request a track</div><ul class="party-queue">' +
-      library.filter(it => ['movie', 'show', 'music', 'audiobook'].includes(it.kind)).slice(0, 20).map(it =>
+      library.filter(it => ['movie', 'episode', 'music', 'audiobook'].includes(it.kind)).slice(0, 20).map(it =>
         `<li>${esc(it.title)} <button data-media="${it.id}" data-title="${esc(it.title)}" class="pt-request">Request</button></li>`
       ).join('') + '</ul>';
   }

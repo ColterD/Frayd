@@ -8,7 +8,9 @@ maintained command list. Every result below applies only to its recorded source,
 image and scenario. Earlier pending gates describe their historical checkpoint;
 they do not reopen work completed later. Hosted acceptance for the current head belongs to
 the [draft PR description](https://github.com/ColterD/Frayd/pull/2). Draft status
-and no-deployment boundaries remain in force until owner acceptance.
+remains independent of deployment acceptance. Later owner-authorized local rollout
+and its remaining interactive-acceptance gate are recorded in the
+[verified local rollout](pr-2-changelog.md#verified-local-rollout).
 
 Navigation: [source boundaries](#source-and-delivery-boundaries),
 [dispositions](#coderabbit-dispositions),
@@ -21,7 +23,8 @@ The disposition table tracks original and subsequent CodeRabbit findings,
 outside-diff comments, nitpicks and published tool diagnostics. Summary-only risks
 and GitHub CodeQL alerts have separate sections. Current measured counts and
 head-specific acceptance are recorded in the PR body.
-PR #2 remains draft and unmerged. No deployment is qualified or authorized here.
+PR #2 remains draft and unmerged. This ledger records historical verification;
+deployment authority and qualification are scoped to the later rollout record above.
 
 ## Source and delivery boundaries
 
