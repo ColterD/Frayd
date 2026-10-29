@@ -82,6 +82,24 @@
         "linux_dependency_audit": "https://github.com/ColterD/Frayd/actions/runs/40832779736/job/123310549475"
       },
       "hosted_status_at_capture": "linked Linux jobs completed success; no macOS check run on this commit"
+    },
+    {
+      "source_commit": "2aca11c6372acfbe473c63d5d7b9b5c37a7a7677",
+      "qualification": "fresh Linux image, Node/Python/native checks and actual two-context UI takeover; Rust test, Clippy and release results carried from cdce17c after exact input, binary and toolchain equality",
+      "artifacts": {
+        "app_image": "sha256:337b8b8a96eb93a615f658a4c74b8a6bcf28555d7791cb0d500cb649c298cfa7",
+        "proxy_image": "sha256:9c3d9aad42a07d46b8d42ef6c9cb0984d689db1a285c8c5a25c39307d7085cac",
+        "linux_native_archive_sha256": "ab13d99acd5c730fbb9fe68762a5860af9b63413fd6350c1aa4f05b41e7efd1e"
+      },
+      "local_results": {
+        "linux_image_and_checks": "Docker build, proxy build, export, package, Compose, locked-crate audit, Ruff and shell gates exit 0; 265 Node tests and 56 Python tests pass",
+        "native": "23/23 actual Linux x86_64 native tests pass with no skips against the exported archive; marker-poll correction in a later working tree reruns all 23 against this archive",
+        "rust_carry": "104 Rust tests, Clippy and release build pass at cdce17c; exact Rust inputs, exported binaries and rustc 1.99.1 toolchain equal this commit; no fresh Rust compilation at 2aca11c",
+        "browser": "49/49 actual Chrome cases pass in 56.042 seconds on pre-commit inputs equal to 2aca11c; separate two-context actual server/UI/WebSocket takeover exits 0 with 30 steps, 14 WebSocket events, host wire Play count 1 and two peer playing states after wire; delayed old progress GET leaves the same playing video/source with progress advancing",
+        "cleanup": "owned browser/profile and fixture cleanup verified in local receipts; no deployment or owner Vivaldi acceptance"
+      },
+      "hosted_status_links": {},
+      "hosted_status_at_capture": "2aca11c has not been pushed; cdce17c hosted checks and Mac jobs are historical for this new source"
     }
   ],
   "limits": [

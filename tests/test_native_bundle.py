@@ -562,7 +562,11 @@ class NativeOwnership(unittest.TestCase):
             child = None
             while time.monotonic() < deadline:
                 if marker.exists():
-                    document = json.loads(marker.read_text())
+                    try:
+                        document = json.loads(marker.read_text())
+                    except json.JSONDecodeError:
+                        time.sleep(0.02)
+                        continue
                     if document.get('state') == 'running':
                         child = document['pid']
                         break
