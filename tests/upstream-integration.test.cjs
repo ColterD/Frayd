@@ -65,6 +65,18 @@ test('settings disposal cancels timer and rejects late status publication', asyn
   assert.equal(b.requests.length,1);
 });
 
+test('settings scan refusal reports failure without refreshing the library', async () => {
+  const b=browser();
+  b.context.button={textContent:'Scanning…',disabled:true};
+  b.run('settingsGeneration=1;pollSettings(1,"scan",button)');
+  b.respond(async()=>({ok:true,json:async()=>({scanning:false,scan_error:'Library root unavailable'})}));
+  await [...b.intervals.values()][0]();
+  assert.equal(b.context.button.textContent,'Scan failed');
+  assert.equal(b.context.button.disabled,false);
+  assert.equal(b.intervals.size,0);
+  assert.equal(b.requests.some(request=>request.url==='/api/library'),false);
+});
+
 test('ebook shortcut guard excludes inactive, editable and button focus', () => {
   const b=browser();
   assert.equal(b.run('ebookShortcutAllowed({target:{tagName:"DIV"}})'),false);

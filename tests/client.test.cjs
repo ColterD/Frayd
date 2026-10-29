@@ -215,6 +215,22 @@ test('scan disables repeat clicks, polls until idle, refreshes and restores the 
   assert.deepEqual(b.requests.map(r => r.url), ['/api/scan', '/api/scan/status', '/api/scan/status', '/api/library']);
 });
 
+test('toolbar scan refusal restores control without publishing completion', async () => {
+  for (const admission of [202,409]) {
+    const b=browser();
+    b.respond(async url=>({status:admission,ok:true,json:async()=>url==='/api/scan/status' ? {scanning:false,scan_error:'Cache unavailable'} : []}));
+    const button=b.nodes.get('#add-media');
+    await button.onclick();
+    await [...b.intervals.values()][0]();
+    assert.equal(button.disabled,false);
+    assert.equal(b.intervals.size,0);
+    assert.equal(b.requests.some(request=>request.url==='/api/library'),false);
+    const notices=b.context.document.body.children.map(node=>node.children[0]?.innerHTML||'').join(' ');
+    assert.match(notices,/Scan failed/);
+    assert.doesNotMatch(notices,/Scan complete/);
+  }
+});
+
 test('party follow detects a video after each library replacement', async () => {
   const b = browser();
   b.respond(async url => ({ ok: true, json: async () => url === '/api/library' ? [{ id: 9, kind: 'movie', title: 'Movie' }] : null }));

@@ -152,13 +152,49 @@ controlled 3.2-second delay on the real target-list fetch failed under the old
 three-second phase timeout and passed all 29 cases with that historical startup
 deadline. These were separate controlled delays, not one combined-delay test.
 
-The current harness gives startup 30 seconds for discovery, target-list response,
+The `a4027b8` harness gives startup 30 seconds for discovery, target-list response,
 socket opening and bootstrap. After setup and navigation acknowledgment, the
 browser case phase has a separate 60-second budget. Loopback endpoint validation,
 protocol setup and bounded cleanup remain required. Local timeout controls and
-49 actual-browser cases pass on the corrected working tree; the next hosted run
-has not yet qualified this source. The 15-second values above describe only the
+49 actual-browser cases pass on this source; its hosted workflow has a separate
+result gate. The 15-second values above describe only the
 earlier source and hosted attempts.
+
+## `a4027b8` actual-browser fixture checkpoint
+
+Checked 2026-10-29 on exact source `a4027b8220b2b8c2f511ae6675d1696b2639a25b`.
+The [source binding](../../.codex/evidence/pr2-fbb-final-fixture/source-binding.json)
+matches app image `sha256:670d14d9403ccfcb44a03871040ded86f0958ab1011eaadfa58c28bf151e0334`,
+proxy image `sha256:8af98fa579fe88e34b3ccdc1e4e7d2cdd68ecbc57a089e7e3033f5c85eb91598`
+and the served index, app script and party script bytes. The isolated
+[browser result](../../.codex/evidence/pr2-fbb-final-fixture/browser-result.json)
+records PASS for 60 steps and 28 WebSocket events. A real unknown-code join
+received HTTP 404. Its error-then-close sequence kept “Party not found or rejected”
+visible, left Join available and left no sender. This confirms the preadmission
+rejection path for that code, not every rejection cause.
+
+The same fixture used the actual YouTube API: after guest-to-host rehosting, the
+player object was retained, host pause and play reached the peer, and the peer
+clock advanced 4.4386 → 6.9473 seconds. Both owned browser contexts exited,
+their profiles were removed and both old room codes rejected upgrades with
+HTTP 404. The five public [sample hashes](../../.codex/evidence/pr2-fbb-final-fixture/sample-binding.json)
+matched before and after the browser run. The original `/data` bind remained
+opaque and unchanged. Audible output, owner Vivaldi, authenticated accounts,
+other providers and live deployment remain untested here.
+
+The separate [runtime browser report](../../.codex/evidence/pr2-fbb-final-runtime/browser-result.json)
+records 49/49 actual Chrome cases on the same `a4027b8` source with 320 ms
+startup and approximately 49.9 seconds in the case phase. Its local HTTP/storage
+and controlled DNS suites exited 0 using the same app and proxy images; the
+[runtime receipt](../../.codex/evidence/pr2-fbb-final-runtime/receipt.json) and
+[cleanup inventory](../../.codex/evidence/pr2-fbb-final-runtime/cleanup.json) bind
+those commands and show zero remaining resources in all three owned QA projects.
+The browser suite exercises real DOM and decoded-media controls against a
+fixture; its modeled API behavior does not replace the separate actual YouTube
+API and peer observation above. The later documentation edits leave all 12
+bound runtime and harness inputs equal to `a4027b8`, as recorded in the
+[docs-only delta](../../.codex/evidence/pr2-fbb-final-runtime/docs-only-delta.json).
+These receipts do not claim that runtime tests ran at a later docs-only commit.
 
 Earlier verification head `f16897334b55e5d6c3da201a00791c9bd4855662` had
 [one complete hosted pass](https://github.com/ColterD/Frayd/actions/runs/40747689066/job/123025739721)

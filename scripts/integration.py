@@ -419,13 +419,13 @@ def upstream_contract_qualification(args):
             token = owner['token']
             assert settings()['effective_library_paths'] == []
             assert json.loads(curl_request('/api/scan/status')) == {
-                'scanning': False, 'library_configured': False, 'library_count': 0, 'ingesting': None}
+                'scanning': False, 'scan_error': None, 'library_configured': False, 'library_count': 0, 'ingesting': None}
             curl_request('/api/scan', token=token, method='POST', expected=501)
             post_settings({'library_paths': ['/roots/a', '/roots/b']})
             curl_request('/api/scan', token=token, method='POST', expected=202)
             wait_for_scan_idle()
             assert json.loads(curl_request('/api/scan/status')) == {
-                'scanning': False, 'library_configured': True, 'library_count': 2, 'ingesting': None}
+                'scanning': False, 'scan_error': None, 'library_configured': True, 'library_count': 2, 'ingesting': None}
             items = library()
             ids = dict(sql('SELECT path,id FROM media'))
             assert set(ids) == {'/roots/a/first.cbz', '/roots/b/second.cbz'}, ids
@@ -568,8 +568,11 @@ def upstream_contract_qualification(args):
                 wait_for_scan_idle()
                 assert json.loads(curl_request('/api/health')) == {'status': 'ok'}
                 assert settings()['effective_library_paths'] == ['/roots/a', '/roots/b']
-                status = json.loads(curl_request('/api/scan/status'))
+                raw_status = curl_request('/api/scan/status')
+                status = json.loads(raw_status)
                 assert status['library_configured'] is True and status['library_count'] == 2
+                assert status['scanning'] is False and status['scan_error'] == 'Library root unavailable'
+                assert '/roots/b' not in raw_status.decode(), 'scan status exposed a configured root path'
                 assert sql('SELECT id,path,title FROM media ORDER BY id') == before_offline
                 assert offline_id in {item['id'] for item in library()}
                 assert json.loads(curl_request(f'/api/progress/{offline_id}', token=token))['position'] == 0.75
@@ -584,9 +587,11 @@ def upstream_contract_qualification(args):
                 offline.rename(roots / 'b')
             curl_request('/api/scan', token=token, method='POST', expected=202)
             wait_for_scan_idle()
+            assert json.loads(curl_request('/api/scan/status'))['scan_error'] is None
             compose('restart', 'app')
             ready()
             wait_for_scan_idle()
+            assert json.loads(curl_request('/api/scan/status'))['scan_error'] is None
             assert curl_request(f'/api/stream/{offline_id}') == source_bytes
             assert json.loads(curl_request(f'/api/progress/{offline_id}', token=token))['position'] == 0.75
             assert sql('SELECT id,path,title FROM media ORDER BY id') == before_offline

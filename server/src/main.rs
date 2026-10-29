@@ -42,6 +42,8 @@ pub struct App {
     pub scan_queue: Mutex<ScanQueue>,
     /// True while a scan is running (single scan at a time).
     pub scanning: std::sync::atomic::AtomicBool,
+    /// Path-free failure for the most recently admitted scan generation.
+    pub scan_error: Mutex<Option<&'static str>>,
     /// Login/setup/password attempts: 10 per 5 min per IP.
     pub auth_rl: auth::RateLimiter,
     /// Active listening party (single party — household scale).
@@ -86,6 +88,7 @@ async fn main() {
         library: std::sync::RwLock::new(library.clone()),
         scan_queue: Mutex::new(ScanQueue::default()),
         scanning: std::sync::atomic::AtomicBool::new(false),
+        scan_error: Mutex::new(None),
         auth_rl: auth::RateLimiter::new(300, 10),
         party: Arc::new(party::Party::new()),
         ingest_status: std::sync::Mutex::new(None),
@@ -580,6 +583,8 @@ impl Drop for ScanReset {
         queue.requests.clear();
         let mut ingest=self.app.ingest_status.lock().unwrap_or_else(|e| e.into_inner());
         if ingest.as_deref()==Some("indexing") { *ingest=Some("failed".into()); }
+        let mut error=self.app.scan_error.lock().unwrap_or_else(|e| e.into_inner());
+        if error.is_none() { *error=Some("Scan failed"); }
         self.app.scanning.store(false,std::sync::atomic::Ordering::SeqCst);
     }
 }
@@ -670,7 +675,7 @@ fn run_scan(state: Arc<App>, libs: Vec<PathBuf>) {
         let mut reset=ScanReset {app:state.clone(),armed:true};
         let db=match store::connect(&state.db_path) {
             Ok(db)=>db,
-            Err(error)=>{ tracing::error!(%error,"scan database unavailable");return; }
+            Err(error)=>{ tracing::error!(%error,"scan database unavailable");*state.scan_error.lock().unwrap()=Some("Scan database unavailable");return; }
         };
         let thumbs=thumbs_dir_for(&state.db_path);
         let mut request={
@@ -680,12 +685,13 @@ fn run_scan(state: Arc<App>, libs: Vec<PathBuf>) {
         };
         loop {
             let ScanRequest{generation,roots,for_ingest}=request;
+            *state.scan_error.lock().unwrap()=None;
             let cache=std::env::var_os("FRAYD_TRANSCODES").map(PathBuf::from).unwrap_or_else(|| StdPath::new(&state.db_path).parent().unwrap_or(StdPath::new(".")).join("transcodes"));
             if let Some(root)=roots.iter().find(|root| !root.is_dir()) {
-                tracing::warn!(operation="walk",path=%root.display(),generation,"library scan held: configured root unavailable");return;
+                tracing::warn!(operation="walk",path=%root.display(),generation,"library scan held: configured root unavailable");*state.scan_error.lock().unwrap()=Some("Library root unavailable");return;
             }
             if transcode::validate_cache(&cache,&roots).is_none() || transcode::validate_cache(&thumbs,&roots).is_none() {
-                tracing::warn!(generation,"library scan held: cache boundary unavailable or overlapping");return;
+                tracing::warn!(generation,"library scan held: cache boundary unavailable or overlapping");*state.scan_error.lock().unwrap()=Some("Cache boundary unavailable");return;
             }
             let mut n=0;
             for root in &roots { n+=scanner::scan_with_roots(&db,state.db_path.clone(),root.clone(),Some(&thumbs),&roots); }
@@ -717,6 +723,7 @@ fn queue_ingest_scan(app: Arc<App>, roots: Vec<PathBuf>) {
         queue.requests.push_back(ScanRequest{generation,roots:roots.clone(),for_ingest:true});
     }
     if app.scanning.compare_exchange(false,true,std::sync::atomic::Ordering::SeqCst,std::sync::atomic::Ordering::SeqCst).is_ok() {
+        *app.scan_error.lock().unwrap()=None;
         drop(queue);
         run_scan(app,roots);
     }
@@ -737,6 +744,7 @@ async fn trigger_scan(State(app): State<std::sync::Arc<App>>) -> StatusCode {
         Ordering::SeqCst,
     ) {
         Ok(_) => {
+            *app.scan_error.lock().unwrap()=None;
             run_scan(app, libs);
             StatusCode::ACCEPTED
         }
@@ -884,6 +892,7 @@ async fn scan_status(State(app): State<std::sync::Arc<App>>) -> Json<serde_json:
     let config=app.library.read().unwrap();
     Json(serde_json::json!({
         "scanning": app.scanning.load(std::sync::atomic::Ordering::SeqCst),
+        "scan_error": *app.scan_error.lock().unwrap(),
         "library_configured": !config.roots.is_empty(),
         "library_count":config.roots.len(),
         "ingesting": app.ingest_status.lock().unwrap().as_deref(),
@@ -1700,7 +1709,7 @@ mod backend_regressions {
         db.execute("INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture')", []).unwrap();
         db.execute("INSERT INTO progress(identity_id,media_id,position) VALUES(1,1,7)", []).unwrap();
         Arc::new(App { db: Mutex::new(db), db_path: String::new(), library: std::sync::RwLock::new(LibraryConfig::default()), scan_queue:Mutex::new(ScanQueue::default()), ingest_status: Mutex::new(None),
-            scanning: std::sync::atomic::AtomicBool::new(false), auth_rl: auth::RateLimiter::new(300,10),
+            scanning: std::sync::atomic::AtomicBool::new(false), scan_error:Mutex::new(None), auth_rl: auth::RateLimiter::new(300,10),
             party: Arc::new(party::Party::new()) })
     }
     /// Isolate an account owner, device owner, and private rows for identity-boundary tests.
@@ -2083,12 +2092,50 @@ mod backend_regressions {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert!(!app.scanning.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(scan_status(State(app.clone())).await.0["scan_error"],"Scan database unavailable");
         app.scanning.store(true,std::sync::atomic::Ordering::SeqCst);
+        *app.scan_error.lock().unwrap()=None;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _reset=ScanReset {app:app.clone(),armed:true}; panic!("fixture unwind");
         }));
         assert!(result.is_err());
         assert!(!app.scanning.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(scan_status(State(app.clone())).await.0["scan_error"],"Scan failed");
+    }
+    /// Refused scans publish a path-free error and a later admitted scan clears it.
+    #[tokio::test]
+    async fn refused_root_scan_reports_failure_then_success_clears_it() {
+        let root=std::env::temp_dir().join(format!("frayd-scan-status-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path=root.join("db.sqlite");drop(store::open(path.to_str().unwrap()));
+        let library=root.join("library");
+        let mut app=app_for("unused.cbz");
+        Arc::get_mut(&mut app).unwrap().db_path=path.to_string_lossy().into_owned();
+        app.library.write().unwrap().roots=vec![library.clone()];
+        assert_eq!(trigger_scan(State(app.clone())).await,StatusCode::ACCEPTED);
+        for _ in 0..100 {if !app.scanning.load(std::sync::atomic::Ordering::SeqCst){break;}tokio::time::sleep(std::time::Duration::from_millis(5)).await;}
+        let status=scan_status(State(app.clone())).await.0;
+        assert_eq!(status["scanning"],false);
+        assert_eq!(status["scan_error"],"Library root unavailable");
+        std::fs::create_dir_all(&library).unwrap();
+        assert_eq!(trigger_scan(State(app.clone())).await,StatusCode::ACCEPTED);
+        for _ in 0..100 {if !app.scanning.load(std::sync::atomic::Ordering::SeqCst){break;}tokio::time::sleep(std::time::Duration::from_millis(5)).await;}
+        assert!(scan_status(State(app.clone())).await.0["scan_error"].is_null());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    /// A cache inside the scanned root is refused and visible to status consumers.
+    #[tokio::test]
+    async fn refused_cache_scan_reports_failure() {
+        let root=std::env::temp_dir().join(format!("frayd-scan-cache-status-{}",uuid::Uuid::new_v4()));
+        let library=root.join("library");std::fs::create_dir_all(&library).unwrap();
+        let path=library.join("db.sqlite");drop(store::open(path.to_str().unwrap()));
+        let mut app=app_for("unused.cbz");
+        Arc::get_mut(&mut app).unwrap().db_path=path.to_string_lossy().into_owned();
+        app.library.write().unwrap().roots=vec![library];
+        assert_eq!(trigger_scan(State(app.clone())).await,StatusCode::ACCEPTED);
+        for _ in 0..100 {if !app.scanning.load(std::sync::atomic::Ordering::SeqCst){break;}tokio::time::sleep(std::time::Duration::from_millis(5)).await;}
+        assert_eq!(scan_status(State(app.clone())).await.0["scan_error"],"Cache boundary unavailable");
+        std::fs::remove_dir_all(root).unwrap();
     }
     /// Verify unreadable archives leave metadata intact rather than publishing an empty cache.
     #[tokio::test]
@@ -2114,7 +2161,7 @@ mod ingest_tests {
             INSERT INTO user_perms(identity_id,is_admin) VALUES(1,1),(2,0);").unwrap();
         let library=root.join("library with spaces"); std::fs::create_dir_all(&library).unwrap();
         Arc::new(App { db:Mutex::new(db),db_path:String::new(),library:std::sync::RwLock::new(LibraryConfig{roots:vec![library],locked:false}),scan_queue:Mutex::new(ScanQueue::default()),
-            scanning:std::sync::atomic::AtomicBool::new(false),auth_rl:auth::RateLimiter::new(300,10),
+            scanning:std::sync::atomic::AtomicBool::new(false),scan_error:Mutex::new(None),auth_rl:auth::RateLimiter::new(300,10),
             party:Arc::new(party::Party::new()),ingest_status:Mutex::new(None) })
     }
 
@@ -2188,7 +2235,7 @@ mod upstream_integration_tests {
         let db=store::open(root.join("db.sqlite").to_str().unwrap());
 
         db.execute_batch("INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture-admin'); INSERT INTO user_perms(identity_id,is_admin) VALUES(1,1);").unwrap();
-        let app=Arc::new(App {db:Mutex::new(db),db_path:root.join("db.sqlite").to_string_lossy().into_owned(),library:std::sync::RwLock::new(LibraryConfig::default()),scan_queue:Mutex::new(ScanQueue::default()),scanning:std::sync::atomic::AtomicBool::new(false),auth_rl:auth::RateLimiter::new(300,10),party:Arc::new(party::Party::new()),ingest_status:Mutex::new(None)});
+        let app=Arc::new(App {db:Mutex::new(db),db_path:root.join("db.sqlite").to_string_lossy().into_owned(),library:std::sync::RwLock::new(LibraryConfig::default()),scan_queue:Mutex::new(ScanQueue::default()),scanning:std::sync::atomic::AtomicBool::new(false),scan_error:Mutex::new(None),auth_rl:auth::RateLimiter::new(300,10),party:Arc::new(party::Party::new()),ingest_status:Mutex::new(None)});
         (root,app)
     }
     #[test]
@@ -2272,7 +2319,7 @@ mod upstream_integration_tests {
         queue_ingest_scan(app.clone(),roots.clone());
         assert_eq!(app.scan_queue.lock().unwrap().requests.len(),1);
         let status=scan_status(State(app.clone())).await.0;
-        assert_eq!(status,serde_json::json!({"scanning":true,"library_configured":true,"library_count":2,"ingesting":"indexing"}));
+        assert_eq!(status,serde_json::json!({"scanning":true,"scan_error":null,"library_configured":true,"library_count":2,"ingesting":"indexing"}));
         assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM media",[],|r|r.get::<_,i64>(0)).unwrap(),0);
         run_scan(app.clone(),roots.clone());
         for _ in 0..400 { if !app.scanning.load(std::sync::atomic::Ordering::SeqCst) {break;} tokio::time::sleep(std::time::Duration::from_millis(5)).await; }
@@ -2450,7 +2497,7 @@ mod integration_regressions {
         let db=store::open(root.join("db.sqlite").to_str().unwrap());
         db.execute_batch(r#"INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture-admin'),(2,'account','target'),(3,'account','other');
             INSERT INTO user_perms(identity_id,is_admin,allowed_kinds) VALUES(1,1,NULL),(2,0,'["movie"]'),(3,0,NULL);"#).unwrap();
-        let app=Arc::new(App{db:Mutex::new(db),db_path:root.join("db.sqlite").to_string_lossy().into_owned(),library:std::sync::RwLock::new(LibraryConfig{roots:vec![root.join("library")],locked:false}),scan_queue:Mutex::new(ScanQueue::default()),scanning:std::sync::atomic::AtomicBool::new(false),auth_rl:auth::RateLimiter::new(300,10),party:Arc::new(party::Party::new()),ingest_status:Mutex::new(None)});
+        let app=Arc::new(App{db:Mutex::new(db),db_path:root.join("db.sqlite").to_string_lossy().into_owned(),library:std::sync::RwLock::new(LibraryConfig{roots:vec![root.join("library")],locked:false}),scan_queue:Mutex::new(ScanQueue::default()),scanning:std::sync::atomic::AtomicBool::new(false),scan_error:Mutex::new(None),auth_rl:auth::RateLimiter::new(300,10),party:Arc::new(party::Party::new()),ingest_status:Mutex::new(None)});
         (root,app)
     }
     /// Supply the existing fixture device administrator without creating an account-name fallback.

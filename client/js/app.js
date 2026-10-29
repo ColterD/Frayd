@@ -158,6 +158,11 @@ function pollSettings(generation, mode, button) {
       if (mode === 'scan' && status.scanning) return;
       clearInterval(settingsPoll); settingsPoll = null;
       button.disabled = false;
+      if (mode === 'scan' && status.scan_error) {
+        button.textContent = 'Scan failed';
+        toast(`Scan failed — ${status.scan_error}`, true);
+        return;
+      }
       if (mode === 'ingest' && ingest !== 'done') {
         button.textContent = 'Download failed';
         toast('Download or indexing failed', true);
@@ -451,9 +456,16 @@ $('#add-media').onclick = async () => {
         try {
           const response = await fetch('/api/scan/status');
           if (response.ok === false) throw new Error('Status unavailable');
-          const { scanning } = await response.json();
+          const { scanning, scan_error } = await response.json();
           if (generation !== accountGeneration) { clearInterval(poll); return; }
           if (scanning) { failures = 0; return; }
+          if (scan_error) {
+            clearInterval(poll);
+            btn.disabled = false;
+            btn.innerHTML = ADD_BTN_HTML;
+            toast(`Scan failed — ${scan_error}`, true);
+            return;
+          }
           const before = LIBRARY.length;
           await loadLibrary();
           clearInterval(poll);
