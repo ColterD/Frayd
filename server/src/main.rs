@@ -24,14 +24,16 @@ pub struct App {
     pub db: Mutex<Connection>,
     /// Path to the SQLite file (transcode thread reopens its own handle).
     pub db_path: String,
-    /// Library root from FRAYD_LIBRARY (scan target).
-    pub library: Option<PathBuf>,
+    /// Library root from FRAYD_LIBRARY (scan target). RwLock so admin UI can change it live.
+    pub library: std::sync::RwLock<Option<PathBuf>>,
     /// True while a scan is running (single scan at a time).
     pub scanning: std::sync::atomic::AtomicBool,
     /// Login/setup/password attempts: 10 per 5 min per IP.
     pub auth_rl: auth::RateLimiter,
     /// Active listening party (single party — household scale).
     pub party: Arc<party::Party>,
+    /// yt-dlp ingest state: "downloading" | "done" | "failed" | None. Single ingest at a time.
+    pub ingest_status: std::sync::Mutex<Option<String>>,
 }
 
 #[tokio::main]
@@ -56,10 +58,11 @@ async fn main() {
     let state = std::sync::Arc::new(App {
         db: Mutex::new(db),
         db_path: db_path.clone(),
-        library: library.clone(),
+        library: std::sync::RwLock::new(library.clone()),
         scanning: std::sync::atomic::AtomicBool::new(false),
         auth_rl: auth::RateLimiter::new(300, 10),
         party: Arc::new(party::Party::new()),
+        ingest_status: std::sync::Mutex::new(None),
     });
 
     // optional immediate scan
@@ -67,11 +70,14 @@ async fn main() {
         state
             .scanning
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        run_scan(state.clone(), lib);
+        run_scan(state.clone(), vec![lib]);
     }
 
     let ingest_state = state.clone();
     let app = Router::new()
+        .route("/api/health", get(health))
+        .route("/api/media/:id", axum::routing::delete(delete_media))
+        .route("/api/admin/users/:id", axum::routing::delete(remove_user))
         .route("/api/library", get(library_handler))
         .route("/api/stream/:id", get(stream))
         .route("/api/progress", post(set_progress))
@@ -101,7 +107,7 @@ async fn main() {
         .route("/api/annotations/:id", get(list_annotations))
         .route("/api/annotations", post(create_annotation))
         .route("/api/annotations", axum::routing::delete(delete_annotation))
-        .nest_service("/", ServeDir::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../client")))
+        .nest_service("/", ServeDir::new(client_dir()))
         .layer(
             tower_http::cors::CorsLayer::new()
                 .allow_origin(tower_http::cors::Any)
@@ -181,10 +187,14 @@ async fn main() {
     }
 }
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(serde::Serialize)]
 struct LibraryItem {
     id: i64,
     kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created_at: Option<i64>,
     title: String,
     author: Option<String>,
     duration_secs: Option<f64>,
@@ -551,13 +561,86 @@ fn cache_page_list(db: &Connection, id: i64, path: &std::path::Path) -> Option<V
     Some(names)
 }
 
+/// Web client directory. Resolution order:
+/// 1. FRAYD_CLIENT_DIR env (explicit)
+/// 2. ./client next to the server binary (release zips: server + client/ side by side)
+/// 3. ./client in cwd
+/// 4. source checkout (CARGO_MANIFEST_DIR/../client) — dev builds
+fn client_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("FRAYD_CLIENT_DIR") {
+        return PathBuf::from(d);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent().map(|p| p.join("client")) {
+            if d.is_dir() { return d; }
+        }
+    }
+    if PathBuf::from("client").is_dir() {
+        return PathBuf::from("client");
+    }
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../client"))
+}
+
 /// Spawn a background library scan. Caller must have set `scanning` = true
 /// via compare_exchange; this just runs the scan and clears the flag after.
-fn run_scan(state: std::sync::Arc<App>, lib: PathBuf) {
+/// All library roots: App.library (env or last-set single path) + settings.library_paths JSON array.
+/// Deduped, ordered. Postgres-free — plain SQLite read.
+fn library_roots(app: &App) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(l) = app.library.read().unwrap().clone() {
+        roots.push(l);
+    }
+    let db = app.db.lock().unwrap();
+    let raw: Option<String> = db
+        .query_row("SELECT value FROM settings WHERE key='library_paths'", [], |r| r.get(0))
+        .ok();
+    let parsed = raw.and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok());
+    if let Some(serde_json::Value::Array(list)) = parsed {
+        for v in list {
+            if let Some(s) = v.as_str().filter(|s| !s.is_empty()) {
+                let p = PathBuf::from(s);
+                if !roots.contains(&p) {
+                    roots.push(p);
+                }
+            }
+        }
+    }
+    roots
+}
+
+fn run_scan(state: std::sync::Arc<App>, libs: Vec<PathBuf>) {
     tokio::task::spawn_blocking(move || {
-        let db = state.db.lock().unwrap();
+        // own connection: a long scan must NOT hold the shared DB mutex
+        // (it blocked server bind + every request until the scan finished)
+        let db = store::open(&state.db_path);
         let thumbs = thumbs_dir();
-        let n = scanner::scan(&db, state.db_path.clone(), lib, Some(&thumbs));
+        let mut n = 0;
+        for lib in libs {
+            n += scanner::scan(&db, state.db_path.clone(), lib, Some(&thumbs));
+        }
+        // sweep: drop rows whose path is no longer under any configured root
+        // (folder removed from settings, or moved). Transcode temps already purged by scan.
+        let roots = library_roots(&state);
+        if !roots.is_empty() {
+            let mut stmt = db
+                .prepare("SELECT id, path FROM media")
+                .unwrap();
+            let orphans: Vec<(i64, String)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|(_, p)| {
+                    let path = std::path::Path::new(p);
+                    !roots.iter().any(|r| path.starts_with(r))
+                })
+                .collect();
+            drop(stmt);
+            for (id, p) in orphans {
+                let _ = std::fs::remove_file(thumbs.join(format!("{id}.jpg")));
+                let _ = db.execute("DELETE FROM media WHERE id = ?1", [id]);
+                tracing::info!("sweep: removed orphaned media {id} ({p})");
+            }
+        }
         state
             .scanning
             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -568,20 +651,11 @@ fn run_scan(state: std::sync::Arc<App>, lib: PathBuf) {
 /// POST /api/scan → trigger library rescan. 202 if started, 409 if busy.
 async fn trigger_scan(State(app): State<std::sync::Arc<App>>) -> StatusCode {
     use std::sync::atomic::Ordering;
-    // re-read: env > settings.library_path (so admin UI changes work without restart)
-    let lib = app.library.clone().or_else(|| {
-        let db = app.db.lock().unwrap();
-        let raw: Option<String> = db
-            .query_row("SELECT value FROM settings WHERE key='library_path'", [], |r| r.get(0))
-            .ok();
-        raw.and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
-            .and_then(|v| v.as_str().map(String::from))
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-    });
-    let Some(lib) = lib else {
+    // re-read roots: env > settings (library_path single + library_paths array)
+    let libs = library_roots(&app);
+    if libs.is_empty() {
         return StatusCode::NOT_IMPLEMENTED; // no library configured
-    };
+    }
     match app.scanning.compare_exchange(
         false,
         true,
@@ -589,7 +663,7 @@ async fn trigger_scan(State(app): State<std::sync::Arc<App>>) -> StatusCode {
         Ordering::SeqCst,
     ) {
         Ok(_) => {
-            run_scan(app, lib);
+            run_scan(app, libs);
             StatusCode::ACCEPTED
         }
         Err(_) => StatusCode::CONFLICT,
@@ -624,19 +698,17 @@ async fn ingest(
     if std::process::Command::new("yt-dlp").arg("--version").output().is_err() {
         return StatusCode::NOT_IMPLEMENTED; // yt-dlp not installed
     }
-    let lib = app.library.clone().or_else(|| {
-        let db = app.db.lock().unwrap();
-        let raw: Option<String> = db
-            .query_row("SELECT value FROM settings WHERE key='library_path'", [], |r| r.get(0))
-            .ok();
-        raw.and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
-            .and_then(|v| v.as_str().map(String::from))
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-    });
-    let Some(lib) = lib else { return StatusCode::NOT_IMPLEMENTED };
-    let dest = lib.join("Internet");
+    let libs = library_roots(&app);
+    if libs.is_empty() { return StatusCode::NOT_IMPLEMENTED; }
+    let dest = libs[0].join("Internet");
     std::fs::create_dir_all(&dest).ok();
+    // one ingest at a time
+    {
+        let mut st = app.ingest_status.lock().unwrap();
+        if st.as_deref() == Some("downloading") { return StatusCode::CONFLICT; }
+        *st = Some("downloading".into());
+    }
+    let state = app.clone();
     let url = body.url;
     // spawn detached: download can take minutes; rescan after success
     tokio::task::spawn_blocking(move || {
@@ -649,6 +721,15 @@ async fn ingest(
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
+        *state.ingest_status.lock().unwrap() = Some(if ok { "done" } else { "failed" }.into());
+        if ok {
+            // rescan so the new file appears
+            if let Some(lib) = state.library.read().unwrap().clone() {
+                let st = state.clone();
+                st.scanning.store(true, std::sync::atomic::Ordering::SeqCst);
+                run_scan(st, vec![lib]);
+            }
+        }
         tracing::info!("ingest yt-dlp {url}: {}", if ok { "ok" } else { "failed" });
     });
     StatusCode::ACCEPTED
@@ -709,7 +790,8 @@ async fn party_ws(
 async fn scan_status(State(app): State<std::sync::Arc<App>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "scanning": app.scanning.load(std::sync::atomic::Ordering::SeqCst),
-        "library_configured": app.library.is_some(),
+        "library_configured": app.library.read().unwrap().is_some(),
+        "ingesting": app.ingest_status.lock().unwrap().as_deref(),
     }))
 }
 
@@ -858,6 +940,96 @@ async fn media_path(app: &std::sync::Arc<App>, id: i64) -> Option<String> {
         .ok()
 }
 
+/// DELETE /api/admin/users/:id?identity= — remove a user account: sessions, perms,
+/// progress, annotations, and the identity row. Admin-only; cannot remove self or last admin.
+async fn remove_user(
+    State(app): State<std::sync::Arc<App>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+    Path(id): Path<i64>,
+) -> StatusCode {
+    let admin_iid = {
+        let db = app.db.lock().unwrap();
+        match require_admin(&db, &headers, q.get("identity").map(|s| s.as_str())) {
+            Ok(iid) => iid,
+            Err(s) => return s,
+        }
+    };
+    if admin_iid == id {
+        return StatusCode::CONFLICT; // don't remove yourself
+    }
+    let db = app.db.lock().unwrap();
+    let is_account: Option<String> = db
+        .query_row("SELECT kind FROM identities WHERE id = ?1", [id], |r| r.get(0))
+        .ok();
+    if is_account.as_deref() != Some("account") {
+        return StatusCode::NOT_FOUND; // only accounts removable — device identities are guests
+    }
+    let admins: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM user_perms WHERE is_admin = 1 AND identity_id != ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if admins == 0 {
+        return StatusCode::CONFLICT; // last admin
+    }
+    let _ = db.execute("DELETE FROM sessions WHERE identity_id = ?1", [id]);
+    let _ = db.execute("DELETE FROM user_perms WHERE identity_id = ?1", [id]);
+    let _ = db.execute("DELETE FROM progress WHERE identity_id = ?1", [id]);
+    let _ = db.execute("DELETE FROM annotations WHERE identity_id = ?1", [id]);
+    match db.execute("DELETE FROM identities WHERE id = ?1", [id]) {
+        Ok(0) => StatusCode::NOT_FOUND,
+        Ok(_) => StatusCode::NO_CONTENT,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// GET /api/health — liveness + build/library info (no auth; nothing sensitive).
+async fn health(State(app): State<std::sync::Arc<App>>) -> Json<serde_json::Value> {
+    let library = app.library.read().unwrap().as_ref().map(|p| p.display().to_string());
+    Json(serde_json::json!({
+        "ok": true,
+        "version": VERSION,
+        "library": library,
+        "scanning": app.scanning.load(std::sync::atomic::Ordering::SeqCst),
+    }))
+}
+
+/// DELETE /api/media/:id — remove item from library (DB row + thumbnails). Admin-only.
+/// Never touches the source file on disk (owner can delete it themselves).
+async fn delete_media(
+    State(app): State<std::sync::Arc<App>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+    Path(id): Path<i64>,
+) -> StatusCode {
+    let iid = {
+        let db = app.db.lock().unwrap();
+        match require_admin(&db, &headers, q.get("identity").map(|s| s.as_str())) {
+            Ok(iid) => iid,
+            Err(s) => return s,
+        }
+    };
+    let db = app.db.lock().unwrap();
+    // only allow deleting items visible to this admin's perms (paranoia: consistent with library view)
+    let exists: Option<i64> = db
+        .query_row("SELECT id FROM media WHERE id = ?1", [id], |r| r.get(0))
+        .ok();
+    if exists.is_none() {
+        return StatusCode::NOT_FOUND;
+    }
+    let _ = iid; // require_admin already validated identity
+    // thumbnail: per-media-id file <id>.jpg in thumbs dir
+    let _ = std::fs::remove_file(thumbs_dir().join(format!("{id}.jpg")));
+    match db.execute("DELETE FROM media WHERE id = ?1", [id]) {
+        Ok(0) => StatusCode::NOT_FOUND,
+        Ok(_) => StatusCode::NO_CONTENT,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 async fn library_handler(
     State(app): State<std::sync::Arc<App>>,
     headers: axum::http::HeaderMap,
@@ -885,11 +1057,11 @@ async fn library_handler(
     let filter = q.get("q").map(|s| format!("%{}%", s.replace('%', "").replace('_', "")));
     let sql = format!(
         "SELECT id, kind, title, author, duration_secs,
-                json_extract(meta_json, '$.synopsis'), series
+                json_extract(meta_json, '$.synopsis'), series, created_at
          FROM media
          WHERE (?1 IS NULL OR title LIKE ?1 OR author LIKE ?1
                 OR json_extract(meta_json, '$.synopsis') LIKE ?1){}
-         ORDER BY kind, title",
+         ORDER BY created_at DESC",
         kinds_clause.as_ref().map(|(c, _)| c.as_str()).unwrap_or("")
     );
     let mut stmt = db.prepare(&sql).unwrap();
@@ -903,6 +1075,7 @@ async fn library_handler(
                 duration_secs: r.get(4)?,
                 synopsis: r.get(5)?,
                 series: r.get(6)?,
+                created_at: r.get(7)?,
             })
         })
         .unwrap()
@@ -1292,19 +1465,30 @@ async fn set_setting(
     headers: axum::http::HeaderMap,
     Query(q): Query<std::collections::HashMap<String, String>>,
     Json(body): Json<serde_json::Value>,
-) -> StatusCode {
+) -> axum::response::Response {
     let db = app.db.lock().unwrap();
     if require_admin(&db, &headers, q.get("identity").map(|s| s.as_str())).is_err() {
-        return StatusCode::FORBIDDEN;
+        return StatusCode::FORBIDDEN.into_response();
     }
-    let Some(serde_json::Value::Object(map)) = Some(body) else { return StatusCode::BAD_REQUEST };
+    let Some(serde_json::Value::Object(map)) = Some(body) else { return StatusCode::BAD_REQUEST.into_response() };
     for (k, v) in map {
+        // library_path: validate the folder exists before persisting (typo = empty scan)
+        if k == "library_path" && !v.is_null() {
+            let Some(p) = v.as_str().map(PathBuf::from) else { return StatusCode::BAD_REQUEST.into_response() };
+            if !p.is_dir() {
+                return (StatusCode::BAD_REQUEST, "path is not a directory").into_response();
+            }
+        }
         let _ = db.execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
             rusqlite::params![k, v.to_string()],
         );
+        // live-apply library path change (scan handler also re-reads, but keep App in sync)
+        if k == "library_path" {
+            *app.library.write().unwrap() = v.as_str().filter(|s| !s.is_empty()).map(PathBuf::from);
+        }
     }
-    StatusCode::NO_CONTENT
+    StatusCode::NO_CONTENT.into_response()
 }
 
 

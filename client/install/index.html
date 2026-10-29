@@ -141,6 +141,9 @@ async function poll() {
   }
   if (!liveBase) { $('#stat').textContent = 'Waiting for your server to come up…'; setTimeout(poll, 3000); return; }
   $('#stat').innerHTML = `<span class="ok">✓ Server is live at ${liveBase}</span> <a href="${liveBase}" style="color:var(--acc)">open Frayd →</a>`;
+  // install done — redirect into the app automatically
+  $('#stat').innerHTML = `<span class="ok">✓ Server is live — taking you to Frayd…</span>`;
+  setTimeout(() => location.href = liveBase, 1500);
   // setup needed? (only works same-origin or with CORS; best-effort)
   try {
     const s = await (await fetch(liveBase + '/api/setup', { signal: AbortSignal.timeout(2500) })).json();

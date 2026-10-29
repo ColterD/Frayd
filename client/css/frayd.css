@@ -389,3 +389,27 @@ body.auth {
 .party-queue li button { margin-left: auto; padding: 4px 10px; font-size: 12px; }
 .party-empty, .party-error { color: #8A8F9E; margin-bottom: 10px; }
 .party-error { color: #f66; }
+
+/* toasts */
+#toast-host { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: 9999; display: flex; flex-direction: column; gap: 8px; align-items: center; }
+.toast { background: #1e2030; color: #fff; border: 1px solid #262833; border-left: 3px solid #4ade80; border-radius: 8px; padding: 10px 16px; font-size: 14px; opacity: 0; transition: opacity .25s; max-width: 90vw; }
+.toast.on { opacity: 1; }
+.toast-err { border-left-color: #f87171; }
+
+/* admin delete on cards */
+.media-card { position: relative; }
+.card-del { position: absolute; top: 6px; right: 6px; background: rgba(13,14,18,.85); border: 1px solid #262833; color: #8A8F9E; border-radius: 6px; padding: 4px; display: none; cursor: pointer; }
+.card-del:hover { color: #f87171; border-color: #f87171; }
+.card-del .icon { width: 14px; height: 14px; display: block; }
+.media-card:hover .card-del { display: block; }
+
+/* empty state */
+.empty-state { color: var(--fg-muted, #8A8F9E); text-align: center; padding: 48px 24px; font-size: 14px; line-height: 1.7; }
+
+/* settings: per-kind permission checkboxes, remove buttons */
+.p-kinds-box { display: flex; flex-wrap: wrap; gap: 4px 12px; flex: 1; }
+.p-kind { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: #c8cce0; text-transform: capitalize; cursor: pointer; }
+.p-kind input { accent-color: #5B46F6; }
+.p-remove, .lib-remove { background: none; border: 1px solid #262833; color: #8A8F9E; border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
+.p-remove:hover, .lib-remove:hover { color: #f87171; border-color: #f87171; }
+.perm-row { flex-wrap: wrap; }
