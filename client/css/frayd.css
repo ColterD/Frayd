@@ -373,6 +373,7 @@ body.auth .auth-footer { text-align: center; color: var(--fg-muted); font-size: 
 #settings-modal .modal-panel { width: 100%; max-width: 520px; max-height: 86vh; overflow-y: auto; background: #15161c; border: 1px solid #262833; border-radius: 12px; padding: 16px; }
 #settings-close { margin-top: 14px; width: 100%; background: #16181E; color: #fff; border: 1px solid #2a2d36; border-radius: 8px; padding: 10px; cursor: pointer; }
 #settings-close:hover { background: #5B46F6; }
+#settings-stage pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 .perm-row { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid #1e2029; }
 .perm-row .k { flex: 1; font-size: 14px; overflow: hidden; text-overflow: ellipsis; }
 .perm-row select { background: #0D0E12; color: #fff; border: 1px solid #262833; border-radius: 6px; padding: 5px 8px; font-size: 13px; }
@@ -396,7 +397,7 @@ body.auth .auth-footer { text-align: center; color: var(--fg-muted); font-size: 
 #party-stage > button { display: block; width: 100%; margin-bottom: 12px; padding: 12px; font-weight: 600; }
 .party-join { display: flex; gap: 8px; }
 .party-join input {
-  flex: 1; background: #0D0E12; border: 1px solid #262833; border-radius: 8px;
+  flex: 1; min-width: 0; background: #0D0E12; border: 1px solid #262833; border-radius: 8px;
   color: #fff; padding: 10px 12px; font-size: 16px; letter-spacing: 4px; text-transform: uppercase;
 }
 .party-code { margin-bottom: 12px; color: #8A8F9E; }

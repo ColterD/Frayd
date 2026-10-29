@@ -172,6 +172,19 @@ async function isolatedResponsiveCase(width) {
       nav.find(node => node.dataset.kind === 'movie').click(); equal(activeKind, 'movie', 'Visible movie navigation works');
       reachable(document.getElementById('settings-btn')); document.getElementById('settings-btn').click();
       await until(() => !!document.querySelector('.p-scan'), 'Visible Settings opens usable controls');
+      const settingsPanel = document.querySelector('#settings-modal .modal-panel');
+      const guide = settingsPanel.querySelector('pre');
+      const guideText = 'Media/\n  Movies/    *.mp4 *.mkv\n  Shows/     S01E01 files\n  Music/     *.mp3 *.flac\n  Audiobooks/ *.m4b *.mp3\n  Ebooks/    *.epub\n  Comics/    *.cbz *.cbr\n  Manga/     folder of images under a *manga* dir';
+      equal(guide.textContent, guideText, 'Suggested layout retains all guide text and indentation');
+      measured.settingsGeometry = { panel: rect(settingsPanel), clientWidth: settingsPanel.clientWidth, scrollWidth: settingsPanel.scrollWidth, guideText: guide.textContent, controls: [] };
+      check(settingsPanel.scrollWidth <= settingsPanel.clientWidth + 1 && guide.scrollWidth <= guide.clientWidth + 1, 'Settings guide wraps inside panel without horizontal scrolling');
+      for (const control of settingsPanel.querySelectorAll('input,button,select')) {
+        reachable(control);
+        check(contains(rect(settingsPanel), rect(control)) && settingsPanel.scrollLeft === 0, 'Every basic settings control fits panel through vertical scrolling');
+        measured.settingsGeometry.controls.push({ id: control.id || control.className, bounds: rect(control), scrollTop: settingsPanel.scrollTop });
+      }
+      equal(guide.textContent, guideText, 'Scrolling settings preserves the complete guide');
+
       document.getElementById('settings-close').click();
       reachable(document.getElementById('logout'));
       reachable(document.querySelector('#search input'));
@@ -179,6 +192,39 @@ async function isolatedResponsiveCase(width) {
       await until(() => !document.getElementById('add-media').disabled, 'Visible scan control handles modeled busy response');
       reachable(document.getElementById('party-btn')); document.getElementById('party-btn').click();
       check(document.getElementById('party-modal').classList.contains('on'), 'Visible party control opens panel');
+      const originalSocket = window.WebSocket;
+      let layoutSocket;
+      window.WebSocket = class {
+        constructor() { this.readyState = 1; layoutSocket = this; }
+        send() {}
+        close() { this.readyState = 3; }
+      };
+      try {
+        const partyPanel = document.querySelector('#party-modal .party-inner');
+        const checkPartyRow = (input, button) => {
+          reachable(input); reachable(button);
+          check(contains(rect(partyPanel), rect(input)) && contains(rect(partyPanel), rect(button)), 'Party entry controls fit their panel');
+          check(partyPanel.scrollWidth <= partyPanel.clientWidth + 1 && document.documentElement.scrollWidth <= innerWidth + 1, 'Party panel and document stay within viewport');
+          return { panel: rect(partyPanel), input: rect(input), button: rect(button), clientWidth: partyPanel.clientWidth, scrollWidth: partyPanel.scrollWidth };
+        };
+        const joinInput = document.getElementById('party-code-input'), joinButton = document.getElementById('pt-join');
+        measured.partyGeometry = { join: checkPartyRow(joinInput, joinButton), modeledTransport: true };
+        joinInput.value = 'LAYO';
+        let trustedJoin = false;
+        joinButton.addEventListener('click', event => { trustedJoin = event.isTrusted; }, { once: true });
+        const joinBounds = rect(joinButton);
+        await api('click', { x: joinBounds.left + joinBounds.width / 2, y: joinBounds.top + joinBounds.height / 2 });
+        check(trustedJoin && layoutSocket, 'Trusted Join click reaches production connection handler');
+        layoutSocket.onmessage({ data: JSON.stringify({ type: 'state', is_host: true, self_label: 'Host', state: { media_id: null, title: '', position: 0, playing: false, queue: [] } }) });
+        const ytInput = document.getElementById('pt-yt'), ytPlay = document.getElementById('pt-yt-go');
+        measured.partyGeometry.host = checkPartyRow(ytInput, ytPlay);
+        let trustedPlay = false;
+        ytPlay.addEventListener('click', event => { trustedPlay = event.isTrusted; }, { once: true });
+        const playBounds = rect(ytPlay);
+        await api('click', { x: playBounds.left + playBounds.width / 2, y: playBounds.top + playBounds.height / 2 });
+        check(trustedPlay && document.querySelector('.party-error')?.textContent.includes('Paste a YouTube URL'), 'Trusted host Play click reaches production URL validation');
+        measured.partyGeometry.trustedJoin = trustedJoin; measured.partyGeometry.trustedPlay = trustedPlay;
+      } finally { PartyUI.close(); window.WebSocket = originalSocket; }
       document.getElementById('pt-close').click();
       const playerControls = [...document.querySelectorAll('#playerbar button')];
       measured.audioToolbarControls = playerControls.map(node => ({ id: node.id, label: node.getAttribute('aria-label') }));
@@ -232,7 +278,7 @@ async function isolatedResponsiveCase(width) {
         modal.classList.remove('yt');
         check(rect(iframe).width === 0 && rect(wrapper).width === innerWidth, 'Returning native mode hides external iframe and restores Plyr');
       } finally { iframe.replaceWith(external); modal.classList.remove('yt'); document.getElementById('vm-back').click(); }
-      return { viewport: { width: innerWidth, height: innerHeight }, sizes, grids, ratios, layoutGeometry: { login: measured.loginGeometry, authFlow: measured.authFlowGeometry, hero: measured.heroGeometry, native: measured.videoGeometry, youtubeModel: measured.youtubeLayoutModel }, navigationLabels: nav.map(n => n.textContent.trim()), adminAndPlayerControlsReachable: true, realMediaControl: true, audioPauseUi: measured.audioPauseUi, deletionCancellation: true, nativeDiagnostics: fixture, overflowInventory: measured.overflowInventory };
+      return { viewport: { width: innerWidth, height: innerHeight }, sizes, grids, ratios, layoutGeometry: { login: measured.loginGeometry, authFlow: measured.authFlowGeometry, settings: measured.settingsGeometry, party: measured.partyGeometry, hero: measured.heroGeometry, native: measured.videoGeometry, youtubeModel: measured.youtubeLayoutModel }, navigationLabels: nav.map(n => n.textContent.trim()), adminAndPlayerControlsReachable: true, realMediaControl: true, audioPauseUi: measured.audioPauseUi, deletionCancellation: true, nativeDiagnostics: fixture, overflowInventory: measured.overflowInventory };
     } catch (error) {
       error.observed = { ...measured, audio: { readyState: pbAudio.readyState, paused: pbAudio.paused,
         duration: pbAudio.duration, currentTime: pbAudio.currentTime, mediaError: pbAudio.error?.code || null }, nativeDiagnostics: fixture };
