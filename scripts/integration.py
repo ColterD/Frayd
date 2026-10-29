@@ -572,7 +572,7 @@ def upstream_contract_qualification(args):
                 status = json.loads(raw_status)
                 assert status['library_configured'] is True and status['library_count'] == 2
                 assert status['scanning'] is False and status['scan_error'] == 'Library root unavailable'
-                assert '/roots/b' not in raw_status.decode(), 'scan status exposed a configured root path'
+                assert all(path not in raw_status.decode() for path in ('/roots/a', '/roots/b')), 'scan status exposed a configured root path'
                 assert sql('SELECT id,path,title FROM media ORDER BY id') == before_offline
                 assert offline_id in {item['id'] for item in library()}
                 assert json.loads(curl_request(f'/api/progress/{offline_id}', token=token))['position'] == 0.75
