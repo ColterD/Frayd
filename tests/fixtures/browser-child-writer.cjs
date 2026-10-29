@@ -12,19 +12,19 @@ if (process.argv.includes('--version')) {
     const path = require('node:path');
     process.on('SIGTERM', () => {});
     function write() {
+      if (process.argv[2] && fs.existsSync(path.join(process.argv[2], 'writer.pause'))) {
+        fs.writeFileSync(path.join(process.argv[2], 'writer.paused'), 'paused');
+        return;
+      }
       fs.mkdirSync(path.join(process.argv[1], 'Default'), { recursive: true });
       const writer = path.join(process.argv[1], 'Default', 'writer');
-      try { fs.writeFileSync(writer, String(Date.now())); }
-      catch (error) {
-        // The cleanup oracle can remove our directory between mkdir and open.
-        // Only that owned-path race is retried by the next interval.
-        if (error.code !== 'ENOENT' || error.path !== writer) throw error;
-      }
+      fs.writeFileSync(writer, String(Date.now()));
     }
     write();
     setInterval(write, 5);
     process.send('ready');
-  `, profile], { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] });
+  `, profile, process.env.FRAYD_CHILD_FIXTURE_CONTROL_DIR || ''],
+  { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] });
   child.once('message', async () => {
     if (process.env.FRAYD_CHILD_FIXTURE_EARLY_EXIT === '1') {
       console.error('original browser exit sentinel');

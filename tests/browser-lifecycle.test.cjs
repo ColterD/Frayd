@@ -2,7 +2,7 @@
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
 const { createServer } = require('node:http');
-const { mkdtempSync, readFileSync, existsSync, rmSync, writeFileSync, mkdirSync } = require('node:fs');
+const { mkdtempSync, readFileSync, existsSync, rmSync, writeFileSync, mkdirSync, unlinkSync } = require('node:fs');
 const { join, resolve, dirname } = require('node:path');
 const { tmpdir } = require('node:os');
 const { once, EventEmitter } = require('node:events');
@@ -79,6 +79,8 @@ test('interception diagnostics preserve fatal errors and safely correlate retire
 test('PID-only cleanup leaves a profile writer; owned process-group cleanup stops it before removal', { timeout: 8000 }, async () => {
   const ownedParent = mkdtempSync(join(tmpdir(), 'frayd-cleanup-oracle-'));
   const profile = join(ownedParent, 'frayd=ci/profile');
+  const pauseRequest = join(ownedParent, 'writer.pause');
+  const pauseAcknowledged = join(ownedParent, 'writer.paused');
   mkdirSync(profile, { recursive: true });
   let resolveReady;
   const ready = new Promise(resolve => { resolveReady = resolve; });
@@ -90,7 +92,8 @@ test('PID-only cleanup leaves a profile writer; owned process-group cleanup stop
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const browser = spawn(executable, [`--user-data-dir=${profile}`, `http://127.0.0.1:${server.address().port}/`],
-    { detached: true, stdio: ['ignore', 'ignore', 'pipe'] });
+    { detached: true, stdio: ['ignore', 'ignore', 'pipe'],
+      env: { ...process.env, FRAYD_CHILD_FIXTURE_CONTROL_DIR: ownedParent } });
   let fixtureStderr = '';
   browser.stderr.on('data', bytes => { fixtureStderr = (fixtureStderr + bytes).slice(-4096); });
   let readyTimer;
@@ -118,8 +121,16 @@ test('PID-only cleanup leaves a profile writer; owned process-group cleanup stop
     }
     const before = readFileSync(writerFile, 'utf8');
     await waitForWriterChange(before, 'Child continues writing after launcher exits');
-    // Successful removal is required: swallowing ENOTEMPTY could accept an old file.
-    rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 5 });
+    writeFileSync(pauseRequest, 'pause');
+    const pauseDeadline = Date.now() + 1000;
+    while (!existsSync(pauseAcknowledged) && Date.now() < pauseDeadline) {
+      process.kill(reported.writerPid, 0);
+      await delay(10);
+    }
+    assert.equal(existsSync(pauseAcknowledged), true, 'Living writer acknowledges a quiet deletion window');
+    rmSync(profile, { recursive: true, force: true });
+    assert.equal(existsSync(profile), false, 'Profile deletion actually succeeded while writer was paused');
+    unlinkSync(pauseRequest);
     await waitForWriterChange(null, 'Surviving child recreates removed profile');
     await stopBrowserGroup(browser);
     rmSync(profile, { recursive: true, force: true });
