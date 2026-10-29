@@ -7,7 +7,7 @@ It does not authorize deployment or qualify arbitrary media, browsers or public 
 
 ## Current source and historical visual boundary
 
-All pending, held and staged statuses in this section are **as of the 2026-10-29 pre-cutover qualification checkpoint for `8d87905`**. See [PR #2](https://github.com/ColterD/Frayd/pull/2) for subsequent current-image acceptance, deployment and live TV import; those later outcomes do not rewrite this checkpoint.
+Initial pending, held and staged statuses are **as of the 2026-10-29 pre-cutover `8d87905` checkpoint**; the later source update below names its own boundary. See [PR #2](https://github.com/ColterD/Frayd/pull/2) for subsequent current-image acceptance, deployment and live TV import; those later outcomes do not rewrite this checkpoint.
 
 Production source is frozen at `8d879054a16637619b7efc1e1e79ce6d38e568d2`, incorporating pinned upstream `dd8eaf42d692dee118525b6d98d883cbe76967f4` and synced fork-main base `21b2e9b6bf4cff26254f5dfcec9deecd02453718`. The latest local fixture passes Node 334/334 and Chrome 47/47 with zero browser errors. These source-bound fixture results do not substitute for the current image pipeline, final patched-reader gates, actual-server workflows or hosted/platform acceptance, which remain pending.
 
@@ -16,6 +16,12 @@ The fixture runs production hero rendering at 320, 768, 1024 and 1440 CSS pixels
 Current comic/EPUB readers keep page/chunk unknown until resume completes, disable loading-time navigation/search controls and suppress premature saves during close, resize or keyboard input. Ten focused regressions reproduce then correct bookmark loss. Actual-server `bda4733` observations for the 14-work fixture, conversion, mixed-author navigation, account/permissions/deletion and native party paths retain only their recorded scope; they do not qualify this later reader correction or the current images. The fixture has 14 works across seven categories, plus two conversion derivatives and one copied record: 17 indexed rows do not mean 17 new works.
 
 The earlier actual-server baseline uses source `4d09a102943d001ae15346f199db79864c2af86d`, app image `sha256:f874cdffe2266d22206819206ffff37d4fc7fc32c9e8945f84ffb20b8bbf981a` and proxy `sha256:70303339f3025d285fd532d08fea55f02cecdb9360f531ea1142ed366a5ddc58`. Its isolated UI scan indexed 12 public works, but visual checks failed: a 320px login had horizontal overflow; a long archive URL clipped inside the hero; and movie playback decoded while a small left-aligned player left pause/seek controls unreachable. Broader workflows stopped for the upstream merge. Those source-bound failures and that source's passing automation remain historical evidence. The current layout fixture addresses the reproduced geometry; final actual-server rechecks are still required.
+
+### `438837c` YouTube correction and reader diagnostic
+
+The later production snapshot `438837cae29a81bb0899bafbecbf4039b7347de8` corrects an actual paused YouTube join that advanced from about 16 to 29 seconds while the host remained paused. First-ready paused state now cues; reused paused/cued seeks include zero, and CUED/UNSTARTED Play cannot mistake a zero clock for the prepared start. Ten vendor-faithful controls pass after eight baseline failures/two positive passes; Node 344/344 and modeled-API DOM 47/47 pass with zero runtime errors. These controls do not load a real YouTube iframe; the rebuilt-image actual retest remains pending at this checkpoint.
+
+A richer cold-EPUB diagnostic on unchanged `8d87905` passes at one, five and thirty seconds: complete response 13,937 bytes with expected hash, generated srcdoc 23,832 bytes, actual `about:srcdoc` displaying page 2/4, no errors. Earlier blank observations had incomplete capture and remain unattributed; this diagnostic is no production repair or proof of their cause. Historical hosted results belong to `a300f15`; subsequent-head hosted qualification remains separate.
 
 ### Public sample expansion and held TV import
 

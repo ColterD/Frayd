@@ -2872,3 +2872,36 @@ test('already-playing YouTube reuse preserves the drift threshold', () => {
   assert.equal(player.getPlayerState(), 1);
   assert.deepEqual(player.calls, [['seek', 24]]);
 });
+
+test('paused YouTube host native-bar seek broadcasts its changed position once without playing or echoing', () => {
+  const f = externalRoleSession();
+  const host = f.join(true);
+  const player = f.players[0]; player.emitReady();
+  player.playVideo(); player.position = 31.66337; player.pauseVideo();
+  f.seekTick(); host.sent.length = 0;
+  player.seekTo(42.333333);
+  assert.equal(player.getPlayerState(), 2);
+  assert.deepEqual(host.sent, [], 'Paused native seek has no new player-state event');
+  f.seekTick();
+  assert.deepEqual(host.sent, [{ type: 'seek', position: 42.333333 }]);
+  host.onmessage({ data: JSON.stringify({ type: 'state', state: { external_url: 'same-role-video', media_id: null,
+    title: 'Host echo', queue: [], position: 42.333333, playing: false, updated_at: Date.now()/1000 } }) });
+  f.seekTick(); f.seekTick();
+  assert.deepEqual(host.sent, [{ type: 'seek', position: 42.333333 }], 'Stationary pause and host echo do not rebroadcast');
+  assert.equal(player.getPlayerState(), 2);
+});
+
+test('YouTube entry reveals idle native chrome and keeps exit controls visible while native playback still auto-hides', () => {
+  const b = browser();
+  youtubePlayerFixture(b);
+  const overlay = b.context.document.createElement('div'); b.nodes.set('.vm-overlay', overlay);
+  let idle;
+  b.context.setTimeout = callback => { idle = callback; return 1; };
+  b.run('document.querySelector("#video-modal").classList.add("on"); startChromeAutoHide()');
+  idle(); assert.equal(overlay.classList.contains('hidden'), true);
+  b.run('partyFollowExternal("exit-video", "External", 0, false, Date.now()/1000)');
+  assert.equal(overlay.classList.contains('hidden'), false, 'External entry reveals previously hidden exit controls');
+  idle(); assert.equal(overlay.classList.contains('hidden'), false, 'Iframe playback cannot rely on parent mousemove to reveal controls');
+  b.run('document.querySelector("#video-modal").classList.remove("yt"); startChromeAutoHide()');
+  idle(); assert.equal(overlay.classList.contains('hidden'), true, 'Native chrome retains idle hide');
+});

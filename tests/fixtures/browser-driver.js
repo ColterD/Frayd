@@ -1343,6 +1343,16 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
           await until(() => hostSocket.sent.some(command => command.type === 'seek'), 'reused guest player gets current host seek poller');
           equal(hostSocket.sent.filter(command => command.type === 'seek').length, 1, 'Reused host player has one seek poller');
           check(hostSocket.sent.every(command => command.position === 37), 'Current host events use current external position');
+          mock.position = 31.66337; mock.pauseVideo();
+          mock.seekTo(42.333333);
+          check(mock.state === 2, 'Native YouTube bar seek retains paused state');
+          await until(() => hostSocket.sent.some(command => command.type === 'seek' && command.position === 42.333333),
+            'paused native-bar position reaches the current host socket through the real poller');
+          const pausedSeekCount = hostSocket.sent.filter(command => command.type === 'seek').length;
+          await delay(2200);
+          equal(hostSocket.sent.filter(command => command.type === 'seek').length, pausedSeekCount,
+            'Stationary paused player does not broadcast repeated seeks');
+          check(mock.state === 2, 'Paused seek mirroring never starts playback');
           const hostCommands = hostSocket.sent.map(command => command.type);
           const nextGuest = openRole(false);
           mock.playVideo(); mock.pauseVideo(); mock.playVideo();
@@ -1353,8 +1363,57 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
           mock.playVideo(); mock.pauseVideo();
           equal(nextGuest.sent, [], 'Leave clears the current external sender');
           equal(playerCreations, beforeRolePlayerCount + 1, 'Role changes never create a duplicate player');
-          roleReuse = { pausedJoin, samePlayer: true, hostCommands, guestCommands: 0, departedHostCommands: 0,
+          roleReuse = { pausedJoin, pausedNativeSeek: { position: 42.333333, stayedPaused: true, noStationarySpam: true },
+            samePlayer: true, hostCommands, guestCommands: 0, departedHostCommands: 0,
             playerCreations: 1, realSeekPoller: true, externalPlaybackMocked: true };
+          // The earlier reader fixture is independent of the external player check.
+          document.getElementById('em-close').click();
+          document.getElementById('settings-modal').classList.remove('on');
+          const appShell = document.getElementById('app');
+          const backBeforeEntry = document.getElementById('vm-back').getBoundingClientRect();
+          const shellBeforeEntry = getComputedStyle(appShell).display;
+          if (shellBeforeEntry === 'none') {
+            check(backBeforeEntry.width === 0 && backBeforeEntry.height === 0,
+              'Hidden app shell gives its video Back control zero bounds');
+            document.getElementById('guest').click();
+            await until(() => getComputedStyle(appShell).display !== 'none', 'production guest entry reveals app shell');
+            await until(() => LIBRARY.length === 0, 'guest entry finishes its empty fixture library load');
+            LIBRARY = [{ id: 10, kind: 'movie' }, { id: 11, kind: 'music' }];
+          }
+          roleReuse.idleShellEntry = { beforeDisplay: shellBeforeEntry,
+            beforeBackSize: { width: backBeforeEntry.width, height: backBeforeEntry.height },
+            afterDisplay: getComputedStyle(appShell).display };
+          PartyUI.hide();
+          partyFollow(10, 'Native before iframe', 0, false, Date.now() / 1000);
+          await until(() => document.getElementById('video-modal').classList.contains('on')
+            && !document.getElementById('video-modal').classList.contains('yt'), 'native video presentation before external idle');
+          partyFollowExternal('same-role-video', 'External idle controls', 42.333333, false, Date.now() / 1000);
+          const backBounds = document.getElementById('vm-back').getBoundingClientRect();
+          const beforeCleanupHit = document.elementFromPoint(backBounds.x + backBounds.width / 2, backBounds.y + backBounds.height / 2);
+          check(backBounds.width > 0 && backBounds.height > 0 && document.getElementById('vm-back').contains(beforeCleanupHit),
+            `External Back is hit-testable after guest entry: ${JSON.stringify({ bounds: { width: backBounds.width, height: backBounds.height }, hit: beforeCleanupHit?.id || beforeCleanupHit?.tagName })}`);
+          const iframe = document.createElement('iframe');
+          iframe.srcdoc = '<!doctype html><body style="margin:0;background:black;height:100vh">Owned iframe event boundary</body>';
+          document.getElementById('yt-party').appendChild(iframe);
+          try {
+            await delay(2700);
+            check(!document.querySelector('.vm-overlay').classList.contains('hidden'), 'External header stays visible after native idle transition and external idle');
+            for (const id of ['vm-back', 'vm-party']) {
+              const button = document.getElementById(id); const bounds = button.getBoundingClientRect();
+              check(button.contains(document.elementFromPoint(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2)),
+                `External idle ${id} remains pointer reachable above the iframe`);
+            }
+            document.getElementById('vm-party').click();
+            check(document.getElementById('party-modal').classList.contains('on'), 'External idle Party opens production panel');
+            PartyUI.hide();
+            document.getElementById('vm-back').click();
+            check(!document.getElementById('video-modal').classList.contains('on'), 'External idle Back exits the modal');
+            partyFollow(10, 'Native after iframe exit', 0, false, Date.now() / 1000);
+            check(document.getElementById('video-modal').classList.contains('on')
+              && !document.getElementById('video-modal').classList.contains('yt'), 'Native video can reopen after external Back');
+            roleReuse.idleHeader = { nativeEntry: true, nativeAutoHideControl: 'focused VM test', externalPersistent: true, iframeHitTests: true,
+              partyOpens: true, backExits: true, nativeReopens: true };
+          } finally { iframe.remove(); }
         }
         return { queuedAudioControl: { stalePauseBroadcasts: 0, legitimatePauseBroadcasts: 1, readinessDescriptorRestoredInFinally: true },
           retiredVideoMetadataIgnored: true, observations, latestPendingStateViaAppFollow: { position: 20, playing: false }, localActivations, roleReuse,
@@ -1387,8 +1446,6 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
   Object.defineProperty(mediaPrototype, 'paused', originalPaused);
   await run('native decoded movie resume after production party end', async () => {
     const video = await nativeResume('after prior party lifecycle', true);
-    // Retire the reader fixture overlay before targeting visible native audio controls.
-    document.getElementById('em-close').click();
     const originalFetch = window.fetch;
     const audioEchoes = [];
     const audioMuted = pbAudio.muted;

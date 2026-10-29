@@ -1712,6 +1712,7 @@ window.partyFollowExternal = (vid, title, position, playing, updatedAt) => {
     + (ytDesired.playing ? Math.max(0, Date.now() / 1000 - ytDesired.updatedAt) : 0);
   $('#video-modal').classList.add('on');
   $('#video-modal').classList.add('yt');
+  wakeChrome();
   $('#pb-title').textContent = title || 'YouTube';
   $('#pb-sub').textContent = 'party · youtube';
   const ensure = (cb) => {
@@ -1731,10 +1732,17 @@ window.partyFollowExternal = (vid, title, position, playing, updatedAt) => {
     clearInterval(window._ytSeekTimer);
     window._ytSeekTimer = null;
     if (window.partySend) {
+      let lastPosition = desired.position;
       window._ytSeekTimer = setInterval(() => {
         if (!ytPlayerReady || !ytPlayer || !ytPlayer.getCurrentTime
           || !window.partySend || partyPlaybackKind !== 'external') return;
-        if (ytPlayer.getPlayerState() === 1) window.partySend({ type: 'seek', position: ytPlayer.getCurrentTime() });
+        const state = ytPlayer.getPlayerState();
+        const position = ytPlayer.getCurrentTime();
+        // Paused native-bar seeks need polling too; stationary clocks must not echo.
+        if (state === 1 || state === 2 && Math.abs(position - lastPosition) > 0.25) {
+          window.partySend({ type: 'seek', position });
+          lastPosition = position;
+        }
       }, 2000);
     }
     if (ytId !== vid) {
@@ -2026,7 +2034,7 @@ function wakeChrome() {
   ov.classList.remove('hidden');
   clearTimeout(chromeHideTimer);
   chromeHideTimer = setTimeout(() => {
-    if ($('#video-modal').classList.contains('on')) ov.classList.add('hidden');
+    if ($('#video-modal').classList.contains('on') && !$('#video-modal').classList.contains('yt')) ov.classList.add('hidden');
   }, 2500);
 }
 /** Attach mouse activity to the video overlay timer and reveal controls immediately. */

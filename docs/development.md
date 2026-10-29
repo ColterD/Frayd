@@ -118,6 +118,37 @@ npm dependency is introduced, and the Cargo audit does not scan that external
 browser. These DOM checks complement the manual media matrix; they do not close
 its held interactive acceptance cases.
 
+### Unwired UI design fragments
+
+`client/index.html` retains five named `<template id="unwired-…">` fragments
+beside their intended locations. Template children do not enter the active DOM,
+tab order or accessibility tree. The hero fragment sits outside `#hero` because
+`renderHero()` replaces that element's contents. No runtime code instantiates
+these fragments. Even a manually cloned prototype has disabled controls, explicit
+`type="button"` buttons, no control IDs and no event handlers. The working default
+continues to expose only implemented actions; these fragments are design intent,
+not supported features or a promise of activation.
+
+| Fragment | Removal provenance | Contract required before activation |
+| --- | --- | --- |
+| `unwired-remember` | `8d879054a16637619b7efc1e1e79ce6d38e568d2` | Define actual token/identity storage, session expiry, unchecked behavior, logout and shared-device policy; the checkbox must change that policy. |
+| `unwired-social-auth` (Google / SSO) | `8d879054a16637619b7efc1e1e79ce6d38e568d2` | Implement configured provider routes, redirect/state validation, errors and safe account linking with the local household/account model. |
+| `unwired-notifications` | `8d879054a16637619b7efc1e1e79ce6d38e568d2` | Provide an authorized event source, actual notification surface, empty/error states and read/dismiss persistence. |
+| `unwired-hero-info` | `829af7d02172fcf36610aacd044699db82d43176` | Open actual selected-media details with close/focus behavior and truthful metadata; preserve the working hero play action. |
+| `unwired-audio-navigation` (Previous / Next) | `d49b227b721b0ef20bb87c2e83f148a7e0cb108a` | Define queue order and boundaries, previous-track versus restart behavior, per-track resume/progress ownership and host/guest party authority. |
+
+These are local source-history references checked on 2026-10-29; retrieve the
+pre-removal markup with `git show <commit>^:client/index.html` (the hero button
+was generated in `client/js/app.js`). SVGs and labels are retained where useful;
+removed styling remains recoverable from history. No dependency, configuration,
+environment flag or activation path is added. Before activating a fragment,
+implement its contract, accessible interaction and affected-path tests, then
+move the control into the live UI and qualify the real browser workflow.
+
+`python3 -m unittest discover -s tests -p 'test_unwired_ui.py'` checks the source
+boundary and disabled prototype contract. Canonical Python discovery runs this
+check in CI; the real DOM suite separately checks default auth/audio controls.
+
 ### Party protocol
 
 `POST /api/party` returns a public code and private `host_capability`. Host socket
