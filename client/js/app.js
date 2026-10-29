@@ -345,6 +345,9 @@ document.querySelectorAll('.nav-item').forEach(btn => {
     document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     filtering = btn.dataset.kind !== 'all';
+    if (btn.dataset.kind !== 'show') showsDrill = null;
+    if (!authorDrill[btn.dataset.kind]) { /* keep */ }
+    else authorDrill[btn.dataset.kind] = null;
     filterKind(btn.dataset.kind);
   };
 });
@@ -378,9 +381,11 @@ async function loadLibrary() {
   renderRows(LIBRARY);
 }
 
+const KIND_ALIAS = { show: 'episode' };
 function filterKind(kind, query) {
   let items = LIBRARY;
-  if (kind && kind !== 'all') items = items.filter(i => i.kind === kind);
+  const k = KIND_ALIAS[kind] || kind;
+  if (k && k !== 'all') items = items.filter(i => i.kind === k);
   if (query) {
     const q = query.toLowerCase();
     items = items.filter(i =>
@@ -477,6 +482,53 @@ async function continueRow() {
   return wrap;
 }
 
+// TV Shows: series grid → click → season/episode view for that series
+let showsDrill = null; // series name while drilled in
+
+function groupedByShow(items) {
+  if (showsDrill) return showDetail(showsDrill, items.filter(i => (i.series || 'Unknown series') === showsDrill));
+  const wrap = el('section');
+  const bySeries = {};
+  items.forEach(i => (bySeries[i.series || 'Unknown series'] ||= []).push(i));
+  const grid = el('div', 'cards show-grid');
+  for (const [show, eps] of Object.entries(bySeries)) {
+    const c = el('div', 'media-card landscape');
+    c.innerHTML = `
+      <img class="thumb" loading="lazy" src="/api/thumb/${eps[0].id}" alt=""
+           onerror="this.outerHTML='<div class=&quot;thumb-fallback&quot;>${esc(show[0] || '?')}</div>'">
+      <div class="card-body">
+        <div class="title">${esc(show)}</div>
+        <div class="sub">${eps.length} episode${eps.length === 1 ? '' : 's'}</div>
+      </div>`;
+    c.onclick = () => { showsDrill = show; filterKind('show'); };
+    grid.appendChild(c);
+  }
+  wrap.appendChild(grid);
+  return wrap;
+}
+
+function showDetail(show, eps) {
+  const wrap = el('section');
+  const back = el('button', 'link back-row', '← All shows');
+  back.onclick = () => { showsDrill = null; filterKind('show'); };
+  wrap.appendChild(back);
+  wrap.appendChild(el('div', 'row-head', `<h3>${esc(show)}</h3>`));
+  // season sub-grouping: parse SxxEyy from title
+  const bySeason = {};
+  eps.forEach(e => {
+    const m = (e.title || '').toLowerCase().match(/s(\d{1,2})e/);
+    (bySeason[m ? +m[1] : 0] ||= []).push(e);
+  });
+  for (const [season, seasonEps] of Object.entries(bySeason).sort((a, b) => a[0] - b[0])) {
+    if (+season > 0) wrap.appendChild(el('div', 'row-head series-head', `<h4>Season ${+season}</h4>`));
+    const cards = el('div', 'cards');
+    seasonEps.sort((a, b) => (a.title || '').localeCompare(b.title || '', undefined, { numeric: true }));
+    seasonEps.forEach(it => cards.appendChild(card(it, false)));
+    wrap.appendChild(cards);
+  }
+  return wrap;
+}
+
 async function renderRows(items) {
   const main = $('#main');
   main.innerHTML = '<div id="hero"></div>';
@@ -488,14 +540,18 @@ async function renderRows(items) {
     if (cont) main.appendChild(cont);
   }
   const byKind = {};
-  items.forEach(i => (byKind[i.kind] ||= []).push(i));
-  const order = ['movie', 'music', 'audiobook', 'ebook', 'comic', 'manga'];
+  // DB kind 'episode' renders as the 'show' module
+  items.forEach(i => (byKind[i.kind === 'episode' ? 'show' : i.kind] ||= []).push(i));
+  const order = ['movie', 'show', 'music', 'audiobook', 'ebook', 'comic', 'manga'];
+  const soloKind = filtering && currentKind() !== 'all' && byKind[order.find(k => byKind[k]?.length)] && order.filter(k => byKind[k]?.length).length === 1;
+  const solo = soloKind ? order.find(k => byKind[k]?.length) : null;
   for (const kind of order) {
     const kindItems = byKind[kind];
     if (!kindItems?.length) continue;
-    // books/audio: author → series → books grouping
-    if (kind === 'audiobook' || kind === 'ebook' || kind === 'music') {
-      main.appendChild(groupedByAuthor(kind, kindItems));
+    if (kind === 'show') {
+      main.appendChild(groupedByShow(kindItems));
+    } else if (kind === 'audiobook' || kind === 'ebook' || kind === 'music') {
+      main.appendChild(groupedByAuthor(kind, kindItems, solo === kind));
     } else {
       main.appendChild(section(kind[0].toUpperCase() + kind.slice(1) + 's', kindItems, false));
     }
@@ -514,26 +570,79 @@ async function renderRows(items) {
 }
 
 // author → series → books: one section per author, sub-rows per series
-function groupedByAuthor(kind, items) {
+// Audiobooks/Ebooks/Music: folder drill-down — author grid → (series grid) → items
+// drill state per kind: { author, series }
+const authorDrill = { audiobook: null, ebook: null, music: null };
+
+function groupedByAuthor(kind, items, solo = false) {
   const label = kind[0].toUpperCase() + kind.slice(1) + 's';
   const wrap = el('section');
-  const byAuthor = {};
-  items.forEach(i => (byAuthor[i.author || 'Unknown'] ||= []).push(i));
-  for (const [author, authorItems] of Object.entries(byAuthor)) {
-    const head = el('div', 'row-head', `<h3>${esc(label)} — ${esc(author)}</h3>`);
-    wrap.appendChild(head);
+  const drill = authorDrill[kind];
+
+  if (!drill) {
+    // level 1: author folders
+    const byAuthor = {};
+    items.forEach(i => (byAuthor[i.author || 'Unknown'] ||= []).push(i));
+    const grid = el('div', 'cards');
+    for (const [author, authorItems] of Object.entries(byAuthor)) {
+      const c = el('div', 'media-card landscape');
+      c.innerHTML = `
+        <div class="thumb-fallback folder-fallback">${esc(author[0] || '?')}</div>
+        <div class="card-body">
+          <div class="title">${esc(author)}</div>
+          <div class="sub">${authorItems.length} item${authorItems.length === 1 ? '' : 's'}</div>
+        </div>`;
+      c.onclick = () => { authorDrill[kind] = { author }; filterKind(kind); };
+      grid.appendChild(c);
+    }
+    wrap.appendChild(grid);
+    return wrap;
+  }
+
+  const authorItems = items.filter(i => (i.author || 'Unknown') === drill.author);
+  const back = el('button', 'link back-row', `← All ${label.toLowerCase()}`);
+  back.onclick = () => { authorDrill[kind] = null; filterKind(kind); };
+  wrap.appendChild(back);
+
+  if (!drill.series) {
+    // level 2: series folders within author (skip if author has no series)
     const bySeries = {};
     authorItems.forEach(i => (bySeries[i.series || ''] ||= []).push(i));
-    for (const [series, seriesItems] of Object.entries(bySeries)) {
-      if (series) {
-        const sh = el('div', 'row-head series-head', `<h4>${esc(series)}</h4>`);
-        wrap.appendChild(sh);
-      }
+    const seriesKeys = Object.keys(bySeries).filter(Boolean);
+    if (!seriesKeys.length) {
+      // flat author: straight to items
       const cards = el('div', 'cards');
-      seriesItems.forEach(it => cards.appendChild(card(it, false)));
-      wrap.appendChild(cards);
+      authorItems.forEach(it => cards.appendChild(card(it, false)));
+      wrap.appendChild(el('div', 'row-head', `<h3>${esc(drill.author)}</h3>`), cards);
+      return wrap;
     }
+    wrap.appendChild(el('div', 'row-head', `<h3>${esc(drill.author)}</h3>`));
+    const grid = el('div', 'cards');
+    for (const series of seriesKeys) {
+      const seriesItems = bySeries[series];
+      const c = el('div', 'media-card landscape');
+      c.innerHTML = `
+        <div class="thumb-fallback folder-fallback">${esc(series[0])}</div>
+        <div class="card-body">
+          <div class="title">${esc(series)}</div>
+          <div class="sub">${seriesItems.length} item${seriesItems.length === 1 ? '' : 's'}</div>
+        </div>`;
+      c.onclick = () => { authorDrill[kind] = { ...drill, series }; filterKind(kind); };
+      grid.appendChild(c);
+    }
+    wrap.appendChild(grid);
+    return wrap;
   }
+
+  // level 3: items in series
+  const seriesItems = authorItems.filter(i => i.series === drill.series);
+  const up = el('button', 'link back-row', `← ${drill.author}`);
+  up.onclick = () => { authorDrill[kind] = { author: drill.author }; filterKind(kind); };
+  wrap.appendChild(up);
+  wrap.appendChild(el('div', 'row-head', `<h3>${esc(drill.series)}</h3>`));
+  const cards = el('div', 'cards');
+  seriesItems.forEach(it => cards.appendChild(card(it, false)));
+  wrap.appendChild(cards);
   return wrap;
 }
 
@@ -547,7 +656,8 @@ function fmtDuration(s) {
 function renderHero(it) {
   const hero = $('#hero');
   hero.style.display = 'block';
-  const verb = ['movie', 'show'].includes(it.kind) ? 'Play' : ['comic', 'manga', 'ebook'].includes(it.kind) ? 'Read' : 'Listen';
+  const vk = it.kind === 'episode' ? 'show' : it.kind;
+  const verb = ['movie', 'show'].includes(vk) ? 'Play' : ['comic', 'manga', 'ebook'].includes(vk) ? 'Read' : 'Listen';
   const blurb = it.synopsis || `Resume where you left off, or start fresh — progress syncs across your devices.`;
   const tags = [it.kind, fmtDuration(it.duration_secs), it.author].filter(Boolean)
     .map(t => `<span class="tag">${esc(t)}</span>`).join('');
@@ -574,10 +684,11 @@ function renderHero(it) {
 const pbAudio = $('#pb-audio');
 
 function openItem(it) {
-  if (it.kind === 'movie' || it.kind === 'show') openVideo(it);
-  else if (it.kind === 'music' || it.kind === 'audiobook') playAudio(it);
-  else if (it.kind === 'comic' || it.kind === 'manga') openComic(it);
-  else if (it.kind === 'ebook') openEbook(it);
+  const kind = it.kind === 'episode' ? 'show' : it.kind;
+  if (kind === 'movie' || kind === 'show') openVideo(it);
+  else if (kind === 'music' || kind === 'audiobook') playAudio(it);
+  else if (kind === 'comic' || kind === 'manga') openComic(it);
+  else if (kind === 'ebook') openEbook(it);
 }
 
 // ---------- comic reader ----------
