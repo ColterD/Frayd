@@ -1802,6 +1802,99 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
         continuationOrder: ['Progress episode', 'Progress movie'], actualDOM: true, modeledProgressAPI: true } };
   });
   await run('trusted ebook keys preserve editable inactive settings and button focus', async () => {
+    document.getElementById('em-close').click();
+    const comicSaved = new Map([[90, 3], [91, 2]]), comicWrites = [];
+    let comicHeld = true, releaseComic;
+    responder = async (url, options) => {
+      const path = new URL(url, location.origin).pathname;
+      if (/^\/api\/comic\/(90|91)\/pages$/.test(path)) return reply(['0', '1', '2', '3', '4']);
+      if (/^\/api\/progress\/(90|91)$/.test(path)) {
+        const id = Number(path.split('/').at(-1)), position = comicSaved.get(id);
+        if (id === 90 && comicHeld) return new Promise(resolve => { releaseComic = () => { comicHeld = false; resolve(reply({ position })); }; });
+        return reply({ position });
+      }
+      if (path === '/api/progress' && options.method === 'POST') {
+        const body = JSON.parse(options.body);
+        if (comicSaved.has(body.media_id)) { comicWrites.push({ id: body.media_id, page: body.position }); comicSaved.set(body.media_id, body.position); return reply({}); }
+      }
+      return defaultResponder(url, options);
+    };
+    await openComic({ id: 90, title: 'Owned pending comic A' });
+    await until(() => releaseComic, 'comic saved response reaches held boundary');
+    check(comic.page === null && document.getElementById('cm-pageinfo').textContent === 'Loading…', 'Comic exposes unknown loading position');
+    check(document.getElementById('cm-prev').disabled && document.getElementById('cm-next').disabled, 'Comic navigation is disabled during restore');
+    document.getElementById('cm-next').click();
+    document.body.tabIndex = -1; document.body.focus();
+    await key('ArrowRight'); await key(' ');
+    equal(comicWrites, [], 'Pending comic button/keyboard cannot save unknown position');
+    document.getElementById('cm-close').click();
+    equal(comicWrites, [], 'Closing pending comic does not save zero');
+    await openComic({ id: 91, title: 'Owned comic B' });
+    await until(() => comic?.page === 2, 'comic B restores its own page');
+    releaseComic(); await delay(20);
+    equal(comic.it.id, 91, 'Late A cannot replace B'); equal(comic.page, 2, 'Late A cannot move B');
+    check(document.getElementById('cm-img').src.endsWith('/api/comic/91/page/2'), 'Comic B retains its own image');
+    document.getElementById('cm-close').click();
+    await openComic({ id: 90, title: 'Owned pending comic A' });
+    await until(() => comic?.page === 3, 'closed pending comic reopens at saved page3');
+    check(document.getElementById('cm-img').src.endsWith('/api/comic/90/page/3'), 'Reopened comic image uses saved page3');
+    document.getElementById('cm-prev').click(); equal(comic.page, 2, 'Ready comic previous navigation works');
+    document.getElementById('cm-next').click(); equal(comic.page, 3, 'Ready comic next navigation works');
+    document.getElementById('cm-close').click();
+    equal(comicSaved.get(90), 3, 'Ready close preserves comic bookmark3');
+    check(!comicWrites.some(write => write.id === 90 && write.page === 0), 'No initial zero write reached comic fixture');
+    const epubReadiness = [];
+    for (const boundary of ['toc', 'progress']) {
+      let savedPosition = 2.3, responseHeld = true, releaseResponse, releaseChapter;
+      const writes = [], chapterReads = [];
+      responder = async (url, options) => {
+        const path = new URL(url, location.origin).pathname;
+        if (path === '/api/epub/7/spine') return reply(['one.xhtml', 'two.xhtml', 'three.xhtml', 'four.xhtml']);
+        if (path === '/api/annotations/7') return reply([]);
+        if (path === '/api/epub/7/toc') {
+          if (boundary === 'toc' && responseHeld) return new Promise(resolve => { releaseResponse = () => { responseHeld = false; resolve(reply([])); }; });
+          return reply([]);
+        }
+        if (path === '/api/progress/7') {
+          const position = savedPosition;
+          if (boundary === 'progress' && responseHeld) return new Promise(resolve => { releaseResponse = () => { responseHeld = false; resolve(reply({ position })); }; });
+          return reply({ position });
+        }
+        if (/^\/api\/epub\/7\/chunk\/[0-3]$/.test(path)) {
+          const chapter = Number(path.split('/').at(-1)); chapterReads.push(chapter);
+          const html = () => new Response('<html><head></head><body>Owned readiness chapter</body></html>', { headers: { 'Content-Type': 'text/html' } });
+          if (chapter === 2) return new Promise(resolve => { releaseChapter = () => resolve(html()); });
+          return html();
+        }
+        if (path === '/api/progress' && options.method === 'POST') {
+          const body = JSON.parse(options.body);
+          if (body.media_id === 7) { savedPosition = body.position; writes.push(savedPosition); return reply({}); }
+        }
+        return defaultResponder(url, options);
+      };
+      const opening = openEbook({ id: 7, title: 'Owned pending EPUB' });
+      await until(() => releaseResponse, 'EPUB initial ' + boundary + ' response reaches hold');
+      check(ebook.chunk === null && document.getElementById('em-pageinfo').textContent === 'Loading…', 'EPUB exposes unknown loading chapter');
+      check(document.getElementById('em-prev').disabled && document.getElementById('em-next').disabled && document.getElementById('em-toc-btn').disabled, 'EPUB pending navigation is disabled');
+      document.getElementById('em-next').click(); document.getElementById('em-toc-btn').click();
+      document.body.focus(); await key('ArrowRight'); await key(' '); await key('t');
+      window.dispatchEvent(new Event('resize')); await delay(340);
+      equal(chapterReads, [], 'Pending EPUB keyboard/resize does not coerce null to chapter0');
+      equal(writes, [], 'Pending EPUB callbacks do not save unknown chapter');
+      document.getElementById('em-close').click();
+      equal(writes, [], 'Closing initial EPUB restore does not overwrite bookmark');
+      releaseResponse(); await opening; await delay(20);
+      equal(writes, [], 'Retired EPUB initial response cannot save');
+      const reopening = openEbook({ id: 7, title: 'Owned pending EPUB' });
+      await until(() => releaseChapter && ebook.chunk === 2, 'EPUB reopens at saved chapter before its body loads');
+      check(Math.abs(ebook.lastFrac - 0.3) < 1e-9, 'Known resume fraction is retained before layout');
+      document.getElementById('em-close').click();
+      equal(savedPosition, 2.3, 'Known EPUB chapter close preserves saved fractional bookmark');
+      releaseChapter(); await reopening; await delay(20);
+      equal(writes, [2.3], 'Only known EPUB position was saved');
+      epubReadiness.push({ boundary, pendingCloseWrites: 0, resizeAndKeysIgnored: true, reopenedChapter: 2, knownClosePosition: savedPosition });
+    }
+    const readerBookmarkReadiness = { comic: { pendingCloseWrites: 0, reopenedPage: comicSaved.get(90), lateOtherComicUnchanged: true, readyNavigation: true }, epub: epubReadiness, actualDOM: true, modeledProgressResponses: true, originalHeldBodiesPreserved: true };
     responder = defaultResponder;
     await api('configure', { body: '<p>Reader shortcut fixture</p>', annotations: [] });
     ebook = { it: { id: 7 }, spine: ['one.xhtml', 'two.xhtml'], chunk: 0, annots: [], toc: [] };
@@ -1854,7 +1947,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     check((await probe()).opaqueOrigin === 'null', 'Current opaque WindowProxy remains functional');
     document.getElementById('em-close').click();
     targets.slice(2).forEach(target => target.remove());
-    return { trustedKeyboard: true, targets: ['search INPUT', 'reader INPUT', 'TEXTAREA', 'SELECT', 'contenteditable', 'BUTTON'], positiveChapter: 1, opaqueOrigin: 'null', outsiderOrigins };
+    return { readerBookmarkReadiness, trustedKeyboard: true, targets: ['search INPUT', 'reader INPUT', 'TEXTAREA', 'SELECT', 'contenteditable', 'BUTTON'], positiveChapter: 1, opaqueOrigin: 'null', outsiderOrigins };
   });
   async function installer(mode, isolated = false) {
     const node = document.createElement('iframe'); node.width = '600'; node.height = '900';

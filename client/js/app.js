@@ -1017,7 +1017,7 @@ function openItem(it) {
 }
 
 // ---------- comic reader ----------
-let comic = null; // { it, pages, page }
+let comic = null; // page is null until the saved position has restored
 let comicOpenGeneration = 0;
 
 /**
@@ -1030,7 +1030,10 @@ async function openComic(it) {
   const current = () => opening === comicOpenGeneration && owner === accountGeneration;
   const pages = await (await fetch(`/api/comic/${it.id}/pages`)).json();
   if (!current() || !Array.isArray(pages) || !pages.length) return;
-  comic = { it, pages, page: 0 };
+  comic = { it, pages, page: null };
+  $('#cm-img').src = '';
+  $('#cm-pageinfo').textContent = 'Loading…';
+  $('#cm-prev').disabled = $('#cm-next').disabled = true;
   $('#cm-title').textContent = it.title;
   $('#comic-modal').classList.add('on');
   resumeFor(it.id).then(p => {
@@ -1053,25 +1056,26 @@ function showComicPage(n) {
   syncProgress(comic.it.id, comic.page); // progress = page index per schema
 }
 
-$('#cm-prev').onclick = () => comic && showComicPage(comic.page - 1);
-$('#cm-next').onclick = () => comic && showComicPage(comic.page + 1);
+$('#cm-prev').onclick = () => comic?.page != null && showComicPage(comic.page - 1);
+$('#cm-next').onclick = () => comic?.page != null && showComicPage(comic.page + 1);
 $('#cm-close').onclick = closeComic;
 document.addEventListener('keydown', e => {
   if (!$('#comic-modal').classList.contains('on')) return;
-  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); comic && showComicPage(comic.page + 1); }
-  else if (e.key === 'ArrowLeft') { e.preventDefault(); comic && showComicPage(comic.page - 1); }
+  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); comic?.page != null && showComicPage(comic.page + 1); }
+  else if (e.key === 'ArrowLeft') { e.preventDefault(); comic?.page != null && showComicPage(comic.page - 1); }
   else if (e.key === 'Escape') closeComic();
 });
 /** Persist the current page, release comic state and close the reader. */
 function closeComic() {
   ++comicOpenGeneration;
   $('#comic-modal').classList.remove('on');
-  if (comic) { syncProgress(comic.it.id, comic.page); comic = null; }
+  if (comic?.page != null) syncProgress(comic.it.id, comic.page);
+  comic = null;
   $('#cm-img').src = '';
 }
 
 // ---------- ebook reader ----------
-let ebook = null; // { it, spine, chunk }
+let ebook = null; // chunk is null until an initial restore selects a known position
 let ebookOpenGeneration = 0;
 let ebookDocumentGeneration = 0;
 
@@ -1088,8 +1092,15 @@ async function openEbook(it) {
   const annots = await fetch(`/api/annotations/${it.id}?identity=${encodeURIComponent(IDENTITY)}`, { headers: authHeaders() })
     .then(r => r.ok ? r.json() : []).catch(() => []);
   if (opening !== ebookOpenGeneration) return;
-  const book = { it, spine, chunk: 0, annots, toc: [] };
+  const book = { it, spine, chunk: null, annots, toc: [] };
   ebook = book;
+  $('#em-frame').srcdoc = '';
+  $('#em-frame').src = 'about:blank';
+  $('#em-pageinfo').textContent = 'Loading…';
+  $('#em-prev').disabled = $('#em-next').disabled = true;
+  $('#em-toc-btn').disabled = $('#em-search').disabled = true;
+  $('#em-toc').innerHTML = '';
+  $('#em-toc').classList.remove('on');
   $('#em-title').textContent = it.title;
   $('#ebook-modal').classList.add('on');
   // TOC (best-effort)
@@ -1110,12 +1121,14 @@ async function openEbook(it) {
  * @returns {Promise<void>}
  */
 async function showChunk(n, opts = {}) {
-  if (!ebook) return;
+  if (!ebook || n == null) return;
   const book = ebook;
   const readerDocument = { generation: ++ebookDocumentGeneration, ready: false };
   book.document = readerDocument;
   const isCurrent = () => ebook === book && book.document === readerDocument;
   ebook.chunk = Math.max(0, Math.min(n, ebook.spine.length - 1));
+  $('#em-prev').disabled = $('#em-next').disabled = false;
+  $('#em-toc-btn').disabled = $('#em-search').disabled = false;
   ebook.pendingCol = opts.atEnd ? Infinity : opts.frac != null ? opts.frac : 0;
   ebook.lastFrac = opts.atEnd ? 0.999 : (opts.frac ?? 0);
   const chunkUrl = ebook.spine[ebook.chunk]; // zip-relative path
@@ -1346,13 +1359,13 @@ function ebookPageW() { const f = document.getElementById("em-frame"); return Ma
  * @param {number} dir
  */
 function ebookFlip(dir) {
-  if (!ebook) return;
+  if (!ebook || ebook.chunk == null) return;
   $('#em-frame').contentWindow?.postMessage(dir > 0 ? 'next' : 'prev', '*');
 }
 // resize: repaginate (reload chapter at same column); debounce 300ms
 let ebookResizeT = null;
 window.addEventListener('resize', () => {
-  if (!ebook || !$('#ebook-modal').classList.contains('on')) return;
+  if (!ebook || ebook.chunk == null || !$('#ebook-modal').classList.contains('on')) return;
   clearTimeout(ebookResizeT);
   const book = ebook;
   const readerDocument = book.document;
@@ -1361,7 +1374,7 @@ window.addEventListener('resize', () => {
   }, 300);
 });
 window.addEventListener('message', async (e) => {
-  if (!ebook) return;
+  if (!ebook || ebook.chunk == null) return;
   // srcdoc is sandboxed without allow-same-origin, so its origin is opaque.
   // Other opaque frames also report "null": bind messages to our reader window.
   const frameWindow = $('#em-frame').contentWindow;
@@ -1455,13 +1468,14 @@ window.addEventListener('message', async (e) => {
  * @param {string} q
  */
 function ebookSearch(q) {
-  if (!ebook) return;
+  if (!ebook || ebook.chunk == null) return;
   ebook.searchQuery = q;
   $('#em-frame').contentWindow?.postMessage({ type: 'search', query: q }, '*');
 }
 $('#em-search').addEventListener('keydown', (e) => {
   if (e.key !== 'Enter') return;
   e.preventDefault();
+  if (ebook?.chunk == null) return;
   const q = e.target.value.trim();
   if (!q) { $('#em-searchinfo').textContent = ''; return; }
   if (q !== ebook.searchQuery) { ebookSearch(q); return; }
@@ -1491,6 +1505,7 @@ function ebookShortcutAllowed(event) {
 // reader shortcuts: ←/→/space flip, s search, t toc, f fullscreen, Esc closes overlays
 document.addEventListener('keydown', (e) => {
   if (!ebookShortcutAllowed(e)) return;
+  if (ebook.chunk == null && e.key !== 'Escape') return;
   if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); ebookFlip(1); }
   else if (e.key === 'ArrowLeft') { e.preventDefault(); ebookFlip(-1); }
   else if (e.key === 's') { e.preventDefault(); $('#em-search').focus(); }
@@ -1500,11 +1515,16 @@ document.addEventListener('keydown', (e) => {
 });
 $('#em-close').onclick = closeEbook;
 // TOC drawer
-$('#em-toc-btn').onclick = () => { renderToc(); $('#em-toc').classList.toggle('on'); };
+$('#em-toc-btn').onclick = () => {
+  if (ebook?.chunk == null) return;
+  renderToc();
+  $('#em-toc').classList.toggle('on');
+};
 $('#em-prev').ondblclick = $('#em-next').ondblclick = () =>
   $('#em-frame').contentWindow?.postMessage({ type: 'geom' }, '*');
 /** Render the EPUB table of contents and bind chapter navigation. */
 function renderToc() {
+  if (!ebook || ebook.chunk == null) return;
   const el = $('#em-toc');
   if (!ebook?.toc?.length) { el.innerHTML = '<h3>No table of contents</h3>'; return; }
   el.innerHTML = '<h3>Contents</h3>' + ebook.toc.map((t, i) =>
@@ -1519,7 +1539,8 @@ function closeEbook() {
   ++ebookOpenGeneration;
   clearTimeout(ebookResizeT);
   $('#ebook-modal').classList.remove('on');
-  if (ebook) { syncProgress(ebook.it.id, ebook.chunk + (ebook.lastFrac ?? 0)); ebook = null; }
+  if (ebook?.chunk != null) syncProgress(ebook.it.id, ebook.chunk + (ebook.lastFrac ?? 0));
+  ebook = null;
   $('#em-frame').srcdoc = '';
   $('#em-frame').src = 'about:blank';
   $('#em-search').value = '';

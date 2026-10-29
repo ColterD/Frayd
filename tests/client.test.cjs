@@ -2559,3 +2559,211 @@ for (const scenario of ['closed-abort', 'superseded-abort', 'superseded-notallow
     if (scenario === 'closed-abort') assert.equal(b.nodes.get('#video-modal').classList.contains('on'), false);
   });
 }
+
+async function comicBookmarkFixture(heldIds = [9]) {
+  const b = browser();
+  await settle();
+  b.run('IDENTITY = "owned-comic-fixture"');
+  const saved = new Map([[9, 3], [10, 2], [11, 0]]);
+  const held = new Set(heldIds);
+  const releases = new Map();
+  const writes = [];
+  b.respond(async (url, options = {}) => {
+    const path = new URL(url, 'https://fixture.invalid').pathname;
+    if (/^\/api\/comic\/\d+\/pages$/.test(path)) return { ok: true, json: async () => ['0', '1', '2', '3', '4'] };
+    if (path === '/api/progress' && options.method === 'POST') {
+      const body = JSON.parse(options.body);
+      writes.push({ id: body.media_id, page: body.position });
+      saved.set(body.media_id, body.position);
+      return { ok: true, json: async () => ({}) };
+    }
+    if (path.startsWith('/api/progress/')) {
+      const id = Number(path.split('/').at(-1));
+      const position = saved.get(id);
+      if (held.has(id)) return new Promise(resolve => releases.set(id, () => {
+        held.delete(id);
+        resolve({ ok: true, json: async () => ({ position }) });
+      }));
+      return { ok: true, json: async () => ({ position }) };
+    }
+    throw new Error('Unexpected owned comic fixture path: ' + path);
+  });
+  return { b, saved, writes, release: id => {
+    assert.equal(typeof releases.get(id), 'function', 'Saved progress response actually reached the hold');
+    releases.get(id)();
+  } };
+}
+
+test('closing a pending comic restore makes no progress write and reopens its saved page three', async () => {
+  const { b, saved, writes, release } = await comicBookmarkFixture();
+  await b.run('openComic({ id: 9, title: "Owned comic A" })');
+  await settle();
+  b.nodes.get('#cm-close').onclick();
+  assert.deepEqual(writes, [], 'Unknown initial page must never overwrite the saved bookmark');
+  assert.equal(saved.get(9), 3);
+  release(9); await settle();
+  assert.deepEqual(writes, [], 'Closed restore cannot write when its original response arrives');
+  await b.run('openComic({ id: 9, title: "Owned comic A" })'); await settle();
+  assert.equal(b.nodes.get('#cm-img').src, '/api/comic/9/page/3');
+  assert.equal(b.nodes.get('#cm-pageinfo').textContent, '4 / 5');
+  assert.equal(saved.get(9), 3);
+  assert.equal(writes.some(write => write.id === 9 && write.page === 0), false);
+});
+
+test('closed pending comic A cannot overwrite ready comic B or lose A bookmark on reopen', async () => {
+  const { b, saved, writes, release } = await comicBookmarkFixture();
+  await b.run('openComic({ id: 9, title: "Owned comic A" })'); await settle();
+  b.nodes.get('#cm-close').onclick();
+  await b.run('openComic({ id: 10, title: "Owned comic B" })'); await settle();
+  assert.equal(b.nodes.get('#cm-img').src, '/api/comic/10/page/2');
+  const beforeRelease = writes.slice();
+  release(9); await settle();
+  assert.equal(b.nodes.get('#cm-title').textContent, 'Owned comic B');
+  assert.equal(b.nodes.get('#cm-img').src, '/api/comic/10/page/2');
+  assert.deepEqual(writes, beforeRelease);
+  b.nodes.get('#cm-close').onclick();
+  assert.equal(saved.get(10), 2);
+  await b.run('openComic({ id: 9, title: "Owned comic A" })'); await settle();
+  assert.equal(b.nodes.get('#cm-img').src, '/api/comic/9/page/3');
+  assert.equal(saved.get(9), 3);
+});
+
+test('pending comic navigation is disabled and ignored until its saved page restores', async () => {
+  const { b, writes, release } = await comicBookmarkFixture([10]);
+  await b.run('openComic({ id: 9, title: "Owned comic A" })'); await settle();
+  assert.equal(b.nodes.get('#cm-img').src, '/api/comic/9/page/3');
+  await b.run('openComic({ id: 10, title: "Owned comic B" })'); await settle();
+  assert.equal(b.run('comic.page'), null);
+  assert.equal(b.nodes.get('#cm-img').src, '', 'Old comic image is cleared before new title/restore');
+  assert.equal(b.nodes.get('#cm-title').textContent, 'Owned comic B');
+  assert.equal(b.nodes.get('#cm-pageinfo').textContent, 'Loading…');
+  assert.equal(b.nodes.get('#cm-prev').disabled, true);
+  assert.equal(b.nodes.get('#cm-next').disabled, true);
+  const beforeNavigation = writes.slice();
+  b.nodes.get('#cm-next').onclick(); b.nodes.get('#cm-prev').onclick();
+  assert.deepEqual(writes, beforeNavigation);
+  assert.equal(b.run('comic.page'), null);
+  release(10); await settle();
+  assert.equal(b.nodes.get('#cm-img').src, '/api/comic/10/page/2');
+  assert.equal(b.nodes.get('#cm-prev').disabled, false);
+  assert.equal(b.nodes.get('#cm-next').disabled, false);
+  b.nodes.get('#cm-next').onclick();
+  assert.equal(b.nodes.get('#cm-img').src, '/api/comic/10/page/3');
+  assert.deepEqual(writes.at(-1), { id: 10, page: 3 });
+});
+
+for (const [id, page] of [[9, 3], [11, 0]]) {
+  test(`ready comic close still persists saved page ${page}`, async () => {
+    const { b, saved, writes } = await comicBookmarkFixture([]);
+    await b.run(`openComic({ id: ${id}, title: "Ready owned comic" })`); await settle();
+    writes.length = 0;
+    b.nodes.get('#cm-close').onclick();
+    assert.deepEqual(writes, [{ id, page }]);
+    assert.equal(saved.get(id), page);
+  });
+}
+
+test('retired account comic restore cannot paint or save an unknown page on close', async () => {
+  const { b, saved, writes, release } = await comicBookmarkFixture();
+  await b.run('openComic({ id: 9, title: "Old-account comic" })'); await settle();
+  b.run('++accountGeneration');
+  release(9); await settle();
+  b.nodes.get('#cm-close').onclick();
+  assert.deepEqual(writes, []);
+  assert.equal(saved.get(9), 3);
+  assert.equal(b.nodes.get('#cm-img').src, '');
+});
+
+async function ebookBookmarkFixture(boundary) {
+  const b = browser();
+  await settle();
+  b.run('IDENTITY = "owned-ebook-fixture"');
+  let saved = 2.3;
+  let hold = true;
+  let release;
+  const writes = [];
+  const chunkReads = [];
+  b.respond(async (url, options = {}) => {
+    const path = new URL(url, 'https://fixture.invalid').pathname;
+    if (path === '/api/progress' && options.method === 'POST') {
+      saved = JSON.parse(options.body).position;
+      writes.push(saved);
+      return { ok: true, json: async () => ({}) };
+    }
+    if (path === '/api/epub/7/spine') return { ok: true, json: async () => ['a.xhtml', 'b.xhtml', 'c.xhtml', 'd.xhtml'] };
+    if (path === '/api/annotations/7') return { ok: true, json: async () => [] };
+    if (path === '/api/epub/7/toc' && boundary === 'toc' && hold) return new Promise(resolve => {
+      release = () => { hold = false; resolve({ ok: true, json: async () => [{ title: 'Chapter three', spine_idx: 2 }] }); };
+    });
+    if (path === '/api/epub/7/toc') return { ok: true, json: async () => [{ title: 'Chapter three', spine_idx: 2 }] };
+    if (path === '/api/progress/7') {
+      const position = saved;
+      if (boundary === 'progress' && hold) return new Promise(resolve => {
+        release = () => { hold = false; resolve({ ok: true, json: async () => ({ position }) }); };
+      });
+      return { ok: true, json: async () => ({ position }) };
+    }
+    if (path.startsWith('/api/epub/7/chunk/')) {
+      chunkReads.push(Number(path.split('/').at(-1)));
+      return { ok: true, text: async () => '<html><head></head><body>Owned EPUB chapter</body></html>' };
+    }
+    throw new Error('Unexpected owned EPUB fixture path: ' + path);
+  });
+  const opening = b.run('openEbook({ id: 7, title: "Owned EPUB" })');
+  await settle();
+  return { b, writes, chunkReads, opening, saved: () => saved, release: () => {
+    assert.equal(typeof release, 'function', 'Expected EPUB response actually reached its hold');
+    release();
+  } };
+}
+
+for (const boundary of ['toc', 'progress']) {
+  test(`EPUB close while initial ${boundary} is pending preserves saved position two point three`, async () => {
+    const { b, writes, opening, saved, release } = await ebookBookmarkFixture(boundary);
+    assert.equal(b.nodes.get('#ebook-modal').classList.contains('on'), true);
+    b.nodes.get('#em-close').onclick();
+    assert.deepEqual(writes, [], 'Unknown initial chapter must not overwrite the EPUB bookmark');
+    assert.equal(saved(), 2.3);
+    release(); await opening; await settle();
+    assert.deepEqual(writes, [], 'Closed initial callbacks do not save');
+    await b.run('openEbook({ id: 7, title: "Owned EPUB" })'); await settle();
+    assert.equal(b.run('ebook.chunk'), 2);
+    assert.ok(Math.abs(b.run('ebook.lastFrac') - 0.3) < 1e-9);
+    b.nodes.get('#em-close').onclick();
+    assert.equal(writes.at(-1), 2.3);
+    assert.equal(saved(), 2.3);
+  });
+}
+
+for (const boundary of ['toc', 'progress']) {
+  test(`EPUB pending ${boundary} ignores navigation and null repagination until restore`, async () => {
+    const { b, writes, chunkReads, opening, release } = await ebookBookmarkFixture(boundary);
+    const frameMessages = [];
+    b.nodes.get('#em-frame').contentWindow.postMessage = data => frameMessages.push(data);
+    assert.equal(b.run('ebook.chunk'), null);
+    assert.equal(b.nodes.get('#em-frame').srcdoc, '');
+    assert.equal(b.nodes.get('#em-frame').src, 'about:blank');
+    assert.equal(b.nodes.get('#em-pageinfo').textContent, 'Loading…');
+    assert.equal(b.nodes.get('#em-prev').disabled, true);
+    assert.equal(b.nodes.get('#em-next').disabled, true);
+    assert.equal(b.nodes.get('#em-toc-btn').disabled, true);
+    assert.equal(b.nodes.get('#em-search').disabled, true);
+    b.nodes.get('#em-prev').onclick(); b.nodes.get('#em-next').onclick(); b.nodes.get('#em-toc-btn').onclick();
+    await b.run('showChunk(ebook.chunk)');
+    b.run('ebookSearch("Pending")');
+    await b.message({ type: 'page', page: 1, pages: 4 });
+    assert.deepEqual(chunkReads, []);
+    assert.deepEqual(writes, []);
+    assert.deepEqual(frameMessages, []);
+    assert.equal(b.run('ebook.chunk'), null);
+    assert.equal(b.nodes.get('#em-toc').classList.contains('on'), false);
+    release(); await opening; await settle();
+    assert.deepEqual(chunkReads, [2]);
+    assert.equal(b.run('ebook.chunk'), 2);
+    assert.ok(Math.abs(b.run('ebook.lastFrac') - 0.3) < 1e-9);
+    assert.equal(b.nodes.get('#em-prev').disabled, false);
+    assert.equal(b.nodes.get('#em-next').disabled, false);
+    assert.equal(b.nodes.get('#em-toc-btn').disabled, false);
+    assert.equal(b.nodes.get('#em-search').disabled, false);
+  });
+}

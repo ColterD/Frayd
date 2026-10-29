@@ -586,6 +586,10 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
       if (path === '/api/epub/7/spine') return json(['one.xhtml', 'two.xhtml']);
       if (path === '/api/epub/7/toc') return json([]);
       if (path === '/api/annotations/7') return json(annotations);
+      if (/^\/api\/comic\/(90|91)\/page\/[0-4]$/.test(path)) {
+        response.writeHead(200, { 'Content-Type': 'image/png' });
+        return response.end(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII=', 'base64'));
+      }
       if (path === '/api/progress/20' || path === '/api/progress/22') { nativeRequests.push({ path, status: 200, position: 64 }); return json({ position: 64 }); }
       if (path === '/api/progress/21') { nativeRequests.push({ path, status: 200, position: 0 }); return json({ position: 0 }); }
       if (path === '/api/progress/23') { nativeRequests.push({ path, status: 200, position: 0 }); return json({ position: 0 }); }
