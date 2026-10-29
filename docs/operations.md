@@ -272,7 +272,8 @@ downgrade, legacy-schema restore and original-volume rollback remain **unqualifi
 
 ## Supported tools and current limits
 
-- The Docker image includes `ffmpeg` and `ffprobe` for metadata, thumbnails and transcoding. Actual playback still depends on the media format and browser codec support.
+- The Docker image includes `ffmpeg` and `ffprobe` for metadata, thumbnails and transcoding. Actual playback still depends on the media format and browser codec support. New-item metadata uses one structured JSON probe for duration and decoded title, synopsis, author and series tags; missing or unusable metadata retains filename fallbacks. This does not combine thumbnail generation or replacement-duration validation into that probe.
+- Media streaming honors a single bounded, open-ended or suffix byte range. Unsatisfiable ranges return 416; HEAD returns full-resource headers with no body. Multipart ranges are ignored and return the full resource; empty files return an empty 200 response.
 - ZIP-based CBZ/EPUB handling is built into the server. RAR-based CBR needs the optional `unrar` executable, which this image does not include.
 - Automatic router port mapping needs optional `upnpc`. It is not included, and the image defaults `FRAYD_UPNP=0`. The Compose example supplies neither TLS nor automatic network exposure.
 - Outside the isolated Docker network, audio thumbnail fallback can send filename-derived search terms to Apple's iTunes Search API and download artwork. Local metadata/embedded artwork extraction runs first. The supplied Compose app has no external routing, so online artwork lookup is unavailable and a missing thumbnail is expected.

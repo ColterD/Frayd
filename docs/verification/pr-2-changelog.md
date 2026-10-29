@@ -2,7 +2,7 @@
 
 [Documentation index](../README.md) · [Review dispositions](coderabbit-follow-up.md) · [Canonical checks](../development.md#canonical-checks) · [Draft PR #2](https://github.com/ColterD/Frayd/pull/2)
 
-This is the full net change from fork main `7b6957472fa097747b7a1195fbf3dc25e9d6250a` to PR implementation head `edd801637f79d102a7ce396bdfd480c91ad83ec3`, checked 2026-10-29. The implementation comparison covers 57 changed files; the final authored change adds this changelog for 58 net files, while updating the README badge, documentation index, existing marker disposition and native test harness. The historical review ledger contains 129 dispositions. Dispositions include fixes, characterization, diagnostics, documentation and test corrections; they are not 129 reproduced product bugs. The authored follow-up includes the badge, completed native marker test and documentation in this change. The implementation head above identifies the application payload; final source qualification belongs to the PR checks, without attempting to embed this document's own commit SHA.
+This records the full net change from fork main `7b6957472fa097747b7a1195fbf3dc25e9d6250a` through committed implementation head `4d09a102943d001ae15346f199db79864c2af86d`, checked 2026-10-29: 61 changed files. The historical review ledger contains 129 dispositions covering fixes, characterization, diagnostics, documentation and test corrections; these are not 129 reproduced product bugs. The cleanup section includes the committed client, scanner, streaming, Rust and test-fixture changes; the file inventory covers all 61 committed paths. Historical qualifications retain their original source identities; final source qualification belongs to the PR checks.
 
 PR #2 is a fork-only draft, unmerged and unreleased. The separately authorized local deployment at `http://127.0.0.1:3101` passed the bounded operational verification recorded below; owner interactive acceptance remains separate. Current hosted status belongs to the [PR description](https://github.com/ColterD/Frayd/pull/2); historical checkpoints below retain their own source identities.
 
@@ -77,6 +77,16 @@ Nginx resolves the application dynamically so an unchanged proxy can recover aft
 The Cargo OSV audit fails on incomplete pagination, network/API failures and applicable advisories. Its existing narrow publisher-range disagreement check remains explicit; tests do not convert a Cargo audit into OS/browser-image clearance. Python lint adds a hash-locked Ruff 0.17.3 Linux wheel and selected E4/E7/E9/F/B905 checks; package/result lengths use strict zip. CI provisions verified Node 22.23.4 from an exact cache or checksum-pinned official archive; local browser tests require Node 22+ global WebSocket and an existing browser, without npm/browser downloads.
 
 Docker harness operations have allowlisted per-operation timeouts covering build/context callers. Readiness retries transport resets within bounded deadlines; HTTP denial/invalid scan JSON fail fast. Cleanup inventories all states, preserves the primary failure, reports cleanup errors separately and restricts its fixture socket. Browser discovery tolerates partial port files and transient target HTTP failures, cancels unused bodies, and has independent 30-second startup/60-second case budgets. Owned browser descendants stop before protocol interception/profile removal; uncertain shutdown retains the profile. Equals signs in owned profile paths are supported. Test timers/metadata/markers use deterministic ordering, isolated clocks, bounded pause and partial-marker retries. Installer polling overlaps independent responsive cases while retaining the production polling schedule.
+
+## Cleanup and bounded optimization
+
+Commit `829af7d02172fcf36610aacd044699db82d43176` corrects logout dispatch and repeated refresh/account ownership, rejects stale comic reader callbacks, preserves the loaded library identity and retains episode kind when rebuilding TV views. It removes dead compatibility wrappers and inactive UI controls, resets party-follow identity when playback retires, and removes the unused native permission label. Its test changes update the affected browser, client, native and lifecycle oracles rather than introducing a new product surface.
+
+Commit `aeb022cd03c7b6b1f0fd3c72610f80984eb2d9f8` reads new-item duration and decoded tags from one structured ffprobe JSON response, retaining filename fallbacks for unusable metadata. Replacement-duration checks and thumbnail generation remain separate. One render-scoped progress promise per media ID serves both continue rows and cards; sorting an already rendered library avoids another read, while opening media still fetches fresh progress. The stream handler delegates to the existing single-range file service and honors bounded, open-ended and suffix ranges, returns 416 for unsatisfiable ranges, ignores multipart ranges and sends no HEAD body. Empty files return 200. The HTTP integration runner now asserts exact bounded-range bytes and HEAD headers/body.
+
+Commit `4d09a102943d001ae15346f199db79864c2af86d` replaces client-test source-prefix extraction with the explicit shared `tests/fixtures/client-browser.cjs` VM fixture, removes the trivial Settings reopen adapter and the unused external-party hint, replaces three comic `map_or(false, …)` predicates with `is_some_and`, and removes two unused EPUB lifetimes. Docker now denies Clippy warnings. The native harness drops a command-spelling assertion while retaining executable runtime/ownership checks. Documentation uses the strict Clippy command, describes structured probing and Range/HEAD behavior, and replaces repeated checkpoint summaries with links to their exact structured records.
+
+Final-source server/browser, visual regression, source binding and hosted outcomes remain pending their own receipts; historical passes below are not promoted to `4d09a1`. CodeRabbit support ticket 39355 remains pending for hidden review details; published dispositions do not establish an all-clear review.
 
 ## Verification and evidence boundaries
 
@@ -168,6 +178,8 @@ The first attempt triggered a safe full rollback because the initial preservatio
 | `server/Cargo.toml` | [native packaging and platform boundaries](#native-packaging-and-platform-boundaries) |
 | `server/schema.sql` | [conversion storage and recovery](#conversion-storage-and-recovery) |
 | `server/src/bin/frayd-native.rs` | [native packaging and platform boundaries](#native-packaging-and-platform-boundaries) |
+| `server/src/comic.rs` | [cleanup and bounded optimization](#cleanup-and-bounded-optimization) |
+| `server/src/epub.rs` | [cleanup and bounded optimization](#cleanup-and-bounded-optimization) |
 | `server/src/main.rs` | [library administration and scan lifecycle](#library-administration-and-scan-lifecycle) |
 | `server/src/party.rs` | [party sessions and player handoff](#party-sessions-and-player-handoff) |
 | `server/src/scanner.rs` | [library administration and scan lifecycle](#library-administration-and-scan-lifecycle) |
@@ -181,6 +193,7 @@ The first attempt triggered a safe full rollback because the initial preservatio
 | `tests/client.test.cjs` | [reader and local playback state](#reader-and-local-playback-state) |
 | `tests/epub-message.test.cjs` | [reader and local playback state](#reader-and-local-playback-state) |
 | `tests/fixtures/browser-child-writer.cjs` | [containers dependency checks and harness reliability](#containers-dependency-checks-and-harness-reliability) |
+| `tests/fixtures/client-browser.cjs` | [cleanup and bounded optimization](#cleanup-and-bounded-optimization) |
 | `tests/fixtures/browser-driver.js` | [containers dependency checks and harness reliability](#containers-dependency-checks-and-harness-reliability) |
 | `tests/fixtures/generate-native-resume.sh` | [reader and local playback state](#reader-and-local-playback-state) |
 | `tests/fixtures/native-resume.mp4` | [reader and local playback state](#reader-and-local-playback-state) |
