@@ -2,7 +2,7 @@
 
 [Documentation index](../README.md) · [Review dispositions](coderabbit-follow-up.md) · [Canonical checks](../development.md#canonical-checks) · [Draft PR #2](https://github.com/ColterD/Frayd/pull/2)
 
-Net inventory against synced fork main `21b2e9b6bf4cff26254f5dfcec9deecd02453718`: 63 files (2026-10-29). `e7bee5f` is an implementation checkpoint; reviewed `82f8a34` adds five documentation changes. Later fixes appear below; the PR identifies the final head. The historical 129 dispositions are not 129 reproduced bugs; checks remain source-bound.
+Net inventory against synced fork main `21b2e9b6bf4cff26254f5dfcec9deecd02453718`: 70 files (2026-10-29). `e7bee5f` is an implementation checkpoint; reviewed `82f8a34` adds five documentation changes. Later fixes appear below; the PR identifies the final head. The historical 129 dispositions are not 129 reproduced bugs; checks remain source-bound.
 
 Pending, held and staged statuses describe their named **2026-10-29 pre-cutover source checkpoint**, initially `8d87905`. Later deployment, sample-import and acceptance outcomes belong to the [current PR #2 status](https://github.com/ColterD/Frayd/pull/2); this source-bound snapshot does not predict them.
 
@@ -267,6 +267,17 @@ The first attempt triggered a safe full rollback because the initial preservatio
 | `tests/test_native_bundle.py` | [native packaging and platform boundaries](#native-packaging-and-platform-boundaries) |
 | `tests/test_unwired_ui.py` | [documentation and review accounting](#documentation-and-review-accounting) |
 | `tests/upstream-integration.test.cjs` | [upstream integration](#upstream-integration) |
+| `client/js/build-info.js` | [build identity and upstream freshness](#build-identity-and-upstream-freshness) |
+| `scripts/build-metadata.py` | [build identity and upstream freshness](#build-identity-and-upstream-freshness) |
+| `scripts/check-upstream.py` | [build identity and upstream freshness](#build-identity-and-upstream-freshness) |
+| `server/build.rs` | [build identity and upstream freshness](#build-identity-and-upstream-freshness) |
+| `server/src/build_info.rs` | [build identity and upstream freshness](#build-identity-and-upstream-freshness) |
+| `tests/build-info.test.cjs` | [build identity and upstream freshness](#build-identity-and-upstream-freshness) |
+| `tests/test_build_identity.py` | [build identity and upstream freshness](#build-identity-and-upstream-freshness) |
+
+## Build identity and upstream freshness
+
+The package version stays Cargo-owned. Compile-bound full revision, optional tag distance and explicit dirty/unknown state appear in uncached `/api/build`, early-exit `--build-info`, sign-in/sidebar and Settings. One metadata capture route supplies Docker, Compose and isolated native builds; stripped sources stay unknown. Native packaging validates actual server identity separately from checkout identity. The operator-only upstream check uses existing authenticated Git access and disposable full-history storage, reports timestamped ancestry, and never updates checkout/runtime state. Runtime network isolation is unchanged. Synthetic Git/Cargo tests cover ancestry, source changes and missing history; browser fixtures exercise identity rendering. Actual platform qualification remains source-bound.
 
 ## Review-disposition coverage
 

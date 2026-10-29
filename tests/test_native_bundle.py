@@ -21,6 +21,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = Path(os.environ.get('FRAYD_NATIVE_HELPER', ROOT / 'target/native-qualification/debug/frayd-native'))
+SERVER = HELPER.with_name('frayd-server')
 TEMP_ROOT = Path(os.environ.get('FRAYD_NATIVE_TEST_TEMP_ROOT', '/var/tmp')).resolve()
 
 
@@ -211,13 +212,11 @@ class NativeOwnership(unittest.TestCase):
                     pass
 
     def test_package_complete_manifest_and_architecture(self):
-        """Package real helper binaries and reject a mismatched target without fixture writes."""
+        """Package actual server identity and reject a mismatched target without fixture writes."""
         architecture = 'aarch64' if os.uname().machine in ['arm64', 'aarch64'] else 'x86_64'
         target = architecture + ('-apple-darwin' if os.uname().sysname == 'Darwin' else '-unknown-linux-gnu')
         output = self.base / 'package output'
-        # Two real Rust executables exercise packaging, without pretending the
-        # helper used as a payload fixture is an actual Frayd HTTP server.
-        result = run_bounded([str(ROOT / 'scripts/native/package.sh'), str(output), target, str(HELPER), str(HELPER)], capture_output=True, text=True)
+        result = run_bounded([str(ROOT / 'scripts/native/package.sh'), str(output), target, str(SERVER), str(HELPER)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         archive = next(output.glob('*.tar.gz'))
         self.assertEqual(archive.with_suffix(archive.suffix + '.sha256').read_text().split()[0], hashlib.sha256(archive.read_bytes()).hexdigest())
@@ -226,19 +225,26 @@ class NativeOwnership(unittest.TestCase):
         self.assertTrue(manifest['toolchain'].startswith('rustc '))
         if os.environ.get('FRAYD_NATIVE_TOOLCHAIN_FILE'):
             self.assertEqual(manifest['toolchain'], Path(os.environ['FRAYD_NATIVE_TOOLCHAIN_FILE']).read_text().strip())
-        expected = {'frayd-native', 'frayd-server', 'install.sh', 'start.sh', 'uninstall.sh', 'README.md', 'client/vendor/plyr/plyr.min.js'}
+        expected = {'frayd-native', 'frayd-server', 'install.sh', 'start.sh', 'uninstall.sh', 'README.md', 'client/vendor/plyr/plyr.min.js', 'build-info.json'}
         self.assertTrue(expected.issubset({item['path'] for item in manifest['entries']}))
         self.assertFalse(any('.env' in item['path'] for item in manifest['entries']))
         self.assertEqual(manifest['target'], target)
+        identity = json.loads(run_bounded([str(SERVER), '--build-info'], check=True, capture_output=True, text=True).stdout)
+        self.assertEqual(json.loads((payload / 'build-info.json').read_text()), identity)
+        self.assertEqual(identity['commit'], manifest['source'])
         original_bundle = self.bundle
         self.bundle = payload
         self.install('--yes')
         self.run_helper('uninstall', '--yes')
         self.bundle = original_bundle
+        fake_output = self.base / 'helper is not server'
+        rejected = run_bounded([str(ROOT / 'scripts/native/package.sh'), str(fake_output), target, str(HELPER), str(HELPER)], capture_output=True)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertFalse(fake_output.exists())
         wrong_output = self.base / 'wrong architecture output'
         wrong_target = ('x86_64' if architecture == 'aarch64' else 'aarch64') + target[len(architecture):]
         before = self.snapshot()
-        result = run_bounded([str(ROOT / 'scripts/native/package.sh'), str(wrong_output), wrong_target, str(HELPER), str(HELPER)], capture_output=True)
+        result = run_bounded([str(ROOT / 'scripts/native/package.sh'), str(wrong_output), wrong_target, str(SERVER), str(HELPER)], capture_output=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.snapshot(), before)
 
@@ -247,7 +253,7 @@ class NativeOwnership(unittest.TestCase):
         architecture = 'aarch64' if os.uname().machine in ['arm64', 'aarch64'] else 'x86_64'
         target = architecture + ('-apple-darwin' if os.uname().sysname == 'Darwin' else '-unknown-linux-gnu')
         output = self.base / 'umask package'
-        run_bounded([str(ROOT / 'scripts/native/package.sh'), str(output), target, str(HELPER), str(HELPER)], check=True, capture_output=True)
+        run_bounded([str(ROOT / 'scripts/native/package.sh'), str(output), target, str(SERVER), str(HELPER)], check=True, capture_output=True)
         archive = next(output.glob('*.tar.gz'))
         original = next(path for path in output.iterdir() if path.is_dir())
         self.assertIn('tar -xpzf', (original / 'README.md').read_text())

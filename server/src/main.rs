@@ -1,4 +1,5 @@
 mod auth;
+mod build_info;
 mod transcode;
 mod comic;
 mod epub;
@@ -74,6 +75,10 @@ fn upnp_mapping_requested(bind: std::net::IpAddr, environment: bool, stored: boo
 /// Initialize schemas, background scanning, and HTTP routes before accepting requests.
 #[tokio::main]
 async fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--build-info") {
+        println!("{}", build_info::metadata());
+        return;
+    }
     tracing_subscriber::fmt::init();
 
     // default paths relative to this source dir so cwd doesn't matter (env overrides)
@@ -107,6 +112,7 @@ async fn main() {
     let ingest_state = state.clone();
     let app = Router::new()
         .route("/api/health", get(health))
+        .route("/api/build", get(build_info::handler))
         .route("/api/media/:id", axum::routing::delete(delete_media))
         .route("/api/admin/users/:id", axum::routing::delete(remove_user))
         .route("/api/library", get(library_handler))

@@ -41,12 +41,17 @@ async function isolatedResponsiveCase(width) {
   const key = (key, accept = false) => api('key', { key, accept });
     try {
       await until(() => account?.isAdmin && LIBRARY.length === items.length, 'fresh document authenticates with private fixture model');
+      await until(() => [...document.querySelectorAll('[data-build-info]')].every(node => node.textContent === 'v0.1.1 · aaaaaaa'), 'both binary identity labels render');
+      check([...document.querySelectorAll('[data-build-info]')].every(node => node.title.includes('a'.repeat(40)) && node.title.includes('131')), 'Full binary identity retained in tooltips');
       check(!document.getElementById('party-modal').classList.contains('on') && !document.getElementById('playerbar').classList.contains('on'), 'Fresh document starts with clean party/player state');
       // Measure existing production form nodes; only signed-out visibility is modeled.
       const login = document.getElementById('login'), app = document.getElementById('app');
       const loginStyle = login.getAttribute('style'), appClass = app.className, bodyClass = document.body.className;
       const rect = node => { const r = node.getBoundingClientRect(); return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height }; };
       const contains = (outer, inner) => inner.left >= outer.left - 1 && inner.right <= outer.right + 1 && inner.top >= outer.top - 1 && inner.bottom <= outer.bottom + 1;
+      const buildBrand = rect(document.querySelector('#sidebar .brand')), buildLabel = rect(document.querySelector('#sidebar > [data-build-info]'));
+      check(Math.abs(buildBrand.left - buildLabel.left) <= 1 && buildLabel.top >= buildBrand.bottom && buildLabel.top - buildBrand.bottom <= 8, 'Binary identity sits directly below and aligned with sidebar brand');
+      if (width <= 768) check(buildLabel.width >= document.getElementById('sidebar').clientWidth - 25, 'Mobile binary identity owns a full row before navigation');
       try {
         app.classList.remove('on'); login.style.display = 'flex'; document.body.classList.add('auth');
         const card = rect(document.querySelector('.auth-card'));
@@ -1884,6 +1889,10 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
   await run('actual settings DOM scopes seven kind permissions and authoritative locked roots', async () => {
     responder = defaultResponder;
     await openSettings();
+    await until(() => document.querySelector('#settings-stage [data-build-info]')?.textContent === 'v0.1.1 · aaaaaaa', 'late Settings reuses binary identity');
+    const unknownBuild = document.createElement('iframe'); unknownBuild.hidden = true;
+    unknownBuild.src = '/__fixture/build-unknown'; document.body.appendChild(unknownBuild);
+    try { await until(() => unknownBuild.contentDocument?.querySelector('[data-build-info]')?.textContent === 'v0.1.1 · revision unknown · state unknown', 'stripped build remains explicitly unknown in real DOM'); } finally { unknownBuild.remove(); }
     const stage = document.getElementById('settings-stage');
     check(!stage.textContent.includes('/obsolete') && stage.textContent.includes('No folders configured'), 'Empty array beats obsolete legacy root');
     const row = stage.querySelector('[data-id="4"]');

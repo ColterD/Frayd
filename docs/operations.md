@@ -291,3 +291,33 @@ downgrade, legacy-schema restore and original-volume rollback remain **unqualifi
 - The [private native bundle](verification/native-bundle.md) is experimental, with explicit ownership and removal gates; raw browser/bootstrap installers remain separate and experimental; the [Docker quick start](../README.md#run-with-docker) is the reproducible startup route documented here.
 - ZIP readers support stored and deflate archives. Container isolation does not establish that arbitrary media is safe.
 - No license file is currently present in the repository. Do not assume redistribution terms from the public repository alone.
+
+### Check a build against upstream
+
+The app makes no upstream requests. Settings links to the upstream GitHub page
+(sign-in may be required). From a checkout with existing authenticated Git access,
+run an explicit operator check:
+
+```sh
+python3 scripts/check-upstream.py --build-url http://127.0.0.1:3100
+# Alternatively compare a selected source ref, not the running app:
+python3 scripts/check-upstream.py --ref HEAD
+```
+
+The default remote is the checkout's named `upstream`, branch `main`; `--remote`
+selects another existing remote. No token is copied or printed. The check reads
+`/api/build` when requested, fetches into disposable storage, and reports selected
+SHA, upstream SHA/commit time, and UTC check time. Git operations have 45-second
+limits within a 90-second total budget, HTTP uses a 10-second per-operation timeout and checked body deadline, prompts/redirects are disabled, and raw errors
+or remote URLs are not printed. No branch, index, working tree, local fetch refs,
+settings, credentials or installed binary is updated. Existing Git credential
+helpers may be consulted normally.
+
+`current` means equal Git revisions at that checked time; `behind` means selected
+is an ancestor of upstream; `ahead` means it contains upstream plus local commits;
+`diverged` means neither is an ancestor. These are ancestry statements, not claims
+that a dirty/unknown-state build has upstream's exact bytes. `unknown` (exit 2)
+means missing access/history/metadata, shallow checkout, unavailable installed
+commit, or bounded probe failure. Other statuses exit 0. A timestamped successful
+check is never a timeless update guarantee. This command requires Git and full
+history outside the internally isolated app network; it is not an updater.

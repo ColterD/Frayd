@@ -308,6 +308,7 @@ mod native {
                 "start.sh",
                 "uninstall.sh",
                 "README.md",
+                "build-info.json",
             ]
             .contains(&top)
                 || (top != "client" && item.path.contains('/'))

@@ -46,7 +46,12 @@ for relative in client_paths:
     if path.is_symlink() or not path.is_file() or any(parent.is_symlink() for parent in path.parents):
         raise SystemExit('Client redirects/special files refused')
 source_sha = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
+build_info = json.loads(subprocess.check_output([server, '--build-info'], text=True, timeout=10))
+if build_info.get('commit') != source_sha:
+    raise SystemExit('Server binary build commit must match packaging checkout; unknown/mismatched binary refused')
 version = next(line.split('"')[1] for line in (source / 'server/Cargo.toml').read_text().splitlines() if line.startswith('version = '))
+if build_info.get('version') != version:
+    raise SystemExit('Server binary package version must match Cargo version')
 toolchain_path = os.environ.get('FRAYD_NATIVE_TOOLCHAIN_FILE')
 if toolchain_path:
     toolchain_file = Path(toolchain_path)
@@ -62,6 +67,7 @@ bundle = output / f'frayd-{version}-{target}'
 bundle.mkdir(mode=0o700)
 shutil.copy2(server, bundle / 'frayd-server')
 shutil.copy2(helper, bundle / 'frayd-native')
+(bundle / 'build-info.json').write_text(json.dumps(build_info, indent=2) + '\n')
 for relative in client_paths:
     destination = bundle / relative
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -87,8 +93,9 @@ by the basic native lifecycle suite. Keep the extracted helper for removal retry
 Normal foreground Ctrl-C reaps only the owned server. A supervisor crash or
 SIGKILL leaves an orphan receipt holding start/removal for manual inspection;
 no unrelated process is guessed or killed. All data survives uninstall.
-The manifest source SHA identifies the base commit; working-tree modifications
-are described by the actual manifest hashes. macOS archives are unsigned.
+The manifest source SHA identifies the packaging checkout base commit. The
+build-info.json is read from the actual server binary; dirty/unknown builds retain
+that explicit state. Manifest hashes identify the packaged bytes. macOS archives are unsigned.
 ''')
 for path in sorted(bundle.rglob('*')):
     path.chmod(0o755 if path.is_dir() or path.name in {'frayd-server', 'frayd-native', 'install.sh', 'start.sh', 'uninstall.sh'} and path.parent == bundle else 0o644)

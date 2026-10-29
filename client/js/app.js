@@ -274,7 +274,7 @@ async function openSettings() {
       + (libs.length ? libs.map((l, i) => `
       <div class="perm-row"><span class="k">${esc(l)}</span><button class="lib-remove" ${locked ? 'disabled' : ''} data-path="${esc(l)}">Remove</button></div>`).join('') : '<div class="party-sec">No folders configured</div>')
       + `<div class="perm-row"><span class="k">Add folder</span><input class="s-lib-add" placeholder="/path/to/more/media" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px;flex:1"><button class="lib-add" ${locked ? 'disabled' : ''}>Add + scan</button></div>`
-      + `<div class="party-sec">Server settings — ${esc(settings.server_version || '')}</div>`
+      + `<div class="party-sec">Server settings</div><div class="build-info" data-build-info>Build identity unavailable</div><div class="party-sec"><a href="https://github.com/kattiest/Frayd" target="_blank" rel="noopener noreferrer" title="GitHub sign-in may be required">View upstream changes</a></div>`
       + `<div class="perm-row"><span class="k">Site name</span><input class="s-site" value="${esc(settings.site_name ?? 'Frayd')}" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px"><button id="s-site-save">Save</button></div>`
       + `<div class="party-sec">Network <span class="s">(restart server to apply)</span></div>`
       + `<div class="perm-row"><span class="k">Port</span><input class="s-port" type="number" min="1024" max="65535" value="${esc(settings.port ?? 8484)}" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px;width:90px"></div>`
@@ -292,6 +292,7 @@ async function openSettings() {
       <div class="perm-row"><span class="k">Current</span><input type="password" class="pw-old" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px"></div>
       <div class="perm-row"><span class="k">New (min 4)</span><input type="password" class="pw-new" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px"></div>
       <button id="s-pw-save" style="margin-top:10px;width:100%;background:#16181E;color:#fff;border:1px solid #2a2d36;border-radius:8px;padding:10px;cursor:pointer">Change password</button>` : '');
+    window.FraydBuild?.render(stage);
     stage.querySelectorAll('.p-save').forEach(b => b.onclick = async () => {
       try {
       const row = b.closest('.perm-row');

@@ -237,3 +237,36 @@ replacement stays supported.
 Persisted ZIP 0.6.6 page labels can differ from ZIP 9 even when the archive bytes are unchanged. The contextual comic reader compares the entire cached list with unique current and historical flag-aware names, preserves its order, and reads the selected physical entry. It never rewrites the cache or user progress. Ambiguous interpretations remain refused; legacy recovery also holds when ZIP reports duplicate central-directory names. Normal canonical subsets retain exact lookup, while directory, RAR and EPUB readers keep their existing paths.
 
 The CP437 high-half is standard encoding data generated with Python's `cp437` codec; no dependency or second ZIP parser was added. Historical algorithm provenance: [zip 0.6.6, MIT, commit 21a20584](https://github.com/zip-rs/zip/blob/21a20584bc9e05dfa4f3c5b0bc420a1389fae2c3/src/read.rs#L1065), checked 2026-10-29; disposition: ADOPT decoding policy, not a second library. Real persisted-cache TCP and archive controls cover old names/order/progress, canonical subsets, flag handling, collisions and conservative refusal.
+
+### Immutable build identity
+
+`Cargo.toml` owns the package version. `GET /api/build` (`Cache-Control: no-store`)
+and `frayd-server --build-info` expose the same compile-bound JSON: `version`,
+full `commit` or null, optional `commits_since_tag`, and `dirty` true/false/null.
+The CLI exits before database initialization. Sign-in, sidebar and Settings show
+`v0.1.1 · 65c232c`; the tooltip retains full provenance. Dirty source is visibly
+marked; missing source identity/state is explicitly unknown. A revision identifies
+a base commit, not the exact bytes of a dirty build.
+
+Capture provenance **before** isolating source and use the same snapshot for all
+outputs. Standard local routes (no deployment implied):
+
+```sh
+python3 scripts/build-metadata.py -- cargo build --locked --manifest-path server/Cargo.toml --release
+python3 scripts/build-metadata.py -- docker build -t frayd:local .
+python3 scripts/build-metadata.py -- docker compose build
+```
+
+The wrapper supplies `FRAYD_BUILD_COMMIT`, `FRAYD_BUILD_COMMITS_SINCE_TAG`, and
+`FRAYD_BUILD_DIRTY`. `--env` prints only those nonsecret values for CI's environment
+file before its isolated macOS copy. Docker accepts those three build arguments;
+Compose forwards them to the builder. Bare Docker/Compose builds without capture
+report unknown provenance because `.git` stays excluded. Ordinary Cargo source
+builds discover Git locally; isolated builds must supply metadata explicitly.
+Malformed/missing fields remain unknown. Never derive identity from runtime env.
+Linux export uses the same Docker arguments as the image. Native packaging queries
+the actual server CLI and refuses unknown/mismatched base commit or package
+version. Its hashed `build-info.json` records the binary identity separately from the
+packaging checkout `source` in `manifest.json`; manifest hashes retain exact bytes. This
+check assumes a native executable on its matching host, not arbitrary cross-built
+binaries or a trusted attestation of caller-supplied build arguments.

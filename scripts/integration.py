@@ -452,6 +452,12 @@ def upstream_contract_qualification(args):
             base = 'http://' + compose('port', 'proxy', '8080').stdout.decode().strip()
             ready()
             assert json.loads(curl_request('/api/health')) == {'status': 'ok'}
+            binary_build = json.loads(compose('exec', '-T', 'app', 'frayd-server', '--build-info').stdout)
+            with closing(urllib.request.urlopen(base + '/api/build', timeout=5)) as build_response:
+                assert build_response.status == 200
+                assert build_response.headers['Cache-Control'] == 'no-store'
+                assert json.load(build_response) == binary_build
+            print('PASS build identity: actual image binary CLI equals uncached public HTTP metadata; health unchanged')
             owner = json.loads(curl_request('/api/setup', {'email': 'upstream-qa@example.invalid',
                                                          'password': secrets.token_urlsafe(32)}, method='POST'))
             token = owner['token']

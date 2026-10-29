@@ -28,6 +28,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Verify actual native architecture (reject Rosetta)
         shell: bash
@@ -50,6 +51,7 @@ jobs:
           rustup toolchain install 1.99.1 --profile minimal --component clippy
           rustc +1.99.1 --version --verbose
           # Build a disposable source copy; remove it before runtime qualification.
+          python3 scripts/build-metadata.py --env >> "$GITHUB_ENV"
           mkdir "$RUNNER_TEMP/frayd-build-source"
           cp -R server "$RUNNER_TEMP/frayd-build-source/server"
           printf 'FRAYD_NATIVE_HELPER=%s/%s/release/frayd-native\n' "$CARGO_TARGET_DIR" '${{ matrix.target }}' >> "$GITHUB_ENV"

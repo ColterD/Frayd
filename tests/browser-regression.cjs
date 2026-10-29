@@ -12,7 +12,7 @@ const { setTimeout: delay } = require('node:timers/promises');
 
 const root = resolve(__dirname, '..');
 const evidenceDir = join(root, '.codex/evidence/pr2-real-dom');
-const productionFiles = ['client/index.html', 'client/js/app.js', 'client/js/party.js',
+const productionFiles = ['client/index.html', 'client/js/app.js', 'client/js/party.js', 'client/js/build-info.js',
   'client/vendor/plyr/plyr.min.js', 'client/vendor/plyr/plyr.min.css', 'client/vendor/plyr/plyr.svg', 'client/css/frayd.css', 'client/install/index.html'];
 const harnessFiles = ['tests/browser-regression.cjs', 'tests/fixtures/browser-driver.js', 'tests/fixtures/reader-probe.js', 'tests/fixtures/native-resume.mp4', 'tests/fixtures/generate-native-resume.sh'];
 function hash(path) { return createHash('sha256').update(readFileSync(path)).digest('hex'); }
@@ -59,6 +59,7 @@ function responsivePreload(width) {
     const path = new URL(String(url), location.origin).pathname;
     if (path.startsWith('/__fixture/')) return originalFetch(url, options);
     fixture.requests.push({ path, method: options.method || 'GET' });
+    if (path === '/api/build') return reply({ version: '0.1.1', commit: 'a'.repeat(40), commits_since_tag: 131, dirty: false });
     if (path === '/api/library') return reply(fixture.items);
     if (path === '/api/auth/me') return reply({ name: 'Responsive admin', is_admin: true });
     if (path === '/api/progress/23') {
@@ -602,6 +603,11 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
       if (path === '/api/progress/23') { nativeRequests.push({ path, status: 200, position: 0 }); return json({ position: 0 }); }
       if (path.startsWith('/api/progress/')) return json(null);
       if (path === '/api/progress') return json({});
+      if (path === '/api/build') return json({ version: '0.1.1', commit: 'a'.repeat(40), commits_since_tag: 131, dirty: false });
+      if (path === '/__fixture/build-unknown') {
+        response.writeHead(200, { 'Content-Type': 'text/html' });
+        return response.end('<!doctype html><html><body><span data-build-info></span><script>window.fetch=async()=>new Response(JSON.stringify({version:"0.1.1",commit:null,dirty:null,commits_since_tag:null}));</script><script src="/js/build-info.js"></script></body></html>');
+      }
       if (path === '/api/library') return json([]);
       if (path === '/api/auth/logout' && request.method === 'POST') { response.writeHead(204); return response.end(); }
       if (path === '/api/thumb/9' || path === '/api/thumb/10' || /^\/api\/thumb\/(6[0-9]|7[0-9]|20[0-7])$/.test(path)) {

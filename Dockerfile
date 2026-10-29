@@ -4,6 +4,10 @@ RUN timeout --kill-after=10s 180s apt-get -o Acquire::http::Timeout=30 -o Acquir
     && DEBIAN_FRONTEND=noninteractive timeout --kill-after=10s 360s apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=2 install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 COPY server/ ./
+ARG FRAYD_BUILD_COMMIT=unknown
+ARG FRAYD_BUILD_COMMITS_SINCE_TAG=unknown
+ARG FRAYD_BUILD_DIRTY=unknown
+ENV FRAYD_BUILD_COMMIT=$FRAYD_BUILD_COMMIT FRAYD_BUILD_COMMITS_SINCE_TAG=$FRAYD_BUILD_COMMITS_SINCE_TAG FRAYD_BUILD_DIRTY=$FRAYD_BUILD_DIRTY
 ENV CARGO_BUILD_JOBS=2
 RUN rustup component add clippy && cargo test --locked && cargo clippy --locked --all-targets -- -D warnings && cargo build --locked --release \
     && rustc -Vv > /app/server/rustc-version.txt

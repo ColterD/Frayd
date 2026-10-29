@@ -1,7 +1,12 @@
 name: frayd
 services:
   app:
-    build: .
+    build:
+      context: .
+      args:
+        FRAYD_BUILD_COMMIT: ${FRAYD_BUILD_COMMIT:-unknown}
+        FRAYD_BUILD_COMMITS_SINCE_TAG: ${FRAYD_BUILD_COMMITS_SINCE_TAG:-unknown}
+        FRAYD_BUILD_DIRTY: ${FRAYD_BUILD_DIRTY:-unknown}
     image: frayd:local
     restart: unless-stopped
     volumes:
