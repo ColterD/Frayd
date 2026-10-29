@@ -19,7 +19,7 @@ YouTube API. That suite does not qualify actual external playback by itself;
 the real-player checkpoint below is separate.
 
 Party updates clamp captured timestamps under the state lock, preventing stale
-updates from counting elapsed playback twice. The Rust target contains 63 tests. CI requires locked tests, Clippy and release
+updates from counting elapsed playback twice. The Rust target contains 64 tests. CI requires locked tests, Clippy and release
 compilation; warnings in unchanged code remain.
 The frozen client/harness passes 144 Node tests and 32 actual-DOM cases, including
 real native decoding, parser-gated reader restoration and real protocol setup

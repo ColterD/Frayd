@@ -152,6 +152,9 @@ A resolved review thread and a passing check are separate evidence.
 | [BOUNDED-PAUSE-ORACLE](https://github.com/ColterD/Frayd/pull/2#discussion_r4407150991) | Minor | A fixture waits indefinitely for pause even when playback has not started and pause emits no event. | It now waits for playback, uses a one-time listener and bounds pause observation with the existing deadline, removing the listener in finally. Missing-playback and missing-event controls terminate around four seconds with no retained listeners. Actual DOM 32/32 and all six decoded controls pass; audio wrong-ID and video progress oracles remain intact. |
 | [ACTIVE-GUEST-CONTINUITY](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5691012247) | Major, originally unverified; runtime validated | A member reuses an advertised active guest key, evicts the victim and submits requests under its label. | A causal real-socket baseline confirms eviction and impersonation. The shared role predicate rejects guest keys with open outbound receivers before upgrade and atomic registration. Fourteen focused Rust tests and ten real-socket scenarios pass, covering retained victim/observer traffic, preflight races, closed-receiver rejoin, stale cleanup and valid-proof host replacement. This protects active slots; first-slot/inactive identity authentication and global creation are outside the claim. |
 | [COMPLETED-CACHE-DOCS](https://github.com/ColterD/Frayd/pull/2#discussion_r4407203979) | Minor | Operator guidance says completed cache files always remain until manual cleanup despite known-replacement retirement. | Both retention statements now explain that a qualified prior completed pair can retire and later be deleted by recovery. Pending/retiring recovery is distinguished from retained unrelated or uncertain history. Operators are told to preserve original media and app data rather than rely on generated cache for recovery. |
+| [SCAN-WALK-WARNINGS](https://github.com/ColterD/Frayd/pull/2#discussion_r4407392792) | Minor | Walk and manga-probe errors are discarded, silently omitting unreadable paths while the scan completes. | Explicit walk, directory-open, entry and file-type error branches warn with operation/path and continue. A real mode-000 subtree under UID 1000 reproduces the empty-warning baseline; the corrected scan warns while indexing an accessible item, retaining old rows/progress/bytes and skipping links. Six focused scanner tests pass. Root-builder execution drops child UID/GID before creating fixtures and asserts actual PermissionDenied; full-image execution remains a separate gate. |
+
+Full review [5691294988](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5691294988) covers `a7a6dab` through `bfd3aca`, with 41 selected files and two filtered assets. It adds SCAN-WALK-WARNINGS, with no further nitpick, outside-diff, additional-unverified, duplicate or tool section. The preceding incremental review publishes no actionable comments and docstring coverage of 81.82% against 80%, across 154 functions and 24 files with four unsupported skips. The full output omits verbose details and supplies no replacement metric.
 
 Full review [5691074067](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5691074067) covers `a7a6dab` through `34cbefb`, with 41 selected files and two filtered assets. It adds COMPLETED-CACHE-DOCS, without new nitpick, outside-diff, duplicate or tool sections. Incremental review [5691012247](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5691012247) adds BOUNDED-PAUSE-ORACLE and an explicitly unverified active-guest claim; the later controlled reproduction validates that claim. These are two requirements, not duplicate full-review records. Full output omits verbose details and publishes no new docstring metric.
 
@@ -784,3 +787,19 @@ empty, this scheme does not authenticate ownership of its public device label;
 first-slot/inactive identity authentication and exclusive household creation
 remain outside scope. Security reproductions and sanitized receipts use the
 managed security artifact collection.
+
+## Unreadable scan paths
+
+Scan warnings identify the operation and the available failed path. Walk errors
+use the walker's path or library root; directory-entry errors without their own
+path retain the containing directory. Directory-open and file-type failures
+also warn. Accessible siblings still scan; symlink policy, classification,
+reconciliation and retirement behavior remain unchanged.
+
+The permission oracle proves actual PermissionDenied under a nonroot identity,
+not merely a mode change that root could bypass. It verifies warnings for the
+blocked subtree and a missing root, preserves an old row/progress/bytes, indexes
+an accessible item and restores permissions before cleanup. Under a root test
+builder, the child drops UID/GID before creating its own fixtures. Per-entry
+read_dir and file_type error branches have explicit handling but were not
+deterministically induced; no injection abstraction was added for that purpose.

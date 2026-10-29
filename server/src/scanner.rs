@@ -181,6 +181,34 @@ pub fn open(path: &str) -> Connection {
     crate::store::open(path)
 }
 
+/// Probe loose manga images without hiding directory, entry, or metadata failures.
+/// Failed entries do not prevent a later accessible file from qualifying the directory.
+fn manga_directory_has_files(dir: &Path) -> bool {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(operation="read_dir", path=%dir.display(), %error, "library scan directory unavailable");
+            return false;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                // read_dir entry errors carry no entry path; retain the containing directory.
+                tracing::warn!(operation="read_dir_entry", path=%dir.display(), %error, "library scan entry unavailable");
+                continue;
+            }
+        };
+        match entry.file_type() {
+            Ok(file_type) if file_type.is_file() => return true,
+            Ok(_) => (),
+            Err(error) => tracing::warn!(operation="file_type", path=%entry.path().display(), %error, "library scan entry type unavailable"),
+        }
+    }
+    false
+}
+
 /// Incremental scan of a library root. Returns number of new/updated items.
 pub fn scan(db: &Connection, db_path: String, root: std::path::PathBuf, thumbs_dir: Option<&Path>) -> usize {
     if let Some(t) = thumbs_dir {
@@ -190,7 +218,14 @@ pub fn scan(db: &Connection, db_path: String, root: std::path::PathBuf, thumbs_d
     let owned = crate::transcode::reconcile_artifacts(db);
     let mut count = 0;
     let mut seen_manga_dirs: Vec<std::path::PathBuf> = Vec::new();
-    for entry in WalkDir::new(&root).into_iter().filter_map(Result::ok) {
+    for entry in WalkDir::new(&root).follow_links(false) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(operation="walk", path=%error.path().unwrap_or(&root).display(), %error, "library scan traversal failed");
+                continue;
+            }
+        };
         // manga: directory of loose images under a "manga"-ish parent → one item per dir
         if entry.file_type().is_dir() && !seen_manga_dirs.iter().any(|d| d == entry.path()) {
             let dir = entry.path();
@@ -200,10 +235,7 @@ pub fn scan(db: &Connection, db_path: String, root: std::path::PathBuf, thumbs_d
                 .unwrap_or(false);
             let parent_manga = name_manga(dir.file_name())
                 || name_manga(dir.parent().and_then(|p| p.file_name()));
-            if parent_manga && std::fs::read_dir(dir).map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .any(|e| e.file_type().is_ok_and(|t| t.is_file()))
-            }).unwrap_or(false) {
+            if parent_manga && manga_directory_has_files(dir) {
                 seen_manga_dirs.push(dir.to_path_buf());
                 count += upsert_item(db, db_path.clone(), dir, "manga", thumbs_dir, &root);
             }
@@ -391,6 +423,83 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// Permission failures warn with their path while accessible files and existing rows survive.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scan_warns_for_unreadable_entries_without_losing_accessible_or_retained_media() {
+        use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+        use std::sync::{Arc, Mutex};
+
+        let status=std::fs::read_to_string("/proc/self/status").unwrap();
+        let effective_uid=status.lines().find(|line|line.starts_with("Uid:")).unwrap()
+            .split_whitespace().nth(2).unwrap().parse::<u32>().unwrap();
+        if std::env::var_os("FRAYD_TEST_SCAN_PERMISSIONS_CHILD").is_none() {
+            let mut child=Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact","scanner::tests::scan_warns_for_unreadable_entries_without_losing_accessible_or_retained_media","--nocapture"])
+                .env("FRAYD_TEST_SCAN_PERMISSIONS_CHILD","1").env_remove("FRAYD_TRANSCODES");
+            // Cargo builders may run as root. Drop privilege before the child creates any fixture.
+            if effective_uid==0 {child.gid(65534).uid(65534);}
+            let result=child.output().unwrap();
+            print!("{}{}",String::from_utf8_lossy(&result.stdout),String::from_utf8_lossy(&result.stderr));
+            assert!(result.status.success(),"unprivileged scan warning oracle failed: {}",result.status);
+            return;
+        }
+        assert_ne!(effective_uid,0,"root cannot qualify a DAC permission failure");
+
+        struct RestoreDirectory(std::path::PathBuf);
+        impl Drop for RestoreDirectory {
+            fn drop(&mut self) {
+                let _=std::fs::set_permissions(&self.0,std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        #[derive(Clone)]
+        struct WarningWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for WarningWriter {
+            fn write(&mut self,bytes:&[u8])->std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);Ok(bytes.len())
+            }
+            fn flush(&mut self)->std::io::Result<()> {Ok(())}
+        }
+
+        let fixture=Library::new(&[]);
+        let library=fixture.0.join("library");std::fs::create_dir(&library).unwrap();
+        let blocked=library.join("blocked_manga");std::fs::create_dir(&blocked).unwrap();
+        let retained=blocked.join("retained.cbz");std::fs::write(&retained,b"retained source bytes").unwrap();
+        let accessible=library.join("accessible.cbz");std::fs::write(&accessible,[]).unwrap();
+        let outside=fixture.0.join("outside.cbz");std::fs::write(&outside,b"symlink target bytes").unwrap();
+        let link=library.join("linked.cbz");std::os::unix::fs::symlink(&outside,&link).unwrap();
+        let db=open(":memory:");
+        db.execute("INSERT INTO media(id,kind,path,title,mtime_secs,size_bytes) VALUES(1,'comic',?1,'retained title',7,21)",[retained.to_str().unwrap()]).unwrap();
+        db.execute_batch("INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture'); INSERT INTO progress(identity_id,media_id,position) VALUES(1,1,42);").unwrap();
+        let restore=RestoreDirectory(blocked.clone());
+        std::fs::set_permissions(&blocked,std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denial=std::fs::read_dir(&blocked).unwrap_err();
+        assert_eq!(denial.kind(),std::io::ErrorKind::PermissionDenied,"fixture was not actually restricted");
+        let warnings=Arc::new(Mutex::new(Vec::new()));let writer=WarningWriter(warnings.clone());
+        let subscriber=tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_max_level(tracing::Level::WARN).with_writer(move ||writer.clone()).finish();
+        let missing=fixture.0.join("missing-root");
+        tracing::subscriber::with_default(subscriber,|| {
+            assert_eq!(scan(&db,String::new(),library.clone(),None),1);
+            assert_eq!(scan(&db,String::new(),missing.clone(),None),0);
+        });
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM media WHERE path=?1",[accessible.to_str().unwrap()],|row|row.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(db.query_row("SELECT title,mtime_secs,size_bytes FROM media WHERE id=1",[],|row|Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?))).unwrap(),("retained title".into(),7,21));
+        assert_eq!(db.query_row("SELECT position FROM progress WHERE media_id=1",[],|row|row.get::<_,f64>(0)).unwrap(),42.0);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM media",[],|row|row.get::<_,i64>(0)).unwrap(),2,"symlink or inaccessible media was indexed");
+        drop(restore);
+        assert_eq!(std::fs::read(&retained).unwrap(),b"retained source bytes");
+        assert_eq!(std::fs::read(&outside).unwrap(),b"symlink target bytes");
+        let captured=String::from_utf8(warnings.lock().unwrap().clone()).unwrap();
+        println!("effective_uid={effective_uid} permission_error={:?} accessible_indexed=1 retained_rows=1 progress=42 symlink_skipped=true",denial.kind());
+        println!("WARN_CAPTURE_BEGIN\n{captured}WARN_CAPTURE_END");
+        let fixture_path=fixture.0.clone();drop(fixture);assert!(!fixture_path.exists());
+        println!("owned_fixture_removed=true mode_restored_before_cleanup=true");
+        assert!(captured.lines().any(|line|line.contains(blocked.to_str().unwrap()) && line.contains("operation=\"read_dir\"")),"missing manga read_dir warning for {blocked:?}");
+        assert!(captured.lines().any(|line|line.contains(blocked.to_str().unwrap()) && line.contains("operation=\"walk\"")),"missing WalkDir warning for {blocked:?}");
+        assert!(captured.lines().any(|line|line.contains(missing.to_str().unwrap()) && line.contains("operation=\"walk\"")),"missing root-open warning for {missing:?}");
     }
 
     /// Known replacement grants retirement only to its exact inactive, unreferenced generated pair.
