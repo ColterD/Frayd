@@ -2785,7 +2785,11 @@ for (const boundary of ['toc', 'progress']) {
 test('fresh paused YouTube join stays still and later host play pause resumes its saved position', () => {
   const b = browser({ now: () => 100000 });
   const players = youtubePlayerFixture(b);
+  b.nodes.get('#vm-title').textContent = 'Previous native title';
+  b.run('partyFollowExternal("paused-video", "", 16.8285, false, 100)');
+  assert.equal(b.nodes.get('#vm-title').textContent, 'YouTube');
   b.run('partyFollowExternal("paused-video", "Paused fixture", 16.8285, false, 100)');
+  assert.equal(b.nodes.get('#vm-title').textContent, 'Paused fixture');
   const player = players[0];
   player.emitReady();
   const before = player.getCurrentTime();

@@ -1388,6 +1388,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
           await until(() => document.getElementById('video-modal').classList.contains('on')
             && !document.getElementById('video-modal').classList.contains('yt'), 'native video presentation before external idle');
           partyFollowExternal('same-role-video', 'External idle controls', 42.333333, false, Date.now() / 1000);
+          equal(document.getElementById('vm-title').textContent, 'External idle controls', 'External header replaces the previous native title');
           const backBounds = document.getElementById('vm-back').getBoundingClientRect();
           const beforeCleanupHit = document.elementFromPoint(backBounds.x + backBounds.width / 2, backBounds.y + backBounds.height / 2);
           check(backBounds.width > 0 && backBounds.height > 0 && document.getElementById('vm-back').contains(beforeCleanupHit),

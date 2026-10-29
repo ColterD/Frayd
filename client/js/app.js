@@ -1714,6 +1714,7 @@ window.partyFollowExternal = (vid, title, position, playing, updatedAt) => {
   $('#video-modal').classList.add('yt');
   wakeChrome();
   $('#pb-title').textContent = title || 'YouTube';
+  $('#vm-title').textContent = title || 'YouTube';
   $('#pb-sub').textContent = 'party · youtube';
   const ensure = (cb) => {
     if (ytReady) return cb();

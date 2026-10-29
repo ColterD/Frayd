@@ -90,7 +90,9 @@ test('PID-only cleanup leaves a profile writer; owned process-group cleanup stop
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const browser = spawn(executable, [`--user-data-dir=${profile}`, `http://127.0.0.1:${server.address().port}/`],
-    { detached: true, stdio: 'ignore' });
+    { detached: true, stdio: ['ignore', 'ignore', 'pipe'] });
+  let fixtureStderr = '';
+  browser.stderr.on('data', bytes => { fixtureStderr = (fixtureStderr + bytes).slice(-4096); });
   let readyTimer;
   try {
     const reported = await Promise.race([ready, new Promise((_, reject) => {
@@ -102,13 +104,23 @@ test('PID-only cleanup leaves a profile writer; owned process-group cleanup stop
     browser.kill('SIGKILL'); // Original runner behavior: only the launcher exits.
     await stopped;
     const writerFile = join(profile, 'Default/writer');
+    async function waitForWriterChange(previous, message) {
+      const deadline = Date.now() + 1000;
+      do {
+        process.kill(reported.writerPid, 0);
+        try {
+          const current = readFileSync(writerFile, 'utf8');
+          if (current && current !== previous) return current;
+        } catch (error) { if (error.code !== 'ENOENT') throw error; }
+        await delay(10);
+      } while (Date.now() < deadline);
+      assert.fail(`${message}; fixture stderr: ${fixtureStderr || '(empty)'}`);
+    }
     const before = readFileSync(writerFile, 'utf8');
-    await delay(40);
-    assert.notEqual(readFileSync(writerFile, 'utf8'), before, 'Child continues writing after launcher exits');
-    try { rmSync(profile, { recursive: true, force: true }); }
-    catch (error) { if (error.code !== 'ENOTEMPTY') throw error; }
-    await delay(40);
-    assert.equal(existsSync(writerFile), true, 'Surviving child recreates removed profile');
+    await waitForWriterChange(before, 'Child continues writing after launcher exits');
+    // Successful removal is required: swallowing ENOTEMPTY could accept an old file.
+    rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 5 });
+    await waitForWriterChange(null, 'Surviving child recreates removed profile');
     await stopBrowserGroup(browser);
     rmSync(profile, { recursive: true, force: true });
     await delay(40);
