@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "scope": "Public, non-security QA summary for fork draft PR 2. Each result applies only to its named source and inputs. The draft PR description carries latest-head acceptance.",
+  "source_repository": "https://github.com/ColterD/Frayd",
+  "reproduce_with_tracked_sources": {
+    "canonical_commands": "docs/development.md#canonical-checks",
+    "linux_workflow": ".github/workflows/checks.yml",
+    "macos_workflow": ".github/workflows/release-mac.yml",
+    "browser_harness": "tests/browser-regression.cjs",
+    "http_harness": "scripts/integration.py",
+    "dns_harness": "tests/test_dns_recovery.py",
+    "native_harness": "tests/test_native_bundle.py"
+  },
+  "checkpoints": [
+    {
+      "source_commit": "a4027b8220b2b8c2f511ae6675d1696b2639a25b",
+      "qualification": "executed on this source",
+      "artifacts": {
+        "app_image": "sha256:670d14d9403ccfcb44a03871040ded86f0958ab1011eaadfa58c28bf151e0334",
+        "proxy_image": "sha256:8af98fa579fe88e34b3ccdc1e4e7d2cdd68ecbc57a089e7e3033f5c85eb91598",
+        "linux_native_archive_sha256": "2d7d8109f2572e706588dff13ea66ca2280f0c2db6ceeb4189486d44f8e8cd77"
+      },
+      "local_results": {
+        "linux_build_and_checks": "pass: 92 server plus 6 archive Rust tests, 184 Node tests, 50 Python tests, 22 native tests, Clippy, Ruff, shell checks and locked-crate audit",
+        "http_storage": "scripts/integration.py exit 0; 256.854 seconds",
+        "dns_recovery": "tests/test_dns_recovery.py exit 0; controlled SERVFAIL, unchanged proxy recovered in 2.01 seconds",
+        "browser_fixture": "tests/browser-regression.cjs exit 0; 49/49 actual Chrome DOM cases; about 0.320 seconds startup and 49.9 seconds case phase; real decoded-media controls and modeled API responses",
+        "party_join_feedback": "actual browser retained rejection feedback after a failed party join; detailed fixture transcript stays in local operator evidence",
+        "separate_actual_external_api_fixture": "pass: 60 browser steps and 28 WebSocket events; actual YouTube API retained one player across rehosting and peer clock advanced 4.4386 to 6.9473 seconds",
+        "cleanup": "browser exited, owned profile removed, and all three disposable HTTP/DNS/browser projects had zero remaining containers, networks and volumes",
+        "source_and_fixture_binding": "served index/app/party bytes matched committed source and image; five public sample copies retained their historical SHA-256 before, after and after browser work"
+      },
+      "hosted_status_links": {
+        "linux_checks": "https://github.com/ColterD/Frayd/actions/runs/40829888480/job/123301414338",
+        "linux_dependency_audit": "https://github.com/ColterD/Frayd/actions/runs/40829888480/job/123301414007",
+        "macos_arm64": "https://github.com/ColterD/Frayd/actions/runs/40829915029/job/123301502051",
+        "macos_x86_64": "https://github.com/ColterD/Frayd/actions/runs/40829915029/job/123301501828"
+      },
+      "hosted_status_at_capture": "all four linked jobs completed success; this is check-run status, not a fresh local execution of macOS"
+    },
+    {
+      "source_commit": "782ca8ab9072f362b8ccbe8c58b3b78ed6eef020",
+      "qualification": "executed on this source",
+      "artifacts": {
+        "app_image": "sha256:8b37d6fb69d7753eceeea7b9dec9efff2f3d65486c69dd53904c766c294a21c4",
+        "proxy_image": "sha256:de276fdf8203bdd64abeb2602cc6c496158645003836885522d81f96595395f9",
+        "linux_native_archive_sha256": "15665ea3c422ba58ae4cd640b714d18cf2602caa58295064b8c4188f119b7ea6"
+      },
+      "local_results": {
+        "linux_build_and_checks": "pass: 94 server plus 6 archive Rust tests, 186 Node tests, 50 Python tests, 22 native tests, Clippy, Ruff, shell checks and locked-crate audit",
+        "http_storage": "scripts/integration.py exit 0; 255.905 seconds",
+        "dns_recovery": "tests/test_dns_recovery.py exit 0; 13.131 seconds",
+        "browser_fixture": "tests/browser-regression.cjs exit 0; 49/49 actual Chrome DOM cases; about 0.235 seconds startup and 50.0 seconds case phase; real decoded-media controls and modeled API responses",
+        "separate_actual_external_api_fixture": "pass: 62 browser steps and 28 WebSocket events; actual YouTube API peer clock advanced 4.4804 to 6.9890 seconds",
+        "cleanup": "browser exited, owned profile removed, and all three disposable HTTP/DNS/browser projects had zero remaining containers, networks and volumes",
+        "source_and_fixture_binding": "served source bytes matched image; five public sample copies remained unchanged during isolated fixture QA"
+      },
+      "hosted_status_links": {
+        "linux_checks": "https://github.com/ColterD/Frayd/actions/runs/40831563936/job/123306736884",
+        "linux_dependency_audit": "https://github.com/ColterD/Frayd/actions/runs/40831563936/job/123306736550",
+        "macos_arm64": "https://github.com/ColterD/Frayd/actions/runs/40831609667/job/123306886780",
+        "macos_x86_64": "https://github.com/ColterD/Frayd/actions/runs/40831609667/job/123306886404"
+      },
+      "hosted_status_at_capture": "all four linked jobs completed success; macOS behavior is evidenced by those jobs rather than local Linux execution"
+    },
+    {
+      "source_commit": "4e5651f40d2fcc3e21782899462e8c7c5f8bc24c",
+      "qualification": "direct HTTP/Python/package/docs checks plus exact-input-equality transfer from 782ca8ab; no Rust, Node, image build, browser or macOS rerun locally",
+      "artifacts": {
+        "reused_app_image": "sha256:8b37d6fb69d7753eceeea7b9dec9efff2f3d65486c69dd53904c766c294a21c4",
+        "reused_proxy_image": "sha256:de276fdf8203bdd64abeb2602cc6c496158645003836885522d81f96595395f9",
+        "repackaged_linux_native_archive_sha256": "a513ffbc4eb9298c2714e81e5c1d33daca225fa8a028220479e1006601fae75d"
+      },
+      "local_results": {
+        "direct_http_storage": "scripts/integration.py exit 0 against reused images; 256.497 seconds; two disposable projects had zero remaining containers, networks and volumes",
+        "direct_python_and_package": "50 Python tests, including 22 native tests, package command and Ruff exit 0",
+        "transferred_by_exact_input_equality": "782ca8ab Rust 94 server plus 6 archive tests, 186 Node tests and immutable images; input equality checked, these commands were not reexecuted at 4e5651f",
+        "documentation": "GitHub POST /markdown GFM rendered one 108-data-row, four-cell disposition table; 71 local links resolved and 20 shell fences passed bash syntax"
+      },
+      "hosted_status_links": {
+        "linux_checks": "https://github.com/ColterD/Frayd/actions/runs/40832779736/job/123310548850",
+        "linux_dependency_audit": "https://github.com/ColterD/Frayd/actions/runs/40832779736/job/123310549475"
+      },
+      "hosted_status_at_capture": "linked Linux jobs completed success; no macOS check run on this commit"
+    }
+  ],
+  "limits": [
+    "This checkpoint is not a deployment or owner acceptance record.",
+    "Image digests identify local artifacts; public CI job links provide hosted status and logs, not those local artifact bytes.",
+    "Operational raw logs, private fixture paths, account/session/database contents and security-finding details are intentionally excluded.",
+    "Later behavior changes require new source-bound qualification; no prior pass is promoted to an unnamed current head."
+  ]
+}

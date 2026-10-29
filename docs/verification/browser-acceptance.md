@@ -163,12 +163,12 @@ earlier source and hosted attempts.
 ## `a4027b8` actual-browser fixture checkpoint
 
 Checked 2026-10-29 on exact source `a4027b8220b2b8c2f511ae6675d1696b2639a25b`.
-The [source binding](../../.codex/evidence/pr2-fbb-final-fixture/source-binding.json)
+The [public checkpoint](acceptance-checkpoints.json)
 matches app image `sha256:670d14d9403ccfcb44a03871040ded86f0958ab1011eaadfa58c28bf151e0334`,
 proxy image `sha256:8af98fa579fe88e34b3ccdc1e4e7d2cdd68ecbc57a089e7e3033f5c85eb91598`
-and the served index, app script and party script bytes. The isolated
-[browser result](../../.codex/evidence/pr2-fbb-final-fixture/browser-result.json)
-records PASS for 60 steps and 28 WebSocket events. A real unknown-code join
+and the served index, app script and party script bytes. The checkpoint records
+PASS for 60 steps and 28 WebSocket events; the tracked
+[browser harness](../../tests/browser-regression.cjs) gives the reproducible test entrypoint. A real unknown-code join
 received HTTP 404. Its error-then-close sequence kept “Party not found or rejected”
 visible, left Join available and left no sender. This confirms the preadmission
 rejection path for that code, not every rejection cause.
@@ -177,24 +177,21 @@ The same fixture used the actual YouTube API: after guest-to-host rehosting, the
 player object was retained, host pause and play reached the peer, and the peer
 clock advanced 4.4386 → 6.9473 seconds. Both owned browser contexts exited,
 their profiles were removed and both old room codes rejected upgrades with
-HTTP 404. The five public [sample hashes](../../.codex/evidence/pr2-fbb-final-fixture/sample-binding.json)
+HTTP 404. The five public sample copies
 matched before and after the browser run. The original `/data` bind remained
 opaque and unchanged. Audible output, owner Vivaldi, authenticated accounts,
 other providers and live deployment remain untested here.
 
-The separate [runtime browser report](../../.codex/evidence/pr2-fbb-final-runtime/browser-result.json)
+The separate [runtime checkpoint](acceptance-checkpoints.json)
 records 49/49 actual Chrome cases on the same `a4027b8` source with 320 ms
 startup and approximately 49.9 seconds in the case phase. Its local HTTP/storage
 and controlled DNS suites exited 0 using the same app and proxy images; the
-[runtime receipt](../../.codex/evidence/pr2-fbb-final-runtime/receipt.json) and
-[cleanup inventory](../../.codex/evidence/pr2-fbb-final-runtime/cleanup.json) bind
-those commands and show zero remaining resources in all three owned QA projects.
+checkpoint binds those commands and records zero remaining resources in all three
+owned QA projects. Its public CI job links preserve the hosted result boundaries.
 The browser suite exercises real DOM and decoded-media controls against a
 fixture; its modeled API behavior does not replace the separate actual YouTube
-API and peer observation above. The later documentation edits leave all 12
-bound runtime and harness inputs equal to `a4027b8`, as recorded in the
-[docs-only delta](../../.codex/evidence/pr2-fbb-final-runtime/docs-only-delta.json).
-These receipts do not claim that runtime tests ran at a later docs-only commit.
+API and peer observation above. These a402 results do not claim that runtime
+tests ran at a later documentation commit.
 
 Earlier verification head `f16897334b55e5d6c3da201a00791c9bd4855662` had
 [one complete hosted pass](https://github.com/ColterD/Frayd/actions/runs/40747689066/job/123025739721)

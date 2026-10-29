@@ -144,10 +144,12 @@ def request(path, data=None, token=None, headers=None, expected=200, timeout=15)
     try:
         response = urllib.request.urlopen(req, timeout=timeout)
     except urllib.error.HTTPError as error:
-        assert error.code == expected, (path, error.code, expected)
+        with closing(error):
+            assert error.code == expected, (path, error.code, expected)
         return b''
-    assert response.status == expected, (path, response.status, expected)
-    return response.read()
+    with closing(response):
+        assert response.status == expected, (path, response.status, expected)
+        return response.read()
 
 
 def curl_request(path, data=None, token=None, method='GET', expected=200):
@@ -260,12 +262,29 @@ def dns_recovery_ready(proxy, app):
 
 
 def wait_for_scan_idle():
-    """Wait for scan admission to clear using bounded disposable-app requests."""
+    """Retry only scan-status transport failures within the disposable scan budget."""
     deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        if not json.loads(request('/api/scan/status', timeout=2))['scanning']:
-            return
-        time.sleep(0.5)
+    last_transport_error = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            status = json.loads(request('/api/scan/status', timeout=min(2, remaining)))
+        except urllib.error.HTTPError:
+            raise
+        except OSError as error:
+            last_transport_error = type(error).__name__
+        else:
+            last_transport_error = None
+            if not status['scanning']:
+                return
+        pause = min(0.5, deadline - time.monotonic())
+        if pause > 0:
+            time.sleep(pause)
+    if last_transport_error is not None:
+        raise AssertionError(f'disposable scan did not finish within 30 seconds; '
+                             f'last status transport error: {last_transport_error}') from None
     raise AssertionError('disposable scan did not finish within 30 seconds')
 
 
@@ -664,12 +683,7 @@ def main():
         fixture = archive.getvalue()
         docker('exec', '-i', name, 'sh', '-c', 'cat > /data/library/qa-comic.cbz', input=fixture)
         request('/api/scan', {}, token, expected=202)
-        for _ in range(40):
-            if not json.loads(request('/api/scan/status'))['scanning']:
-                break
-            time.sleep(0.5)
-        else:
-            raise AssertionError('scan did not finish')
+        wait_for_scan_idle()
         items = json.loads(request('/api/library'))
         assert len(items) == 1 and items[0]['kind'] == 'comic', items
         media_id = items[0]['id']
@@ -776,12 +790,7 @@ def main():
             assert json.loads(request('/api/scan/status', timeout=2))['scanning'] is True
             check_scan_read_paths('DURING blocked scan', media_id, token)
             docker('exec', name, 'touch', '/tmp/qa-ffprobe-release')
-            for _ in range(60):
-                if not json.loads(request('/api/scan/status', timeout=2))['scanning']:
-                    break
-                time.sleep(0.5)
-            else:
-                raise AssertionError('released ffprobe scan did not finish')
+            wait_for_scan_idle()
             check_scan_read_paths('AFTER released scan', media_id, token)
             movies = [item for item in json.loads(request('/api/library'))
                       if item['title'] == 'qa-video' and item['kind'] == 'movie']

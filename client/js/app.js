@@ -1431,6 +1431,7 @@ function playAudio(it) {
 
 let progressTimer = null;
 let progressGeneration = 0;
+let disposeProgressListeners = null;
 /**
  * Save only while this tracker still owns a metadata-ready matching native stream.
  * Party audio may replace src without installing a tracker; its retired local ID
@@ -1441,11 +1442,14 @@ let progressGeneration = 0;
  * @param {{id: number}} it Library item whose progress this tracker may save.
  */
 function trackProgress(media, it) {
+  disposeProgressListeners?.();
+  disposeProgressListeners = null;
   clearInterval(progressTimer);
   const generation = ++progressGeneration;
+  const kind = media === pbAudio ? 'audio' : 'video';
   const ownsProgress = () => {
     const native = media === plyr ? plyr.media : media;
-    return generation === progressGeneration && native.readyState >= 1
+    return generation === progressGeneration && partyPlaybackKind === kind && native.readyState >= 1
       && hasNativeStream(native, it.id);
   };
   let last = 0;
@@ -1456,11 +1460,23 @@ function trackProgress(media, it) {
       syncProgress(it.id, media.currentTime);
     }
   }, 1000);
-  media.onpause = () => { if (ownsProgress()) syncProgress(it.id, media.currentTime); };
-  media.onended = () => {
-    if (!ownsProgress()) return;
+  const listenerTarget = media === plyr ? document : media;
+  const capture = media === plyr;
+  const ownsEvent = event => event.target === (media === plyr ? plyr.media : media);
+  const onPause = event => {
+    if (ownsEvent(event) && media.paused && ownsProgress()) syncProgress(it.id, media.currentTime);
+  };
+  const onEnded = event => {
+    if (!ownsEvent(event) || !ownsProgress()) return;
     clearInterval(progressTimer);
     syncProgress(it.id, media.duration);
+  };
+  // Capture preserves Plyr element identity; native listeners preserve UI properties.
+  listenerTarget.addEventListener('pause', onPause, capture);
+  listenerTarget.addEventListener('ended', onEnded, capture);
+  disposeProgressListeners = () => {
+    listenerTarget.removeEventListener('pause', onPause, capture);
+    listenerTarget.removeEventListener('ended', onEnded, capture);
   };
 }
 
@@ -1724,8 +1740,12 @@ $('#pb-vol').onclick = (e) => {
   $('#pb-vol .fill').style.width = (v * 100) + '%';
 };
 $('#pb-close').onclick = () => {
-  pbAudio.pause();
-  clearInterval(progressTimer);
+  if (partyPlaybackKind === 'audio') {
+    ++nativeLoadGeneration;
+    partyLoadPending = false;
+    pbAudio.pause();
+    clearInterval(progressTimer);
+  }
   $('#playerbar').classList.remove('on');
 };
 
@@ -1807,8 +1827,16 @@ function startChromeAutoHide() {
 }
 
 $('#vm-back').onclick = () => {
-  if (plyr.currentTime > 0 && videoItem) syncProgress(videoItem.id, plyr.currentTime);
-  plyr.stop();
+  ++videoOpenGeneration;
+  videoLoadPending = false;
+  if (partyPlaybackKind === 'video') {
+    if (videoItem && plyr.media.readyState >= 1 && hasNativeStream(plyr.media, videoItem.id)
+      && plyr.currentTime > 0) syncProgress(videoItem.id, plyr.currentTime);
+    ++nativeLoadGeneration;
+    // Preserve the position for the queued native pause event.
+    plyr.pause();
+    clearInterval(progressTimer);
+  }
   $('#video-modal').classList.remove('on');
   videoItem = null;
 };

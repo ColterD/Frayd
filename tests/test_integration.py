@@ -323,6 +323,8 @@ class ReadinessTests(unittest.TestCase):
     def test_transient_failure_retries_then_accepts_success(self):
         """Every supported transport/status failure can recover on the next probe."""
         for error in self.transient_errors():
+            if isinstance(error, urllib.error.HTTPError):
+                self.addCleanup(error.close)
             with (
                 self.subTest(error_type=type(error).__name__),
                 patch.object(integration, 'request', side_effect=[error, b'{"status":"ok"}']) as request,
@@ -335,6 +337,8 @@ class ReadinessTests(unittest.TestCase):
     def test_deadline_exhaustion_reports_the_last_failure(self):
         """A persistent failure terminates at the 20-second deadline with its cause."""
         for error in self.transient_errors():
+            if isinstance(error, urllib.error.HTTPError):
+                self.addCleanup(error.close)
             with self.subTest(error_type=type(error).__name__):
                 with (
                     patch.object(integration, 'request', side_effect=error) as request,
@@ -363,6 +367,69 @@ class ReadinessTests(unittest.TestCase):
             self.assertEqual(call.kwargs, {'timeout': 5})
         self.assertIn('DIAGNOSTIC Docker DNS unavailable: OSError', output.getvalue())
         self.assertNotIn('Config', str(docker.call_args_list))
+
+
+class ScanStatusPollingTests(unittest.TestCase):
+    """Keep scan-status transport retries inside the finite idle wait."""
+
+    def test_transport_failure_recovers_without_replaying_scan_post(self):
+        """A failed status GET can recover; the scan admission POST runs once."""
+        paths = []
+
+        def response(path, *args, **kwargs):
+            paths.append(path)
+            if path == '/api/scan':
+                return b''
+            if paths.count('/api/scan/status') == 1:
+                raise urllib.error.URLError('temporary disconnect')
+            return b'{"scanning":false}'
+
+        with (patch.object(integration, 'request', side_effect=response),
+              patch.object(integration.time, 'sleep')):
+            integration.request('/api/scan', {}, expected=202)
+            integration.wait_for_scan_idle()
+        self.assertEqual(paths, ['/api/scan', '/api/scan/status', '/api/scan/status'])
+
+    def test_persistent_transport_failure_stops_at_deadline(self):
+        """The last transport failure is named after a finite number of polls."""
+        with (patch.object(integration, 'request', side_effect=TimeoutError('timed out')) as request,
+              patch.object(integration.time, 'monotonic', side_effect=[0, 0, 29.25, 29.5, 29.75, 30]),
+              patch.object(integration.time, 'sleep') as sleep,
+              self.assertRaisesRegex(AssertionError, 'scan.*TimeoutError')):
+            integration.wait_for_scan_idle()
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual([call.args for call in request.call_args_list],
+                         [('/api/scan/status',), ('/api/scan/status',)])
+        self.assertEqual([call.kwargs['timeout'] for call in request.call_args_list], [2, 0.5])
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.5, 0.25])
+
+    def test_scan_post_transport_failure_is_not_replayed(self):
+        """The request adapter leaves a failed mutation to its caller."""
+        with (patch.object(integration, 'base', 'http://127.0.0.1:1'),
+              patch.object(integration.urllib.request, 'urlopen', side_effect=TimeoutError('timed out')) as open_url,
+              self.assertRaises(TimeoutError)):
+            integration.request('/api/scan', {}, expected=202)
+        open_url.assert_called_once()
+
+    def test_http_denial_and_invalid_json_fail_fast(self):
+        """Unexpected status and invalid payload are application failures, not retryable transport."""
+        for failure in (AssertionError('status 403'),
+                        urllib.error.HTTPError('/api/scan/status', 403, 'denied', None, None)):
+            with (self.subTest(failure=type(failure).__name__),
+                  patch.object(integration, 'request', side_effect=failure) as request,
+                  patch.object(integration.time, 'sleep') as sleep,
+                  self.assertRaises(type(failure))):
+                integration.wait_for_scan_idle()
+            request.assert_called_once()
+            sleep.assert_not_called()
+            if isinstance(failure, urllib.error.HTTPError):
+                failure.close()
+        with (patch.object(integration, 'request', return_value=b'not JSON') as request,
+              patch.object(integration.time, 'sleep') as sleep,
+              self.assertRaises(json.JSONDecodeError)):
+            integration.wait_for_scan_idle()
+        request.assert_called_once()
+        sleep.assert_not_called()
 
 
 if __name__ == '__main__':

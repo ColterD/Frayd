@@ -33,6 +33,7 @@ jobs:
           printf '%s\n' "$FRAYD_NODE_BIN_DIRECTORY" >> "$GITHUB_PATH"
       - name: Client tests
         run: |
+          python3 -m json.tool docs/verification/acceptance-checkpoints.json > /dev/null
           node --check client/js/app.js
           node --check client/js/party.js
           bash -n tests/fixtures/generate-native-resume.sh

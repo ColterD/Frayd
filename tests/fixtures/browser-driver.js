@@ -115,9 +115,14 @@ async function isolatedResponsiveCase(width) {
       document.getElementById('pt-close').click();
       const playerControls = [...document.querySelectorAll('#playerbar button')];
       playerControls.forEach(reachable);
+      let trustedAudioPause = false;
+      pbAudio.addEventListener('pause', event => { trustedAudioPause = event.isTrusted; }, { once: true });
       reachable(document.getElementById('pb-play')); document.getElementById('pb-play').click();
-      await until(() => pbAudio.paused, 'Visible player pause works');
-      document.getElementById('pb-play').click(); await until(() => !pbAudio.paused, 'Visible player play works');
+      await until(() => pbAudio.paused && trustedAudioPause, 'Visible player receives native trusted pause');
+      equal(document.getElementById('pb-play').textContent, '▶', 'Paused native audio shows the play action');
+      measured.audioPauseUi = { trustedPause: trustedAudioPause, glyph: document.getElementById('pb-play').textContent };
+      document.getElementById('pb-play').click();
+      await until(() => !pbAudio.paused && document.getElementById('pb-play').textContent === '❚❚', 'Visible player play restores pause action');
       for (const id of ['pb-vol', 'pb-bar']) {
         const node = document.getElementById(id); const r = node.getBoundingClientRect();
         check(r.width > 0 && r.left >= 0 && r.right <= innerWidth + 1, 'Volume/seek track stays reachable');
@@ -133,7 +138,7 @@ async function isolatedResponsiveCase(width) {
       const enter = await key('Enter'); const space = await key(' ');
       check(enter.dialogs.length === 1 && space.dialogs.length === 1 && LIBRARY.length === before, 'Native cancellation retains cards at this viewport');
       check(!document.getElementById('video-modal').classList.contains('on'), 'Delete keys do not open playback');
-      return { viewport: { width: innerWidth, height: innerHeight }, sizes, grids, ratios, navigationLabels: nav.map(n => n.textContent.trim()), adminAndPlayerControlsReachable: true, realMediaControl: true, deletionCancellation: true, nativeDiagnostics: fixture, overflowInventory: measured.overflowInventory };
+      return { viewport: { width: innerWidth, height: innerHeight }, sizes, grids, ratios, navigationLabels: nav.map(n => n.textContent.trim()), adminAndPlayerControlsReachable: true, realMediaControl: true, audioPauseUi: measured.audioPauseUi, deletionCancellation: true, nativeDiagnostics: fixture, overflowInventory: measured.overflowInventory };
     } catch (error) {
       error.observed = { ...measured, audio: { readyState: pbAudio.readyState, paused: pbAudio.paused,
         duration: pbAudio.duration, currentTime: pbAudio.currentTime, mediaError: pbAudio.error?.code || null }, nativeDiagnostics: fixture };
@@ -441,7 +446,34 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
         decodableBlank, canPlayH264: plyr.media.canPlayType('video/mp4; codecs="avc1.42E01E"') });
       check(plyr.currentTime >= expectedPosition && plyr.currentTime < expectedPosition + 6,
         `Native saved${expectedPosition} resume: ${JSON.stringify(trace)}`);
-      return { trace: trace.slice(), decodedWidth: plyr.media.videoWidth, nativeEvents: true };
+      let pauseProgress = null;
+      if (id === 21 && expectedPosition === 0) {
+        const originalFetch = window.fetch;
+        const saves = [];
+        const media = plyr.media;
+        let trustedPause = false;
+        const onPause = event => { trustedPause = event.isTrusted; };
+        media.addEventListener('pause', onPause, { once: true });
+        window.fetch = (url, options) => {
+          if (String(url) === '/api/progress' && options?.method === 'POST') saves.push(JSON.parse(options.body));
+          return originalFetch(url, options);
+        };
+        try {
+          check(plyr.currentTime > 0 && plyr.currentTime < 10, 'Pause before the ten-second periodic save threshold');
+          plyr.pause();
+          await until(() => saves.length > 0, 'actual Plyr pause event saves local video progress');
+          check(trustedPause && media.paused, 'Native pause is trusted and delivered through vendored Plyr');
+          equal(saves.length, 1, 'One pause event saves progress once');
+          equal(saves[0].media_id, id, 'Pause saves the indexed video identity');
+          check(Math.abs(saves[0].position - media.currentTime) < 0.01 && saves[0].position > 0,
+            'Pause saves the actual position before a periodic save can run');
+          pauseProgress = { trustedPause, periodicThreshold: 10, saves };
+        } finally {
+          window.fetch = originalFetch;
+          media.removeEventListener('pause', onPause);
+        }
+      }
+      return { trace: trace.slice(), decodedWidth: plyr.media.videoWidth, nativeEvents: true, pauseProgress };
     } finally {
       try { if (decodableBlank) await api('release-media', {}); }
       finally {

@@ -31,11 +31,15 @@ function browser() {
         handlers.push({ callback, once: options?.once });
         events.set(name, handlers);
       },
+      removeEventListener(name, callback) {
+        events.set(name, (events.get(name) || []).filter(handler => handler.callback !== callback));
+      },
+      listenerCount(name) { return (events.get(name) || []).length; },
       emit(name) {
         for (const handler of documentCaptures.get(name) || []) handler({ target: this, type: name });
         const handlers = events.get(name) || [];
         events.set(name, handlers.filter(handler => !handler.once));
-        for (const handler of handlers) handler.callback();
+        for (const handler of handlers) handler.callback({ target: this, type: name });
         this['on' + name]?.();
       },
       appendChild(child) { this.children.push(child); },
@@ -61,6 +65,9 @@ function browser() {
   let nextIntervalId = 0;
   let response = async () => ({ ok: true, status: 200, json: async () => null });
   const document = {
+    removeEventListener(name, callback, capture) {
+      if (capture === true) documentCaptures.set(name, (documentCaptures.get(name) || []).filter(handler => handler !== callback));
+    },
     body: element(), querySelector: selector => nodes.get(selector) || null,
     getElementById: id => nodes.get('#' + id), querySelectorAll: () => [],
     createElement: element,
@@ -115,6 +122,7 @@ function browser() {
   vm.runInContext(readFileSync(join(clientPath, 'js/app.js'), 'utf8'), context);
   return {
     context, nodes, requests, intervals, sockets,
+    captureCount: name => (documentCaptures.get(name) || []).length,
     run: source => vm.runInContext(source, context),
     respond: fn => { response = fn; },
     message: (data, overrides = {}) => listeners.get('message')({ data: { generation: vm.runInContext('ebook?.document?.generation', context), ...data }, origin: 'null', source: nodes.get('#em-frame').contentWindow, ...overrides }),
@@ -1302,6 +1310,50 @@ for (const kind of ['video', 'audio']) {
 }
 
 
+test('native audio progress preserves pause and ended UI property handlers', async () => {
+  const b = browser();
+  b.run('uiEnded = 0; pbAudio.onended = () => ++uiEnded');
+  b.run("playAudio({ id: 10, kind: 'music', title: 'Audio UI' })");
+  await settle();
+  const media = b.nodes.get('#pb-audio');
+  const button = b.nodes.get('#pb-play');
+  assert.equal(button.textContent, '❚❚');
+  media.currentTime = 4;
+  media.duration = 90;
+  b.requests.length = 0;
+  media.pause();
+  await settle();
+  assert.equal(button.textContent, '▶');
+  assert.deepEqual(progress(b), [4]);
+  media.emit('ended');
+  assert.equal(b.run('uiEnded'), 1);
+  assert.deepEqual(progress(b), [4, 90]);
+  await media.play();
+  await settle();
+  assert.equal(button.textContent, '❚❚');
+});
+
+test('native audio listener replacement removes exact handlers and preserves unrelated listeners', async () => {
+  const b = browser();
+  b.run('unrelatedPauses = 0; pbAudio.addEventListener("pause", () => ++unrelatedPauses)');
+  b.run("playAudio({ id: 10, kind: 'music', title: 'Audio listener' })");
+  await settle();
+  const media = b.nodes.get('#pb-audio');
+  b.run('trackProgress(pbAudio, { id: 10 })');
+  assert.equal(media.listenerCount('pause'), 2);
+  assert.equal(media.listenerCount('ended'), 1);
+  b.run("openVideo({ id: 11, kind: 'movie', title: 'Video successor' })");
+  await settle();
+  assert.equal(media.listenerCount('pause'), 1);
+  assert.equal(media.listenerCount('ended'), 0);
+  assert.equal(b.run('unrelatedPauses'), 1);
+  const timer = b.run('progressTimer');
+  b.requests.length = 0;
+  media.emit('ended');
+  assert.deepEqual(progress(b), []);
+  assert.equal(b.intervals.has(timer), true);
+});
+
 test('current local audio saves periodic pause and ended progress', async () => {
   const b = browser();
   b.run("playAudio({ id: 10, kind: 'audiobook', title: 'Current local' })");
@@ -1318,6 +1370,258 @@ test('current local audio saves periodic pause and ended progress', async () => 
   assert.deepEqual(progress(b), [12, 18, 90]);
   assert.equal(b.intervals.has(b.run('progressTimer')), false);
 });
+
+test('local Plyr pause and ended events save progress before a periodic tick', async () => {
+  const b = browser();
+  b.run("openVideo({ id: 10, kind: 'movie', title: 'Local video' })");
+  await settle();
+  const media = b.run('plyr.media');
+  media.currentTime = 4;
+  b.run('plyr.duration = 90');
+  b.requests.length = 0;
+  b.run('plyr.pause()');
+  await settle();
+  assert.deepEqual(progress(b), [4]);
+  media.emit('ended');
+  assert.deepEqual(progress(b), [4, 90]);
+});
+
+test('same-ID Plyr tracker replacement removes its exact old listeners and keeps one current timer', async () => {
+  const b = browser();
+  b.run("openVideo({ id: 10, kind: 'movie', title: 'Same video' })");
+  await settle();
+  const media = b.run('plyr.media');
+  const staleTick = b.intervals.get(b.run('progressTimer'));
+  b.run('trackProgress(plyr, { id: 10 })');
+  const timer = b.run('progressTimer');
+  assert.equal(b.captureCount('pause'), 1);
+  assert.equal(b.captureCount('ended'), 1);
+  media.currentTime = 4;
+  b.run('plyr.duration = 90');
+  b.requests.length = 0;
+  staleTick();
+  assert.deepEqual(progress(b), []);
+  assert.equal(b.intervals.has(timer), true);
+  b.run('plyr.pause()');
+  await settle();
+  assert.deepEqual(progress(b), [4]);
+  media.emit('ended');
+  assert.deepEqual(progress(b), [4, 90]);
+  assert.equal(b.intervals.has(timer), false);
+});
+
+test('retired native video events cannot save successor progress or clear its timer', async () => {
+  const b = browser();
+  b.run("openVideo({ id: 10, kind: 'movie', title: 'Previous' })");
+  await settle();
+  const previous = b.run('plyr.media');
+  b.run("openVideo({ id: 10, kind: 'movie', title: 'Successor same ID' })");
+  await settle();
+  const current = b.run('plyr.media');
+  const timer = b.run('progressTimer');
+  b.requests.length = 0;
+  current.currentTime = 24;
+  current.duration = 90;
+  previous.emit('pause');
+  previous.emit('ended');
+  assert.deepEqual(progress(b), []);
+  assert.equal(b.intervals.has(timer), true);
+  assert.equal(b.captureCount('pause'), 1);
+  assert.equal(b.captureCount('ended'), 1);
+  // A queued pause delivered after the current media resumes also has no authority.
+  current.emit('pause');
+  assert.deepEqual(progress(b), []);
+  current.pause();
+  await settle();
+  assert.deepEqual(progress(b), [24]);
+});
+
+test('switching from a Plyr tracker to audio removes only progress event handlers', async () => {
+  const b = browser();
+  b.run('otherPauses = 0; document.addEventListener("pause", event => { if (event.target === plyr.media) ++otherPauses; }, true)');
+  b.run("openVideo({ id: 10, kind: 'movie', title: 'Previous' })");
+  await settle();
+  const media = b.run('plyr.media');
+  b.run("playAudio({ id: 11, kind: 'music', title: 'Current' })");
+  await settle();
+  const timer = b.run('progressTimer');
+  assert.equal(b.captureCount('pause'), 1, 'unrelated pause listener remains');
+  assert.equal(b.captureCount('ended'), 0);
+  b.requests.length = 0;
+  b.run('plyr.pause()');
+  await settle();
+  media.emit('ended');
+  assert.equal(b.run('otherPauses'), 1);
+  assert.deepEqual(progress(b), []);
+  assert.equal(b.intervals.has(timer), true);
+});
+
+for (const kind of ['audio', 'video']) {
+  for (const queuedPause of [false, true]) {
+    test(`${kind} host close preserves one native pause and progress at 41 (queued=${queuedPause})`, async () => {
+      const { b, socket, media } = await hostParty(kind === 'audio' ? 'music' : 'movie');
+      if (kind === 'audio') b.run('trackProgress(pbAudio, { id: 9 })');
+      if (kind === 'video') b.run('plyr.duration = 120');
+      media.currentTime = 41;
+      b.requests.length = 0;
+      if (queuedPause) media.pause();
+      b.nodes.get(kind === 'audio' ? '#pb-close' : '#vm-back').onclick();
+      await settle();
+      assert.deepEqual(socket.sent, [{ type: 'pause', position: 41 }]);
+      assert.ok(progress(b).length > 0);
+      assert.ok(progress(b).every(position => position === 41), JSON.stringify(progress(b)));
+      assert.equal(media.paused, true);
+    });
+  }
+
+  test(`${kind} paused same-ID pending resume close preserves stored 64 without a zero save`, async () => {
+    const b = browser();
+    const entry = kind === 'audio' ? 'playAudio' : 'openVideo';
+    const item = { id: 10, kind: kind === 'audio' ? 'music' : 'movie', title: 'Same' };
+    b.run(`${entry}(${JSON.stringify(item)})`);
+    await settle();
+    const media = b.run(kind === 'audio' ? 'pbAudio' : 'plyr.media');
+    media.pause();
+    await settle();
+    media.currentTime = 0;
+    let release;
+    b.respond(url => url.startsWith('/api/progress/10?')
+      ? new Promise(resolve => { release = () => resolve({ ok: true, json: async () => ({ position: 64 }) }); })
+      : Promise.resolve({ ok: true, json: async () => null }));
+    b.run(`${entry}(${JSON.stringify(item)})`);
+    b.requests.length = 0;
+    b.nodes.get(kind === 'audio' ? '#pb-close' : '#vm-back').onclick();
+    release();
+    await settle();
+    media.emit('loadedmetadata');
+    assert.deepEqual(progress(b), []);
+    assert.equal(media.paused, true);
+    assert.equal(media.currentTime, 0);
+  });
+
+  test(`${kind} close after external ownership sends no native pause`, async () => {
+    const { b, socket } = await hostParty(kind === 'audio' ? 'music' : 'movie');
+    youtubePlayerFixture(b);
+    b.run("partyFollowExternal('external', 'External', 0, false, Date.now()/1000, true)");
+    await settle();
+    socket.sent.length = 0;
+    b.requests.length = 0;
+    b.nodes.get(kind === 'audio' ? '#pb-close' : '#vm-back').onclick();
+    await settle();
+    assert.deepEqual(socket.sent, []);
+    assert.deepEqual(progress(b), []);
+  });
+
+  test(`${kind} external handoff retires same-stream progress`, async () => {
+    const b = browser();
+    youtubePlayerFixture(b);
+    const item = { id: 10, kind: kind === 'audio' ? 'music' : 'movie', title: 'Local' };
+    b.run(`${kind === 'audio' ? 'playAudio' : 'openVideo'}(${JSON.stringify(item)})`);
+    await settle();
+    const media = b.run(kind === 'audio' ? 'pbAudio' : 'plyr.media');
+    media.currentTime = 24;
+    media.duration = 90;
+    const stalePause = () => media.emit('pause');
+    const staleEnded = () => media.emit('ended');
+    b.requests.length = 0;
+    b.run("partyFollowExternal('same', 'External', 0, true, Date.now()/1000, false)");
+    await settle();
+    b.intervals.get(b.run('progressTimer'))();
+    stalePause();
+    staleEnded();
+    assert.deepEqual(progress(b), []);
+  });
+
+  test(`${kind} close retires pending resume and metadata without losing current close progress`, async () => {
+    const b = browser();
+    let release;
+    b.respond(url => url.startsWith('/api/progress/10?')
+      ? new Promise(resolve => { release = () => resolve({ ok: true, json: async () => ({ position: 37 }) }); })
+      : Promise.resolve({ ok: true, json: async () => null }));
+    const item = { id: 10, kind: kind === 'audio' ? 'music' : 'movie', title: 'Local' };
+    b.run(`${kind === 'audio' ? 'playAudio' : 'openVideo'}(${JSON.stringify(item)})`);
+    const media = b.run(kind === 'audio' ? 'pbAudio' : 'plyr.media');
+    b.nodes.get(kind === 'audio' ? '#pb-close' : '#vm-back').onclick();
+    release();
+    await settle();
+    media.emit('loadedmetadata');
+    assert.equal(media.paused, true);
+    assert.equal(media.src, '');
+    assert.equal(b.nodes.get(kind === 'audio' ? '#playerbar' : '#video-modal').classList.contains('on'), false);
+
+    b.respond(async () => ({ ok: true, json: async () => null }));
+    b.run(`${kind === 'audio' ? 'playAudio' : 'openVideo'}(${JSON.stringify(item)})`);
+    await settle();
+    const current = b.run(kind === 'audio' ? 'pbAudio' : 'plyr.media');
+    current.currentTime = 21;
+    b.requests.length = 0;
+    b.nodes.get(kind === 'audio' ? '#pb-close' : '#vm-back').onclick();
+    await settle();
+    assert.ok(progress(b).includes(21), JSON.stringify(progress(b)));
+  });
+
+  test(`${kind} close clears a local host load before delayed metadata can broadcast`, async () => {
+    const b = browser();
+    b.run('commands = []; window.partySend = command => commands.push(command); partyHostHook(window.partySend)');
+    b.run(`${kind === 'audio' ? 'playAudio' : 'openVideo'}({ id: 10, kind: '${kind === 'audio' ? 'music' : 'movie'}', title: 'Host' })`);
+    await settle();
+    const media = b.run(kind === 'audio' ? 'pbAudio' : 'plyr.media');
+    media.readyState = 0;
+    b.run('commands.length = 0');
+    b.nodes.get(kind === 'audio' ? '#pb-close' : '#vm-back').onclick();
+    await settle();
+    media.readyState = 1;
+    media.emit('loadedmetadata');
+    await settle();
+    assert.equal(b.run('commands.filter(command => command.type === "load").length'), 0);
+    assert.equal(media.paused, true);
+    assert.equal(b.run(kind === 'audio' ? 'partyLoadPending' : 'videoLoadPending'), false);
+  });
+
+  test(`${kind} close blocks delayed party metadata for the same stream`, async () => {
+    const b = browser();
+    const item = { id: 10, kind: kind === 'audio' ? 'music' : 'movie', title: 'Party' };
+    b.run(`LIBRARY = [${JSON.stringify(item)}]`);
+    const media = b.run(kind === 'audio' ? 'pbAudio' : 'plyr.media');
+    media.readyState = 0;
+    b.run("partyFollow(10, 'Party', 37, true, Date.now()/1000)");
+    b.nodes.get(kind === 'audio' ? '#pb-close' : '#vm-back').onclick();
+    media.readyState = 1;
+    media.emit('loadedmetadata');
+    await settle();
+    assert.equal(media.paused, true);
+    assert.equal(media.currentTime, 0);
+    assert.equal(b.nodes.get(kind === 'audio' ? '#playerbar' : '#video-modal').classList.contains('on'), false);
+  });
+}
+
+for (const kind of ['audio', 'video']) {
+  test(`inactive ${kind === 'audio' ? 'video' : 'audio'} close preserves pending ${kind} resume and progress`, async () => {
+    const b = browser();
+    let release;
+    b.respond(url => url.startsWith('/api/progress/10?')
+      ? new Promise(resolve => { release = () => resolve({ ok: true, json: async () => ({ position: 64 }) }); })
+      : Promise.resolve({ ok: true, json: async () => null }));
+    b.run(`${kind === 'audio' ? 'playAudio' : 'openVideo'}({ id: 10, kind: '${kind === 'audio' ? 'music' : 'movie'}', title: 'Pending' })`);
+    const timer = b.run('progressTimer');
+    // Escape invokes the video close handler even when its modal is hidden.
+    b.nodes.get(kind === 'audio' ? '#vm-back' : '#pb-close').onclick();
+    release();
+    await settle();
+    const media = b.run(kind === 'audio' ? 'pbAudio' : 'plyr.media');
+    if (kind === 'video') b.run('plyr.duration = 120');
+    media.emit('loadedmetadata');
+    await settle();
+    assert.equal(media.src, '/api/stream/10');
+    assert.equal(media.currentTime, 64);
+    assert.equal(media.paused, false);
+    assert.equal(b.intervals.has(timer), true);
+    b.requests.length = 0;
+    media.currentTime = 74;
+    b.intervals.get(timer)();
+    assert.deepEqual(progress(b), [74]);
+  });
+}
 
 test('audio progress rejects periodic pause and ended callbacks after its stream changes', async () => {
   const b = browser();
@@ -1336,22 +1640,29 @@ test('audio progress rejects periodic pause and ended callbacks after its stream
   assert.deepEqual(progress(b), []);
 });
 
-test('retired same-ID progress callbacks cannot write or clear the current tracker', async () => {
+test('retired same-ID audio tracker leaves one current event listener and cannot clear its timer', async () => {
   const b = browser();
   b.run("playAudio({ id: 10, kind: 'audiobook', title: 'Local' })");
   await settle();
   const media = b.nodes.get('#pb-audio');
-  const retired = [media.onpause, media.onended, b.intervals.get(b.run('progressTimer'))];
-  b.run("trackProgress(pbAudio, { id: 10 })");
+  const retiredTick = b.intervals.get(b.run('progressTimer'));
+  b.run('trackProgress(pbAudio, { id: 10 })');
   const timer = b.run('progressTimer');
+  assert.equal(media.listenerCount('pause'), 1);
+  assert.equal(media.listenerCount('ended'), 1);
   media.currentTime = 24;
   media.duration = 90;
   b.requests.length = 0;
-  for (const callback of retired) callback();
+  retiredTick();
   assert.deepEqual(progress(b), []);
   assert.equal(b.intervals.has(timer), true);
-  b.intervals.get(timer)();
+  media.pause();
+  await settle();
   assert.deepEqual(progress(b), [24]);
+  assert.equal(b.intervals.has(timer), true);
+  media.emit('ended');
+  assert.deepEqual(progress(b), [24, 90]);
+  assert.equal(b.intervals.has(timer), false);
 });
 
 test('local audio progress waits for metadata from the current stream', async () => {
