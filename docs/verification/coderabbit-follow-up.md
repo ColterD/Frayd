@@ -153,6 +153,10 @@ A resolved review thread and a passing check are separate evidence.
 | [ACTIVE-GUEST-CONTINUITY](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5691012247) | Major, originally unverified; runtime validated | A member reuses an advertised active guest key, evicts the victim and submits requests under its label. | A causal real-socket baseline confirms eviction and impersonation. The shared role predicate rejects guest keys with open outbound receivers before upgrade and atomic registration. Fourteen focused Rust tests and ten real-socket scenarios pass, covering retained victim/observer traffic, preflight races, closed-receiver rejoin, stale cleanup and valid-proof host replacement. This protects active slots; first-slot/inactive identity authentication and global creation are outside the claim. |
 | [COMPLETED-CACHE-DOCS](https://github.com/ColterD/Frayd/pull/2#discussion_r4407203979) | Minor | Operator guidance says completed cache files always remain until manual cleanup despite known-replacement retirement. | Both retention statements now explain that a qualified prior completed pair can retire and later be deleted by recovery. Pending/retiring recovery is distinguished from retained unrelated or uncertain history. Operators are told to preserve original media and app data rather than rely on generated cache for recovery. |
 | [SCAN-WALK-WARNINGS](https://github.com/ColterD/Frayd/pull/2#discussion_r4407392792) | Minor | Walk and manga-probe errors are discarded, silently omitting unreadable paths while the scan completes. | Explicit walk, directory-open, entry and file-type error branches warn with operation/path and continue. A real mode-000 subtree under UID 1000 reproduces the empty-warning baseline; the corrected scan warns while indexing an accessible item, retaining old rows/progress/bytes and skipping links. Six focused scanner tests pass. Root-builder execution drops child UID/GID before creating fixtures and asserts actual PermissionDenied; full-image execution remains a separate gate. |
+| [REPLACED-VIDEO-DURATION](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5691427197) | Minor, outside diff | Replacing an indexed video updates its fingerprint while keeping the old duration. | Real one-second to three-second replacement reproduces stored duration one on the baseline and three after correction. Known movie/episode changes invalidate the old duration; successful probes publish under a write transaction only when current file and captured database fingerprints match. Failed known probes leave NULL, unchanged values remain, and failed unknown-version probes retain unqualified legacy values. Identity/progress and three controlled stale-publication cases pass; seven focused scanner tests pass. |
+| [IMPORT-PATH-COMPONENTS](https://github.com/ColterD/Frayd/pull/2#discussion_r4407536057) | Minor | The import recipe checks only the final source component, so a symlinked ancestor can reach find, tar and destination creation. | Preflight checks each component in traversal order before any copy command. The baseline accepts five ancestor-link variants; the correction rejects seven path variants before command markers. Four real private/group-only/space-path copies and nine refusal controls pass under app UID/GID 10001 with no capabilities. Fifteen source entries retain their metadata/bytes/targets, and disposable resources are removed. The trusted source must remain unchanged during this non-atomic recipe. |
+
+Full review [5691464634](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5691464634) covers `a7a6dab` through `3e5279d`, with 41 selected files and two filtered assets. It adds IMPORT-PATH-COMPONENTS, without new nitpick, outside-diff, additional-unverified, duplicate or tool sections. Incremental review [5691427197](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5691427197) separately adds the outside-diff REPLACED-VIDEO-DURATION requirement and reports docstring coverage of 82.05% against 80%, across 156 functions and 24 files with three unsupported skips. The full output omits verbose details and supplies no replacement metric. GitHub Advanced Security's separate annotation for test-only numeric UID logging is not a CodeRabbit requirement; its output-minimization fix is described below.
 
 Full review [5691294988](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5691294988) covers `a7a6dab` through `bfd3aca`, with 41 selected files and two filtered assets. It adds SCAN-WALK-WARNINGS, with no further nitpick, outside-diff, additional-unverified, duplicate or tool section. The preceding incremental review publishes no actionable comments and docstring coverage of 81.82% against 80%, across 154 functions and 24 files with four unsupported skips. The full output omits verbose details and supplies no replacement metric.
 
@@ -803,3 +807,27 @@ an accessible item and restores permissions before cleanup. Under a root test
 builder, the child drops UID/GID before creating its own fixtures. Per-entry
 read_dir and file_type error branches have explicit handling but were not
 deterministically induced; no injection abstraction was added for that purpose.
+
+The permission child asserts that its effective identity is nonroot and that
+directory access actually fails with PermissionDenied. Its diagnostic output
+reports that invariant without printing the numeric user ID. This removes the
+test-only logging operation reported by CodeQL alert 16 without a suppression
+or alert dismissal; the privilege drop and permission assertions remain intact.
+
+## Replacement duration
+
+Existing movies and episodes refresh their duration when a detectable source
+change updates the fingerprint. The probe runs outside the write lock. Publication
+acquires an immediate transaction before rechecking the current file, then guards
+the database path and fingerprint. Controlled source replacement, a separate
+connection's database fingerprint update, and replacement while publication waits
+for the write lock all reject the stale probe.
+
+A known replacement clears obsolete duration in the same transaction that clears
+playback and qualifies retirement. Probe failure leaves duration unknown. An
+incomplete prior fingerprint preserves its unqualified legacy value on failure;
+a successful current-version probe replaces it. Unchanged files are not reprobed,
+so failed probes have no automatic retry on a later unchanged scan. This change
+does not refresh audio duration or other metadata and retains the documented
+seconds-plus-size detection limit. The original media ID, user title/author and
+progress survive the actual one-second to three-second replacement test.

@@ -29,7 +29,7 @@ docker compose up -d --wait
 
 The app sees `/data/library`, not the host path. The image's `FRAYD_LIBRARY=/data/library` overrides the library path saved in Settings. Change the mount source to select a different host folder, then choose **Scan library** after adding or changing media.
 
-Alternatively, copy regular files and directories into a new subdirectory of the default library volume, using additional disk space. Symlinks, including a symlinked source directory, and special files are rejected without following them. Keep the source unchanged throughout the preflight and copy: these steps are not atomic. Run this block in Bash with GNU `find` and GNU `tar`, set the absolute source directory, and choose a new import name using only letters, digits, underscores or hyphens:
+Alternatively, copy regular files and directories into a new subdirectory of the default library volume, using additional disk space. Symlinks, including any source path component, and special files are rejected without following them. Keep the source unchanged throughout the preflight and copy: these steps are not atomic. Run this block in Bash with GNU `find` and GNU `tar`, set the absolute source directory, and choose a new import name using only letters, digits, underscores or hyphens:
 
 ```sh
 (
@@ -40,6 +40,17 @@ Alternatively, copy regular files and directories into a new subdirectory of the
   case "$SOURCE_DIR" in /*) ;; *) echo 'Source must be absolute' >&2; exit 1 ;; esac
   while [[ "$SOURCE_DIR" != / && "$SOURCE_DIR" == */ ]]; do
     SOURCE_DIR=${SOURCE_DIR%/}
+  done
+  SOURCE_COMPONENT_PATH=/
+  SOURCE_REMAINDER=${SOURCE_DIR#/}
+  while [[ -n "$SOURCE_REMAINDER" ]]; do
+    SOURCE_COMPONENT=${SOURCE_REMAINDER%%/*}
+    case "$SOURCE_REMAINDER" in
+      */*) SOURCE_REMAINDER=${SOURCE_REMAINDER#*/} ;;
+      *) SOURCE_REMAINDER= ;;
+    esac
+    SOURCE_COMPONENT_PATH="${SOURCE_COMPONENT_PATH%/}/$SOURCE_COMPONENT"
+    test ! -L "$SOURCE_COMPONENT_PATH" || { echo 'Source path must not contain symlinks' >&2; exit 1; }
   done
   test ! -L "$SOURCE_DIR"
   test -d "$SOURCE_DIR"

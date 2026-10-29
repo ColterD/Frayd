@@ -19,7 +19,7 @@ YouTube API. That suite does not qualify actual external playback by itself;
 the real-player checkpoint below is separate.
 
 Party updates clamp captured timestamps under the state lock, preventing stale
-updates from counting elapsed playback twice. The Rust target contains 64 tests. CI requires locked tests, Clippy and release
+updates from counting elapsed playback twice. The Rust target contains 65 tests. CI requires locked tests, Clippy and release
 compilation; warnings in unchanged code remain.
 The frozen client/harness passes 144 Node tests and 32 actual-DOM cases, including
 real native decoding, parser-gated reader restoration and real protocol setup
@@ -58,8 +58,8 @@ result remains a separate gate.
 
 Current hosted outcomes, immutable source/image bindings and remaining manual
 gates are reported in the [draft PR](https://github.com/ColterD/Frayd/pull/2).
-Historical `1ece1df` / `5d8c4f…` results remain bound to that artifact. The current
-runtime checkpoint below uses a newly built server; no merge or live deployment
+Historical `1ece1df` / `5d8c4f…` results remain bound to that artifact. The historical
+runtime checkpoint below uses its recorded server; no merge or live deployment
 is authorized.
 
 ## Actual YouTube session checkpoint (5d63 / 767fe)

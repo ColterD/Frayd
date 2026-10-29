@@ -293,6 +293,9 @@ fn upsert_item(
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(path) DO UPDATE SET
                kind = ?1, mtime_secs = ?5, size_bytes = ?4,
+               duration_secs = CASE WHEN ?1 IN ('movie','episode')
+                   AND media.mtime_secs IS NOT NULL AND media.size_bytes IS NOT NULL
+                   THEN NULL ELSE media.duration_secs END,
                transcode_path = CASE WHEN media.mtime_secs IS NOT NULL AND media.size_bytes IS NOT NULL
                    THEN NULL ELSE media.transcode_path END,
                meta_json = CASE WHEN ?1 IN ('comic','manga') AND json_valid(media.meta_json)
@@ -358,6 +361,25 @@ fn upsert_item(
             crate::transcode::maybe_enqueue(db_path, id, path_pb, library_root.to_path_buf());
         }
     } else if updated > 0 && matches!(kind, "movie" | "episode") {
+        // Known replacements already invalidated their old duration in the fingerprint transaction.
+        // Failed probes preserve only unqualified legacy values; publish successful probes for this version.
+        if let Some(duration) = ffprobe_duration(&path_str) {
+            let published = (|| -> rusqlite::Result<()> {
+                let tx=rusqlite::Transaction::new_unchecked(db,rusqlite::TransactionBehavior::Immediate)?;
+                // Check the file after acquiring the write lock, including any time spent waiting.
+                let same_version = std::fs::metadata(path).ok()
+                    .filter(|current| current.len() == meta.len())
+                    .and_then(|current| current.modified().ok())
+                    .is_some_and(|modified| Some(modified) == meta.modified().ok());
+                if same_version {
+                    tx.execute("UPDATE media SET duration_secs=?1 WHERE path=?2
+                        AND mtime_secs IS ?3 AND size_bytes IS ?4",
+                        rusqlite::params![duration,path_str,mtime,meta.len() as i64])?;
+                }
+                tx.commit()
+            })();
+            if let Err(error) = published { tracing::warn!(%error,"video duration refresh held"); }
+        }
         // A replaced video can queue its current version without waiting for another scan.
         crate::transcode::maybe_enqueue_for_existing(db_path,path.to_path_buf(),library_root.to_path_buf());
     } else if updated == 0 {
@@ -422,6 +444,134 @@ mod tests {
     impl Drop for Library {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Replacement duration comes from the current media while identity and user state remain stable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn replaced_video_refreshes_duration_and_invalidates_only_known_failed_versions() {
+        if std::env::var_os("FRAYD_TEST_DURATION_CHILD").is_none() {
+            let result=Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","scanner::tests::replaced_video_refreshes_duration_and_invalidates_only_known_failed_versions","--nocapture"])
+                .env("FRAYD_TEST_DURATION_CHILD","1").env_remove("FRAYD_TRANSCODES").output().unwrap();
+            print!("{}{}",String::from_utf8_lossy(&result.stdout),String::from_utf8_lossy(&result.stderr));
+            assert!(result.status.success(),"replacement duration oracle failed: {}",result.status);
+            return;
+        }
+        crate::transcode::BUSY.store(true,std::sync::atomic::Ordering::SeqCst);
+        let fixture=Library::new(&[]);
+        let library=fixture.0.join("library");std::fs::create_dir(&library).unwrap();
+        let mut generated=Vec::new();
+        for seconds in [1,3] {
+            let file=fixture.0.join(format!("{seconds}-seconds.mp4"));
+            let result=Command::new("ffmpeg").args(["-v","error","-nostdin","-f","lavfi","-i","color=c=black:s=16x16:r=10",
+                "-t",&seconds.to_string(),"-c:v","mpeg4","-q:v","5","-threads","1","-an"]).arg(&file).output().unwrap();
+            assert!(result.status.success(),"real media generation failed: {}",String::from_utf8_lossy(&result.stderr));
+            let duration=ffprobe_duration(file.to_str().unwrap()).expect("real ffprobe must qualify fixture duration");
+            assert!((duration-seconds as f64).abs()<0.01);
+            generated.push((file,duration));
+        }
+        assert_ne!(std::fs::metadata(&generated[0].0).unwrap().len(),std::fs::metadata(&generated[1].0).unwrap().len());
+        let src=library.join("movie.mp4");std::fs::copy(&generated[0].0,&src).unwrap();
+        let database=fixture.0.join("duration.sqlite");let db=open(database.to_str().unwrap());
+        assert_eq!(scan(&db,String::new(),library.clone(),None),1);
+        let (id,initial):(i64,f64)=db.query_row("SELECT id,duration_secs FROM media WHERE path=?1",[src.to_str().unwrap()],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert!((initial-generated[0].1).abs()<0.01);
+        db.execute_batch("INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture');").unwrap();
+        db.execute("INSERT INTO progress(identity_id,media_id,position) VALUES(1,?1,0.5)",[id]).unwrap();
+        db.execute("UPDATE media SET title='owner title',author='owner author',transcode_path='legacy-unqualified' WHERE id=?1",[id]).unwrap();
+        std::fs::copy(&generated[1].0,&src).unwrap();
+        assert_eq!(scan(&db,String::new(),library.clone(),None),1);
+        let duration=||db.query_row("SELECT duration_secs FROM media WHERE id=?1",[id],|row|row.get::<_,Option<f64>>(0)).unwrap();
+        let replaced=duration().unwrap();
+        println!("real_ffprobe_initial={} real_ffprobe_replacement={} stored_initial={initial} stored_replacement={replaced}",generated[0].1,generated[1].1);
+        assert!((replaced-generated[1].1).abs()<0.01,"replaced source retained stale duration");
+        assert_eq!(db.query_row("SELECT transcode_path FROM media WHERE id=?1",[id],|row|row.get::<_,Option<String>>(0)).unwrap(),None);
+        assert_eq!(scan(&db,String::new(),library.clone(),None),0);
+        assert_eq!(duration(),Some(replaced),"unchanged source must retain its qualified duration");
+
+        std::fs::write(&src,b"invalid replacement media").unwrap();
+        assert_eq!(ffprobe_duration(src.to_str().unwrap()),None,"failure control unexpectedly probed");
+        assert_eq!(scan(&db,String::new(),library.clone(),None),1);
+        assert_eq!(duration(),None,"known changed source must not retain an obsolete duration after probe failure");
+        std::fs::copy(&generated[0].0,&src).unwrap();
+        assert_eq!(scan(&db,String::new(),library.clone(),None),1);
+        assert!((duration().unwrap()-generated[0].1).abs()<0.01);
+
+        for (mtime,size) in [(None,Some(17)),(Some(7),None),(None,None)] {
+            db.execute("UPDATE media SET mtime_secs=?1,size_bytes=?2,duration_secs=83,transcode_path='legacy-unqualified' WHERE id=?3",
+                rusqlite::params![mtime,size,id]).unwrap();
+            std::fs::write(&src,b"unknown original version").unwrap();
+            assert_eq!(scan(&db,String::new(),library.clone(),None),1);
+            assert_eq!(duration(),Some(83.0),"unknown prior version cannot prove legacy duration obsolete");
+            assert_eq!(db.query_row("SELECT transcode_path FROM media WHERE id=?1",[id],|row|row.get::<_,String>(0)).unwrap(),"legacy-unqualified");
+        }
+        db.execute("UPDATE media SET mtime_secs=NULL,size_bytes=NULL WHERE id=?1",[id]).unwrap();
+        std::fs::copy(&generated[1].0,&src).unwrap();
+        assert_eq!(scan(&db,String::new(),library.clone(),None),1);
+        assert!((duration().unwrap()-generated[1].1).abs()<0.01,"successful probe must qualify an unknown prior version");
+        assert_eq!(db.query_row("SELECT id,title,author FROM media WHERE path=?1",[src.to_str().unwrap()],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?))).unwrap(),(id,"owner title".into(),"owner author".into()));
+        assert_eq!(db.query_row("SELECT position FROM progress WHERE media_id=?1",[id],|row|row.get::<_,f64>(0)).unwrap(),0.5);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM media",[],|row|row.get::<_,i64>(0)).unwrap(),1);
+        println!("unchanged_duration_retained=true known_failed_probe_duration_null=true unknown_failed_probe_legacy_retained=true unknown_success_refreshed=true identity_progress_preserved=true");
+
+        // Pause the real ffprobe after it reads the file, then alter one publication precondition.
+        use std::os::unix::fs::PermissionsExt;
+        let original_path=std::env::var_os("PATH").unwrap();
+        let real_probe=std::env::split_paths(&original_path).map(|directory|directory.join("ffprobe"))
+            .find(|candidate|candidate.is_file()).unwrap().canonicalize().unwrap();
+        let bin=fixture.0.join("bin");std::fs::create_dir(&bin).unwrap();
+        let wrapper=bin.join("ffprobe");
+        std::fs::write(&wrapper,r#"#!/bin/sh
+"$FRAYD_TEST_DURATION_PROBE" "$@"
+probe_status=$?
+: > "$FRAYD_TEST_DURATION_READY"
+attempt=0
+while [ ! -f "$FRAYD_TEST_DURATION_RELEASE" ]; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -gt 1000000 ]; then exit 70; fi
+done
+exit "$probe_status"
+"#).unwrap();
+        std::fs::set_permissions(&wrapper,std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("FRAYD_TEST_DURATION_PROBE",real_probe);
+        for mode in ["source","database","locked-source"] {
+            let ready=fixture.0.join(format!("{mode}-ready"));let release=fixture.0.join(format!("{mode}-release"));
+            std::env::set_var("FRAYD_TEST_DURATION_READY",&ready);
+            std::env::set_var("FRAYD_TEST_DURATION_RELEASE",&release);
+            std::fs::copy(&generated[0].0,&src).unwrap();
+            db.execute("UPDATE media SET mtime_secs=0,size_bytes=0,duration_secs=83 WHERE id=?1",[id]).unwrap();
+            std::env::set_var("PATH",&bin);
+            std::thread::scope(|scope| {
+                let change=scope.spawn(|| {
+                    let reached=(0..500).any(|_| {
+                        if ready.exists() {return true;}
+                        std::thread::sleep(std::time::Duration::from_millis(5));false
+                    });
+                    if reached {
+                        if mode=="source" {std::fs::copy(&generated[1].0,&src).unwrap();}
+                        else if mode=="locked-source" {
+                            let lock=crate::store::connect(database.to_str().unwrap()).unwrap();
+                            lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+                            std::fs::write(&release,[]).unwrap();
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                            std::fs::copy(&generated[1].0,&src).unwrap();
+                            lock.execute_batch("COMMIT").unwrap();
+                        } else {
+                            let other=crate::store::connect(database.to_str().unwrap()).unwrap();
+                            assert_eq!(other.execute("UPDATE media SET mtime_secs=mtime_secs+1,duration_secs=23 WHERE id=?1",[id]).unwrap(),1);
+                        }
+                    }
+                    std::fs::write(&release,[]).unwrap();
+                    assert!(reached,"real ffprobe did not reach the controlled publication boundary");
+                });
+                assert_eq!(scan(&db,String::new(),library.clone(),None),1);
+                change.join().unwrap();
+            });
+            std::env::set_var("PATH",&original_path);
+            assert_eq!(duration(),if mode=="database" {Some(23.0)} else {None},"{mode} race published a stale probe");
+            println!("duration_publication_race={mode} real_probe_finished_before_change=true stale_probe_rejected=true");
         }
     }
 
@@ -493,7 +643,7 @@ mod tests {
         assert_eq!(std::fs::read(&retained).unwrap(),b"retained source bytes");
         assert_eq!(std::fs::read(&outside).unwrap(),b"symlink target bytes");
         let captured=String::from_utf8(warnings.lock().unwrap().clone()).unwrap();
-        println!("effective_uid={effective_uid} permission_error={:?} accessible_indexed=1 retained_rows=1 progress=42 symlink_skipped=true",denial.kind());
+        println!("unprivileged=true permission_error={:?} accessible_indexed=1 retained_rows=1 progress=42 symlink_skipped=true",denial.kind());
         println!("WARN_CAPTURE_BEGIN\n{captured}WARN_CAPTURE_END");
         let fixture_path=fixture.0.clone();drop(fixture);assert!(!fixture_path.exists());
         println!("owned_fixture_removed=true mode_restored_before_cleanup=true");
