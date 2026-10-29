@@ -144,7 +144,33 @@ fixture checks do not replace current-image browser acceptance. The filename-fir
 online iTunes path is **UNWIRED**:
 recover `44d1ed7` `extract_thumb`/`fetch_online_thumb`/`itunes_artwork` only
 with verified artist/album matching and explicit provider opt-in. There is no
-new provider, dependency, flag or schema; no general catalog metadata lookup.
+new artwork provider, flag or schema; no general catalog metadata lookup. The
+separate EPUB parser dependency is recorded below.
+
+### EPUB bounds and reader layout
+
+The EPUB container/OPF path uses `quick-xml` 0.42.0 with default features off
+(`server/Cargo.lock`); its MIT upstream commit is
+[`36a2c52`](https://github.com/tafia/quick-xml/tree/36a2c52a4f6c90878c3f60c3c3b5c62efaef28a9),
+checked 2026-10-29 and adopted for namespace-aware, bounded parsing. The locked
+crate checksum is `41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b`;
+it adds one registry package and reuses `memchr` 2.8.3. The local dependency
+audit covered 210 packages. This does not certify future advisory absence.
+
+Metadata entries are capped at 2 MiB decompressed, binary entries at 32 MiB;
+the stream reads at most limit+1 bytes rather than trusting ZIP headers. XML
+has 100,000-event/128-depth bounds, ignores external DTDs and does not expand
+custom entities. URI matching decodes once and preserves literal percent names.
+Rejection stops cover fallback before FFmpeg/output publication. Cached legacy
+art uses a 12-byte sniff and 64 KiB stream chunks; these are per-entry/read
+bounds, not an archive, concurrency or RSS budget.
+
+The browser reader waits for fonts and a positive layout before reporting a
+page or saving resume; resize can wake an unmeasurable document. Rejected chapter
+responses publish a visible unavailable state without a false save. Run the
+canonical Rust/Clippy/audit commands and `node --test tests/epub-message.test.cjs`
+plus the real-DOM regression. Those checks do not prove actual first-open
+behavior on a new image or explain Chromium's earlier empty-frame trigger.
 
 ### Unwired UI design fragments
 
