@@ -57,6 +57,8 @@ function browser() {
     setTimeout() {}, clearTimeout() {},
     setInterval: fn => { const id = intervals.size + 1; intervals.set(id, fn); return id; },
     clearInterval: id => intervals.delete(id),
+    requestAnimationFrame: fn => { try { fn(); } catch {} },
+    confirm: () => false,
     Plyr: class {}, Image: class {},
     WebSocket: class { constructor() { sockets.push(this); } },
   });
