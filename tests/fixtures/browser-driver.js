@@ -837,7 +837,49 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       ytPlayer = saved.player; ytId = saved.id; ytReady = saved.apiReady; ytPlayerReady = saved.playerReady;
     }
   });
+  // Enter through the real guest path: the app's hidden ancestor has no usable reader viewport.
+  const readerAppState = { visible: document.getElementById('app').classList.contains('on'),
+    auth: document.body.classList.contains('auth'), loginStyle: document.getElementById('login').getAttribute('style'), library: LIBRARY };
+  if (!readerAppState.visible) {
+    document.getElementById('guest').click();
+    await until(() => document.getElementById('app').classList.contains('on') && LIBRARY !== readerAppState.library, 'guest entry completes its library restore');
+    LIBRARY = readerAppState.library; // Retain the known media IDs used by subsequent fixture cases.
+  }
   await run('saved marks survive parser-gated reader startup', async () => {
+    // A zero-sized embedded viewport must retain the fetched bookmark until layout is usable.
+    const chapterBody = Array.from({ length: 4 }, (_, index) =>
+      '<div style="height:80%;' + (index ? 'break-before:column;' : '') + '">Page ' + (index + 1) + '</div>').join('');
+    await api('configure', { body: chapterBody, annotations: [] });
+    ebook = { it: { id: 7 }, spine: ['one.xhtml', 'two.xhtml', 'three.xhtml'], chunk: 2, annots: [] };
+    document.getElementById('ebook-modal').classList.add('on');
+    const chapterFetch = window.fetch;
+    const paginationWrites = [];
+    // The loopback fixture owns chunk endpoints 0/1; alias its body for saved chapter 2.
+    window.fetch = (url, options) => {
+      if (url === '/api/progress' && options?.method === 'POST') paginationWrites.push(JSON.parse(options.body).position);
+      return chapterFetch(url === '/api/epub/7/chunk/2' ? '/api/epub/7/chunk/0' : url, options);
+    };
+    try {
+      await showChunk(2, { frac: 1 / 3 });
+      const hiddenFrame = readerFrame();
+      hiddenFrame.style.display = 'none';
+      try {
+        await new Promise(resolve => hiddenFrame.addEventListener('load', resolve, { once: true }));
+        // A transport probe proves the hidden child has executed its load handler.
+        await probe();
+        equal(ebook.lastFrac, 1 / 3, 'Unmeasurable initial layout retains saved 2.333');
+        check(!ebook.document.ready, 'Hidden chapter does not announce usable pagination');
+        equal(paginationWrites, [], 'Unmeasurable pagination cannot autosave a false one-page position');
+      } finally { hiddenFrame.style.removeProperty('display'); }
+      await until(() => ebook.document.ready && document.getElementById('em-pageinfo').textContent === '3 · p2/4', 'visible four-page chapter restores saved fractional column');
+      equal(ebook.lastFrac, 1 / 3, 'First visible page report preserves saved 2.333');
+      equal(paginationWrites, [2 + 1 / 3], 'First actual autosave preserves saved 2.333');
+      await api('configure', { body: '<p>One real page</p>', annotations: [] });
+      await showChunk(2, { frac: 1 / 3 });
+      await until(() => ebook.document.ready && document.getElementById('em-pageinfo').textContent === '3 · p1/1', 'visible single-page chapter reports its real bound');
+      equal(ebook.lastFrac, 0, 'Visible single-page chapter legitimately publishes zero fraction');
+      equal(paginationWrites, [2 + 1 / 3, 2], 'Valid single-page autosave remains accepted');
+    } finally { window.fetch = chapterFetch; }
     const saved = [{ kind: 'highlight', spine_idx: 0, cfi: 'char:7:6', text: 'target', color: 'yellow' }];
     await api('configure', { body: '<p id="target">prefix target suffix</p>', annotations: saved, parserGate: true });
     ebook = { it: { id: 7 }, spine: ['one.xhtml', 'two.xhtml'], chunk: 0, annots: saved };
@@ -887,7 +929,8 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     await until(() => readerFrame() !== beforeResize && ebook.document.ready, 'resize publishes a fresh ready chapter');
     equal(ebook.lastFrac, resizeFraction, 'Resize preserves the reported position');
     equal((await probe()).marks, ['target'], 'Resize restores saved marks');
-    return { freshFrame: true, retiredWindowRejected: true, resizeReady: true,
+    return { initialPagination: { hiddenAutosaves: 0, autosavePositions: paginationWrites, visibleSinglePage: true },
+      freshFrame: true, retiredWindowRejected: true, resizeReady: true,
       marks: observed.marks, parserHeldBeyondOldTimer: true, posts: 0,
       reopen: true, tocRevisit: true, duplicateRestoreIdempotent: true, staleReadyIgnored: true };
   });
@@ -925,6 +968,10 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       fixture.rejection ? 'Select text without crossing formatting or paragraph breaks.' : '', 'Selection status');
     return { posts: 0, marks: 0 };
   });
+  document.getElementById('app').classList.toggle('on', readerAppState.visible);
+  document.body.classList.toggle('auth', readerAppState.auth);
+  if (readerAppState.loginStyle === null) document.getElementById('login').removeAttribute('style');
+  else document.getElementById('login').setAttribute('style', readerAppState.loginStyle);
   await run('actual vendored Plyr replaces media twice; active host events and follower seek remain connected', async () => {
     LIBRARY = [{ id: 10, kind: 'movie' }, { id: 11, kind: 'movie' }];
     const forwarded = [];

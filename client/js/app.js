@@ -1175,6 +1175,7 @@ async function showChunk(n, opts = {}) {
         const PW = ${PW}, PAD = ${PAD}; // inner page padding (visual margin, kills edge-butt)
         const STEP = ${PW}; // column (PW-2*PAD) + gap (2*PAD) = exactly PW: viewport = one page, no bleed
         let col = 0;
+        let layoutReady = false;
         function report() { sendReader({type:'page', page: col + 1, pages: pageCount()}); }
         function pageCount() {
           const pages = Math.round((document.documentElement.scrollWidth - ${PW}) / STEP) + 1;
@@ -1211,9 +1212,25 @@ async function showChunk(n, opts = {}) {
           const sp = document.createElement('div');
           sp.style.cssText = 'width:1px;height:100%;break-before:column';
           document.body.appendChild(sp);
-          // All listeners and body are ready; parent now sends this document's resume and marks.
-          col = 0;
-          sendReader({ type: 'reader-ready' });
+          // Load can precede the embedded viewport's first usable column layout.
+          // Wait for fonts and a browser render; hidden frames resume on their resize event.
+          function readyWhenVisible() {
+            requestAnimationFrame(() => {
+              if (layoutReady) return;
+              const bounds = document.body.getBoundingClientRect();
+              if (!window.innerWidth || !window.innerHeight
+                || !document.documentElement.clientWidth || !document.documentElement.clientHeight
+                || !bounds.width || !bounds.height) return;
+              layoutReady = true;
+              window.removeEventListener('resize', readyWhenVisible);
+              col = 0;
+              sendReader({ type: 'reader-ready' });
+            });
+          }
+          document.fonts.ready.then(() => {
+            window.addEventListener('resize', readyWhenVisible);
+            readyWhenVisible();
+          });
         });
         // Parent-driven resume and highlights are bound to this document generation.
         window.addEventListener('message', (e) => {

@@ -225,3 +225,73 @@ for (const failure of [false, true]) {
     assert.match(current.srcdoc, failure ? /Failed to load chapter/ : /Published chapter/);
   });
 }
+
+async function paginationDocument({ visible = false, pages = 4, layoutPending = false } = {}) {
+  const vm = require('node:vm');
+  const b = reader();
+  b.run('ebook.spine.push("d"); ebook.chunk = 2');
+  b.respond(async () => ({ text: async () => '<html><head></head><body>Saved chapter</body></html>' }));
+  await b.run('showChunk(2, { frac: 1 / 3 })');
+  const script = b.nodes.get('#em-frame').srcdoc.match(/<script>([\s\S]*?)<\/script>/)[1];
+  const events = new Map(), renders = [];
+  let width = visible ? 760 : 0;
+  const body = { appendChild() {}, getBoundingClientRect: () => ({ width, height: width ? 600 : 0 }) };
+  const document = {
+    body, head: { appendChild() {} }, fonts: { ready: Promise.resolve() },
+    documentElement: {
+      get clientWidth() { return width; }, get clientHeight() { return width ? 600 : 0; },
+      get scrollWidth() { return width && !layoutPending ? 760 * (pages + 1) : 0; },
+    },
+    createElement: () => ({ style: {} }), addEventListener() {},
+  };
+  const parent = { postMessage: data => b.message(data) };
+  const frame = {
+    get innerWidth() { return width; }, get innerHeight() { return width ? 600 : 0; },
+    scrollX: 0, scrollTo({ left }) { this.scrollX = left; },
+    addEventListener(name, fn) { events.set(name, [...(events.get(name) || []), fn]); },
+    removeEventListener(name, fn) { events.set(name, (events.get(name) || []).filter(listener => listener !== fn)); },
+  };
+  const emit = (name, event) => { for (const fn of [...(events.get(name) || [])]) fn(event); };
+  b.nodes.get('#em-frame').contentWindow.postMessage = data => emit('message', { source: parent, data });
+  vm.runInNewContext(script, { window: frame, document, parent,
+    requestAnimationFrame: fn => renders.push(fn), setTimeout() {} });
+  return { b, load: () => emit('load'), show: () => { width = 760; emit('resize'); },
+    async render() { await Promise.resolve(); layoutPending = false; for (const fn of renders.splice(0)) fn(); },
+  };
+}
+
+test('initial unmeasurable chapter retains saved 2.333 until rendered pagination restores its column', async () => {
+  const reader = await paginationDocument();
+  reader.load();
+  await reader.render();
+  assert.equal(reader.b.run('ebook.lastFrac'), 1 / 3);
+  assert.equal(reader.b.run('ebook.document.ready'), false);
+  assert.equal(reader.b.requests.filter(request => request.options?.method === 'POST').length, 0);
+  reader.show();
+  await reader.render();
+  assert.equal(reader.b.run('ebook.document.ready'), true);
+  assert.equal(reader.b.nodes.get('#em-pageinfo').textContent, '3 · p2/4');
+  assert.equal(reader.b.run('ebook.lastFrac'), 1 / 3);
+  assert.deepEqual(reader.b.requests.filter(request => request.options?.method === 'POST')
+    .map(request => JSON.parse(request.options.body).position), [2 + 1 / 3]);
+});
+
+test('visible rendered single-page chapter legitimately publishes fraction zero', async () => {
+  const reader = await paginationDocument({ visible: true, pages: 1 });
+  reader.load(); await reader.render();
+  assert.equal(reader.b.run('ebook.document.ready'), true);
+  assert.equal(reader.b.nodes.get('#em-pageinfo').textContent, '3 · p1/1');
+  assert.equal(reader.b.run('ebook.lastFrac'), 0);
+  assert.deepEqual(reader.b.requests.filter(request => request.options?.method === 'POST')
+    .map(request => JSON.parse(request.options.body).position), [2]);
+});
+
+test('visible viewport waits for a render before its first resume can overwrite the saved fraction', async () => {
+  const reader = await paginationDocument({ visible: true, layoutPending: true });
+  reader.load();
+  assert.equal(reader.b.run('ebook.lastFrac'), 1 / 3);
+  assert.equal(reader.b.run('ebook.document.ready'), false);
+  await reader.render();
+  assert.equal(reader.b.nodes.get('#em-pageinfo').textContent, '3 · p2/4');
+  assert.equal(reader.b.run('ebook.lastFrac'), 1 / 3);
+});
