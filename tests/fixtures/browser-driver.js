@@ -181,6 +181,8 @@ async function isolatedResponsiveCase(width) {
       check(document.getElementById('party-modal').classList.contains('on'), 'Visible party control opens panel');
       document.getElementById('pt-close').click();
       const playerControls = [...document.querySelectorAll('#playerbar button')];
+      measured.audioToolbarControls = playerControls.map(node => ({ id: node.id, label: node.getAttribute('aria-label') }));
+      equal(playerControls.map(node => node.id), ['pb-play', 'pb-close'], 'Audio toolbar exposes its functional controls without inactive Previous/Next buttons');
       playerControls.forEach(reachable);
       let trustedAudioPause = false;
       pbAudio.addEventListener('pause', event => { trustedAudioPause = event.isTrusted; }, { once: true });
