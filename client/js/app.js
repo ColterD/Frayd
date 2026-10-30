@@ -2169,6 +2169,7 @@ function fmt(s) {
 
 // ---------- video (Plyr) ----------
 const plyr = new Plyr('#plyr-video', {
+  iconUrl: '/vendor/plyr/plyr.svg',
   controls: ['play-large', 'play', 'progress', 'current-time', 'duration', 'mute', 'volume', 'settings', 'pip', 'airplay', 'fullscreen'],
   settings: ['speed'],
   seekTime: 10,

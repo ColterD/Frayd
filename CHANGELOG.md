@@ -38,6 +38,10 @@ Historical results apply only to their named source.
 
 - Keep indexed media, progress and notes when a configured root is unavailable. Keep media IDs after source replacement.
 - Hold invalid older saved root settings for repair instead of stopping startup. Show the configuration error in Settings.
+- Diagnose the effective library configuration instead of unused saved roots. Preserve server errors for failed database reads.
+- Load player icons from the vendored local sprite instead of an external CDN.
+- Include the generated MP4 fixture only in test build stages. Keep public proxy configuration readable in the runtime image.
+- Record native archive file modes. Document extraction that preserves them under a private umask.
 - Keep an invalid explicit library override locked with no active roots. Report a path-free error instead of selecting saved roots.
 - Check source aliases once for the complete multi-root scan before scan writes begin. Keep admission checks for standalone scans.
 - Distinguish temporary scan contention or concurrent changes from persistent identity repair. Back up application data before persistent repair.
@@ -95,4 +99,4 @@ Historical results apply only to their named source.
 - Native shutdown covers descendants that stay in the owned process group. A process that leaves that group is outside this guarantee.
 - Keep uncertain native child records after incomplete cleanup. This behavior does not provide complete process-tree containment.
 - Public hosting, signing, physical audio and broad upgrade compatibility remain unqualified.
-- An older CodeRabbit review omitted output. Support ticket #39355 tracks recovery. The omitted output remains unknown.
+- Support ticket #39355 recovered approval-only counts for an older review. The full raw diagnostic output was not retained.

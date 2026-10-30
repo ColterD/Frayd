@@ -100,7 +100,7 @@ function browser({ now, storage = {}, initialResponse } = {}) {
     requestAnimationFrame: fn => fn(),
     confirm: () => false,
     Plyr: class {
-      constructor() { this.events = element(); this.duration = 0; this.bindMedia(nodes.get('#plyr-video')); }
+      constructor(_selector, config) { this.config = config; this.events = element(); this.duration = 0; this.bindMedia(nodes.get('#plyr-video')); }
       bindMedia(media) {
         this.media = media;
         for (const name of ['play', 'pause', 'seeked', 'loadedmetadata', 'ready'])

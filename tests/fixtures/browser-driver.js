@@ -503,6 +503,17 @@ async function isolatedResponsiveCase(width) {
       check(rect(wrapper).width === viewportWidth && rect(wrapper).height === innerHeight, 'Native Plyr fills viewport');
       check(getComputedStyle(document.getElementById('yt-party')).display === 'none', 'Native mode hides inactive external surface');
       reachable(document.querySelector('.plyr__controls [data-plyr="play"]'));
+      equal(plyr.config.iconUrl, '/vendor/plyr/plyr.svg', 'Production constructor selects the vendored icon sprite');
+      const icons = [...nativeControls.querySelectorAll('[data-plyr="play"] svg use')];
+      const hrefs = icons.map(icon => icon.getAttribute('href') || icon.getAttribute('xlink:href'));
+      check(hrefs.includes('/vendor/plyr/plyr.svg#plyr-play') && hrefs.includes('/vendor/plyr/plyr.svg#plyr-pause'),
+        'Play and pause controls reference the local vendored symbols');
+      check(hrefs.every(href => href.startsWith('/vendor/plyr/plyr.svg#')), 'Control icons have no external fallback');
+      await until(() => icons.some(icon => icon.getBBox().width > 0 && icon.getBBox().height > 0),
+        'the actual current-state local play/pause icon renders');
+      measured.videoGeometry.iconUrl = plyr.config.iconUrl;
+      measured.videoGeometry.icons = icons.map((icon, index) => ({ href: hrefs[index],
+        width: icon.getBBox().width, height: icon.getBBox().height }));
       // Model only the external-provider layout state; no YouTube playback claim.
       const modal = document.getElementById('video-modal'), external = document.getElementById('yt-party');
       modal.classList.add('yt');

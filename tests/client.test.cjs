@@ -3219,3 +3219,9 @@ for (const scenario of [
     assert.equal(b.context.localStorage.frayd_token, undefined);
   });
 }
+
+
+test('production video constructor uses the vendored same-origin icon sprite', () => {
+  const b = browser();
+  assert.equal(b.run('plyr.config.iconUrl'), '/vendor/plyr/plyr.svg');
+});

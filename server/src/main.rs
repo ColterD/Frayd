@@ -2015,22 +2015,26 @@ fn get_settings_blocking(app:Arc<App>,headers:axum::http::HeaderMap,q:std::colle
     if let Err(status) = require_admin(&db, &headers, q.get("identity").map(|s| s.as_str())) {
         return status.into_response();
     }
-    let mut stmt = db.prepare("SELECT key, value FROM settings").unwrap();
+    let rows=match db.prepare("SELECT key, value FROM settings").and_then(|mut stmt| {
+        stmt.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()
+    }) {
+        Ok(rows)=>rows,
+        Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
     let mut map = serde_json::Map::new();
-    let rows = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-        .unwrap()
-        .filter_map(Result::ok);
     for (k, v) in rows {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&v) {
             map.insert(k, parsed);
         }
     }
     // Persisted paths and effective override are distinct authorized metadata.
-    let error=if config.locked && config.roots.is_empty() {
-        Some("FRAYD_LIBRARY configuration unavailable; correct the environment and restart")
-    } else { stored_roots(&db).err().map(|_| "Library configuration unavailable; repair configured roots") };
-    let paths=stored_root_strings(&db).unwrap_or_default();
+    let error=if config.locked {
+        config.roots.is_empty().then_some("Library configuration unavailable")
+    } else { stored_roots(&db).err().map(|_| "Library configuration unavailable") };
+    let paths=match stored_root_strings(&db) {
+        Ok(paths)=>paths,
+        Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
     map.remove("library_path");
     map.insert("library_paths".into(),serde_json::json!(paths));
     map.insert("library_config_error".into(),serde_json::json!(error));
@@ -4924,6 +4928,37 @@ mod final_server_regressions {
     }
     fn query() -> Query<std::collections::HashMap<String,String>> { Query(std::collections::HashMap::from([("identity".into(),"admin".into())])) }
     #[tokio::test]
+    async fn settings_error_describes_effective_roots_and_preserves_failures() {
+        let (root,app)=fixture();let stored=serde_json::json!(["~/Media"]).to_string();
+        for (override_path,locked,has_error) in [(Some(root.join("library")),true,false),(Some(root.join("unresolved/../alias")),true,true),(None,false,true)] {
+            {
+                let db=app.db.lock().unwrap();
+                db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('library_paths',?1)",[&stored]).unwrap();
+                *app.library.write().unwrap()=environment_library_config(&db,override_path.as_deref().map(|path|path.as_os_str()));
+            }
+            let response=get_settings(State(app.clone()),axum::http::HeaderMap::new(),query()).await.into_response();
+            assert_eq!(response.status(),StatusCode::OK);
+            let body:serde_json::Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),usize::MAX).await.unwrap()).unwrap();
+            assert_eq!(body["library_locked"],locked);assert_eq!(body["library_paths"],serde_json::json!(["~/Media"]));
+            assert_eq!(!body["library_config_error"].is_null(),has_error,"only the effective configuration may report a failure: {body}");
+            if !has_error {assert_eq!(body["effective_library_paths"],serde_json::json!([root.join("library")]));}
+            else {assert_eq!(body["effective_library_paths"],serde_json::json!([]));}
+            assert_eq!(app.db.lock().unwrap().query_row("SELECT value FROM settings WHERE key='library_paths'",[],|row|row.get::<_,String>(0)).unwrap(),stored);
+            let edit=set_setting(State(app.clone()),axum::http::HeaderMap::new(),query(),Json(serde_json::json!({"library_paths":[root.join("library")]}))).await.status();
+            assert_eq!(edit,if locked {StatusCode::CONFLICT}else{StatusCode::NO_CONTENT});
+        }
+        // A valid override suppresses unused parse diagnostics, never a real database or permission error.
+        *app.library.write().unwrap()=environment_library_config(&app.db.lock().unwrap(),Some(root.join("library").as_os_str()));
+        app.db.lock().unwrap().execute("UPDATE settings SET value=zeroblob(1) WHERE key='library_paths'",[]).unwrap();
+        assert_eq!(get_settings(State(app.clone()),axum::http::HeaderMap::new(),query()).await.into_response().status(),StatusCode::INTERNAL_SERVER_ERROR);
+        app.db.lock().unwrap().execute("UPDATE settings SET value='[]' WHERE key='library_paths'",[]).unwrap();
+        app.db.lock().unwrap().execute("UPDATE user_perms SET is_admin=0 WHERE identity_id=1",[]).unwrap();
+        assert_eq!(get_settings(State(app.clone()),axum::http::HeaderMap::new(),query()).await.into_response().status(),StatusCode::FORBIDDEN);
+        app.db.lock().unwrap().execute_batch("DROP TABLE user_perms").unwrap();
+        assert_eq!(get_settings(State(app.clone()),axum::http::HeaderMap::new(),query()).await.into_response().status(),StatusCode::INTERNAL_SERVER_ERROR);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
     async fn explicit_environment_failures_hold_locked_without_saved_root_fallback() {
         let (root,mut app)=fixture();
         let state=Arc::get_mut(&mut app).unwrap();state.download_backend=Some(DownloadBackend::Direct);state.downloads_enabled=true;
@@ -4952,7 +4987,7 @@ mod final_server_regressions {
             let body:serde_json::Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),usize::MAX).await.unwrap()).unwrap();
             assert_eq!(body["library_paths"],serde_json::json!([root.join("library")]));
             assert_eq!(body["effective_library_paths"],serde_json::json!([]));assert_eq!(body["library_locked"],true);
-            assert_eq!(body["library_config_error"],"FRAYD_LIBRARY configuration unavailable; correct the environment and restart");
+            assert_eq!(body["library_config_error"],"Library configuration unavailable");
             assert_eq!(trigger_scan(State(app.clone())).await,StatusCode::NOT_IMPLEMENTED);
             assert_eq!(ingest(State(app.clone()),axum::http::HeaderMap::new(),query(),Json(IngestReq{url:"https://example.invalid/video.mp4".into()})).await,StatusCode::NOT_IMPLEMENTED);
             assert_eq!(set_setting(State(app.clone()),axum::http::HeaderMap::new(),query(),Json(serde_json::json!({"library_paths":[root.join("library")]}))).await.status(),StatusCode::CONFLICT);

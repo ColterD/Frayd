@@ -17,12 +17,6 @@ const productionFiles = ['client/index.html', 'client/js/app.js', 'client/js/par
   'client/vendor/plyr/plyr.min.js', 'client/vendor/plyr/plyr.min.css', 'client/vendor/plyr/plyr.svg', 'client/css/frayd.css', 'client/install/index.html'];
 const harnessFiles = ['tests/browser-regression.cjs', 'tests/fixtures/browser-driver.js', 'tests/fixtures/reader-probe.js', 'tests/fixtures/native-resume.mp4', 'tests/fixtures/generate-native-resume.sh'];
 function hash(path) { return createHash('sha256').update(readFileSync(path)).digest('hex'); }
-/** Configure only the one app bootstrap without altering its exact cache-busted tag. */
-function withLocalPlyrIcons(source) {
-  const tags = source.match(/<script src="js\/app\.js(?:\?[^"<>]*)?"><\/script>/g) || [];
-  if (tags.length !== 1) throw new Error('Expected exactly one production app script');
-  return source.replace(tags[0], '<script>Plyr.defaults.iconUrl="/vendor/plyr/plyr.svg";</script>' + tags[0]);
-}
 function responsiveAudioFixture() {
   // Deterministic 120 s mono PCM; no file, dependency, download or physical output.
   const samples = 120 * 8000;
@@ -529,7 +523,7 @@ async function main({ removeProfile = rmSync, resultDirectory = process.env.FRAY
         }
         const source = readFileSync(join(root, 'client/index.html'), 'utf8');
         response.writeHead(200, { 'Content-Type': 'text/html' });
-        return response.end(withLocalPlyrIcons(source).replace('<head>', '<head><base href="/"><script>(' + responsivePreload.toString() + ')(' + width + ');window.__toolbarRetryMode=' + modeLiteral + '</script>')
+        return response.end(source.replace('<head>', '<head><base href="/"><script>(' + responsivePreload.toString() + ')(' + width + ');window.__toolbarRetryMode=' + modeLiteral + '</script>')
           .replace('</body>', '<script src="/__fixture/browser-driver.js"></script></body>'));
       }
       if (path.startsWith('/__fixture/installer/')) {
@@ -662,7 +656,7 @@ async function main({ removeProfile = rmSync, resultDirectory = process.env.FRAY
         return json({ error: 'Unexpected fixture route' }, 404);
       }
       let bytes = readFileSync(join(root, staticFile));
-      if (path === '/') bytes = Buffer.from(withLocalPlyrIcons(bytes.toString())
+      if (path === '/') bytes = Buffer.from(bytes.toString()
         .replace('</body>', '<script src="/__fixture/browser-driver.js"></script></body>'));
       response.writeHead(200, { 'Content-Type': contentTypes[extname(staticFile)] || 'application/octet-stream' });
       response.end(bytes);
@@ -771,5 +765,5 @@ async function main({ removeProfile = rmSync, resultDirectory = process.env.FRAY
   writeFileSync(join(directory, 'result.json'), JSON.stringify(output, null, 2) + '\n');
   console.log(JSON.stringify(output, null, 2));
 }
-module.exports = { main, stopBrowserGroup, withLocalPlyrIcons, EXPECTED_CASES };
+module.exports = { main, stopBrowserGroup, EXPECTED_CASES };
 if (require.main === module) main().catch(error => { console.error(error.stack); process.exitCode = 1; });

@@ -416,16 +416,18 @@ class QualificationMixin:
             failure = ("$ErrorActionPreference = 'Continue'; function Invoke-RestMethod { [CmdletBinding()] "
                        "param([Parameter(Position=0)][string]$Uri,[string]$OutFile) "
                        "Write-Error 'fixture download failure' }; ")
-            # Prove the stale script can execute when a nonterminating error is ignored.
-            unsafe = ("cd $env:TEMP; irm 'https://example.invalid/never-contacted' -OutFile frayd-install.ps1; "
-                      "powershell.exe -NoProfile -ExecutionPolicy Bypass -File '.\\frayd-install.ps1'")
+            # Mechanism control, not a verbatim historical command: ignoring the download
+            # error executes the real stale script in this engine, without another host.
+            unsafe = ("irm 'https://example.invalid/never-contacted' -OutFile frayd-install.ps1; "
+                      "& (Join-Path $env:TEMP 'frayd-install.ps1')")
             control = subprocess.run(base + [failure + unsafe], env=env, cwd=directory,
-                                     capture_output=True, text=True, timeout=30, check=False)
+                                     stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30, check=False)
             self.assertEqual(control.returncode, 0, control.stderr)
+            self.assertIn('fixture download failure', control.stderr)
             self.assertTrue(marker.exists(), 'unsafe control must execute the existing harmless script')
             marker.unlink()
             blocked = subprocess.run(base + [failure + generated_windows_command()], env=env, cwd=directory,
-                                     capture_output=True, text=True, timeout=30, check=False)
+                                     stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30, check=False)
             self.assertNotEqual(blocked.returncode, 0)
             self.assertIn('fixture download failure', blocked.stderr)
             self.assertFalse(marker.exists(), 'failed download must never execute the stale script')
