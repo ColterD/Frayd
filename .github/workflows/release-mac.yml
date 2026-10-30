@@ -49,6 +49,8 @@ jobs:
           python3 scripts/build-metadata.py --env >> "$GITHUB_ENV"
           mkdir "$RUNNER_TEMP/frayd-build-source"
           cp -R server "$RUNNER_TEMP/frayd-build-source/server"
+          mkdir -p "$RUNNER_TEMP/frayd-build-source/tests/fixtures"
+          cp tests/fixtures/native-resume.mp4 "$RUNNER_TEMP/frayd-build-source/tests/fixtures/native-resume.mp4"
           printf 'FRAYD_NATIVE_HELPER=%s/%s/release/frayd-native\n' "$CARGO_TARGET_DIR" '${{ matrix.target }}' >> "$GITHUB_ENV"
 
       - name: Locked native diagnostics and both binaries

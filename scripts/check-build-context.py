@@ -38,7 +38,14 @@ def main():
         with tempfile.TemporaryDirectory(prefix='frayd-context-qa-') as directory:
             context = Path(directory)
             write_fixture(context / '.dockerignore', (ROOT / '.dockerignore').read_text(encoding='utf-8'))
-            write_fixture(context / 'Dockerfile', 'FROM scratch\nCOPY client/ /client/\nCOPY server/ /server/\n')
+            write_fixture(context / 'Dockerfile', 'FROM scratch\nCOPY . /\n')
+            tests = context / 'tests'
+            (tests / 'fixtures' / 'private').mkdir(parents=True)
+            write_fixture(tests / 'fixtures/native-resume.mp4', 'normal synthetic generated video fixture')
+            for name in ('test_other.py', 'private.txt', 'fixtures/other.mp4', 'fixtures/generate-native-resume.sh',
+                         'fixtures/native-resume.mp4.orig', 'fixtures/.env', 'fixtures/frayd.sqlite',
+                         'fixtures/private/secret.txt'):
+                write_fixture(tests / name, 'NONSECRET_SYNTHETIC_SENTINEL_' + name)
             client = context / 'client'
             (client / 'install').mkdir(parents=True)
             (client / 'js').mkdir()
@@ -63,13 +70,16 @@ def main():
         assert b'NONSECRET_SYNTHETIC_SENTINEL' not in exported, 'Synthetic state sentinel leaked into Docker context'
         assert b'NONSECRET_INSTALLER_SENTINEL' not in exported
         with tarfile.open(fileobj=io.BytesIO(exported)) as archive:
+            fixture_files = sorted(m.name for m in archive.getmembers() if m.isfile() and m.name.startswith('tests/'))
+            assert fixture_files == ['tests/fixtures/native-resume.mp4'], fixture_files
+            assert archive.extractfile(fixture_files[0]).read() == b'normal synthetic generated video fixture'
             client_files = sorted(m.name for m in archive.getmembers() if m.isfile() and m.name.startswith('client/'))
             assert client_files == ['client/js/app.js'], client_files
             asset = archive.extractfile('client/js/app.js')
             assert asset.read() == b'normal synthetic client asset'
             server_files = sorted(m.name for m in archive.getmembers() if m.isfile() and m.name.startswith('server/'))
             assert server_files == sorted('server/' + name for name in SERVER_SOURCES), server_files
-        print('PASS: Docker context keeps client and server sources and excludes env, database, media, build, editor and installer files')
+        print('PASS: Docker context keeps client/server sources and exactly one build-only fixture; excludes test neighbors, secrets, databases, other media, build, editor and installer files')
 
 
 if __name__ == '__main__':

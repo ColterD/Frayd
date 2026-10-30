@@ -8,6 +8,8 @@ RUN timeout --kill-after=10s 180s apt-get $APT_TRANSPORT -o APT::Update::Error-M
     && DEBIAN_FRONTEND=noninteractive timeout --kill-after=10s 360s apt-get $APT_TRANSPORT install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 COPY server/ ./
+# Rust test-only include_bytes! paths resolve outside /app/server.
+COPY tests/fixtures/native-resume.mp4 /app/tests/fixtures/native-resume.mp4
 ARG FRAYD_BUILD_COMMIT=unknown
 ARG FRAYD_BUILD_COMMITS_SINCE_TAG=unknown
 ARG FRAYD_BUILD_DIRTY=unknown

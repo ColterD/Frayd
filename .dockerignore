@@ -9,6 +9,12 @@
 !server/*.sql
 !server/src/**
 !server/tests/**
+# Only this generated fixture enters the build context, not the surrounding test tree.
+!tests/
+tests/*
+!tests/fixtures/
+tests/fixtures/*
+!tests/fixtures/native-resume.mp4
 !client/index.html
 !client/css/**
 !client/js/**

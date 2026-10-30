@@ -2298,8 +2298,8 @@ exit "$probe_status"
         std::fs::write(&output, b"converted bytes").unwrap();
         std::fs::write(&temporary, b"temporary bytes").unwrap();
         std::fs::write(&lease_path, b"lease bytes").unwrap();
-        let lease=std::fs::OpenOptions::new().read(true).write(true).open(&lease_path).unwrap();
-        #[cfg(target_os="linux")] assert!(lease.try_lock().is_ok());
+        let _active_artifact_lease=std::fs::OpenOptions::new().read(true).write(true).open(&lease_path).unwrap();
+        #[cfg(target_os="linux")] assert!(_active_artifact_lease.try_lock().is_ok());
         let mut sources=Vec::new();
         for (id,name,old_kind) in [(41,"ordinary.mp3","audiobook"),(42,"movie.mp4","music")] {
             let path=library.join(name);std::fs::write(&path,b"original exact source bytes").unwrap();let metadata=std::fs::metadata(&path).unwrap();
