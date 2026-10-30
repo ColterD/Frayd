@@ -13,9 +13,6 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 30
     env:
-      FRAYD_RUNNER_ENVIRONMENT: ${{ runner.environment }}
-      FRAYD_RUNNER_OS: ${{ runner.os }}
-      FRAYD_RUNNER_ARCH: ${{ runner.arch }}
       HOMEBREW_NO_AUTO_UPDATE: '1'
       HOMEBREW_NO_ANALYTICS: '1'
       HOMEBREW_NO_INSTALL_CLEANUP: '1'
@@ -34,9 +31,9 @@ jobs:
           umask 077
           test "$GITHUB_REPOSITORY" = ColterD/Frayd
           test "$GITHUB_REF" = refs/heads/qa/bootstrap-mac-20261030
-          test "$FRAYD_RUNNER_ENVIRONMENT" = github-hosted
-          test "$FRAYD_RUNNER_OS" = macOS
-          test "$FRAYD_RUNNER_ARCH" = ARM64
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = macOS
+          test "$RUNNER_ARCH" = ARM64
           test "$(uname -s)" = Darwin
           test "$(uname -m)" = arm64
           test "$(sysctl -n sysctl.proc_translated 2>/dev/null || true)" != 1
