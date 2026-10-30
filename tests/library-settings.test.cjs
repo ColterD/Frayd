@@ -843,6 +843,25 @@ for (const listed of [false, true]) {
 }
 
 
+for (const listed of [false, true]) {
+  test(`held library configuration locks ${listed ? 'listed' : 'empty'} environment roots until operator repair`, async () => {
+    const b = browser();
+    const { stage, control } = passwordPanel(b);
+    b.respond(async url => reply(url.endsWith('/perms') ? [] : {
+      library_paths: listed ? ['/fixture/invalid-folder'] : [], library_locked: true,
+      library_config_error: 'Invalid environment library configuration',
+    }));
+    await b.run('openSettings()');
+    assert.match(stage.innerHTML, /Correct FRAYD_LIBRARY and restart the server\./);
+    assert.doesNotMatch(stage.innerHTML, /Remove invalid listed entries|Add a valid folder/);
+    assert.match(stage.innerHTML, /class="lib-add" disabled>Add \+ scan/);
+    control('.s-lib-add').value = '/fixture/valid-folder';
+    await control('.lib-add').onclick();
+    assert.equal(b.requests.some(request => request.options?.method === 'POST'), false);
+  });
+}
+
+
 for (const enabled of [false, true, undefined]) {
   test(`URL download availability ${String(enabled)} controls input action and admission`, async () => {
     const b = browser();

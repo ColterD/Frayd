@@ -384,9 +384,10 @@ async function openSettings() {
         <button class="p-remove" data-name="${esc(p.key)}" title="Remove user, their progress and highlights">Remove</button>
       </div>`).join('') : '<div class="party-sec">No accounts yet</div>')
       + `<div class="party-sec">Media folders${locked ? ' — locked by FRAYD_LIBRARY' : ''}</div>`
-      + (settings.library_config_error ? `<div class="party-error">${esc(settings.library_config_error)}. ${libs.length
-        ? 'Remove invalid listed entries, then add a valid folder.'
-        : 'Add a valid folder to replace the held configuration.'}</div>` : '')
+      + (settings.library_config_error ? `<div class="party-error">${esc(settings.library_config_error)}. ${locked
+        ? 'Correct FRAYD_LIBRARY and restart the server.'
+        : libs.length ? 'Remove invalid listed entries, then add a valid folder.'
+          : 'Add a valid folder to replace the held configuration.'}</div>` : '')
       + (libs.length ? libs.map(l => `
       <div class="perm-row"><span class="k">${esc(l)}</span>`
         + `<button class="lib-remove" ${locked ? 'disabled' : ''} data-path="${esc(l)}">Remove</button></div>`).join('')

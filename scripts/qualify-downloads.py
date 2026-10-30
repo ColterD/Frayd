@@ -1,5 +1,6 @@
 """Qualify opt-in Rust direct-file downloads on one disposable app image and owned HTTP fixtures."""
 import argparse
+from contextlib import contextmanager
 import copy
 import hashlib
 import json
@@ -7,6 +8,7 @@ import secrets
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -143,6 +145,38 @@ def retire_egress(project):
         qa.docker('network', 'rm', identity)
 
 
+@contextmanager
+def cleanup_download_project(compose, project):
+    """Always check exact owned resources, retaining every cleanup error and the scenario failure."""
+    errors = []
+
+    def tracked_compose(*args):
+        try:
+            return compose(*args)
+        except Exception as error:
+            errors.append(error)
+            raise
+
+    try:
+        with qa.cleanup_project(tracked_compose):
+            yield
+    finally:
+        primary = sys.exc_info()[1]
+        for cleanup in (retire_egress, qa.assert_project_removed):
+            try:
+                cleanup(project)
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            if primary is None:
+                raise ExceptionGroup('Download fixture cleanup failed', errors)
+            for error in errors:
+                if error is not primary:
+                    diagnostic = f'Download fixture cleanup: {error!r}'
+                    primary.add_note(diagnostic)
+                    print(diagnostic, file=sys.stderr)
+
+
 def disabled_scenario(args, enabled_without_tool=False, invalid_backend=False):
     project = 'frayd-downloads-disabled-' + secrets.token_hex(4)
     config = controlled_config(args, project, False)
@@ -202,7 +236,7 @@ def optional_scenario(args):
         fixtures.chmod(0o755)
         config['services']['fixture'] = fixture_service(args, 'isolated', directory)
         compose = qa.project_compose(project, config)
-        try:
+        with cleanup_download_project(compose, project):
             qa.start_project(compose)
             container = qa.container_id(compose, 'app')
             info = security(container)
@@ -295,13 +329,6 @@ def optional_scenario(args):
             assert json.loads(qa.request('/api/admin/settings', token=token))['downloads_enabled'] is False
             ingest('http://fixture:8000/owned.mp4', token, 501)
             print('PASS: rollback to default environment/network on SAME image preserves volume, indexed video and owner session')
-        finally:
-            # Never delete volumes during rollback. Only this disposable qualifier's exact volume is removed here.
-            compose('down', '--remove-orphans')
-            volume = config['volumes']['data']['name']
-            qa.docker('volume', 'rm', volume)
-            retire_egress(project)
-        qa.assert_project_removed(project)
     print('PASS: exact disposable project resources removed')
 
 

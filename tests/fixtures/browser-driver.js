@@ -1924,6 +1924,19 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     check(stage.textContent.includes('/env/a') && stage.textContent.includes('/env/b') && !stage.textContent.includes('/db'),
       'Effective environment roots displayed');
     check([...stage.querySelectorAll('.lib-add,.lib-remove')].every(b => b.disabled), 'All locked root controls disabled');
+    settingsValue = { ...baseSettings, library_locked: true, effective_library_paths: [],
+      library_config_error: 'Invalid environment library configuration' };
+    await openSettings();
+    const repairGuide = stage.querySelector('.party-error').textContent;
+    check(repairGuide.includes('Correct FRAYD_LIBRARY and restart the server.')
+      && !/Add a valid folder|Remove invalid listed entries/.test(repairGuide), 'Locked invalid environment roots require operator repair');
+    const lockedAdd = stage.querySelector('.lib-add');
+    check(lockedAdd.disabled, 'Invalid environment roots keep Add disabled');
+    const rootPosts = requests.filter(r => r.url === '/api/admin/settings' && r.method === 'POST').length;
+    stage.querySelector('.s-lib-add').value = '/fixture/valid-folder';
+    await lockedAdd.onclick();
+    equal(requests.filter(r => r.url === '/api/admin/settings' && r.method === 'POST').length, rootPosts,
+      'Programmatic locked Add cannot change roots');
     const availability = [];
     for (const enabled of [false, true, undefined]) {
       settingsValue = { ...baseSettings, ...(enabled === undefined ? {} : { downloads_enabled: enabled }) };

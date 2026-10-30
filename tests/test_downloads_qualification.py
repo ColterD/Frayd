@@ -1,6 +1,7 @@
 """Keep rollback cleanup confined to the empty, exact task-owned bridge."""
 import copy
 import importlib.util
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -35,6 +36,47 @@ class EgressCleanupTests(unittest.TestCase):
         ]) as docker:
             qualification.retire_egress(project)
         self.assertEqual(docker.call_args_list[-1].args, ('network', 'rm', 'owned-id'))
+
+
+class ProtectedCleanupTests(unittest.TestCase):
+    def test_scenario_failure_before_creation_survives_all_cleanup_failures(self):
+        original = AssertionError('startup before app or volume creation')
+        with patch.object(qualification, 'controlled_config', return_value={'services': {}}), \
+             patch.object(qualification, 'fixture_service', return_value={}), \
+             patch.object(qualification.qa, 'project_compose') as factory, \
+             patch.object(qualification.qa, 'start_project', side_effect=original), \
+             patch.object(qualification, 'retire_egress', side_effect=RuntimeError('bridge cleanup')) as retire, \
+             patch.object(qualification.qa, 'assert_project_removed', side_effect=RuntimeError('inventory')) as inventory, \
+             patch.object(sys, 'stderr', io.StringIO()) as diagnostic:
+            factory.return_value.side_effect = RuntimeError('compose cleanup before volume exists')
+            with self.assertRaises(AssertionError) as raised:
+                qualification.optional_scenario(object())
+        self.assertIs(raised.exception, original)
+        factory.return_value.assert_called_once_with('down', '--volumes', '--remove-orphans')
+        retire.assert_called_once()
+        inventory.assert_called_once_with(retire.call_args.args[0])
+        self.assertEqual(len(original.__notes__), 3)
+        self.assertIn('bridge cleanup', diagnostic.getvalue())
+        self.assertIn('inventory', diagnostic.getvalue())
+
+    def test_successful_body_reports_cleanup_failure_and_still_checks_resources(self):
+        with patch.object(qualification, 'retire_egress', side_effect=RuntimeError('bridge cleanup')) as retire, \
+             patch.object(qualification.qa, 'assert_project_removed') as inventory:
+            with self.assertRaises(ExceptionGroup) as raised:
+                with qualification.cleanup_download_project(lambda *args: None, 'frayd-owned-test'):
+                    pass
+        self.assertEqual(str(raised.exception.exceptions[0]), 'bridge cleanup')
+        retire.assert_called_once_with('frayd-owned-test')
+        inventory.assert_called_once_with('frayd-owned-test')
+
+    def test_positive_cleanup_uses_compose_owned_volumes_then_exact_bridge_and_inventory(self):
+        calls = []
+        with patch.object(qualification, 'retire_egress', side_effect=lambda project: calls.append(('bridge', project))), \
+             patch.object(qualification.qa, 'assert_project_removed', side_effect=lambda project: calls.append(('inventory', project))):
+            with qualification.cleanup_download_project(lambda *args: calls.append(args), 'frayd-owned-test'):
+                calls.append(('body',))
+        self.assertEqual(calls, [('body',), ('down', '--volumes', '--remove-orphans'),
+                                 ('bridge', 'frayd-owned-test'), ('inventory', 'frayd-owned-test')])
 
 
 class SameImageOptInTests(unittest.TestCase):
