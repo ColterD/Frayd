@@ -1,9 +1,12 @@
-"""Native ownership contract. Runtime qualification requires FRAYD_NATIVE_ARCHIVE and FRAYD_NATIVE_BUILD_SOURCE."""
+"""Native bundle contract. Helper scenarios need FRAYD_NATIVE_HELPER; the real-server scenario also needs FRAYD_NATIVE_ARCHIVE and FRAYD_NATIVE_BUILD_SOURCE."""
 import base64
+import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import signal
@@ -22,40 +25,67 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = Path(os.environ.get('FRAYD_NATIVE_HELPER', ROOT / 'target/native-qualification/debug/frayd-native'))
 SERVER = HELPER.with_name('frayd-server')
-TEMP_ROOT = Path(os.environ.get('FRAYD_NATIVE_TEST_TEMP_ROOT', '/var/tmp')).resolve()
+PACKAGE = ROOT / 'scripts/native/package.py'
+TEMP_ROOT = Path('/var/tmp').resolve()
+ARCHITECTURE = 'aarch64' if os.uname().machine in ['arm64', 'aarch64'] else 'x86_64'
+TARGET = ARCHITECTURE + ('-apple-darwin' if os.uname().sysname == 'Darwin' else '-unknown-linux-gnu')
 
 
-def run_bounded(arguments, *, timeout=60, **options):
-    """Bound a finite fixture command and reap its private group on interruption."""
-    input_data = options.pop('input', None)
-    capture = options.pop('capture_output', False)
-    check = options.pop('check', False)
-    if input_data is not None:
+def run_bounded(arguments, *, timeout=60, check=False, input=None, capture_output=False, **options):
+    """Run a finite fixture command in a private session and kill the whole process group on timeout or interruption.
+
+    subprocess.run(timeout=...) kills only the direct child, which would leave a hung helper's server running.
+    """
+    if capture_output:
+        options['stdout'] = options['stderr'] = subprocess.PIPE
+    if input is not None:
         options['stdin'] = subprocess.PIPE
-    if capture:
-        options['stdout'] = subprocess.PIPE
-        options['stderr'] = subprocess.PIPE
-    process = subprocess.Popen(arguments, start_new_session=True, shell=False, **options)
-    try:
-        stdout, stderr = process.communicate(input_data, timeout=timeout)
-    except BaseException:
+    with subprocess.Popen(arguments, start_new_session=True, **options) as process:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        try:
-            process.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            pass
-        raise
+            stdout, stderr = process.communicate(input, timeout=timeout)
+        except BaseException:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            raise
     result = subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
     if check:
         result.check_returncode()
     return result
 
 
+def wait_for(probe, what, timeout=10):
+    """Poll probe() until it returns something truthy, which is returned; fail the test after timeout seconds."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = probe()
+        if value:
+            return value
+        time.sleep(0.02)
+    raise AssertionError(f'timed out after {timeout}s waiting for {what}')
+
+
+def running_child_pid(prefix):
+    """Return the supervised server's pid once the child receipt says it is running."""
+    try:
+        document = json.loads((prefix / '.frayd-child.json').read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    return document['pid'] if document.get('state') == 'running' else None
+
+
+def snapshot(root):
+    """Names, modes and bytes (or symlink targets) of everything under root."""
+    return [(str(p.relative_to(root)), p.lstat().st_mode, os.readlink(p) if p.is_symlink() else p.read_bytes() if p.is_file() else None) for p in sorted(root.rglob('*'))]
+
+
+def package(output, target=TARGET, server=SERVER, helper=HELPER, **options):
+    return run_bounded([sys.executable, str(PACKAGE), str(output), target, str(server), str(helper)], **options)
+
+
 def setUpModule():
-    """Require explicit native build inputs only when full qualification is requested."""
+    """Fail instead of skipping when full qualification is requested but an input is missing."""
     if os.environ.get('FRAYD_NATIVE_REQUIRE_QUALIFICATION') == '1':
         required = ['FRAYD_NATIVE_HELPER', 'FRAYD_NATIVE_ARCHIVE', 'FRAYD_NATIVE_BUILD_SOURCE']
         missing = [name for name in required if not os.environ.get(name)]
@@ -63,66 +93,199 @@ def setUpModule():
             raise RuntimeError('Native qualification prerequisites missing: ' + ', '.join(missing))
 
 
+class RunBounded(unittest.TestCase):
+    def test_timeout_kills_descendants(self):
+        grandchild = "import fcntl,pathlib,sys,time; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); pathlib.Path(sys.argv[2]).touch(); time.sleep(20)"
+        driver = "import subprocess,sys,time; subprocess.Popen([sys.executable,'-c',*sys.argv[1:]]); time.sleep(20)"
+        with tempfile.TemporaryDirectory() as directory:
+            lease = Path(directory) / 'lease'
+            ready = Path(directory) / 'ready'
+            with self.assertRaises(subprocess.TimeoutExpired):
+                run_bounded([sys.executable, '-c', driver, grandchild, str(lease), str(ready)], timeout=3)
+            self.assertTrue(ready.exists(), 'grandchild never took its lease')
+
+            def lease_released():
+                with lease.open('a') as handle:
+                    try:
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        return False
+                    return True
+
+            wait_for(lease_released, 'the killed grandchild to release its lease', timeout=5)
+
+
+KEY = r'(\s*(?:- )?\s*){}:(?:\s+(.*?))?(?:\s+#.*)?$'
+
+
+def entries(lines, key):
+    """Yield (column, inline value, body) for every `key:` line; body is the deeper-indented lines after it."""
+    for index, line in enumerate(lines):
+        match = re.match(KEY.format(key), line.rstrip())
+        if match:
+            column, body = len(match[1]), []
+            for later in lines[index + 1:]:
+                if later.strip() and not later.lstrip().startswith('#'):
+                    if len(later) - len(later.lstrip()) <= column:
+                        break
+                    body.append(later)
+            yield column, match[2] or '', body
+
+
+def children(body):
+    """Direct `name: first-token` children of an entry body, found by its shallowest indentation."""
+    indent = min((len(line) - len(line.lstrip()) for line in body), default=0)
+    return {m[1]: m[2] for line in body if (m := re.match(r'\s*([\w-]+):\s*(\S*)', line)) and len(line) - len(line.lstrip()) == indent}
+
+
+def workflow_policy_violations(text):
+    """List every way the macOS workflow stops being manual, read-only, non-publishing and locked."""
+    lines, problems = text.splitlines(), []
+    triggers = [(inline, children(body)) for column, inline, body in entries(lines, 'on') if column == 0]
+    if len(triggers) != 1 or triggers[0][0] or set(triggers[0][1]) != {'workflow_dispatch'}:
+        problems.append(f'triggers must be exactly workflow_dispatch, found {triggers}')
+    scopes = [(column, inline, children(body)) for column, inline, body in entries(lines, 'permissions')]
+    problems += [f'permission scope can write: {inline or scope}' for _, inline, scope in scopes
+                 if inline or any(level not in ('read', 'none') for level in scope.values())]
+    if [scope for column, _, scope in scopes if column == 0] != [{'contents': 'read'}]:
+        problems.append(f'top-level permissions must be exactly contents: read, found {scopes}')
+    include = '\n'.join(line for _, _, body in entries(lines, 'include') for line in body)
+    pairs = set(re.findall(r'runner:\s*(\S+)(?:(?!\n\s*- ).)*?target:\s*(\S+)', include, re.DOTALL))
+    required = {('macos-15', 'aarch64-apple-darwin'), ('macos-15-intel', 'x86_64-apple-darwin')}
+    if not required <= pairs:
+        problems.append(f'matrix must include runner/target pairs {sorted(required)}, found {sorted(pairs)}')
+    for _, uses, _ in entries(lines, 'uses'):
+        action, _, reference = uses.partition('@')
+        if re.search(r'upload|download|release|publish|deploy|attest', action, re.IGNORECASE):
+            problems.append(f'publishing or artifact action: {uses}')
+        if not re.fullmatch(r'[0-9a-f]{40}', reference):
+            problems.append(f'action not pinned to a commit: {uses}')
+    scripts = [line for _, inline, body in entries(lines, 'run') for line in (body if re.fullmatch(r'[|>][+-]?', inline) else [inline])]
+    cargo = [line.strip() for line in scripts if re.search(r'(?<![\w./-])cargo\s', line)]
+    if any(re.search(r'\blipo\b|brew install', line) for line in scripts):
+        problems.append('universal binaries and brew installs are not part of the native qualification')
+    problems += [f'cargo without --locked: {line}' for line in cargo if '--locked' not in line]
+    if not any('--bin frayd-native' in line for line in cargo):
+        problems.append('no cargo invocation builds --bin frayd-native')
+    return problems
+
+
+UNINSTALL_SHAPE = [
+    r'set -euo pipefail',
+    r'FRAYD_BUNDLE=\$\(cd -- "\$\(dirname -- "\$0"\)" && pwd -P\)',
+    r'if \[\[ ! -x "\$FRAYD_BUNDLE/frayd-native" \]\]; then',
+    r"printf '%s\\n' '[^']*' >&2",
+    r'exit 2',
+    r'fi',
+    r'exec "\$FRAYD_BUNDLE/frayd-native" uninstall "\$@"',
+]
+
+
+def uninstall_policy_violations(text):
+    """List every statement in the legacy uninstall shim beyond its helper-presence guard and the final exec."""
+    statements = [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith('#')]
+    problems = [f'statement outside the guard-and-exec shape: {statement}' for statement in statements
+                if not any(re.fullmatch(pattern, statement) for pattern in UNINSTALL_SHAPE)]
+    if len(statements) != len(UNINSTALL_SHAPE) or not re.fullmatch(UNINSTALL_SHAPE[-1], statements[-1]):
+        problems.append('the shim must be the guard followed by exactly one final exec of the helper')
+    return problems
+
+
 class NativeSourceContract(unittest.TestCase):
-    def test_no_legacy_destructive_paths(self):
-        """Keep the legacy uninstall shim free of broad process and filesystem deletion."""
-        script = (ROOT / 'scripts/uninstall.sh').read_text()
-        for forbidden in ['pkill', 'rm -rf', 'systemctl', 'launchctl', 'PURGE_LIB', 'PURGE_DEPS']:
-            self.assertNotIn(forbidden, script)
+    release_workflow = ROOT / '.github/workflows/release-mac.yml'
+    pinned = '3d3c42e5aac5ba805825da76410c181273ba90b1'
 
     def test_manual_nonpublishing_workflow(self):
-        """Require manual macOS packaging without publication permissions or floating actions."""
-        workflow = (ROOT / '.github/workflows/release-mac.yml').read_text()
-        for forbidden in ['contents: write', 'softprops/', 'lipo ', 'tags:', '@v4', 'brew install']:
-            self.assertNotIn(forbidden, workflow)
-        for required in ['macos-15-intel', 'aarch64-apple-darwin', '--locked', '--bin frayd-native']:
-            self.assertIn(required, workflow)
+        """The macOS workflow is manual, read-only, non-publishing, pinned and locked."""
+        self.assertEqual(workflow_policy_violations(self.release_workflow.read_text()), [])
+
+    def test_workflow_policy_detects_each_violation(self):
+        text = self.release_workflow.read_text()
+        publishing = f'      - uses: actions/upload-artifact@{self.pinned}\n        with:\n          name: bundle\n'
+        mutations = {
+            'tag trigger': ('on:\n  workflow_dispatch:\n', 'on:\n  push:\n    tags:\n      - v1\n  workflow_dispatch:\n', 'triggers'),
+            'write permission': ('contents: read', 'contents: write', 'permission'),
+            'upload action': ('      - name: Nonsecret package', publishing + '      - name: Nonsecret package', 'publishing or artifact'),
+            'floating action': (f'actions/checkout@{self.pinned}', 'actions/checkout@v4', 'not pinned'),
+            'unlocked cargo': ('cargo +1.99.1 clippy --locked', 'cargo +1.99.1 clippy', 'cargo without --locked'),
+            'missing Intel runner': ('macos-15-intel', 'macos-14', 'matrix must include'),
+            'missing ARM target': ('target: aarch64-apple-darwin', 'target: aarch64-unknown-linux-gnu', 'matrix must include'),
+            'universal binary': ('uname -sm', 'lipo -create a b', 'universal binaries'),
+            'flow-style trigger': ('on:\n  workflow_dispatch:\n', 'on: [push, workflow_dispatch]\n', 'triggers'),
+            'inline write-all': ('permissions:\n  contents: read', 'permissions: write-all', 'permission'),
+            'job-level write': ('    timeout-minutes: 35\n', '    timeout-minutes: 35\n    permissions:\n      contents: write\n', 'permission scope can write'),
+        }
+        for name, (old, new, expected) in mutations.items():
+            with self.subTest(name):
+                self.assertIn(old, text)
+                problems = workflow_policy_violations(text.replace(old, new, 1))
+                self.assertTrue(any(expected in problem for problem in problems), problems)
+
+    def test_uninstall_shim_only_execs_the_helper(self):
+        """The legacy shim has no process, service or filesystem deletion of its own."""
+        script = ROOT / 'scripts/uninstall.sh'
+        text = script.read_text()
+        self.assertEqual(uninstall_policy_violations(text), [])
+        for name, extra in {'pkill': 'pkill -f frayd', 'rm': 'rm -rf "$HOME/.frayd"', 'systemctl': 'systemctl --user stop frayd',
+                            'launchctl': 'launchctl unload x'}.items():
+            with self.subTest(name):
+                mutated = text.replace('exec "$FRAYD_BUNDLE', extra + '\nexec "$FRAYD_BUNDLE', 1)
+                self.assertIn(extra, mutated)
+                self.assertTrue(uninstall_policy_violations(mutated))
+        with self.subTest('extra exec'):
+            self.assertTrue(uninstall_policy_violations(text + 'exec rm -rf /\n'))
+
+    def test_uninstall_shim_forwards_arguments_and_status_or_refuses_without_the_helper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory)
+            shim = bundle / 'uninstall.sh'
+            shim.write_text((ROOT / 'scripts/uninstall.sh').read_text())
+            shim.chmod(0o755)
+            refused = run_bounded([str(shim), '--yes'], capture_output=True, text=True)
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn('extracted native bundle', refused.stderr)
+            helper = bundle / 'frayd-native'
+            helper.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > "{bundle}/arguments"\nexit 7\n')
+            helper.chmod(0o755)
+            forwarded = run_bounded([str(shim), '--prefix', 'some prefix', '--yes'], capture_output=True, text=True)
+            self.assertEqual(forwarded.returncode, 7)
+            self.assertEqual((bundle / 'arguments').read_text().splitlines(), ['uninstall', '--prefix', 'some prefix', '--yes'])
 
     def test_runtime_discovery_requires_both_inputs(self):
-        """Partial runtime inputs skip discovery; complete inputs reach archive validation."""
-        with tempfile.TemporaryDirectory(prefix='frayd discovery ', dir=TEMP_ROOT) as directory:
-            archive = Path(directory) / 'fixture.tar.gz'
-            build_source = Path(directory) / 'absent-source/server'
-            for have_archive, have_source in [(False, False), (True, False), (False, True), (True, True)]:
-                with self.subTest(archive=have_archive, build_source=have_source):
-                    environment = os.environ.copy()
-                    for name in ['FRAYD_NATIVE_ARCHIVE', 'FRAYD_NATIVE_BUILD_SOURCE', 'FRAYD_NATIVE_REQUIRE_QUALIFICATION']:
-                        environment.pop(name, None)
-                    if have_archive:
-                        environment['FRAYD_NATIVE_ARCHIVE'] = str(archive)
-                    if have_source:
-                        environment['FRAYD_NATIVE_BUILD_SOURCE'] = str(build_source)
-                    result = run_bounded(
-                        [sys.executable, '-m', 'unittest', 'discover', '-s', str(ROOT / 'tests'),
-                         '-p', 'test_native_bundle.py', '-k', 'NativeRuntime', '-v'],
-                        env=environment, capture_output=True, text=True,
-                    )
-                    self.assertIn('Ran 1 test', result.stderr)
-                    self.assertNotIn('KeyError', result.stderr)
-                    if have_archive and have_source:
-                        # Complete inputs must admit the real case, which rejects
-                        # this deliberately absent synthetic archive checksum.
-                        self.assertEqual(result.returncode, 1, result.stderr)
-                        self.assertIn('FileNotFoundError', result.stderr)
-                        self.assertIn('fixture.tar.gz.sha256', result.stderr)
-                        self.assertNotIn('skipped', result.stderr)
+        """A lone archive or build source skips the runtime class; with both, archive validation is reached."""
+        spec = importlib.util.spec_from_file_location('native_bundle_probe', __file__)
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / 'archive.tar.gz'
+            archive.write_bytes(b'synthetic archive without a checksum file')
+            for with_archive, with_build_source in [(False, False), (True, False), (False, True), (True, True)]:
+                with self.subTest(archive=with_archive, build_source=with_build_source), mock.patch.dict(os.environ):
+                    os.environ.pop('FRAYD_NATIVE_ARCHIVE', None)
+                    os.environ.pop('FRAYD_NATIVE_BUILD_SOURCE', None)
+                    if with_archive:
+                        os.environ['FRAYD_NATIVE_ARCHIVE'] = str(archive)
+                    if with_build_source:
+                        os.environ['FRAYD_NATIVE_BUILD_SOURCE'] = directory
+                    probe = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(probe)
+                    result = unittest.TestResult()
+                    unittest.defaultTestLoader.loadTestsFromTestCase(probe.NativeRuntime).run(result)
+                    if with_archive and with_build_source:
+                        self.assertEqual((len(result.skipped), result.failures), (0, []))
+                        self.assertEqual(len(result.errors), 1, result.errors)
+                        self.assertRegex(result.errors[0][1], r'FileNotFoundError: .*archive\.tar\.gz\.sha256')
                     else:
-                        self.assertEqual(result.returncode, 0, result.stderr)
-                        self.assertIn('OK (skipped=1)', result.stderr)
-                        self.assertIn('requires FRAYD_NATIVE_ARCHIVE and FRAYD_NATIVE_BUILD_SOURCE', result.stderr)
+                        self.assertEqual((len(result.skipped), result.errors, result.failures), (1, [], []))
 
 
 class NativeOwnership(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        """Skip ownership cases unless a freshly built helper path is supplied."""
         if not os.environ.get('FRAYD_NATIVE_HELPER'):
             raise unittest.SkipTest('Supply a freshly built FRAYD_NATIVE_HELPER explicitly; generic Python discovery does not install/build Rust')
         if not HELPER.is_file():
             raise RuntimeError('Explicit native helper is unavailable')
 
     def setUp(self):
-        """Create a private bundle, install/data paths and protected sentinels for each case."""
         self.temp = tempfile.TemporaryDirectory(prefix='frayd native ', dir=TEMP_ROOT)
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
@@ -145,7 +308,6 @@ class NativeOwnership(unittest.TestCase):
             (self.base / name).write_bytes(b'NONSECRET protected fixture sentinel')
 
     def manifest(self):
-        """Write a manifest covering each bundle entry with mode, size and content digest."""
         entries = []
         for p in sorted(self.bundle.rglob('*')):
             if p.name == 'manifest.json':
@@ -154,69 +316,19 @@ class NativeOwnership(unittest.TestCase):
         (self.bundle / 'manifest.json').write_text(json.dumps({'schema': 1, 'version': '0.1.1', 'source': 'a' * 40, 'target': 'fixture', 'toolchain': 'fixture', 'entries': entries}))
 
     def run_helper(self, command, *args, code=0, answer='', environment=None):
-        """Invoke the native helper with this fixture prefix and assert its exit status."""
         result = run_bounded([str(HELPER), command, '--prefix', str(self.prefix), *args], input=answer, text=True, capture_output=True, env=environment)
         self.assertEqual(result.returncode, code, result.stderr)
         return result
 
     def install(self, *args, **kw):
-        """Install the fixture bundle into its private prefix and data directory."""
         return self.run_helper('install', '--bundle', str(self.bundle), '--data-dir', str(self.data), *args, **kw)
 
     def snapshot(self):
-        """Capture names, modes and bytes or symlink targets across the private fixture."""
-        return [(str(p.relative_to(self.base)), p.lstat().st_mode, os.readlink(p) if p.is_symlink() else p.read_bytes() if p.is_file() else None) for p in sorted(self.base.rglob('*'))]
-
-    def test_timeout_reaps_owned_descendants(self):
-        """On timeout, reap a descendant proven to hold a file lease."""
-        import fcntl
-        lease = self.base / 'timeout child lease'
-        ready = self.base / 'timeout child ready'
-        group_record = self.base / 'timeout owned group'
-        child = "import fcntl,pathlib,sys,time; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); time.sleep(2); pathlib.Path(sys.argv[2]).write_text('ready'); time.sleep(60)"
-        driver = "import os,pathlib,subprocess,sys,time; pathlib.Path(sys.argv[1]).write_text(str(os.getpgrp())); subprocess.Popen([sys.executable,'-c',sys.argv[2],sys.argv[3],sys.argv[4]]); time.sleep(60)"
-        original_communicate = subprocess.Popen.communicate
-        awaiting_readiness = True
-
-        def communicate_after_ready(process, input_data=None, timeout=None):
-            """Wait for the descendant lease before allowing the bounded runner to time out."""
-            nonlocal awaiting_readiness
-            if awaiting_readiness:
-                # Patch only this test's first communicate call. run_bounded has
-                # already recorded its process, so readiness failure still enters
-                # its normal owned-group cleanup without changing the runner API.
-                awaiting_readiness = False
-                deadline = time.monotonic() + 10
-                while not ready.exists():
-                    self.assertIsNone(process.poll(), 'fixture exited before readiness')
-                    self.assertLess(time.monotonic(), deadline, 'fixture readiness timed out')
-                    time.sleep(0.02)
-                with lease.open('r+') as handle:
-                    with self.assertRaises(BlockingIOError):
-                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return original_communicate(process, input_data, timeout=timeout)
-
-        try:
-            with mock.patch.object(subprocess.Popen, 'communicate', communicate_after_ready):
-                with self.assertRaises(subprocess.TimeoutExpired):
-                    run_bounded([sys.executable, '-c', driver, str(group_record), child, str(lease), str(ready)], timeout=1, capture_output=True, text=True)
-            self.assertFalse(awaiting_readiness)
-            self.assertTrue(ready.exists(), 'descendant was ready before the cleanup timer')
-            with lease.open('r+') as handle:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        finally:
-            if group_record.exists():
-                try:
-                    os.killpg(int(group_record.read_text()), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+        return snapshot(self.base)
 
     def test_package_complete_manifest_and_architecture(self):
-        """Package actual server identity and reject a mismatched target without fixture writes."""
-        architecture = 'aarch64' if os.uname().machine in ['arm64', 'aarch64'] else 'x86_64'
-        target = architecture + ('-apple-darwin' if os.uname().sysname == 'Darwin' else '-unknown-linux-gnu')
         output = self.base / 'package output'
-        result = run_bounded([str(ROOT / 'scripts/native/package.sh'), str(output), target, str(SERVER), str(HELPER)], capture_output=True, text=True)
+        result = package(output, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         archive = next(output.glob('*.tar.gz'))
         self.assertEqual(archive.with_suffix(archive.suffix + '.sha256').read_text().split()[0], hashlib.sha256(archive.read_bytes()).hexdigest())
@@ -228,32 +340,26 @@ class NativeOwnership(unittest.TestCase):
         expected = {'frayd-native', 'frayd-server', 'install.sh', 'start.sh', 'uninstall.sh', 'README.md', 'client/vendor/plyr/plyr.min.js', 'build-info.json'}
         self.assertTrue(expected.issubset({item['path'] for item in manifest['entries']}))
         self.assertFalse(any('.env' in item['path'] for item in manifest['entries']))
-        self.assertEqual(manifest['target'], target)
+        self.assertEqual(manifest['target'], TARGET)
         identity = json.loads(run_bounded([str(SERVER), '--build-info'], check=True, capture_output=True, text=True).stdout)
         self.assertEqual(json.loads((payload / 'build-info.json').read_text()), identity)
         self.assertEqual(identity['commit'], manifest['source'])
-        original_bundle = self.bundle
         self.bundle = payload
         self.install('--yes')
         self.run_helper('uninstall', '--yes')
-        self.bundle = original_bundle
         fake_output = self.base / 'helper is not server'
-        rejected = run_bounded([str(ROOT / 'scripts/native/package.sh'), str(fake_output), target, str(HELPER), str(HELPER)], capture_output=True)
+        rejected = package(fake_output, server=HELPER, capture_output=True)
         self.assertNotEqual(rejected.returncode, 0)
         self.assertFalse(fake_output.exists())
-        wrong_output = self.base / 'wrong architecture output'
-        wrong_target = ('x86_64' if architecture == 'aarch64' else 'aarch64') + target[len(architecture):]
+        wrong_target = ('x86_64' if ARCHITECTURE == 'aarch64' else 'aarch64') + TARGET[len(ARCHITECTURE):]
         before = self.snapshot()
-        result = run_bounded([str(ROOT / 'scripts/native/package.sh'), str(wrong_output), wrong_target, str(SERVER), str(HELPER)], capture_output=True)
+        result = package(self.base / 'wrong architecture output', target=wrong_target, capture_output=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.snapshot(), before)
 
     def test_tar_preserved_modes_under_restrictive_umask(self):
-        """Require preserved archive modes for installation under a restrictive umask."""
-        architecture = 'aarch64' if os.uname().machine in ['arm64', 'aarch64'] else 'x86_64'
-        target = architecture + ('-apple-darwin' if os.uname().sysname == 'Darwin' else '-unknown-linux-gnu')
         output = self.base / 'umask package'
-        run_bounded([str(ROOT / 'scripts/native/package.sh'), str(output), target, str(SERVER), str(HELPER)], check=True, capture_output=True)
+        package(output, check=True, capture_output=True)
         archive = next(output.glob('*.tar.gz'))
         original = next(path for path in output.iterdir() if path.is_dir())
         self.assertIn('tar -xpzf', (original / 'README.md').read_text())
@@ -278,7 +384,6 @@ class NativeOwnership(unittest.TestCase):
         self.assertTrue((self.data / '.frayd-data.json').is_file())
 
     def test_decline_zero_effects(self):
-        """Declining install or uninstall leaves the fixture byte-for-byte unchanged."""
         before = self.snapshot()
         self.install(answer='n\n')
         self.assertEqual(self.snapshot(), before)
@@ -288,7 +393,6 @@ class NativeOwnership(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
 
     def test_install_start_remove_preserves_data_and_reinstall(self):
-        """Starting uses private data; uninstall preserves it and permits reinstall."""
         self.install('--yes')
         result = self.run_helper('start', '--port', '28484')
         self.assertEqual(result.stdout.splitlines(), ['127.0.0.1', str(self.data / 'frayd.db'), str(self.prefix / 'client')])
@@ -301,7 +405,6 @@ class NativeOwnership(unittest.TestCase):
         self.run_helper('uninstall', '--yes')
 
     def test_removal_without_data_authority_preserves_all_remaining_data(self):
-        """Missing data authority permits prefix removal while retaining remaining data."""
         for state in ['moved directory', 'deleted directory', 'missing marker', 'malformed marker']:
             with self.subTest(state=state):
                 self.prefix = self.base / ('installed ' + state)
@@ -329,7 +432,6 @@ class NativeOwnership(unittest.TestCase):
                 self.assertEqual(self.data.exists(), state in ['missing marker', 'malformed marker'])
 
     def test_missing_data_marker_does_not_weaken_removal_guards(self):
-        """A missing data marker cannot bypass modified payload or overlap guards."""
         for guard in ['modified payload', 'unknown payload', 'uncertain child', 'data alias overlap']:
             with self.subTest(guard=guard):
                 self.prefix = self.base / ('installed ' + guard)
@@ -363,7 +465,6 @@ class NativeOwnership(unittest.TestCase):
                 self.run_helper('uninstall', '--yes')
 
     def test_missing_absolute_library_keeps_installed_lifecycle_available(self):
-        """An unavailable absolute library allows lifecycle actions without creating roots."""
         self.install('--yes')
         sentinel = self.data / 'frayd.db'
         sentinel.write_bytes(b'NONSECRET preserved offline fixture database')
@@ -386,7 +487,6 @@ class NativeOwnership(unittest.TestCase):
         self.assertFalse(missing.exists())
 
     def test_prospective_missing_library_overlap_refuses_without_writes(self):
-        """Refuse missing library paths that may overlap owned or aliased locations."""
         for parent in [self.prefix, self.data, self.bundle]:
             with self.subTest(operation='install', parent=parent.name):
                 missing = parent / 'offline media' / 'nested root'
@@ -415,7 +515,6 @@ class NativeOwnership(unittest.TestCase):
                 self.assertFalse(missing.exists())
 
     def test_incomplete_bundle_refuses_before_writes(self):
-        """An incomplete bundle is refused before any installation write."""
         (self.bundle / 'start.sh').unlink()
         self.manifest()
         before = self.snapshot()
@@ -423,7 +522,6 @@ class NativeOwnership(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
 
     def test_corrupt_or_extra_bundle_zero_effects(self):
-        """Checksum, extra-entry, traversal and symlink corruption leave no effects."""
         for mutation in ['checksum', 'extra', 'traversal', 'symlink']:
             with self.subTest(mutation=mutation):
                 index = self.bundle / 'client/index.html'
@@ -450,7 +548,6 @@ class NativeOwnership(unittest.TestCase):
                 (self.bundle / 'manifest.json').write_bytes(manifest)
 
     def test_permissive_umask_and_unknown_existing_data(self):
-        """Unknown existing data is refused and permissive umask still yields private modes."""
         self.data.mkdir(mode=0o700)
         (self.data / '.env').write_bytes(b'NONSECRET fixture configuration')
         (self.data / 'frayd.db').write_bytes(b'NONSECRET fixture database')
@@ -468,7 +565,6 @@ class NativeOwnership(unittest.TestCase):
         self.assertEqual(stat.S_IMODE((self.data / '.frayd-data.json').stat().st_mode), 0o600)
 
     def test_unknown_modified_and_extra_prefix_refused(self):
-        """Existing unknown or modified prefix content blocks install and removal."""
         self.prefix.mkdir()
         (self.prefix / '.env').write_text('preserve')
         before = self.snapshot()
@@ -491,7 +587,6 @@ class NativeOwnership(unittest.TestCase):
                 path.write_bytes(original)
 
     def test_filesystem_failure_preserves_receipt_for_retry(self):
-        """A filesystem removal failure keeps the receipt available for a later retry."""
         self.install('--yes')
         self.base.chmod(0o500)
         self.addCleanup(self.base.chmod, 0o700)
@@ -503,8 +598,45 @@ class NativeOwnership(unittest.TestCase):
         self.run_helper('uninstall', '--yes')
         self.assertFalse(self.prefix.exists())
 
+    def test_final_removal_failure_after_confirmation_restores_retry_metadata(self):
+        if os.geteuid() == 0:
+            self.skipTest('root bypasses the parent mode that makes the final prefix removal fail')
+        self.install('--yes')
+        receipt = (self.prefix / '.frayd-install.json').read_bytes()
+        # The parent-mode preflight passes; the parent becomes read-only while the helper waits for consent.
+        process = subprocess.Popen(
+            [str(HELPER), 'uninstall', '--prefix', str(self.prefix)],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
+        try:
+            os.set_blocking(process.stderr.fileno(), False)
+            prompt = bytearray()
+
+            def prompted():
+                prompt.extend(process.stderr.read() or b'')
+                return prompt.endswith(b'[y/N] ') or process.poll() is not None
+            wait_for(prompted, 'uninstall confirmation prompt')
+            self.assertTrue(prompt.endswith(b'[y/N] '), prompt)
+            os.set_blocking(process.stderr.fileno(), True)
+            self.base.chmod(0o500)
+            self.addCleanup(self.base.chmod, 0o700)
+            _, stderr = process.communicate(b'y\n', timeout=10)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=10)
+        self.assertEqual(process.returncode, 2, stderr)
+        self.assertIn(b'final removal failed', stderr)
+        self.assertEqual(sorted(p.name for p in self.prefix.iterdir()), ['.frayd-install.json', '.frayd-lock'])
+        self.assertEqual((self.prefix / '.frayd-install.json').read_bytes(), receipt)
+        self.assertEqual((self.prefix / '.frayd-lock').read_bytes(), b'')
+        for name in ['.frayd-install.json', '.frayd-lock']:
+            self.assertEqual(stat.S_IMODE((self.prefix / name).stat().st_mode), 0o600, name)
+        self.base.chmod(0o700)
+        self.run_helper('uninstall', '--yes')
+        self.assertFalse(self.prefix.exists())
+        self.assertTrue((self.data / '.frayd-data.json').is_file())
+
     def test_partial_removal_retry_and_data_redirect_refusal(self):
-        """Reject redirected data; tolerate a previously removed owned file on retry."""
         self.install('--yes')
         redirect = self.data / 'thumbs'
         redirect.symlink_to(self.base, target_is_directory=True)
@@ -519,7 +651,6 @@ class NativeOwnership(unittest.TestCase):
         self.assertTrue((self.data / '.frayd-data.json').exists())
 
     def test_foreground_interrupt_cleans_child_and_allows_removal(self):
-        """Helper, child and simultaneous foreground INT/TERM exit cleanly after reaping."""
         (self.bundle / 'frayd-server').write_text('#!/bin/sh\nexec sleep 60\n')
         self.manifest()
         for target in ['group', 'helper', 'child', 'both-ready']:
@@ -529,19 +660,7 @@ class NativeOwnership(unittest.TestCase):
                     process = subprocess.Popen([str(HELPER), 'start', '--prefix', str(self.prefix)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, start_new_session=True)
                     try:
                         marker = self.prefix / '.frayd-child.json'
-                        deadline = time.monotonic() + 10
-                        while time.monotonic() < deadline:
-                            if marker.exists():
-                                try:
-                                    document = json.loads(marker.read_text())
-                                except json.JSONDecodeError:
-                                    continue
-                                if document.get('state') == 'running':
-                                    child = document['pid']
-                                    break
-                            time.sleep(0.02)
-                        else:
-                            self.fail('fixture child did not start')
+                        child = wait_for(lambda: running_child_pid(self.prefix), 'fixture child start')
                         if target == 'group':
                             os.killpg(process.pid, interrupt)
                         elif target == 'helper':
@@ -574,7 +693,6 @@ class NativeOwnership(unittest.TestCase):
                         process.stderr.close()
 
     def test_unexpected_child_exit_remains_an_error(self):
-        """Ordinary failures must remain errors rather than being accepted as interrupts."""
         (self.bundle / 'frayd-server').write_text('#!/bin/sh\nexit 7\n')
         self.manifest()
         self.install('--yes')
@@ -584,27 +702,13 @@ class NativeOwnership(unittest.TestCase):
         self.run_helper('uninstall', '--yes')
 
     def test_orphan_receipt_and_active_installation_refusal(self):
-        """Active or uncertain child receipts block start and uninstall without writes."""
         (self.bundle / 'frayd-server').write_text('#!/bin/sh\nexec sleep 60\n')
         self.manifest()
         self.install('--yes')
         process = subprocess.Popen([str(HELPER), 'start', '--prefix', str(self.prefix)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         try:
-            deadline = time.monotonic() + 10
             marker = self.prefix / '.frayd-child.json'
-            child = None
-            while time.monotonic() < deadline:
-                if marker.exists():
-                    try:
-                        document = json.loads(marker.read_text())
-                    except (json.JSONDecodeError, FileNotFoundError):
-                        time.sleep(0.02)
-                        continue
-                    if document.get('state') == 'running':
-                        child = document['pid']
-                        break
-                time.sleep(0.02)
-            self.assertIsNotNone(child)
+            child = wait_for(lambda: running_child_pid(self.prefix), 'fixture child start')
             before = self.snapshot()
             self.run_helper('uninstall', '--yes', code=2)
             self.run_helper('start', code=2)
@@ -623,7 +727,6 @@ class NativeOwnership(unittest.TestCase):
                 process.wait(timeout=10)
 
     def test_invalid_targets_and_flags_zero_effects(self):
-        """Invalid target paths and destructive flags leave all fixture paths unchanged."""
         before = self.snapshot()
         for target in ['relative', '/', '/usr/frayd', str(ROOT / 'native-test-prefix'), str(self.base) + '/./unsafe', str(self.base) + '//unsafe', str(self.base / '.cargo/new'), str(self.base / '.rustup/new'), str(self.base / 'original checkout/new')]:
             result = run_bounded([str(HELPER), 'install', '--bundle', str(self.bundle), '--prefix', target, '--data-dir', str(self.data), '--yes'], capture_output=True)
@@ -643,189 +746,159 @@ class NativeOwnership(unittest.TestCase):
     'actual server qualification requires FRAYD_NATIVE_ARCHIVE and FRAYD_NATIVE_BUILD_SOURCE',
 )
 class NativeRuntime(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix='frayd runtime ', dir=TEMP_ROOT)
+        self.addCleanup(temp.cleanup)
+        self.base = Path(temp.name)
+        archive = Path(os.environ['FRAYD_NATIVE_ARCHIVE'])
+        checksum = archive.with_suffix(archive.suffix + '.sha256').read_text().split()[0]
+        self.assertEqual(hashlib.sha256(archive.read_bytes()).hexdigest(), checksum)
+        extracted = self.base / 'relocated extracted bundle'
+        extracted.mkdir(mode=0o700)
+        with tarfile.open(archive) as tar:
+            for member in tar.getmembers():
+                self.assertTrue(member.isfile() or member.isdir())
+                self.assertFalse(Path(member.name).is_absolute())
+                self.assertNotIn('..', Path(member.name).parts)
+            tar.extractall(extracted, filter='data')
+        bundles = list(extracted.iterdir())
+        self.assertEqual(len(bundles), 1)
+        self.bundle = bundles[0]
+        self.prefix = self.base / 'installed application'
+        self.data = self.base / 'application data'
+        self.library = self.base / 'library fixture'
+        self.library.mkdir(mode=0o700)
+        run_bounded([str(self.bundle / 'install.sh'), '--prefix', str(self.prefix), '--data-dir', str(self.data), '--yes'], check=True, capture_output=True)
+        with socket.socket() as probe:
+            probe.bind(('127.0.0.1', 0))
+            self.port = probe.getsockname()[1]
+        self.environment = os.environ.copy()
+        for name in ['FRAYD_LIBRARY', 'FRAYD_CERT', 'FRAYD_KEY', 'FRAYD_UPNP']:
+            self.environment.pop(name, None)
+        self.environment['FRAYD_BIND'] = 'invalid inherited value'
+        # Paths deliberately poison inherited defaults: helper must override all four.
+        for name in ['FRAYD_DB', 'FRAYD_THUMBS', 'FRAYD_TRANSCODES', 'FRAYD_CLIENT_DIR']:
+            self.environment[name] = str(self.base / 'MUST NOT EXIST')
+        self.process = None
+        self.addCleanup(self.kill_server)
+
+    def kill_server(self):
+        if self.process is not None and self.process.poll() is None:
+            # This process group was created by this fixture only.
+            os.killpg(self.process.pid, signal.SIGKILL)
+            self.process.wait(timeout=10)
+
+    def request(self, path, payload=None, token=None, expected=200):
+        headers = {'Content-Type': 'application/json'}
+        if token:
+            headers['Authorization'] = 'Bearer ' + token
+        body = None if payload is None else json.dumps(payload).encode()
+        req = urllib.request.Request(f'http://127.0.0.1:{self.port}{path}', data=body, headers=headers)
+        with urllib.request.urlopen(req, timeout=3) as response:
+            self.assertEqual(response.status, expected)
+            return response.read()
+
+    def request_json(self, *args, **kw):
+        return json.loads(self.request(*args, **kw))
+
+    def start(self):
+        self.process = subprocess.Popen([str(self.prefix / 'start.sh'), '--prefix', str(self.prefix), '--port', str(self.port)], env=self.environment, cwd=self.base, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+        def healthy():
+            self.assertIsNone(self.process.poll(), 'supervisor exited before readiness')
+            try:
+                return self.request_json('/api/health') == {'status': 'ok'}
+            except OSError:
+                return False
+
+        wait_for(healthy, 'native HTTP readiness', timeout=20)
+
+    def stop(self, group_interrupt=False):
+        """Stop the server by group interrupt or by terminating its child; require a clean exit and a cleared receipt."""
+        receipt = self.prefix / '.frayd-child.json'
+        if group_interrupt:
+            os.killpg(self.process.pid, signal.SIGINT)
+        else:
+            child = json.loads(receipt.read_text())['pid']
+            parent = run_bounded(['ps', '-o', 'ppid=', '-p', str(child)], text=True, capture_output=True, check=True, timeout=10).stdout.strip()
+            self.assertEqual(int(parent), self.process.pid)
+            os.kill(child, signal.SIGTERM)
+        self.assertEqual(self.process.wait(timeout=10), 0)
+        self.assertFalse(receipt.exists())
+        self.process = None
+
     def test_relocated_real_server_reader_and_persistence(self):
-        """Relocated archive serves real HTTP assets and retains reader state across restart."""
         build_source = Path(os.environ['FRAYD_NATIVE_BUILD_SOURCE'])
         self.assertTrue(build_source.is_absolute())
         self.assertFalse(any(build_source.iterdir()) if build_source.exists() else False, 'compile-time source must be absent or empty in an isolated namespace')
         self.assertFalse((build_source.parent / 'client/index.html').exists(), 'compile-time client assets must also be unavailable')
-        with tempfile.TemporaryDirectory(prefix='frayd runtime ', dir=TEMP_ROOT) as directory:
-            base = Path(directory)
-            extracted = base / 'relocated extracted bundle'
-            extracted.mkdir(mode=0o700)
-            archive = Path(os.environ['FRAYD_NATIVE_ARCHIVE'])
-            checksum = archive.with_suffix(archive.suffix + '.sha256').read_text().split()[0]
-            self.assertEqual(hashlib.sha256(archive.read_bytes()).hexdigest(), checksum)
-            with tarfile.open(archive) as tar:
-                for member in tar.getmembers():
-                    self.assertTrue(member.isfile() or member.isdir())
-                    self.assertFalse(Path(member.name).is_absolute())
-                    self.assertNotIn('..', Path(member.name).parts)
-                tar.extractall(extracted, filter='data')
-            bundles = list(extracted.iterdir())
-            self.assertEqual(len(bundles), 1)
-            bundle = bundles[0]
-            prefix = base / 'installed application'
-            data = base / 'application data'
-            library = base / 'library fixture'
-            library.mkdir(mode=0o700)
-            run_bounded([str(bundle / 'install.sh'), '--prefix', str(prefix), '--data-dir', str(data), '--yes'], check=True, capture_output=True)
-            # Every HTTP asset is compared with this extracted manifest, not source files.
-            manifest = json.loads((bundle / 'manifest.json').read_text())
-            self.assertTrue(manifest['toolchain'].startswith('rustc '))
-            if os.environ.get('FRAYD_NATIVE_TOOLCHAIN_FILE'):
-                self.assertEqual(manifest['toolchain'], Path(os.environ['FRAYD_NATIVE_TOOLCHAIN_FILE']).read_text().strip())
-            expected_architecture = os.environ.get('FRAYD_NATIVE_EXPECT_ARCH')
-            if expected_architecture:
-                self.assertEqual(os.uname().machine, expected_architecture)
-            for asset in (p for p in manifest['entries'] if p['kind'] == 'file' and p['path'].startswith('client/vendor/')):
-                self.assertTrue((prefix / asset['path']).is_file())
-            with socket.socket() as probe:
-                probe.bind(('127.0.0.1', 0))
-                port = probe.getsockname()[1]
-            url = f'http://127.0.0.1:{port}'
-            tools = base / 'private tools'
-            tools.mkdir(mode=0o700)
-            upnp_record = base / 'router mapping requests'
-            upnp_recorder = tools / 'upnpc'
-            upnp_recorder.write_text('#!/bin/sh\nprintf \'requested\\n\' >> "$FRAYD_NATIVE_UPNP_RECORD"\n')
-            upnp_recorder.chmod(0o700)
-            environment = os.environ.copy()
-            environment['PATH'] = str(tools) + os.pathsep + environment.get('PATH', '')
-            environment['FRAYD_NATIVE_UPNP_RECORD'] = str(upnp_record)
-            # Prove the recorder works; it performs no router or network operation.
-            run_bounded([str(upnp_recorder)], env=environment, check=True)
-            self.assertEqual(upnp_record.read_text(), 'requested\n')
-            upnp_record.unlink()
-            for name in ['FRAYD_LIBRARY', 'FRAYD_CERT', 'FRAYD_KEY']:
-                environment.pop(name, None)
-            environment['FRAYD_UPNP'] = '0'
-            environment['FRAYD_BIND'] = 'invalid inherited value'
-            # Paths deliberately poison inherited defaults: helper must override all four.
-            for name in ['FRAYD_DB', 'FRAYD_THUMBS', 'FRAYD_TRANSCODES', 'FRAYD_CLIENT_DIR']:
-                environment[name] = str(base / 'MUST NOT EXIST')
-            process = None
-
-            def request(path, payload=None, token=None, expected=200):
-                """Issue a loopback JSON request and assert its expected HTTP status."""
-                headers = {'Content-Type': 'application/json'}
-                if token:
-                    headers['Authorization'] = 'Bearer ' + token
-                body = None if payload is None else json.dumps(payload).encode()
-                req = urllib.request.Request(url + path, data=body, headers=headers)
-                with urllib.request.urlopen(req, timeout=3) as response:
-                    self.assertEqual(response.status, expected)
-                    return response.read()
-
-            def start():
-                """Start the relocated server and wait up to twenty seconds for health."""
-                nonlocal process
-                process = subprocess.Popen([str(prefix / 'start.sh'), '--prefix', str(prefix), '--port', str(port)], env=environment, cwd=base, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-                deadline = time.monotonic() + 20
-                while time.monotonic() < deadline:
-                    self.assertIsNone(process.poll(), 'supervisor exited before readiness')
-                    try:
-                        if json.loads(request('/api/health')) == {'status': 'ok'}:
-                            return
-                    except OSError:
-                        time.sleep(0.1)
-                self.fail('native HTTP readiness timed out')
-
-            def stop(group_interrupt=False):
-                """Stop the server by group interrupt or child signal and clear its receipt."""
-                nonlocal process
-                if process is None or process.poll() is not None:
-                    return
-                if group_interrupt:
-                    os.killpg(process.pid, signal.SIGINT)
-                    self.assertEqual(process.wait(timeout=10), 0)
-                    self.assertFalse((prefix / '.frayd-child.json').exists())
-                    process = None
-                    return
-                child = json.loads((prefix / '.frayd-child.json').read_text())['pid']
-                parent = run_bounded(['ps', '-o', 'ppid=', '-p', str(child)], text=True, capture_output=True, check=True, timeout=10).stdout.strip()
-                self.assertEqual(int(parent), process.pid)
-                os.kill(child, signal.SIGTERM)
-                self.assertEqual(process.wait(timeout=10), 0)
-                self.assertFalse((prefix / '.frayd-child.json').exists())
-                process = None
-
-            try:
-                start()
-                self.assertEqual(request('/'), (prefix / 'client/index.html').read_bytes())
-                vendor = next(p for p in manifest['entries'] if p['kind'] == 'file' and p['path'].startswith('client/vendor/'))
-                self.assertEqual(hashlib.sha256(request('/' + vendor['path'][len('client/'):])).hexdigest(), vendor['sha256'])
-                self.assertEqual(json.loads(request('/api/setup')), {'needed': True})
-                credentials = {'email': 'native-fixture@example.invalid', 'password': secrets.token_urlsafe(32)}
-                owner = json.loads(request('/api/setup', credentials))
-                self.assertTrue(owner['is_admin'])
-                token = owner['token']
-                request('/api/admin/settings', {'library_paths': [str(library)]}, token, expected=204)
-                image = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII=')
-                with zipfile.ZipFile(library / 'native-reader.cbz', 'w') as comic:
-                    comic.writestr('001.png', image)
-                request('/api/scan', {}, token, expected=202)
-                deadline = time.monotonic() + 20
-                while json.loads(request('/api/scan/status'))['scanning']:
-                    self.assertLess(time.monotonic(), deadline)
-                    time.sleep(0.1)
-                media_id = next(item['id'] for item in json.loads(request('/api/library')) if item['kind'] == 'comic')
-                self.assertEqual(json.loads(request(f'/api/comic/{media_id}/pages')), ['001.png'])
-                self.assertEqual(request(f'/api/comic/{media_id}/page/0'), image)
-                request('/api/progress', {'media_id': media_id, 'position': 0.5}, token, expected=204)
-                # Active lifecycle refusal must leave every installed byte unchanged.
-                before = [(str(p.relative_to(prefix)), p.stat().st_mode, p.read_bytes() if p.is_file() else None) for p in sorted(prefix.rglob('*'))]
-                refused = run_bounded([str(bundle / 'uninstall.sh'), '--prefix', str(prefix), '--yes'], capture_output=True)
-                self.assertEqual(refused.returncode, 2)
-                self.assertEqual(before, [(str(p.relative_to(prefix)), p.stat().st_mode, p.read_bytes() if p.is_file() else None) for p in sorted(prefix.rglob('*'))])
-                request('/api/admin/settings', {'upnp': True}, token, expected=204)
-                stop()
-                environment['FRAYD_UPNP'] = '1'
-                start()
-                # Both inherited and persisted opt-ins must be inert on loopback.
-                deadline = time.monotonic() + 0.5
-                while time.monotonic() < deadline:
-                    self.assertFalse(upnp_record.exists(), 'loopback server requested router mapping')
-                    time.sleep(0.05)
-                self.assertEqual(json.loads(request('/api/setup')), {'needed': False})
-                login = json.loads(request('/api/auth/login', credentials))
-                self.assertEqual(json.loads(request(f'/api/progress/{media_id}', token=login['token']))['position'], 0.5)
-                self.assertEqual(request(f'/api/comic/{media_id}/page/0'), image)
-                self.assertFalse((base / 'MUST NOT EXIST').exists())
-                request('/api/admin/settings', {'upnp': False}, login['token'], expected=204)
-                environment['FRAYD_UPNP'] = '0'
-                stop(group_interrupt=True)
-                # An unavailable explicit root must leave account/metadata reads
-                # healthy without granting permission to recreate source media.
-                missing_library = base / 'unavailable source mount' / 'media'
-                environment['FRAYD_LIBRARY'] = str(missing_library)
-                start()
-                self.assertEqual(json.loads(request('/api/health')), {'status': 'ok'})
-                offline_status = json.loads(request('/api/scan/status'))
-                self.assertTrue(offline_status['library_configured'])
-                self.assertEqual(offline_status['library_count'], 1)
-                offline_login = json.loads(request('/api/auth/login', credentials))
-                self.assertEqual(json.loads(request(f'/api/progress/{media_id}', token=offline_login['token']))['position'], 0.5)
-                offline_metadata = json.loads(request('/api/library'))
-                self.assertTrue(any(item['id'] == media_id and item['kind'] == 'comic' and item['title'] == 'native-reader' for item in offline_metadata))
-                self.assertFalse(missing_library.exists())
-                self.assertFalse(missing_library.parent.exists())
-                stop(group_interrupt=True)
-                environment.pop('FRAYD_LIBRARY')
-                start()
-                self.assertEqual(request(f'/api/comic/{media_id}/page/0'), image)
-                self.assertEqual(json.loads(request(f'/api/progress/{media_id}', token=offline_login['token']))['position'], 0.5)
-                stop(group_interrupt=True)
-                preserved = {str(p.relative_to(data)): p.read_bytes() for p in data.rglob('*') if p.is_file()}
-                run_bounded([str(bundle / 'uninstall.sh'), '--prefix', str(prefix), '--yes'], check=True, capture_output=True)
-                self.assertFalse(prefix.exists())
-                self.assertTrue(preserved == {str(p.relative_to(data)): p.read_bytes() for p in data.rglob('*') if p.is_file()}, 'application data changed during removal')
-                print(json.dumps({'scenario': 'actual-native-relocated-reader-persistence-removal', 'status': 'passed', 'platform': os.uname().sysname, 'architecture': os.uname().machine, 'archive_sha256': checksum, 'base_source_commit': manifest['source'], 'version': manifest['version'], 'source_files_unavailable': True, 'unavailable_absolute_library_reads': 'passed', 'loopback_upnp_requests': 0, 'media_codecs': 'not-qualified'}))
-            finally:
-                if process is not None and process.poll() is None:
-                    # This process group was created by this exact fixture only.
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait(timeout=10)
+        # Every HTTP asset is compared with this extracted manifest, not source files.
+        manifest = json.loads((self.bundle / 'manifest.json').read_text())
+        self.assertTrue(manifest['toolchain'].startswith('rustc '))
+        if os.environ.get('FRAYD_NATIVE_TOOLCHAIN_FILE'):
+            self.assertEqual(manifest['toolchain'], Path(os.environ['FRAYD_NATIVE_TOOLCHAIN_FILE']).read_text().strip())
+        if os.environ.get('FRAYD_NATIVE_EXPECT_ARCH'):
+            self.assertEqual(os.uname().machine, os.environ['FRAYD_NATIVE_EXPECT_ARCH'])
+        vendor_files = [p for p in manifest['entries'] if p['kind'] == 'file' and p['path'].startswith('client/vendor/')]
+        for asset in vendor_files:
+            self.assertTrue((self.prefix / asset['path']).is_file())
+        self.start()
+        self.assertEqual(self.request('/'), (self.prefix / 'client/index.html').read_bytes())
+        vendor = vendor_files[0]
+        self.assertEqual(hashlib.sha256(self.request('/' + vendor['path'][len('client/'):])).hexdigest(), vendor['sha256'])
+        self.assertEqual(self.request_json('/api/setup'), {'needed': True})
+        credentials = {'email': 'native-fixture@example.invalid', 'password': secrets.token_urlsafe(32)}
+        owner = self.request_json('/api/setup', credentials)
+        self.assertTrue(owner['is_admin'])
+        token = owner['token']
+        self.request('/api/admin/settings', {'library_paths': [str(self.library)]}, token, expected=204)
+        image = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII=')
+        with zipfile.ZipFile(self.library / 'native-reader.cbz', 'w') as comic:
+            comic.writestr('001.png', image)
+        self.request('/api/scan', {}, token, expected=202)
+        wait_for(lambda: not self.request_json('/api/scan/status')['scanning'], 'library scan to finish', timeout=20)
+        media_id = next(item['id'] for item in self.request_json('/api/library') if item['kind'] == 'comic')
+        self.assertEqual(self.request_json(f'/api/comic/{media_id}/pages'), ['001.png'])
+        self.assertEqual(self.request(f'/api/comic/{media_id}/page/0'), image)
+        self.request('/api/progress', {'media_id': media_id, 'position': 0.5}, token, expected=204)
+        # Active lifecycle refusal must leave every installed byte unchanged.
+        before = snapshot(self.prefix)
+        refused = run_bounded([str(self.bundle / 'uninstall.sh'), '--prefix', str(self.prefix), '--yes'], capture_output=True)
+        self.assertEqual(refused.returncode, 2)
+        self.assertEqual(snapshot(self.prefix), before)
+        self.stop()
+        self.start()
+        self.assertEqual(self.request_json('/api/setup'), {'needed': False})
+        login = self.request_json('/api/auth/login', credentials)
+        self.assertEqual(self.request_json(f'/api/progress/{media_id}', token=login['token'])['position'], 0.5)
+        self.assertEqual(self.request(f'/api/comic/{media_id}/page/0'), image)
+        self.assertFalse((self.base / 'MUST NOT EXIST').exists())
+        self.stop(group_interrupt=True)
+        # An unavailable explicit root must leave account/metadata reads
+        # healthy without granting permission to recreate source media.
+        missing_library = self.base / 'unavailable source mount' / 'media'
+        self.environment['FRAYD_LIBRARY'] = str(missing_library)
+        self.start()
+        self.assertEqual(self.request_json('/api/health'), {'status': 'ok'})
+        offline_status = self.request_json('/api/scan/status')
+        self.assertTrue(offline_status['library_configured'])
+        self.assertEqual(offline_status['library_count'], 1)
+        offline_login = self.request_json('/api/auth/login', credentials)
+        self.assertEqual(self.request_json(f'/api/progress/{media_id}', token=offline_login['token'])['position'], 0.5)
+        offline_metadata = self.request_json('/api/library')
+        self.assertTrue(any(item['id'] == media_id and item['kind'] == 'comic' and item['title'] == 'native-reader' for item in offline_metadata))
+        self.assertFalse(missing_library.exists())
+        self.assertFalse(missing_library.parent.exists())
+        self.stop(group_interrupt=True)
+        del self.environment['FRAYD_LIBRARY']
+        self.start()
+        self.assertEqual(self.request(f'/api/comic/{media_id}/page/0'), image)
+        self.assertEqual(self.request_json(f'/api/progress/{media_id}', token=offline_login['token'])['position'], 0.5)
+        self.stop(group_interrupt=True)
+        preserved = snapshot(self.data)
+        run_bounded([str(self.bundle / 'uninstall.sh'), '--prefix', str(self.prefix), '--yes'], check=True, capture_output=True)
+        self.assertFalse(self.prefix.exists())
+        self.assertEqual(snapshot(self.data), preserved, 'application data changed during removal')
 
 
 if __name__ == '__main__':

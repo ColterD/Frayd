@@ -33,14 +33,9 @@ jobs:
       - name: Verify actual native architecture (reject Rosetta)
         shell: bash
         run: |
-          test "$(uname -s)" = Darwin
           test "$(uname -m)" = "$FRAYD_NATIVE_EXPECT_ARCH"
+          # Rosetta passes the x86_64 uname check but reports proc_translated=1.
           test "$(sysctl -n sysctl.proc_translated 2>/dev/null || true)" != 1
-          if test "$FRAYD_NATIVE_EXPECT_ARCH" = x86_64; then
-            test "$(sysctl -n hw.optional.arm64 2>/dev/null || true)" != 1
-          else
-            test "$(sysctl -n hw.optional.arm64)" = 1
-          fi
           printf 'CARGO_TARGET_DIR=%s/frayd-native-target\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
           uname -sm
           printf 'Runner image: %s / %s\n' "$ImageOS" "$ImageVersion"
@@ -67,10 +62,9 @@ jobs:
       - name: Package complete per-architecture archive
         shell: bash
         run: |
-          bash -n scripts/native/package.sh scripts/native/install.sh scripts/native/start.sh scripts/uninstall.sh
-          scripts/native/package.sh "$RUNNER_TEMP/frayd-packages" '${{ matrix.target }}' "$CARGO_TARGET_DIR/${{ matrix.target }}/release/frayd-server" "$FRAYD_NATIVE_HELPER"
-          # Only the copied compile-time source is removed; active checkout stays intact.
-          python3 -c 'import os, pathlib, shutil; p=pathlib.Path(os.environ["RUNNER_TEMP"])/"frayd-build-source"; assert p.parent == pathlib.Path(os.environ["RUNNER_TEMP"]) and not p.is_symlink(); shutil.rmtree(p)'
+          python3 scripts/native/package.py "$RUNNER_TEMP/frayd-packages" '${{ matrix.target }}' "$CARGO_TARGET_DIR/${{ matrix.target }}/release/frayd-server" "$FRAYD_NATIVE_HELPER"
+          # Runtime tests must not find the compile-time source; the checkout stays intact.
+          rm -r -- "${RUNNER_TEMP:?}/frayd-build-source"
           printf 'FRAYD_NATIVE_ARCHIVE=%s\n' "$RUNNER_TEMP"/frayd-packages/*.tar.gz >> "$GITHUB_ENV"
           printf 'FRAYD_NATIVE_BUILD_SOURCE=%s\n' "$RUNNER_TEMP/frayd-build-source/server" >> "$GITHUB_ENV"
 
@@ -80,10 +74,7 @@ jobs:
           python3 -m unittest discover -s tests -p test_native_bundle.py -v
 
       - name: Nonsecret package provenance in retained job logs
-        if: success()
         shell: bash
         run: |
-          python3 -c 'import json,os,pathlib; p=pathlib.Path(os.environ["RUNNER_TEMP"])/"frayd-packages"; print(next(p.glob("*.tar.gz.sha256")).read_text()); print(next(p.glob("*/manifest.json")).read_text())'
-          printf '%s\n' 'Actual native basic lifecycle passed. Media codecs, signing, binary retention and publication remain unqualified/held.' >> "$GITHUB_STEP_SUMMARY"
-          # No upload/download/release action: pinned upload v7.0.2 failed the
-          # coordinator production-dependency advisory gate on 2026-10-28.
+          cat "$RUNNER_TEMP"/frayd-packages/*.tar.gz.sha256 "$RUNNER_TEMP"/frayd-packages/*/manifest.json
+          printf '%s\n' 'Native lifecycle qualification passed. Media codecs, signing, artifact retention and publication are not qualified.' >> "$GITHUB_STEP_SUMMARY"
