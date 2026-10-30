@@ -1,11 +1,12 @@
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
-const { browser } = require('./fixtures/client-browser.cjs');
+const vm = require('node:vm');
+const { browser, settle, reply } = require('./fixtures/client-browser.cjs');
 
 const highlight = { type: 'highlight', cfi: 'char:0:5', text: 'Hello' };
 function reader() {
   const b = browser();
-  b.run('ebookDocumentGeneration = 1; ebook = { it: { id: 7 }, chunk: 1, spine: ["a", "b", "c"], document: { generation: 1, ready: true, frameWindow: $("#em-frame").contentWindow, items: [] } }');
+  b.run('ebookDocumentGeneration = 1; ebook = { it: { id: 7 }, annots: [], chunk: 1, spine: ["a", "b", "c"], document: { generation: 1, ready: true, frameWindow: $("#em-frame").contentWindow, items: [] } }');
   b.send = (data, overrides = {}) => b.dispatchMessage({
     data: data && typeof data === "object" && !Array.isArray(data) ? { generation: b.run("ebook?.document?.generation"), ...data } : data, origin: 'null', source: b.nodes.get('#em-frame').contentWindow, ...overrides,
   });
@@ -22,7 +23,7 @@ for (const [name, overrides] of [
   test(`rejects ${name} before annotation, progress, chapter or UI effects`, () => {
     const b = reader();
     for (const data of [highlight, { type: 'page', page: 2, pages: 3 },
-      { type: 'chapter', dir: 1 }, { type: 'geom' },
+      { type: 'chapter', dir: 1 },
       { type: 'search-results', count: 8 }, { type: 'search-hit', idx: 1, total: 8 }]) {
       b.send(data, overrides);
     }
@@ -94,13 +95,13 @@ test('reader chapter reports preserve both directions and enforce spine boundari
   const b = reader();
   b.respond(async () => ({ ok: true, text: async () => '<html><head></head><body>Chapter</body></html>' }));
   b.send({ type: 'chapter', dir: 1 });
-  await new Promise(setImmediate);
+  await settle();
   assert.equal(b.run('ebook.chunk'), 2);
   b.send({ type: 'chapter', dir: 1 });
   assert.equal(b.requests.length, 1);
   b.run('ebook.document.ready = true');
   b.send({ type: 'chapter', dir: -1 });
-  await new Promise(setImmediate);
+  await settle();
   assert.equal(b.run('ebook.chunk'), 1);
   assert.equal(b.run('ebook.lastFrac'), 0.999);
   b.run('ebook.chunk = 0; ebook.document.ready = true');
@@ -108,14 +109,13 @@ test('reader chapter reports preserve both directions and enforce spine boundari
   assert.deepEqual(b.requests.map(r => r.url), ['/api/epub/7/chunk/2', '/api/epub/7/chunk/1']);
 });
 
-test('reader single-page, final-page, empty search and geometry reports remain accepted', () => {
+test('reader single-page, final-page and empty search reports remain accepted', () => {
   const b = reader();
   b.send({ type: 'page', page: 1, pages: 1 });
   b.send({ type: 'page', page: 3, pages: 3 });
   assert.deepEqual(b.requests.map(r => JSON.parse(r.options.body).position), [1, 1.999]);
   b.send({ type: 'search-results', count: 0 });
   assert.equal(b.nodes.get('#em-searchinfo').textContent, 'No hits');
-  b.send({ type: 'geom', innerWidth: 760 });
   assert.equal(b.requests.length, 2);
 });
 
@@ -176,17 +176,17 @@ test('closed or superseded book opening cannot publish its late TOC and resume',
   let finishToc;
   b.respond(async url => {
     if (url.includes('/spine')) return { json: async () => ['chapter.xhtml'] };
-    if (url.includes('/annotations/')) return { ok: true, json: async () => [] };
+    if (url.includes('/annotations/')) return reply([]);
     if (url.includes('/toc')) return new Promise(resolve => { finishToc = resolve; });
-    return { ok: true, json: async () => null };
+    return reply(null);
   });
   const opening = b.run('openEbook({ id: 9, title: "Old" })');
-  await new Promise(setImmediate);
+  await settle();
   b.nodes.get('#em-close').onclick();
-  b.run('ebook = { it: { id: 10 }, chunk: 0, spine: ["new"], toc: [], document: { generation: 10, ready: true } }');
+  b.run('ebook = { it: { id: 10 }, annots: [], chunk: 0, spine: ["new"], toc: [], document: { generation: 10, ready: true } }');
   finishToc({ ok: true, json: async () => [{ title: 'Old TOC' }] });
   await opening;
-  await new Promise(setImmediate);
+  await settle();
   assert.equal(b.run('ebook.it.id'), 10);
   assert.equal(b.run('ebook.toc.length'), 0);
   assert.equal(b.requests.some(request => request.url.includes('/chunk/') || request.url.includes('/progress/9')), false);
@@ -201,7 +201,7 @@ for (const failure of [false, true]) {
     retired.setAttribute('title', 'Reader');
     retired.setAttribute('referrerpolicy', 'no-referrer');
     b.respond(async () => {
-      if (failure) throw new Error('Owned chapter failure');
+      if (failure) throw new Error('Fixture chapter failure');
       return { ok: true, text: async () => '<html><head></head><body>Published chapter</body></html>' };
     });
     await b.run('showChunk(1, { frac: 0.75 })');
@@ -226,15 +226,13 @@ for (const failure of [false, true]) {
   });
 }
 
-async function paginationDocument({ visible = false, pages = 4, layoutPending = false, uppercaseScript = false } = {}) {
-  const vm = require('node:vm');
+async function paginationDocument({ visible = false, pages = 4, layoutPending = false } = {}) {
   const b = reader();
   b.run('ebook.spine.push("d"); ebook.chunk = 2');
   b.respond(async () => ({ ok: true, text: async () => '<html><head></head><body>Saved chapter</body></html>' }));
   await b.run('showChunk(2, { frac: 1 / 3 })');
   // Extract the bridge for VM execution; this is not an HTML sanitizer.
-  const markup = uppercaseScript ? b.nodes.get('#em-frame').srcdoc.replace(/<(\/?)script>/gi, '<$1SCRIPT>') : b.nodes.get('#em-frame').srcdoc;
-  const script = markup.match(/<script>([\s\S]*?)<\/script>/i)[1];
+  const script = b.nodes.get('#em-frame').srcdoc.match(/<script>([\s\S]*?)<\/script>/)[1];
   const events = new Map(), renders = [];
   let width = visible ? 760 : 0;
   const body = { appendChild() {}, getBoundingClientRect: () => ({ width, height: width ? 600 : 0 }) };
@@ -279,7 +277,7 @@ test('initial unmeasurable chapter retains saved 2.333 until rendered pagination
 });
 
 test('visible rendered single-page chapter legitimately publishes fraction zero', async () => {
-  const reader = await paginationDocument({ visible: true, pages: 1, uppercaseScript: true });
+  const reader = await paginationDocument({ visible: true, pages: 1 });
   reader.load(); await reader.render();
   assert.equal(reader.b.run('ebook.document.ready'), true);
   assert.equal(reader.b.nodes.get('#em-pageinfo').textContent, '3 · p1/1');
@@ -298,7 +296,7 @@ test('visible viewport waits for a render before its first resume can overwrite 
   assert.equal(reader.b.run('ebook.lastFrac'), 1 / 3);
 });
 
-for (const [status, body] of [[404, ''], [500, 'Owned server rejection'], [200, ''], [200, 'Plain chapter without a head']]) {
+for (const [status, body] of [[404, ''], [500, 'Fixture server rejection'], [200, ''], [200, 'Plain chapter without a head']]) {
   test(`chapter response ${status} ${body ? 'text' : 'empty'} publishes a current error without losing the requested fraction`, async () => {
     const b = reader();
     const response = new Response(body, { status });

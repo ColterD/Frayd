@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
-const { browser } = require('./fixtures/client-browser.cjs');
+const { browser, settle, reply } = require('./fixtures/client-browser.cjs');
 
 test('authoritative roots, episode permissions and explicit null clearing', () => {
   const b = browser();
@@ -14,7 +14,7 @@ test('authoritative roots, episode permissions and explicit null clearing', () =
 test('newer library request owns publication and preserves active filter', async () => {
   const b = browser();
   let release;
-  b.respond(url => url === '/api/library' ? new Promise(resolve => { release = resolve; }) : Promise.resolve({ok:true,json:async()=>null}));
+  b.respond(url => url === '/api/library' ? new Promise(resolve => { release = resolve; }) : Promise.resolve(reply(null)));
   const old = b.run('loadLibrary()');
   b.respond(async () => ({ok:true,json:async()=>[{id:2,kind:'music',title:'New'}]}));
   await b.run('loadLibrary()');
@@ -45,13 +45,13 @@ test('deletion invalidates pending loads and retains rows on refusal or cancel',
 test('settings account retirement cancels timer and rejects late status publication', async () => {
   const b=browser();
   let release;
-  b.respond(url => url === '/api/scan/status' ? new Promise(resolve=>{release=resolve;}) : Promise.resolve({ok:true,json:async()=>null}));
+  b.respond(url => url === '/api/scan/status' ? new Promise(resolve=>{release=resolve;}) : Promise.resolve(reply(null)));
   b.run('settingsGeneration=1; pollSettings(1, "scan", {textContent:"waiting",disabled:true})');
   const poll=[...b.intervals.values()][0];
   const pending=poll();
   b.context.location.reload = () => {};
   b.nodes.get('#logout').emit('click');
-  release({ok:true,json:async()=>({scanning:false})});
+  release(reply({scanning:false}));
   await pending;
   assert.equal(b.intervals.size,0);
   assert.equal(b.requests.filter(request => request.url === "/api/library").length,0);
@@ -61,7 +61,7 @@ test('settings scan refusal reports failure without refreshing the library', asy
   const b=browser();
   b.context.button={textContent:'Scanning…',disabled:true};
   b.run('settingsGeneration=1;pollSettings(1,"scan",button)');
-  b.respond(async()=>({ok:true,json:async()=>({scanning:false,scan_error:'Library root unavailable'})}));
+  b.respond(async()=>reply({scanning:false,scan_error:'Library root unavailable'}));
   await [...b.intervals.values()][0]();
   assert.equal(b.context.button.textContent,'Scan failed');
   assert.equal(b.context.button.disabled,false);
@@ -94,7 +94,7 @@ test('scan feedback distinguishes accepted, busy, no roots, server and network f
     } else {
       assert.equal(b.context.button.disabled,false);
       assert.equal(b.intervals.size,0);
-      assert.match(b.context.button.textContent,status===409?/already running/:status===501?/No library folder/:status===500?/500/:/unreachable/);
+      assert.match(b.context.button.textContent,status===501?/No library folder/:status===500?/500/:/unreachable/);
     }
   }
 });
@@ -116,11 +116,11 @@ test('ingest indexing keeps its poll until failure and never refreshes library',
   b.context.button={textContent:'',disabled:true};
   b.run('settingsGeneration=1;pollSettings(1,"ingest",button)');
   const poll=[...b.intervals.values()][0];
-  b.respond(async()=>({ok:true,json:async()=>({ingesting:'indexing'})}));
+  b.respond(async()=>reply({ingesting:'indexing'}));
   await poll();
   assert.equal(b.context.button.textContent,'Indexing…');
   assert.equal(b.intervals.size,1);
-  b.respond(async()=>({ok:true,json:async()=>({ingesting:'failed'})}));
+  b.respond(async()=>reply({ingesting:'failed'}));
   await poll();
   assert.equal(b.context.button.textContent,'Download failed');
   assert.equal(b.context.button.disabled,false);
@@ -132,7 +132,7 @@ test('stale search and continue rows cannot replace a newer filter', async () =>
   const b=browser();
   b.run('LIBRARY=[{id:1,kind:"movie",title:"Movie"},{id:2,kind:"music",title:"Song"}]');
   let release;
-  b.respond(url=>url.startsWith('/api/library?') ? new Promise(resolve=>{release=resolve;}) : Promise.resolve({ok:true,json:async()=>null}));
+  b.respond(url=>url.startsWith('/api/library?') ? new Promise(resolve=>{release=resolve;}) : Promise.resolve(reply(null)));
   const pending=b.run('serverSearch("old")');
   await b.run('filterKind("music","")');
   const html=b.nodes.get('#main').innerHTML;
@@ -145,7 +145,7 @@ test('stale search and continue rows cannot replace a newer filter', async () =>
 
 test('admin delete survives card markup and stops click and key bubbling', async () => {
   const b=browser();
-  b.run('account={isAdmin:true}; testCard=card({id:9,title:"Movie",kind:"movie"})');
+  b.run('account={isAdmin:true}; testCard=card({id:9,title:"Movie",kind:"movie"},resumeFor)');
   const card=b.run('testCard');
   const button=card.children.find(child=>child.className==='card-del');
   assert.ok(button);
@@ -186,33 +186,77 @@ test('settings render locks root controls, sends scoped permissions and cancels 
   assert.equal(b.requests.length,count);
 });
 
+for (const rerender of ['fails', 'is closed']) {
+  test(`settings Add + scan starts the saved folder scan when its re-render ${rerender}`, async () => {
+    const b = browser();
+    const controls = new Map();
+    const control = selector => {
+      if (!controls.has(selector)) controls.set(selector, { value: '', textContent: '', addEventListener() {} });
+      return controls.get(selector);
+    };
+    const stage = b.nodes.get('#settings-stage');
+    // The boundary double does not parse innerHTML; only a rendered panel owns a scan button.
+    stage.querySelector = selector => selector === '.p-scan' && !stage.innerHTML.includes('class="p-scan"')
+      ? null : control(selector);
+    stage.querySelectorAll = () => [];
+    for (const selector of ['#s-site-save', '#s-net-save']) b.nodes.set(selector, control(selector));
+    let reads = 0;
+    let releaseRerender;
+    b.respond(async (url, options) => {
+      if (url === '/api/scan') return { ok: true, status: 202 };
+      if (url === '/api/scan/status') return { ok: true, status: 200, json: async () => ({ scanning: true }) };
+      if (options?.method === 'POST') return { ok: true, status: 200 };
+      if (url === '/api/admin/settings' && ++reads === 2) {
+        if (rerender === 'fails') return { ok: false, status: 500 };
+        await new Promise(resolve => { releaseRerender = resolve; });
+      }
+      return { ok: true, status: 200, json: async () => url.endsWith('/perms') ? [] : { library_paths: [] } };
+    });
+    await b.run('openSettings()');
+    control('.s-lib-add').value = '/media/new';
+    const adding = control('.lib-add').onclick();
+    if (rerender === 'is closed') {
+      await settle();
+      b.nodes.get('#settings-close').emit('click');
+      releaseRerender();
+    }
+    await adding;
+    assert.deepEqual(JSON.parse(b.requests.find(r => r.options?.method === 'POST').options.body),
+      { library_paths: ['/media/new'] });
+    assert.equal(b.requests.filter(r => r.url === '/api/scan' && r.options?.method === 'POST').length, 1);
+    assert.equal(b.intervals.size, 1, 'the requested scan is monitored');
+    const notices = b.notices();
+    assert.match(notices, /Scanning library/);
+  });
+}
+
 test('late progress does not paint detached or superseded cards; row sorting is stable across refresh', async () => {
   const b=browser();
   let release;
   b.respond(()=>new Promise(resolve=>{release=resolve;}));
-  b.run('testCard=card({id:9,title:"Movie",kind:"movie",duration_secs:100})');
+  b.run('testCard=card({id:9,title:"Movie",kind:"movie",duration_secs:100},resumeFor)');
   const card=b.run('testCard');
   const strip={style:{},firstElementChild:{style:{}}};
   card.isConnected=true;
   card.querySelector=()=>strip;
   b.run('++renderGeneration');
-  release({ok:true,json:async()=>({position:30})});
-  await new Promise(resolve=>setImmediate(resolve));
+  release(reply({position:30}));
+  await settle();
   assert.equal(strip.style.display,undefined);
-  b.respond(async()=>({ok:true,json:async()=>null}));
-  b.run('sortItems=[{id:2,title:"B",kind:"movie",created_at:1},{id:1,title:"A",kind:"movie",created_at:1},{id:3,title:"C",kind:"movie",created_at:2}];testSection=section("movie",sortItems)');
+  b.respond(async()=>reply(null));
+  b.run('sortItems=[{id:2,title:"B",kind:"movie",created_at:1},{id:1,title:"A",kind:"movie",created_at:1},{id:3,title:"C",kind:"movie",created_at:2}];testSection=section("movie",sortItems,resumeFor)');
   const section=b.run('testSection');
   const cards=section.children[1];
   assert.deepEqual(Array.from(cards.children,item=>item.title),['C','A','B']);
   section.children[0].children[0].onclick();
   // The boundary double does not parse innerHTML; use a fresh section to observe persisted ordering.
-  const refreshed=b.run('section("movie",sortItems)');
+  const refreshed=b.run('section("movie",sortItems,resumeFor)');
   assert.deepEqual(Array.from(refreshed.children[1].children,item=>item.title),['A','B','C']);
 });
 
 test('production library rendering assigns book portraits and retains music/video landscapes', async () => {
   const b=browser();
-  b.respond(async()=>({ok:true,json:async()=>null}));
+  b.respond(async()=>reply(null));
   b.run('account={isAdmin:true}; LIBRARY=["movie","music","audiobook","ebook","comic","manga"].map((kind,id)=>({id:id+1,title:kind,kind,author:"Author"})); filtering=false; authorDrill.music={author:"Author"}; authorDrill.ebook={author:"Author"}; authorDrill.audiobook={author:"Author"}');
   await b.run('renderRows(LIBRARY)');
   const cards=[];
@@ -229,9 +273,9 @@ test('production library rendering assigns book portraits and retains music/vide
 
 test('continue row derives audiobook portrait while retaining playable music/video landscapes', async () => {
   const b=browser();
-  b.respond(async()=>({ok:true,json:async()=>({position:20})}));
+  b.respond(async()=>reply({position:20}));
   b.run('LIBRARY=["movie","music","audiobook","ebook","comic","manga"].map((kind,id)=>({id:id+1,title:kind,kind,duration_secs:100}))');
-  const row=await b.run('continueRow()');
+  const row=await b.run('continueRow(LIBRARY,resumeFor)');
   const cards=row.children[1].children;
   assert.equal(cards.length,3);
   for(const card of cards) assert.equal(card.className,card.title==='audiobook'?'media-card portrait':'media-card landscape',card.title);
@@ -261,12 +305,12 @@ for (const closeBeforeAdmission of [false, true]) {
 test('retired settings status cannot clear a replacement monitor', async () => {
   const b = browser();
   let release;
-  b.respond(url => url === '/api/scan/status' ? new Promise(resolve => { release = resolve; }) : Promise.resolve({ok:true,json:async()=>[]}));
+  b.respond(url => url === '/api/scan/status' ? new Promise(resolve => { release = resolve; }) : Promise.resolve(reply([])));
   b.run('pollSettings(settingsGeneration,"scan",{})');
   const old = [...b.intervals.values()][0]();
   b.run('pollSettings(settingsGeneration,"scan",{})');
   const replacement = b.run('settingsPoll');
-  release({ok:true,json:async()=>({scanning:false})});
+  release(reply({scanning:false}));
   await old;
   assert.equal(b.intervals.has(replacement), true);
   assert.equal(b.run('settingsPoll'), replacement);
@@ -299,12 +343,12 @@ for (const failure of ['network', 'server']) {
     b.context.button = {disabled:true,textContent:'Scanning…'};
     let reads = 0;
     b.respond(async url => {
-      if (url !== '/api/scan/status') return {ok:true,json:async()=>[]};
+      if (url !== '/api/scan/status') return reply([]);
       if (++reads === 1) {
         if (failure === 'network') throw Error('connection reset');
         return {ok:false,status:503};
       }
-      return {ok:true,json:async()=>({scanning:false})};
+      return reply({scanning:false});
     });
     b.run('pollSettings(settingsGeneration,"scan",button)');
     const poll = [...b.intervals.values()][0];
@@ -323,7 +367,7 @@ test('settings scan status stops after three consecutive failures; valid busy st
   const b = browser();
   b.context.button = {disabled:true,textContent:'Scanning…'};
   let reads = 0;
-  b.respond(async()=>++reads === 3 ? {ok:true,json:async()=>({scanning:true})} : {ok:false,status:502});
+  b.respond(async()=>++reads === 3 ? reply({scanning:true}) : {ok:false,status:502});
   b.run('pollSettings(settingsGeneration,"scan",button)');
   const poll = [...b.intervals.values()][0];
   for (let n=0;n<5;++n) {
@@ -368,7 +412,7 @@ test('settings ingest network failure stops immediately', async () => {
 });
 
 for (const closeBeforeAdmission of [false,true]) {
-  test(`settings busy scan attaches one observer after POST409 (closed=${closeBeforeAdmission})`, async () => {
+  test(`settings busy scan attaches one observer after POST 409 (closed=${closeBeforeAdmission})`, async () => {
     const b=browser();
     b.context.button={disabled:false,textContent:''};
     let release;
@@ -387,7 +431,7 @@ for (const closeBeforeAdmission of [false,true]) {
   });
 }
 
-test('settings POST409 monitor logout rejects late status failure without UI publication', async () => {
+test('settings POST 409 monitor logout rejects late status failure without UI publication', async () => {
   const b=browser();
   b.context.button={disabled:false,textContent:''};
   b.context.location.reload=()=>{};

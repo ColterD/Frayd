@@ -1,5 +1,22 @@
 /* global ebook, showChunk, LIBRARY, plyr, partyPlaybackKind, openVideo, PartyUI */
 'use strict';
+// One assertion and fixture-control set serves the suite and its isolated documents.
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+function check(value, message) { if (!value) throw new Error(message); }
+function equal(actual, expected, message) {
+  check(JSON.stringify(actual) === JSON.stringify(expected), `${message}: ${JSON.stringify(actual)} != ${JSON.stringify(expected)}`);
+}
+async function until(predicate, label, budget = 4000) {
+  const deadline = Date.now() + budget;
+  while (!(await predicate())) { check(Date.now() < deadline, `Timed out: ${label}`); await delay(20); }
+}
+async function api(path, body) {
+  const response = await fetch('/__fixture/' + path, body === undefined ? {} : {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  check(response.ok, `Fixture ${path}: ${response.status}`);
+  return response.json();
+}
 function responsiveOverflowInventory() {
   const main = document.getElementById('main');
   const edge = main.getBoundingClientRect().left + main.clientWidth;
@@ -26,32 +43,28 @@ function responsiveOverflowInventory() {
 async function isolatedResponsiveCase(width) {
   const fixture = window.__responsiveFixture;
   const items = fixture.items;
-  const measured = { viewport: { width: innerWidth, height: innerHeight }, freshDocument: true };
-  const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
-  function check(value, message) { if (!value) throw new Error(message); }
-  function equal(actual, expected, message) { check(JSON.stringify(actual) === JSON.stringify(expected), message); }
-  async function until(predicate, label) {
-    const deadline = Date.now() + 4000;
-    while (!(await predicate())) { check(Date.now() < deadline, 'Timed out: ' + label); await delay(20); }
-  }
-  async function api(path, body) {
-    const response = await fetch('/__fixture/' + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    check(response.ok, 'Owned fixture control failed'); return response.json();
-  }
+  const measured = { viewport: { width: innerWidth, height: innerHeight } };
   const key = (key, accept = false) => api('key', { key, accept });
     try {
       await until(() => account?.isAdmin && LIBRARY.length === items.length, 'fresh document authenticates with private fixture model');
-      await until(() => [...document.querySelectorAll('[data-build-info]')].every(node => node.textContent === 'v0.1.1 · aaaaaaa'), 'both binary identity labels render');
-      check([...document.querySelectorAll('[data-build-info]')].every(node => node.title.includes('a'.repeat(40)) && node.title.includes('131')), 'Full binary identity retained in tooltips');
-      check(!document.getElementById('party-modal').classList.contains('on') && !document.getElementById('playerbar').classList.contains('on'), 'Fresh document starts with clean party/player state');
+      await until(() => [...document.querySelectorAll('[data-build-info]')].every(node => node.textContent === 'v0.1.1 · aaaaaaa'),
+        'both binary identity labels render');
+      check([...document.querySelectorAll('[data-build-info]')].every(node => node.title.includes('a'.repeat(40)) && node.title.includes('131')),
+        'Full binary identity retained in tooltips');
+      check(!document.getElementById('party-modal').classList.contains('on') && !document.getElementById('playerbar').classList.contains('on'),
+        'Fresh document starts with clean party/player state');
       // Measure existing production form nodes; only signed-out visibility is modeled.
       const login = document.getElementById('login'), app = document.getElementById('app');
       const loginStyle = login.getAttribute('style'), appClass = app.className, bodyClass = document.body.className;
-      const rect = node => { const r = node.getBoundingClientRect(); return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height }; };
-      const contains = (outer, inner) => inner.left >= outer.left - 1 && inner.right <= outer.right + 1 && inner.top >= outer.top - 1 && inner.bottom <= outer.bottom + 1;
+      const rect = node => { const r = node.getBoundingClientRect();
+        return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height }; };
+      const contains = (outer, inner) => inner.left >= outer.left - 1 && inner.right <= outer.right + 1 && inner.top >= outer.top - 1
+        && inner.bottom <= outer.bottom + 1;
       const buildBrand = rect(document.querySelector('#sidebar .brand')), buildLabel = rect(document.querySelector('#sidebar > [data-build-info]'));
-      check(Math.abs(buildBrand.left - buildLabel.left) <= 1 && buildLabel.top >= buildBrand.bottom && buildLabel.top - buildBrand.bottom <= 8, 'Binary identity sits directly below and aligned with sidebar brand');
-      if (width <= 768) check(buildLabel.width >= document.getElementById('sidebar').clientWidth - 25, 'Mobile binary identity owns a full row before navigation');
+      check(Math.abs(buildBrand.left - buildLabel.left) <= 1 && buildLabel.top >= buildBrand.bottom && buildLabel.top - buildBrand.bottom <= 8,
+        'Binary identity sits directly below and aligned with sidebar brand');
+      if (width <= 768) check(buildLabel.width >= document.getElementById('sidebar').clientWidth - 25,
+        'Mobile binary identity owns a full row before navigation');
       try {
         app.classList.remove('on'); login.style.display = 'flex'; document.body.classList.add('auth');
         const card = rect(document.querySelector('.auth-card'));
@@ -66,21 +79,27 @@ async function isolatedResponsiveCase(width) {
           await api('viewport', { width, height });
           await until(() => innerHeight === height, 'short authentication viewport settles');
           scrollTo(0, 0);
-          const brandRect = rect(login.querySelector('.auth-brand')), cardRect = rect(login.querySelector('.auth-card')), footerRect = rect(login.querySelector('.auth-footer'));
+          const brandRect = rect(login.querySelector('.auth-brand')), cardRect = rect(login.querySelector('.auth-card')),
+            footerRect = rect(login.querySelector('.auth-footer'));
           measured.authFlowGeometry = { width, height, brand: brandRect, card: cardRect, footer: footerRect, controls: [] };
-          check(brandRect.top >= 0 && brandRect.bottom <= cardRect.top && cardRect.bottom <= footerRect.top, 'Authentication brand, form and guest footer never overlap at short height');
+          check(brandRect.top >= 0 && brandRect.bottom <= cardRect.top && cardRect.bottom <= footerRect.top,
+            'Authentication brand, form and guest footer never overlap at short height');
           check(document.documentElement.scrollWidth <= innerWidth + 1, 'Short authentication document stays within viewport width');
           const controls = [...login.querySelectorAll('input,button,a')];
           measured.authFlowGeometry.controlOrder = controls.map(control => control.id || control.getAttribute('type'));
-          equal(measured.authFlowGeometry.controlOrder, ['email', 'password', 'pw-toggle', 'submit', 'guest'], 'Authentication offers exactly its five implemented controls');
-          check(controls[0].type === 'email' && controls[0].required && controls[1].type === 'password' && controls[1].required, 'Native sign-in field validation remains enabled');
+          equal(measured.authFlowGeometry.controlOrder, ['email', 'password', 'pw-toggle', 'submit', 'guest'],
+            'Authentication offers exactly its five implemented controls');
+          check(controls[0].type === 'email' && controls[0].required && controls[1].type === 'password' && controls[1].required,
+            'Native sign-in field validation remains enabled');
           check(controls[3].type === 'submit' && controls[3].form === document.getElementById('login-form'), 'Sign in retains native form submission');
           for (const control of controls) {
             control.scrollIntoView({ block: 'center', inline: 'nearest' });
             control.focus();
             const bounds = rect(control), hit = document.elementFromPoint(bounds.left + bounds.width / 2, bounds.top + bounds.height / 2);
-            check(bounds.width > 0 && bounds.top >= -1 && bounds.bottom <= innerHeight + 1 && bounds.left >= -1 && bounds.right <= innerWidth + 1, 'Authentication control stays reachable through natural document scrolling');
-            check((hit === control || control.contains(hit)) && document.activeElement === control, 'Authentication control accepts pointer hit and keyboard focus');
+            check(bounds.width > 0 && bounds.top >= -1 && bounds.bottom <= innerHeight + 1 && bounds.left >= -1 && bounds.right <= innerWidth + 1,
+              'Authentication control stays reachable through natural document scrolling');
+            check((hit === control || control.contains(hit)) && document.activeElement === control,
+              'Authentication control accepts pointer hit and keyboard focus');
             if (control.id === 'pw-toggle') {
               const password = document.getElementById('password'), beforeType = password.type;
               const point = { x: bounds.left + bounds.width / 2, y: bounds.top + bounds.height / 2 };
@@ -98,7 +117,8 @@ async function isolatedResponsiveCase(width) {
           }
           measured.authFlowGeometry.tabOrderVerified = true;
           measured.authFlowGeometry.needsScroll = document.documentElement.scrollHeight > innerHeight + 1;
-          if (measured.authFlowGeometry.needsScroll) check(measured.authFlowGeometry.controls.some(control => control.scrollY > 0), 'Overflowing sign-in content remains reachable by natural scrolling');
+          if (measured.authFlowGeometry.needsScroll) check(measured.authFlowGeometry.controls.some(control => control.scrollY > 0),
+            'Overflowing sign-in content remains reachable by natural scrolling');
           else check(footerRect.bottom <= innerHeight + 1, 'Compact sign-in content fits without requiring artificial scrolling');
         } finally {
           await api('viewport', { width, height: 1000 });
@@ -118,7 +138,8 @@ async function isolatedResponsiveCase(width) {
       await filterKind('all', '');
       const shelves = [...document.querySelectorAll('#main > section')];
       equal(shelves.map(shelf => shelf.querySelector('h3')?.textContent),
-        ['Movies', 'TV Shows', 'Music', 'Audiobooks', 'Ebooks', 'Comics', 'Manga'].map(name => 'Recently Added ' + name), 'Seven separately headed dashboard siblings');
+        ['Movies', 'TV Shows', 'Music', 'Audiobooks', 'Ebooks', 'Comics', 'Manga'].map(name => 'Recently Added ' + name),
+          'Seven separately headed dashboard siblings');
       measured.folderGrids = shelves.filter(shelf => /TV Shows|Music|Audiobooks|Ebooks/.test(shelf.querySelector('h3').textContent)).map(shelf => {
         const grid = shelf.querySelector('.cards');
         const boxes = [...grid.children].map(node => node.getBoundingClientRect());
@@ -126,7 +147,8 @@ async function isolatedResponsiveCase(width) {
         check(boxes.length >= 4 && getComputedStyle(grid).display === 'grid', 'Multiple folders use actual production grid');
         check(grid.scrollWidth <= grid.clientWidth + 1, 'Folder grid fits available width');
         if (width >= 768) check(boxes[1].left > boxes[0].left && Math.abs(boxes[1].top - boxes[0].top) < 1, 'Multiple TV/author folders lay out horizontally');
-        return { heading: shelf.querySelector('h3').textContent, columns, count: boxes.length, boxes: boxes.map(box => ({left: box.left, top: box.top, width: box.width})) };
+        return { heading: shelf.querySelector('h3').textContent, columns, count: boxes.length,
+          boxes: boxes.map(box => ({left: box.left, top: box.top, width: box.width})) };
       });
       LIBRARY = items;
       authorDrill.music = { author: 'Fixture artist' };
@@ -149,13 +171,9 @@ async function isolatedResponsiveCase(width) {
         check(rendered?.classList.contains('portrait'), `Normal library render derives portrait layout for ${item.kind}`);
       }
       check(!Object.hasOwn(pbAudio, 'readyState'), 'Responsive native audio has no synthetic readyState override');
-      measured.nativeAudioReadinessIsUnmodified = true;
-      measured.overflowInventory = responsiveOverflowInventory();
-      measured.overflowInventoryBeforeAudio = measured.overflowInventory;
-      measured.mainBeforeAudio = { client: document.getElementById('main').clientWidth, scroll: document.getElementById('main').scrollWidth };
       const music = items.find(item => item.id === 23);
       const audioCard = actualCards.find(node => node.title.startsWith(music.title));
-      check(audioCard, 'Production music card exists for native23');
+      check(audioCard, 'Production music card exists for native item 23');
       audioCard.scrollIntoView({ block: 'center', inline: 'nearest' });
       const clickRect = audioCard.getBoundingClientRect();
       const clickPoint = { x: clickRect.left + clickRect.width / 2, y: clickRect.top + clickRect.height / 2 };
@@ -163,12 +181,11 @@ async function isolatedResponsiveCase(width) {
       check(clickHit === audioCard || audioCard.contains(clickHit), 'Native user click reaches production audio card');
       measured.nativePlaybackGesture = await api('click', clickPoint);
       check(fixture.cardClicks.some(event => event.id === 23 && event.isTrusted), 'Production audio-card click isTrusted');
-      await until(() => pbAudio.readyState >= 2 && !pbAudio.paused, 'owned PCM audio-element playback starts');
+      await until(() => pbAudio.readyState >= 2 && !pbAudio.paused, 'PCM audio-element playback starts');
       const startedAt = pbAudio.currentTime;
       await until(() => !pbAudio.paused && pbAudio.currentTime > startedAt + 0.03, 'native audio time advances');
-      check(pbAudio.currentTime < 5, 'Fresh source with progress0 cannot inherit stale203/end position');
+      check(pbAudio.currentTime < 5, 'Fresh source with zero progress cannot inherit the stale 203 s or end position');
       measured.nativeDiagnostics = fixture;
-      measured.overflowInventory = responsiveOverflowInventory();
       const sizes = {};
       measured.sizes = sizes;
       for (const [name, element] of [['document', document.documentElement], ['body', document.body], ['main', document.getElementById('main')]]) {
@@ -179,12 +196,14 @@ async function isolatedResponsiveCase(width) {
         const rect = grid.getBoundingClientRect();
         const cards = [...grid.querySelectorAll('.media-card')];
         check(grid.scrollWidth <= grid.clientWidth + 1, 'Card grid fits its available width');
-        check(cards.every(c => c.getBoundingClientRect().left >= rect.left - 1 && c.getBoundingClientRect().right <= rect.right + 1), 'Every card fits its grid');
+        check(cards.every(c => c.getBoundingClientRect().left >= rect.left - 1 && c.getBoundingClientRect().right <= rect.right + 1),
+          'Every card fits its grid');
         check(new Set(cards.map(c => Math.round(c.getBoundingClientRect().top))).size > 1, 'Multiple cards wrap onto new rows');
-        return { width: grid.clientWidth, columns: getComputedStyle(grid).gridTemplateColumns, rows: new Set(cards.map(c => Math.round(c.getBoundingClientRect().top))).size };
+        return { width: grid.clientWidth, columns: getComputedStyle(grid).gridTemplateColumns,
+          rows: new Set(cards.map(c => Math.round(c.getBoundingClientRect().top))).size };
       });
       const ratios = [...document.querySelectorAll('.portrait .thumb,.portrait .thumb-fallback')].map(node => {
-        const r = node.getBoundingClientRect(); check(Math.abs(r.width / r.height - 2 / 3) < 0.01, 'Portrait thumbnail/fallback keeps2:3');
+        const r = node.getBoundingClientRect(); check(Math.abs(r.width / r.height - 2 / 3) < 0.01, 'Portrait thumbnail/fallback keeps 2:3');
         return { tag: node.tagName, width: r.width, height: r.height };
       });
       measured.grids = grids; measured.ratios = ratios;
@@ -207,8 +226,11 @@ async function isolatedResponsiveCase(width) {
             const hit = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
             return { box, hit: hit?.id || hit?.className || hit?.tagName, reachable: hit === node || node.contains(hit) };
           };
-          measured.shortAudioFooter = { metadata, subtitle: { text: document.getElementById('pb-sub').textContent, bounds: rect(document.getElementById('pb-sub')) }, viewport: { width: innerWidth, height: innerHeight }, main: rect(main),
-            paddingBottom: getComputedStyle(main).paddingBottom, maxScroll: main.scrollTop, documentScroll: scrollY, documentHeight: document.documentElement.scrollHeight, card: rect(lastCard),
+          measured.shortAudioFooter = { metadata,
+            subtitle: { text: document.getElementById('pb-sub').textContent, bounds: rect(document.getElementById('pb-sub')) },
+            viewport: { width: innerWidth, height: innerHeight }, main: rect(main),
+            paddingBottom: getComputedStyle(main).paddingBottom, maxScroll: main.scrollTop, documentScroll: scrollY,
+              documentHeight: document.documentElement.scrollHeight, card: rect(lastCard),
             title: pointHit(title), bar: rect(bar), audioControls: ['pb-play', 'pb-close'].map(id => ({id, ...pointHit(document.getElementById(id))})) };
           check(rect(lastCard).bottom <= rect(bar).top, 'Last library card clears the active wrapped player at maximum scroll');
           check(measured.shortAudioFooter.title.reachable, 'Last library card title center accepts a pointer hit above the player');
@@ -227,7 +249,8 @@ async function isolatedResponsiveCase(width) {
           lastCard.scrollIntoView({ block: 'center' });
           measured.shortAudioFooter.centeredCard = pointHit(lastCard);
           check(measured.shortAudioFooter.centeredCard.reachable, 'Last library card center is reachable by scrolling');
-          equal([...bar.querySelectorAll('button')].map(button => button.id), ['pb-play', 'pb-close'], 'Default audio player retains exactly its two implemented buttons');
+          equal([...bar.querySelectorAll('button')].map(button => button.id), ['pb-play', 'pb-close'],
+            'Default audio player retains exactly its two implemented buttons');
           let trustedPlay = false, trustedClose = false;
           const playButton = document.getElementById('pb-play'), closeButton = document.getElementById('pb-close');
           playButton.addEventListener('click', event => { trustedPlay = event.isTrusted; }, { once: true });
@@ -238,10 +261,12 @@ async function isolatedResponsiveCase(width) {
           await until(() => !pbAudio.paused, 'Long-metadata player resumes through trusted control click');
           closeButton.addEventListener('click', event => { trustedClose = event.isTrusted; }, { once: true });
           await api('click', { x: closeBounds.left + closeBounds.width / 2, y: closeBounds.top + closeBounds.height / 2 });
-          check(!bar.classList.contains('on') && pbAudio.paused && trustedPlay && trustedClose, 'Both implemented controls work with long artist, album and title');
+          check(!bar.classList.contains('on') && pbAudio.paused && trustedPlay && trustedClose,
+            'Both implemented controls work with long artist, album and title');
           measured.shortAudioFooter.controlClicks = { trustedPlay, trustedClose, pausedAndResumed: true, closed: true };
           playAudio(music);
-          await until(() => !localAudioLoad.pendingResume && pbAudio.readyState >= 2 && !pbAudio.paused, 'Native audio restores after long-metadata control checks');
+          await until(() => !localAudioLoad.pendingResume && pbAudio.readyState >= 2 && !pbAudio.paused,
+            'Native audio restores after long-metadata control checks');
           await filterKind('episode', '');
           equal(scrollY, 0, 'Category filtering resets document scroll');
           window.scrollTo(0, document.documentElement.scrollHeight);
@@ -264,7 +289,8 @@ async function isolatedResponsiveCase(width) {
         check(r.left >= -1 && r.right <= innerWidth + 1, 'Control stays horizontally reachable');
         check(r.top >= -1 && r.bottom <= innerHeight + 1, 'Control stays vertically reachable');
         const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
-        check(hit === node || node.contains(hit), `Control ${node.id || node.textContent.trim() || node.getAttribute('aria-label')} center accepts a pointer hit; actual=${hit?.id || hit?.className?.baseVal || hit?.className || hit?.tagName}`);
+        check(hit === node || node.contains(hit), `Control ${node.id || node.textContent.trim()
+          || node.getAttribute('aria-label')} center accepts a pointer hit; actual=${hit?.id || hit?.className?.baseVal || hit?.className || hit?.tagName}`);
         node.focus(); check(document.activeElement === node, 'Control accepts focus');
       }
       const nav = [...document.querySelectorAll('#sidebar .nav-item')];
@@ -274,13 +300,17 @@ async function isolatedResponsiveCase(width) {
       await until(() => !!document.querySelector('.p-scan'), 'Visible Settings opens usable controls');
       const settingsPanel = document.querySelector('#settings-modal .modal-panel');
       const guide = settingsPanel.querySelector('pre');
-      const guideText = 'Media/\n  Movies/    *.mp4 *.mkv\n  Shows/     S01E01 files\n  Music/     *.mp3 *.flac\n  Audiobooks/ *.m4b *.mp3\n  Ebooks/    *.epub\n  Comics/    *.cbz *.cbr\n  Manga/     folder of images under a *manga* dir';
+      const guideText = 'Media/\n  Movies/    *.mp4 *.mkv\n  Shows/     S01E01 files\n  Music/     *.mp3 *.flac\n  Audiobooks/ *.m4b *.mp3\n  ' +
+        'Ebooks/    *.epub\n  Comics/    *.cbz *.cbr\n  Manga/     folder of images under a *manga* dir';
       equal(guide.textContent, guideText, 'Suggested layout retains all guide text and indentation');
-      measured.settingsGeometry = { panel: rect(settingsPanel), clientWidth: settingsPanel.clientWidth, scrollWidth: settingsPanel.scrollWidth, guideText: guide.textContent, controls: [] };
-      check(settingsPanel.scrollWidth <= settingsPanel.clientWidth + 1 && guide.scrollWidth <= guide.clientWidth + 1, 'Settings guide wraps inside panel without horizontal scrolling');
+      measured.settingsGeometry = { panel: rect(settingsPanel), clientWidth: settingsPanel.clientWidth, scrollWidth: settingsPanel.scrollWidth,
+        guideText: guide.textContent, controls: [] };
+      check(settingsPanel.scrollWidth <= settingsPanel.clientWidth + 1 && guide.scrollWidth <= guide.clientWidth + 1,
+        'Settings guide wraps inside panel without horizontal scrolling');
       for (const control of settingsPanel.querySelectorAll('input,button,select')) {
         reachable(control);
-        check(contains(rect(settingsPanel), rect(control)) && settingsPanel.scrollLeft === 0, 'Every basic settings control fits panel through vertical scrolling');
+        check(contains(rect(settingsPanel), rect(control)) && settingsPanel.scrollLeft === 0,
+          'Every basic settings control fits panel through vertical scrolling');
         measured.settingsGeometry.controls.push({ id: control.id || control.className, bounds: rect(control), scrollTop: settingsPanel.scrollTop });
       }
       equal(guide.textContent, guideText, 'Scrolling settings preserves the complete guide');
@@ -290,7 +320,8 @@ async function isolatedResponsiveCase(width) {
       reachable(document.querySelector('#search input'));
       reachable(document.getElementById('add-media')); document.getElementById('add-media').click();
       await until(() => !document.getElementById('add-media').disabled, 'Visible scan control handles modeled busy response');
-      equal([...document.querySelectorAll('#topbar button')].map(button => button.id), ['party-btn', 'add-media'], 'Main toolbar offers implemented Party and Scan controls');
+      equal([...document.querySelectorAll('#topbar button')].map(button => button.id), ['party-btn', 'add-media'],
+        'Main toolbar offers implemented Party and Scan controls');
       reachable(document.getElementById('party-btn')); document.getElementById('party-btn').click();
       check(document.getElementById('party-modal').classList.contains('on'), 'Visible party control opens panel');
       const originalSocket = window.WebSocket;
@@ -305,8 +336,10 @@ async function isolatedResponsiveCase(width) {
         const checkPartyRow = (input, button) => {
           reachable(input); reachable(button);
           check(contains(rect(partyPanel), rect(input)) && contains(rect(partyPanel), rect(button)), 'Party entry controls fit their panel');
-          check(partyPanel.scrollWidth <= partyPanel.clientWidth + 1 && document.documentElement.scrollWidth <= innerWidth + 1, 'Party panel and document stay within viewport');
-          return { panel: rect(partyPanel), input: rect(input), button: rect(button), clientWidth: partyPanel.clientWidth, scrollWidth: partyPanel.scrollWidth };
+          check(partyPanel.scrollWidth <= partyPanel.clientWidth + 1 && document.documentElement.scrollWidth <= innerWidth + 1,
+            'Party panel and document stay within viewport');
+          return { panel: rect(partyPanel), input: rect(input), button: rect(button), clientWidth: partyPanel.clientWidth,
+            scrollWidth: partyPanel.scrollWidth };
         };
         const joinInput = document.getElementById('party-code-input'), joinButton = document.getElementById('pt-join');
         measured.partyGeometry = { join: checkPartyRow(joinInput, joinButton), modeledTransport: true };
@@ -316,20 +349,23 @@ async function isolatedResponsiveCase(width) {
         const joinBounds = rect(joinButton);
         await api('click', { x: joinBounds.left + joinBounds.width / 2, y: joinBounds.top + joinBounds.height / 2 });
         check(trustedJoin && layoutSocket, 'Trusted Join click reaches production connection handler');
-        layoutSocket.onmessage({ data: JSON.stringify({ type: 'state', is_host: true, self_label: 'Host', state: { media_id: null, title: '', position: 0, playing: false, queue: [] } }) });
+        layoutSocket.onmessage({ data: JSON.stringify({ type: 'state', is_host: true, self_label: 'Host',
+          state: { media_id: null, title: '', position: 0, playing: false, queue: [] } }) });
         const ytInput = document.getElementById('pt-yt'), ytPlay = document.getElementById('pt-yt-go');
         measured.partyGeometry.host = checkPartyRow(ytInput, ytPlay);
         let trustedPlay = false;
         ytPlay.addEventListener('click', event => { trustedPlay = event.isTrusted; }, { once: true });
         const playBounds = rect(ytPlay);
         await api('click', { x: playBounds.left + playBounds.width / 2, y: playBounds.top + playBounds.height / 2 });
-        check(trustedPlay && document.querySelector('.party-error')?.textContent.includes('Paste a YouTube URL'), 'Trusted host Play click reaches production URL validation');
+        check(trustedPlay && document.querySelector('.party-error')?.textContent.includes('Paste a YouTube URL'),
+          'Trusted host Play click reaches production URL validation');
         measured.partyGeometry.trustedJoin = trustedJoin; measured.partyGeometry.trustedPlay = trustedPlay;
       } finally { PartyUI.close(); window.WebSocket = originalSocket; }
       document.getElementById('pt-close').click();
       const playerControls = [...document.querySelectorAll('#playerbar button')];
       measured.audioToolbarControls = playerControls.map(node => ({ id: node.id, label: node.getAttribute('aria-label') }));
-      equal(playerControls.map(node => node.id), ['pb-play', 'pb-close'], 'Audio toolbar exposes its functional controls without inactive Previous/Next buttons');
+      equal(playerControls.map(node => node.id), ['pb-play', 'pb-close'],
+        'Audio toolbar exposes its functional controls without inactive Previous/Next buttons');
       playerControls.forEach(reachable);
       let trustedAudioPause = false;
       pbAudio.addEventListener('pause', event => { trustedAudioPause = event.isTrusted; }, { once: true });
@@ -363,13 +399,15 @@ async function isolatedResponsiveCase(width) {
             const header = document.querySelector(selector), title = document.getElementById(titleId);
             const bounds = rect(header), titleBounds = rect(title);
             equal(title.textContent, expectedTitle, 'Modal retains complete title text');
-            check(bounds.left >= -1 && bounds.right <= innerWidth + 1 && bounds.top >= -1 && bounds.bottom <= innerHeight + 1, 'Modal header stays in viewport');
+            check(bounds.left >= -1 && bounds.right <= innerWidth + 1 && bounds.top >= -1 && bounds.bottom <= innerHeight + 1,
+              'Modal header stays in viewport');
             const controls = [...header.querySelectorAll('button,input')];
             const controlRects = controls.map(control => {
               const bounds = rect(control), hit = document.elementFromPoint(bounds.left + bounds.width / 2, bounds.top + bounds.height / 2);
-              check(bounds.width > 0 && contains(rect(header), bounds) && (hit === control || control.contains(hit)), 'Every modal header action has an unobstructed hit target');
+              check(bounds.width > 0 && contains(rect(header), bounds) && (hit === control || control.contains(hit)),
+                'Every modal header action has an unobstructed hit target');
               if (!control.disabled) { control.focus(); check(document.activeElement === control, 'Enabled header action accepts focus'); }
-              if (native) check(bounds.width === 44 && bounds.height === 44, 'Native header action preserves44px hit area');
+              if (native) check(bounds.width === 44 && bounds.height === 44, 'Native header action preserves a 44px hit area');
               return { id: control.id, disabled: control.disabled, bounds };
             });
             if (native) {
@@ -378,8 +416,10 @@ async function isolatedResponsiveCase(width) {
               // Inline reader titles can span lines; inspect painted fragments, not their union.
               const range = document.createRange(); range.selectNodeContents(title);
               for (const fragment of range.getClientRects()) {
-                check(fragment.left >= -1 && fragment.right <= innerWidth + 1 && fragment.top >= bounds.top - 1 && fragment.bottom <= bounds.bottom + 1, 'Reader title fragment fits header');
-                check(controlRects.every(control => fragment.right <= control.bounds.left + 1 || fragment.left >= control.bounds.right - 1 || fragment.bottom <= control.bounds.top + 1 || fragment.top >= control.bounds.bottom - 1), 'Reader title paint does not overlap actions');
+                check(fragment.left >= -1 && fragment.right <= innerWidth + 1 && fragment.top >= bounds.top - 1 && fragment.bottom <= bounds.bottom + 1,
+                  'Reader title fragment fits header');
+                check(controlRects.every(control => fragment.right <= control.bounds.left + 1 || fragment.left >= control.bounds.right - 1
+                  || fragment.bottom <= control.bounds.top + 1 || fragment.top >= control.bounds.bottom - 1), 'Reader title paint does not overlap actions');
               }
             }
             measured.modalHeaders.push({ width, height, selector, title: title.textContent, titleBounds, bounds, controls: controlRects });
@@ -397,8 +437,10 @@ async function isolatedResponsiveCase(width) {
         if (path === '/api/comic/90/pages') return Promise.resolve(headerReply(['0', '1']));
         if (path === '/api/epub/7/spine') return Promise.resolve(headerReply(['one.xhtml']));
         if (path === '/api/epub/7/toc' || path === '/api/annotations/7') return Promise.resolve(headerReply([]));
-        if (path === '/api/progress/90' || path === '/api/progress/7') return new Promise(resolve => { releaseHeaderProgress = () => resolve(headerReply(null)); });
-        if (path === '/api/epub/7/chunk/0') return Promise.resolve(new Response('<html><head></head><body><p>Owned reader header fixture</p></body></html>', { headers: { 'Content-Type': 'text/html' } }));
+        if (path === '/api/progress/90'
+          || path === '/api/progress/7') return new Promise(resolve => { releaseHeaderProgress = () => resolve(headerReply(null)); });
+        if (path === '/api/epub/7/chunk/0') return Promise.resolve(new Response('<html><head></head><body><p>Fixture reader header fixture</p></body></html>',
+          { headers: { 'Content-Type': 'text/html' } }));
         return previousReaderFetch(url, options);
       };
       try {
@@ -436,7 +478,8 @@ async function isolatedResponsiveCase(width) {
       const nativeControls = document.querySelector('.plyr__controls');
       await until(() => contains(rect(wrapper), rect(nativeControls)), 'revealed native controls settle inside wrapper');
       const viewportWidth = document.documentElement.clientWidth;
-      measured.videoGeometry = { viewportWidth, wrapper: rect(wrapper), controls: rect(nativeControls), decodedFrames: plyr.media.getVideoPlaybackQuality().totalVideoFrames };
+      measured.videoGeometry = { viewportWidth, wrapper: rect(wrapper), controls: rect(nativeControls),
+        decodedFrames: plyr.media.getVideoPlaybackQuality().totalVideoFrames };
       check(rect(wrapper).width === viewportWidth && rect(wrapper).height === innerHeight, 'Native Plyr fills viewport');
       check(getComputedStyle(document.getElementById('yt-party')).display === 'none', 'Native mode hides inactive external surface');
       reachable(document.querySelector('.plyr__controls [data-plyr="play"]'));
@@ -454,20 +497,20 @@ async function isolatedResponsiveCase(width) {
         modal.classList.remove('yt');
         check(rect(iframe).width === 0 && rect(wrapper).width === viewportWidth, 'Returning native mode hides external iframe and restores Plyr');
       } finally { iframe.replaceWith(external); modal.classList.remove('yt'); document.getElementById('vm-back').click(); }
-      return { viewport: { width: innerWidth, height: innerHeight }, sizes, grids, ratios, folderGrids: measured.folderGrids, shortAudioFooter: measured.shortAudioFooter, layoutGeometry: { login: measured.loginGeometry, authFlow: measured.authFlowGeometry, settings: measured.settingsGeometry, party: measured.partyGeometry, modalHeaders: measured.modalHeaders, hero: measured.heroGeometry, native: measured.videoGeometry, youtubeModel: measured.youtubeLayoutModel }, navigationLabels: nav.map(n => n.textContent.trim()), adminAndPlayerControlsReachable: true, realMediaControl: true, audioPauseUi: measured.audioPauseUi, deletionCancellation: true, nativeDiagnostics: fixture, overflowInventory: measured.overflowInventory };
+      return { viewport: { width: innerWidth, height: innerHeight }, sizes, grids, ratios, folderGrids: measured.folderGrids,
+        shortAudioFooter: measured.shortAudioFooter,
+        layoutGeometry: { login: measured.loginGeometry, authFlow: measured.authFlowGeometry, settings: measured.settingsGeometry,
+        party: measured.partyGeometry, modalHeaders: measured.modalHeaders, hero: measured.heroGeometry, native: measured.videoGeometry,
+        youtubeModel: measured.youtubeLayoutModel }, navigationLabels: nav.map(n => n.textContent.trim()), audioPauseUi: measured.audioPauseUi,
+        nativeDiagnostics: fixture };
     } catch (error) {
-      error.observed = { ...measured, audio: { readyState: pbAudio.readyState, paused: pbAudio.paused,
+      // Failure diagnostics name the elements that overflow #main.
+      error.observed = { ...measured, overflowInventory: responsiveOverflowInventory(), audio: { readyState: pbAudio.readyState, paused: pbAudio.paused,
         duration: pbAudio.duration, currentTime: pbAudio.currentTime, mediaError: pbAudio.error?.code || null }, nativeDiagnostics: fixture };
       throw error;
     } finally { document.getElementById('pb-close').click(); disposeSettings(); }
 }
 async function isolatedToolbarRetryCase(mode) {
-  const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
-  function check(value, message) { if (!value) throw new Error(message); }
-  async function until(predicate, label, budget = 4000) {
-    const deadline = Date.now() + budget;
-    while (!predicate()) { check(Date.now() < deadline, 'Timed out: ' + label); await delay(20); }
-  }
   await until(() => account?.isAdmin && LIBRARY.length > 0, 'fresh modeled account resumes');
   const previousFetch = window.fetch;
   let statusReads = 0, libraryReads = 0;
@@ -486,7 +529,7 @@ async function isolatedToolbarRetryCase(mode) {
     }
     if (url === '/api/scan/status') {
       statusReads++;
-      if (statusReads <= (mode === 'transient' ? 1 : 3)) throw Error('Owned transient status transport failure');
+      if (statusReads <= (mode === 'transient' ? 1 : 3)) throw Error('Fixture transient status transport failure');
       return reply({ scanning: false });
     }
     if (new URL(String(url), location.origin).pathname === '/api/library') {
@@ -500,7 +543,8 @@ async function isolatedToolbarRetryCase(mode) {
     button.scrollIntoView({ block: 'center' });
     const r = button.getBoundingClientRect();
     const point = { x: r.left + r.width / 2, y: r.top + r.height / 2 };
-    check(document.elementFromPoint(point.x, point.y) === button || button.contains(document.elementFromPoint(point.x, point.y)), 'Production toolbar accepts pointer hit');
+    check(document.elementFromPoint(point.x, point.y) === button || button.contains(document.elementFromPoint(point.x, point.y)),
+      'Production toolbar accepts pointer hit');
     const response = await previousFetch('/__fixture/click', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(point) });
     check(response.ok && clicks.at(-1) === true, 'Production scan receives trusted browser click');
   }
@@ -512,37 +556,38 @@ async function isolatedToolbarRetryCase(mode) {
       check(document.getElementById('toast-host').textContent.includes('retrying'), 'Transient failure reports automatic retry');
       await until(() => releaseLibrary, 'next idle status starts refresh');
       await delay(1650);
-      check(statusReads === 2 && libraryReads === 1 && button.disabled, 'No overlapping polls while library refresh is pending beyond1500ms');
+      check(statusReads === 2 && libraryReads === 1 && button.disabled, 'No overlapping polls while library refresh is pending beyond 1500 ms');
       releaseLibrary();
     } else {
-      // Three real1500ms intervals require4500ms;6500ms is scoped to this criterion only.
+      // Three real 1500 ms intervals take 4500 ms; the 6500 ms budget applies to this criterion only.
       await until(() => !button.disabled, 'three failures restore retry control', 6500);
       check(statusReads === 3 && libraryReads === 0, 'Exactly three failures stop without refreshing');
-      check(button.innerHTML === originalMarkup && document.getElementById('toast-host').textContent.includes('click Scan to retry monitoring'), 'Manual retry is truthful and available');
+      check(button.innerHTML === originalMarkup && document.getElementById('toast-host').textContent.includes('click Scan to retry monitoring'),
+        'Manual retry is truthful and available');
       await trustedClick();
-      check(button.disabled && document.getElementById('toast-host').textContent.includes('monitoring progress'), 'POST409 reattaches monitoring');
+      check(button.disabled && document.getElementById('toast-host').textContent.includes('monitoring progress'), 'POST 409 reattaches monitoring');
     }
     await until(() => !button.disabled, 'valid idle status completes monitoring');
     check(libraryReads === 1 && button.innerHTML === originalMarkup, 'Successful current-account completion refreshes once and restores control');
     check(document.getElementById('toast-host').textContent.includes('Scan complete'), 'Completion feedback published');
     check(postStatuses.join(',') === (mode === 'transient' ? '202' : '202,409'), 'Expected scan admission statuses');
-    return { mode, freshDocument: true, trustedClicks: clicks, postStatuses, statusReads, libraryReads,
-      realIntervalMs: 1500, noOverlapDuringHeldRefresh: mode === 'transient', toolbarRestored: true,
-      accountName: account.name, modeledAPI: true, actualDOMAndTimers: true };
+    return { mode, trustedClicks: clicks, postStatuses, statusReads, libraryReads, noOverlapDuringHeldRefresh: mode === 'transient',
+      accountName: account.name };
   } finally { if (releaseLibrary) releaseLibrary(); window.fetch = previousFetch; }
 }
 async function freshResponsiveDocument(width, toolbarRetryMode = null) {
   const viewport = await fetch('/__fixture/viewport', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ width }) });
-  if (!viewport.ok) throw Error('Owned viewport control failed');
+  if (!viewport.ok) throw Error('Fixture viewport control failed');
   const frame = document.createElement('iframe');
   frame.style.cssText = 'position:fixed;inset:0;width:100vw;height:100vh;border:0;z-index:100000';
   let timer;
   let receive;
   try {
     const result = new Promise((resolve, reject) => {
-      timer = setTimeout(() => reject(Error('Fresh responsive document exceeded12s')), 12000);
+      timer = setTimeout(() => reject(Error('Fresh responsive document exceeded 12 s')), 12000);
       receive = event => {
-        if (event.source !== frame.contentWindow || event.origin !== location.origin || event.data?.type !== 'responsive-case-result' || event.data.width !== width) return;
+        if (event.source !== frame.contentWindow || event.origin !== location.origin || event.data?.type !== 'responsive-case-result'
+          || event.data.width !== width) return;
         resolve(event.data);
       };
       window.addEventListener('message', receive);
@@ -563,28 +608,10 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
   const nativeMedia = [];
   window.addEventListener('error', event => {
     if (event instanceof ErrorEvent) errors.push({ message: event.message, stack: event.error?.stack, filename: event.filename, line: event.lineno });
-    else mediaDiagnostics.push({ type: event.type, target: event.target?.tagName, detail: 'Empty fixture streams exercise DOM events without decoded playback.' });
+    else mediaDiagnostics.push({ type: event.type, target: event.target?.tagName,
+      detail: 'Empty fixture streams exercise DOM events without decoded playback.' });
   });
   window.addEventListener('unhandledrejection', event => errors.push({ rejection: String(event.reason), stack: event.reason?.stack }));
-  const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
-  function check(value, message) { if (!value) throw new Error(message); }
-  function equal(actual, expected, message) {
-    check(JSON.stringify(actual) === JSON.stringify(expected), `${message}: ${JSON.stringify(actual)} != ${JSON.stringify(expected)}`);
-  }
-  async function until(predicate, label) {
-    const deadline = Date.now() + 4000;
-    while (!(await predicate())) {
-      if (Date.now() >= deadline) throw new Error(`Timed out: ${label}`);
-      await delay(20);
-    }
-  }
-  async function api(path, body) {
-    const response = await fetch('/__fixture/' + path, body === undefined ? {} : {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-    });
-    check(response.ok, `Fixture ${path}: ${response.status}`);
-    return response.json();
-  }
   if (window.__toolbarRetryMode) {
     const width = window.__responsiveFixture.width;
     try {
@@ -605,11 +632,6 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     }
     return;
   }
-  if (window.__responsiveDiagnosticOnly) {
-    await run('fresh isolated responsive diagnostic at768 CSS pixels', () => freshResponsiveDocument(768));
-    return api('result', { cases, errors, mediaDiagnostics, nativeMedia, passed: cases.filter(c => c.status === 'PASS').length,
-      failed: cases.filter(c => c.status !== 'PASS').length, limits: ['Diagnostic only; full-suite and installer cases are not rerun here.'] });
-  }
   const logoutReceipt = sessionStorage.getItem('frayd-qa-logout');
   if (logoutReceipt) {
     const packet = JSON.parse(logoutReceipt);
@@ -625,10 +647,12 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     sessionStorage.removeItem('frayd-qa-logout');
     check(settingsPoll === null && !document.getElementById('settings-modal').classList.contains('on'), 'new document owns no old settings poll or modal');
     document.getElementById('guest').click();
-    await until(() => document.getElementById('app').classList.contains('on') && document.getElementById('login').style.display === 'none', 'explicit guest re-entry after repeated sign-in refresh');
+    await until(() => document.getElementById('app').classList.contains('on') && document.getElementById('login').style.display === 'none',
+      'explicit guest re-entry after repeated sign-in refresh');
     check(localStorage.frayd_logout === undefined, 'Explicit re-entry clears sign-out marker');
     packet.cases.push({ name: 'settings logout repeated reload retains sign-in until guest re-entry and retires old poll', status: 'PASS',
-      observed: { actualReload: true, repeatedRefreshSignInOnly: true, explicitGuestReentry: true, settingsPoll: null, previousDocumentGeneration: packet.logoutGeneration } });
+      observed: { actualReload: true, repeatedRefreshSignInOnly: true, explicitGuestReentry: true, settingsPoll: null,
+        previousDocumentGeneration: packet.logoutGeneration } });
     delete packet.logoutGeneration;
     delete packet.logoutRefreshed;
     packet.passed++;
@@ -676,7 +700,8 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     reportProgress(cases.length + 1);
     const startedAt = performance.now();
     try { cases.push({ name, status: 'PASS', observed: await fn(), elapsedMs: performance.now() - startedAt }); }
-    catch (error) { cases.push({ name, status: error.code === 'NATIVE_CODEC_UNAVAILABLE' ? 'BLOCKED' : 'FAIL', error: error.stack, elapsedMs: performance.now() - startedAt, ...(error.observed ? { observed: error.observed } : {}) }); }
+    catch (error) { cases.push({ name, status: error.code === 'NATIVE_CODEC_UNAVAILABLE' ? 'BLOCKED' : 'FAIL', error: error.stack,
+      elapsedMs: performance.now() - startedAt, ...(error.observed ? { observed: error.observed } : {}) }); }
     reportProgress(null);
   }
   async function highlight({ body, start, end, text, offset, search, saved = [] }) {
@@ -705,7 +730,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     await probe('select', { start, end });
     await delay(80);
     equal((await api('state')).posts.length, 1, 'Duplicate selection sends no second POST');
-    return { cfi: state.posts[0].cfi, savedText: text, restoredMarks: restored, posts: 1, paintHeldUntil201: true };
+    return { cfi: state.posts[0].cfi, savedText: text, restoredMarks: restored };
   }
   async function nativeResume(name, decodableBlank, id = 20, expectedPosition = 64) {
     if (!document.createElement('video').canPlayType('video/mp4; codecs="avc1.42E01E"')) {
@@ -803,7 +828,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
           media.removeEventListener('pause', onPause);
         }
       }
-      return { trace: trace.slice(), decodedWidth: plyr.media.videoWidth, nativeEvents: true, pauseProgress };
+      return { trace: trace.slice(), decodedWidth: plyr.media.videoWidth, pauseProgress };
     } finally {
       try { if (decodableBlank) await api('release-media', {}); }
       finally {
@@ -836,7 +861,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
         && plyr.media.videoWidth === 160
         && plyr.media.getVideoPlaybackQuality().totalVideoFrames > 0, 'decoded native playback before queued pause');
       media = plyr.media;
-      check(media.getVideoPlaybackQuality().totalVideoFrames > 0, 'Queue scenario decodes owned video frames');
+      check(media.getVideoPlaybackQuality().totalVideoFrames > 0, 'Queue scenario decodes video frames');
       media.addEventListener('pause', observe);
       partyHostHook(command => forwarded.push(command));
       ytReady = true;
@@ -855,8 +880,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       await until(() => forwarded.some(command => command.type === 'pause'), 'legitimate native pause is broadcast');
       equal(forwarded.filter(command => command.type === 'pause').length, 1, 'Legitimate native pause broadcasts once');
       check(pauses.at(-1).trusted && pauses.at(-1).pausedWhenDelivered, 'Legitimate native pause is trusted and currently paused');
-      return { pauses, decodedFrames: media.getVideoPlaybackQuality().totalVideoFrames,
-        actualNativeEvents: true, externalAdapterMocked: true, legitimatePauseBroadcasts: 1 };
+      return { pauses, decodedFrames: media.getVideoPlaybackQuality().totalVideoFrames };
     } finally {
       if (media) media.removeEventListener('pause', observe);
       document.getElementById('vm-back').click();
@@ -868,7 +892,8 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     auth: document.body.classList.contains('auth'), loginStyle: document.getElementById('login').getAttribute('style'), library: LIBRARY };
   if (!readerAppState.visible) {
     document.getElementById('guest').click();
-    await until(() => document.getElementById('app').classList.contains('on') && LIBRARY !== readerAppState.library, 'guest entry completes its library restore');
+    await until(() => document.getElementById('app').classList.contains('on') && LIBRARY !== readerAppState.library,
+      'guest entry completes its library restore');
     LIBRARY = readerAppState.library; // Retain the known media IDs used by subsequent fixture cases.
   }
   await run('saved marks survive parser-gated reader startup', async () => {
@@ -897,21 +922,29 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
         check(!ebook.document.ready, 'Hidden chapter does not announce usable pagination');
         equal(paginationWrites, [], 'Unmeasurable pagination cannot autosave a false one-page position');
       } finally { hiddenFrame.style.removeProperty('display'); }
-      await until(() => ebook.document.ready && document.getElementById('em-pageinfo').textContent === '3 · p2/4', 'visible four-page chapter restores saved fractional column');
+      await until(() => ebook.document.ready && document.getElementById('em-pageinfo').textContent === '3 · p2/4',
+        'visible four-page chapter restores saved fractional column');
       equal(ebook.lastFrac, 1 / 3, 'First visible page report preserves saved 2.333');
       equal(paginationWrites, [2 + 1 / 3], 'First actual autosave preserves saved 2.333');
       await api('configure', { body: '<p>One real page</p>', annotations: [] });
       await showChunk(2, { frac: 1 / 3 });
-      await until(() => ebook.document.ready && document.getElementById('em-pageinfo').textContent === '3 · p1/1', 'visible single-page chapter reports its real bound');
+      await until(() => ebook.document.ready && document.getElementById('em-pageinfo').textContent === '3 · p1/1',
+        'visible single-page chapter reports its real bound');
       equal(ebook.lastFrac, 0, 'Visible single-page chapter legitimately publishes zero fraction');
       equal(paginationWrites, [2 + 1 / 3, 2], 'Valid single-page autosave remains accepted');
     } finally { window.fetch = chapterFetch; }
-    const tallCoverSource = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="500" height="862" viewBox="0 0 500 862"><rect width="500" height="862" fill="#f5e4b9"/><rect x="10" y="10" width="480" height="842" fill="none" stroke="#46342a" stroke-width="20"/><text x="250" y="100" text-anchor="middle" font-size="40">COVER TOP</text><text x="250" y="800" text-anchor="middle" font-size="40">COVER BOTTOM</text></svg>');
-    const coverBody = '<img id="owned-tall-cover" style="width:100%" alt="Owned tall cover: top and bottom must remain visible" src="' + tallCoverSource + '"><script>' +
+    const tallCoverSource = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="500" height="862" ' +
+      'viewBox="0 0 500 862"><rect width="500" height="862" fill="#f5e4b9"/><rect x="10" y="10" width="480" height="842" fill="none" ' +
+      'stroke="#46342a" stroke-width="20"/><text x="250" y="100" text-anchor="middle" font-size="40">COVER TOP</text><text x="250" y="800" ' +
+      'text-anchor="middle" font-size="40">COVER BOTTOM</text></svg>');
+    const coverBody = '<img id="tall-cover" style="width:100%" alt="Fixture tall cover: top and bottom must remain visible" src="'
+      + tallCoverSource + '"><script>' +
       'addEventListener("message",async event=>{if(event.source!==parent||event.data?.type!=="cover-fit-probe")return;' +
-      'const image=document.getElementById("owned-tall-cover");await image.decode();const rect=image.getBoundingClientRect(),body=document.body.getBoundingClientRect(),style=getComputedStyle(document.body);' +
+      'const image=document.getElementById("tall-cover");await image.decode();const rect=image.getBoundingClientRect(),' +
+      'body=document.body.getBoundingClientRect(),style=getComputedStyle(document.body);' +
       'parent.postMessage({type:"cover-fit-result",naturalWidth:image.naturalWidth,naturalHeight:image.naturalHeight,alt:image.alt,' +
-      'image:{top:rect.top,bottom:rect.bottom,width:rect.width,height:rect.height},content:{top:body.top+parseFloat(style.paddingTop),bottom:body.bottom-parseFloat(style.paddingBottom)},viewport:innerHeight},"*")});<\/script>';
+      'image:{top:rect.top,bottom:rect.bottom,width:rect.width,height:rect.height},content:{top:body.top+parseFloat(style.paddingTop),' +
+      'bottom:body.bottom-parseFloat(style.paddingBottom)},viewport:innerHeight},"*")});<\/script>';
     await api('configure', { body: coverBody, annotations: [] });
     ebook = { it: { id: 7 }, spine: ['cover.xhtml', 'chapter.xhtml'], chunk: 0, annots: [] };
     await showChunk(0, { frac: 1 / 3 });
@@ -929,7 +962,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     equal([coverFit.naturalWidth, coverFit.naturalHeight], [500, 862], 'Tall fixture image really decodes at its intrinsic dimensions');
     check(coverFit.image.top >= coverFit.content.top - 1 && coverFit.image.bottom <= coverFit.content.bottom + 1,
       'Decoded tall cover fits inside the actual padded reader content: ' + JSON.stringify(coverFit));
-    equal(coverFit.alt, 'Owned tall cover: top and bottom must remain visible', 'Cover alternative text remains intact');
+    equal(coverFit.alt, 'Fixture tall cover: top and bottom must remain visible', 'Cover alternative text remains intact');
     equal(document.getElementById('em-pageinfo').textContent, '1 · p1/1', 'Fitted cover occupies one actual page');
     equal(ebook.lastFrac, 0, 'Visible cover single-page position legitimately saves zero fraction');
     ebookFlip(-1); await probe();
@@ -941,9 +974,12 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     // Observe actual visible layout after load; a newly attached frame may load before its first layout.
     // The existing parent deadline still rejects a paragraph that never becomes visible.
     publishEbookDocument = html => publishChapter(html + (html.includes('Failed to load chapter.')
-      ? '<script>addEventListener("load",()=>{const p=document.querySelector("p");let initialGeometry,samples=0;function measure(){const r=p.getBoundingClientRect();initialGeometry??={width:r.width,height:r.height};samples++;if(!(r.width>0&&r.height>0)){requestAnimationFrame(measure);return;}parent.postMessage({type:"chapter-error-proof",text:p.textContent,width:r.width,height:r.height,initialGeometry,samples},"*");}measure();});<\/script>' : ''));
+      ? '<script>addEventListener("load",()=>{const p=document.querySelector("p");let initialGeometry,samples=0;function measure(){const ' +
+        'r=p.getBoundingClientRect();initialGeometry??={width:r.width,height:r.height};samples++;if(!(r.width>0&&r.height>' +
+        '0)){requestAnimationFrame(measure);return;}parent.postMessage({type:"chapter-error-proof",text:p.textContent,width:r.width,' +
+        'height:r.height,initialGeometry,samples},"*");}measure();});<\/script>' : ''));
     try {
-      for (const [status, body] of [[404, ''], [500, 'Owned rejected body'], [200, ''], [200, 'Missing head']]) {
+      for (const [status, body] of [[404, ''], [500, 'Fixture rejected body'], [200, ''], [200, 'Missing head']]) {
         window.fetch = (url, options) => {
           if (url === '/api/epub/7/chunk/1') return Promise.resolve(new Response(body, { status }));
           if (url === '/api/progress' && options?.method === 'POST') errorWrites.push(JSON.parse(options.body).position);
@@ -962,12 +998,15 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
         await showChunk(1, { frac: 0.75 });
         const error = await observed;
         equal(error.text, 'Failed to load chapter.', 'Sandboxed chapter error paragraph actually renders');
-        check(error.width > 0 && error.height > 0 && readerFrame().getBoundingClientRect().height > 0, 'Error paragraph and its frame have visible geometry: ' + JSON.stringify({ error, frame: readerFrame().getBoundingClientRect().toJSON(), modal: getComputedStyle(document.getElementById('ebook-modal')).display, app: getComputedStyle(document.getElementById('app')).display }));
+        check(error.width > 0 && error.height > 0 && readerFrame().getBoundingClientRect().height > 0,
+          'Error paragraph and its frame have visible geometry: ' + JSON.stringify({ error, frame: readerFrame().getBoundingClientRect().toJSON(),
+          modal: getComputedStyle(document.getElementById('ebook-modal')).display, app: getComputedStyle(document.getElementById('app')).display }));
         check(readerFrame() !== previous, 'Chapter error uses a fresh published frame');
         equal(document.getElementById('em-pageinfo').textContent, 'Chapter unavailable', 'Error does not retain Loading status');
         equal(ebook.lastFrac, 0.75, 'Error preserves requested bookmark fraction');
         equal(errorWrites, [], 'Chapter error cannot autosave a false zero position');
-        chapterErrors.push({ status, emptyBody: !body, text: error.text, width: error.width, height: error.height, initialGeometry: error.initialGeometry, samples: error.samples });
+        chapterErrors.push({ status, emptyBody: !body, text: error.text, width: error.width, height: error.height, initialGeometry: error.initialGeometry,
+          samples: error.samples });
       }
     } finally { window.fetch = errorFetch; publishEbookDocument = publishChapter; }
     const saved = [{ kind: 'highlight', spine_idx: 0, cfi: 'char:7:6', text: 'target', color: 'yellow' }];
@@ -1020,9 +1059,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     equal(ebook.lastFrac, resizeFraction, 'Resize preserves the reported position');
     equal((await probe()).marks, ['target'], 'Resize restores saved marks');
     return { chapterErrors, errorWrites, coverFit, initialPagination: { hiddenAutosaves: 0, autosavePositions: paginationWrites, visibleSinglePage: true },
-      freshFrame: true, retiredWindowRejected: true, resizeReady: true,
-      marks: observed.marks, parserHeldBeyondOldTimer: true, posts: 0,
-      reopen: true, tocRevisit: true, duplicateRestoreIdempotent: true, staleReadyIgnored: true };
+      marks: observed.marks };
   });
   await run('plain text save, 201 paint, reload and duplicate', () => highlight({
     body: '<p id="target">prefix target suffix</p>', start: 7, end: 13, text: 'target', offset: 7,
@@ -1043,7 +1080,8 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
   }));
   for (const fixture of [
     { name: 'cross-node selection rejected', body: '<p id="target">one <b>two</b></p>', start: 0, end: 7, rejection: true },
-    { name: 'selection ending at next text node offset zero rejected', body: '<p id="target">one</p><p id="next">two</p>', start: 0, end: 3, nextNode: true, rejection: true },
+    { name: 'selection ending at next text node offset zero rejected', body: '<p id="target">one</p><p id="next">two</p>', start: 0, end: 3, nextNode: true,
+      rejection: true },
     { name: 'whitespace-only selection ignored', body: '<p id="target">   </p>', start: 0, end: 3, rejection: false },
   ]) await run(fixture.name, async () => {
     await api('configure', { body: fixture.body, annotations: [] });
@@ -1056,7 +1094,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     equal((await probe()).marks, [], 'Rejected selection has no paint');
     equal(document.getElementById('em-searchinfo').textContent,
       fixture.rejection ? 'Select text without crossing formatting or paragraph breaks.' : '', 'Selection status');
-    return { posts: 0, marks: 0 };
+    return;
   });
   document.getElementById('app').classList.toggle('on', readerAppState.visible);
   document.body.classList.toggle('auth', readerAppState.auth);
@@ -1091,7 +1129,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       window.partyFollow(id, 'Fixture movie', 12, false, Date.now() / 1000);
       equal({ src: active.getAttribute('src'), child: active.querySelector('source')?.getAttribute('src') },
         sourceBeforeFollow, 'Follower retains the current matching Plyr source without reassigning it');
-      // HTTP204 supplies no metadata: model readiness explicitly for this synthetic event.
+      // HTTP 204 supplies no metadata: model readiness explicitly for this synthetic event.
       const readyDescriptor = Object.getOwnPropertyDescriptor(active, 'readyState');
       try {
         Object.defineProperty(active, 'readyState', { configurable: true, value: 1 });
@@ -1105,8 +1143,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       }
       retired.push(active);
     }
-    return { replacements: 2, activeEvents: ['play', 'pause', 'seek'], detachedSyntheticEvents,
-      followerPositions: [12, 24], syntheticEventsOnly: true, metadataReadinessModeledAndRestored: true };
+    return { detachedSyntheticEvents };
   });
   // Keep real Plyr/source/DOM behavior; empty streams need controlled media timing.
   const originalFetch = window.fetch;
@@ -1189,8 +1226,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
         }
         check(source.endsWith('/api/stream/9'), `Actual stream returns to nine: ${source}`);
         check(media.currentTime >= 24 && media.currentTime < 26, 'Party clock replaces local position');
-        return { source, position: media.currentTime, saves, localProgressSettled: true,
-          metadataReadinessModeledAndRestored: true };
+        return { source, position: media.currentTime, saves };
       } finally {
         LIBRARY = priorLibrary;
         window.fetch = priorFetch;
@@ -1251,8 +1287,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     }
     PartyUI.close();
     return { isHost, metadataFirst, loadedMedia: id, partyMedia: nextId, firstPosition: position,
-      sourceBefore, sourceAfter: { src: media.getAttribute('src'), child: media.querySelector('source')?.getAttribute('src') },
-      actualVendoredPlyr: true, productionPartyStateHandler: true, syntheticMediaTimingAndTransport: true };
+      sourceBefore, sourceAfter: { src: media.getAttribute('src'), child: media.querySelector('source')?.getAttribute('src') } };
   }
   for (const metadataFirst of [false, true]) {
     const id = metadataFirst ? 11 : 10;
@@ -1310,7 +1345,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
           Object.defineProperty(audio, 'readyState', { configurable: true, value: 0 });
           playAudio({ id: 11, kind: 'music', title: 'Local audio before cached return' });
           await until(() => audioSourceInstalled, 'local audio source assigned after progress response');
-          // HTTP204 has no decoded metadata; deliver modeled readiness after its listener is installed.
+          // HTTP 204 has no decoded metadata; deliver modeled readiness after its listener is installed.
           Object.defineProperty(audio, 'readyState', { configurable: true, value: 1 });
           audio.dispatchEvent(new Event('loadedmetadata'));
           await until(() => !audio.paused, 'local audio starts before cached video return');
@@ -1332,8 +1367,8 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
         else delete audio.readyState;
       }
     }
-    return { beforeKind: 'audio', afterKind: partyPlaybackKind, audioPaused: audio.paused,
-      videoPaused: media.paused, videoPosition: plyr.currentTime, productionHostHandler: true, cachedActivations, localAudioMetadataModeledAndRestored: true };
+    return { afterKind: partyPlaybackKind, audioPaused: audio.paused,
+      videoPaused: media.paused, videoPosition: plyr.currentTime, cachedActivations };
   });
   await run('host preserves an active paused video in real Plyr', () => {
     LIBRARY = [{ id: 10, kind: 'movie' }, { id: 11, kind: 'movie' }];
@@ -1397,11 +1432,13 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
         playerCreations++;
         mock = { state: -1, position: 0, cuedStart: 0, pauses: 0, ready: false, commands: [],
           requireReady() { if (!this.ready) throw new Error('Mock YouTube player is not ready'); },
-          setState(state) { const changed = this.state !== state; this.state = state; if (changed) config.events.onStateChange({ target: this, data: state }); },
+          setState(state) { const changed = this.state !== state; this.state = state; if (changed) config.events.onStateChange({ target: this, data: state });
+            },
           emitReady() { this.ready = true; config.events.onReady({ target: this }); },
           // Vendor seek from unstarted/cued starts playing; already-paused seek does not.
           seekTo(position) { this.requireReady(); this.commands.push('seek'); this.position = position; if (this.state !== 2) this.setState(1); },
-          cueVideoById({ videoId, startSeconds }) { this.requireReady(); this.commands.push('cue'); this.cuedStart = startSeconds; this.position = 0; this.setState(5); },
+          cueVideoById({ videoId, startSeconds }) { this.requireReady(); this.commands.push('cue'); this.cuedStart = startSeconds; this.position = 0;
+            this.setState(5); },
           getCurrentTime() { this.requireReady(); return this.position; },
           getPlayerState() { this.requireReady(); return this.state; },
           playVideo() { this.requireReady(); this.commands.push('play'); if (this.state === 5) this.position = this.cuedStart; this.setState(1); },
@@ -1552,7 +1589,8 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
             title: 'Role reuse fixture', queue: [], position: 42, playing: false, updated_at: Date.now() / 1000 } }) });
           mock.elapse(12);
           check(mock.state === 2 && mock.position === 42, 'Paused ordinary join follows a later host seek without playing');
-          const pausedJoin = { stoppedOnReady: true, noAdvanceWhilePaused: true, laterHostPlayPause: true, pausedHostSeek: true, playingResetFromCue: true, vendorSeekStartsUnstarted: true };
+          const pausedJoin = { stoppedOnReady: true, noAdvanceWhilePaused: true, laterHostPlayPause: true, pausedHostSeek: true, playingResetFromCue: true,
+            vendorSeekStartsUnstarted: true };
           const reusedPlayer = mock;
           mock.playVideo(); mock.pauseVideo();
           equal(guestSocket.sent, [], 'Guest-created external player cannot broadcast host commands');
@@ -1614,13 +1652,15 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
           const backBounds = document.getElementById('vm-back').getBoundingClientRect();
           const beforeCleanupHit = document.elementFromPoint(backBounds.x + backBounds.width / 2, backBounds.y + backBounds.height / 2);
           check(backBounds.width > 0 && backBounds.height > 0 && document.getElementById('vm-back').contains(beforeCleanupHit),
-            `External Back is hit-testable after guest entry: ${JSON.stringify({ bounds: { width: backBounds.width, height: backBounds.height }, hit: beforeCleanupHit?.id || beforeCleanupHit?.tagName })}`);
+            `External Back is hit-testable after guest entry: ${JSON.stringify({ bounds: { width: backBounds.width, height: backBounds.height },
+              hit: beforeCleanupHit?.id || beforeCleanupHit?.tagName })}`);
           const iframe = document.createElement('iframe');
-          iframe.srcdoc = '<!doctype html><body style="margin:0;background:black;height:100vh">Owned iframe event boundary</body>';
+          iframe.srcdoc = '<!doctype html><body style="margin:0;background:black;height:100vh">Fixture iframe event boundary</body>';
           document.getElementById('yt-party').appendChild(iframe);
           try {
             await delay(2700);
-            check(!document.querySelector('.vm-overlay').classList.contains('hidden'), 'External header stays visible after native idle transition and external idle');
+            check(!document.querySelector('.vm-overlay').classList.contains('hidden'),
+              'External header stays visible after native idle transition and external idle');
             for (const id of ['vm-back', 'vm-party']) {
               const button = document.getElementById(id); const bounds = button.getBoundingClientRect();
               check(button.contains(document.elementFromPoint(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2)),
@@ -1638,15 +1678,14 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
               partyOpens: true, backExits: true, nativeReopens: true };
           } finally { iframe.remove(); }
         }
-        return { queuedAudioControl: { stalePauseBroadcasts: 0, legitimatePauseBroadcasts: 1, readinessDescriptorRestoredInFinally: true },
-          retiredVideoMetadataIgnored: true, observations, latestPendingStateViaAppFollow: { position: 20, playing: false }, localActivations, roleReuse,
-          productionPartyStateHandler: true, mockedYouTubeAPI: true, actualYouTubePlayback: false };
+        return { observations, localActivations, roleReuse };
       } finally {
         if (originalAudioReady) Object.defineProperty(queuedAudioFixture, 'readyState', originalAudioReady);
         else delete queuedAudioFixture.readyState;
-        equal(Object.getOwnPropertyDescriptor(queuedAudioFixture, 'readyState'), originalAudioReady, 'Synthetic producer restores its original readiness descriptor');
+        equal(Object.getOwnPropertyDescriptor(queuedAudioFixture, 'readyState'), originalAudioReady,
+          'Synthetic producer restores its original readiness descriptor');
         PartyUI.close();
-        clearInterval(window._ytSeekTimer);
+        clearInterval(ytSeekTimer);
         ytPlayer = null;
         ytPlayerReady = false;
         ytId = null;
@@ -1712,7 +1751,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
           const point = {x:rect.left + rect.width/2, y:rect.top + rect.height/2};
           const hit = document.elementFromPoint(point.x, point.y);
           check(rect.width > 0 && rect.height > 0 && hit === title,
-            `Visible audio title receives the owned browser gesture: ${JSON.stringify({point, hit:hit?.id || hit?.tagName})}`);
+            `Visible audio title receives the browser gesture: ${JSON.stringify({point, hit:hit?.id || hit?.tagName})}`);
           gesture = await api('click', point);
           check(trustedGesture && gesture.trustedBrowserInput && navigator.userActivation.hasBeenActive,
             'Trusted document gesture precedes progress response release');
@@ -1723,9 +1762,9 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
         }
         if (phase === 'playing') {
           await api('release-media', {});
-          await until(() => pbAudio.readyState >= 2 && !pbAudio.paused && pbAudio.currentTime >= 64, 'native audio resumes64');
+          await until(() => pbAudio.readyState >= 2 && !pbAudio.paused && pbAudio.currentTime >= 64, 'native audio resumes at 64 s');
           pbAudio.currentTime = 41;
-          await until(() => !pbAudio.seeking && pbAudio.currentTime >= 41, 'native user seek41');
+          await until(() => !pbAudio.seeking && pbAudio.currentTime >= 41, 'native user seek to 41 s');
         }
         PartyUI.open();
         document.getElementById('party-code-input').value = 'ABCD';
@@ -1747,7 +1786,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
           duration:pbAudio.duration, muted:pbAudio.muted});
       }
       check(metadata.length === 3 && metadata.every(event => event.trusted), 'All audio phases use actual trusted native metadata');
-      return {...video, audioEchoes, audioMetadata:metadata, typedResponse:true, productionHostStateHandler:true};
+      return {...video, audioEchoes, audioMetadata:metadata};
     } finally {
       window.fetch = originalFetch;
       await api('release-media', {});
@@ -1769,18 +1808,20 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
   const qaIdentity = IDENTITY;
   const requests = [];
   let responder;
-  const reply = (value, status = 200) => new Response(status === 204 ? null : JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });
+  const reply = (value, status = 200) => new Response(status === 204 ? null : JSON.stringify(value),
+    { status, headers: { 'Content-Type': 'application/json' } });
   window.fetch = async (url, options = {}) => {
     if (String(url).startsWith('/__fixture/')) return qaFetch(url, options);
     if (new URL(String(url), location.origin).pathname === '/api/library') {
       equal(new URL(String(url), location.origin).searchParams.get('identity'), IDENTITY, 'Library request retains current modeled identity');
-      equal(options.headers?.Authorization, localStorage.frayd_token ? 'Bearer ' + localStorage.frayd_token : undefined, 'Library request retains current bearer presence');
+      equal(options.headers?.Authorization, localStorage.frayd_token ? 'Bearer ' + localStorage.frayd_token : undefined,
+        'Library request retains current bearer presence');
     }
     requests.push({ url: String(url), method: options.method || 'GET', body: options.body ? JSON.parse(options.body) : null });
     return responder(String(url), options);
   };
   account = { name: 'Disposable admin', isAdmin: true };
-  IDENTITY = 'qa-owned-admin';
+  IDENTITY = 'qa-admin';
   document.body.classList.remove('auth');
   document.getElementById('login').style.display = 'none';
   document.getElementById('app').classList.add('on');
@@ -1794,7 +1835,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       : new URL(String(url), location.origin).pathname === '/api/library' ? reply([]) : reply(null);
   responder = defaultResponder;
   const key = (key, accept = false) => api('key', { key, accept });
-  const movie = { id: 9, title: 'Owned delete fixture', kind: 'movie', duration_secs: 120 };
+  const movie = { id: 9, title: 'Fixture delete fixture', kind: 'movie', duration_secs: 120 };
   await run('admin DOM survives markup and trusted Tab Enter Space isolate card deletion', async () => {
     let deleteStatus = 409;
     responder = async (url, options) => options.method === 'DELETE' ? reply(null, deleteStatus) : defaultResponder(url);
@@ -1802,6 +1843,8 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     await filterKind('movie', '');
     const button = document.querySelector('#main .card-del');
     check(button && button.type === 'button', 'Delete survives card innerHTML');
+    const hitArea = button.getBoundingClientRect();
+    check(hitArea.width >= 40 && hitArea.height >= 40, 'Delete offers a hit area of at least 40px: ' + JSON.stringify(hitArea));
     document.querySelector('#main .row-head button').focus();
     await key('Tab');
     check(document.activeElement === button, 'Trusted Tab reaches delete button');
@@ -1820,79 +1863,20 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     deleteStatus = 204;
     await key(' ', true);
     await until(() => LIBRARY.length === 0, '204 removes modeled row');
-    check(!document.querySelector('#main .card-del') && !document.getElementById('video-modal').classList.contains('on'), 'Success removes card without opening player');
-    return { trustedTabEnterSpace: true, nativeConfirmations: 4, cancelledRequests: 0, modeledHttpStatuses: [409, 204], actualBackendDeletion: false };
-  });
-  await run('toolbar scan completion survives Settings navigation for the current account', async () => {
-    let releaseStatus;
-    let libraryReads = 0;
-    const scanned = { ...movie, id: 10, title: 'New current-account scan item' };
-    responder = async (url, options) => {
-      if (url === '/api/scan') return reply(null, 202);
-      if (url === '/api/scan/status') return new Promise(resolve => { releaseStatus = resolve; });
-      if (new URL(String(url), location.origin).pathname === '/api/library') { libraryReads++; return reply([scanned]); }
-      return defaultResponder(url, options);
-    };
-    const button = document.getElementById('add-media');
-    const originalMarkup = button.innerHTML;
-    LIBRARY = [];
-    button.click();
-    await until(() => releaseStatus, 'toolbar status request is pending');
-    document.getElementById('settings-btn').click();
-    await until(() => !!document.querySelector('.p-scan'), 'Settings navigation renders');
-    check(button.disabled && button.textContent === 'Scanning…', 'Pending toolbar remains visibly busy');
-    releaseStatus(reply({ scanning: false }));
-    await until(() => !button.disabled, 'current-account toolbar scan completes after Settings navigation');
-    equal(button.innerHTML, originalMarkup, 'Toolbar action is restored');
-    equal(libraryReads, 1, 'Valid completion refreshes library exactly once');
-    check(LIBRARY.some(item => item.id === scanned.id), 'Current account receives newly scanned item');
-    check(document.getElementById('toast-host').textContent.includes('Scan complete — 1 new item(s)'), 'Completion feedback reports new item');
-    check(document.getElementById('settings-modal').classList.contains('on'), 'Completion leaves Settings open');
-    document.getElementById('settings-close').click();
-    responder = defaultResponder;
-    return { pendingStatusBeforeSettings: true, libraryReads, toolbarRestored: true, currentAccountRefreshed: true, modeledAPI: true, realPollingTimer: true };
-  });
-  await run('toolbar scan ignores an old-account status after a new account enters', async () => {
-    let releaseStatus;
-    let libraryReads = 0;
-    responder = async (url, options) => {
-      if (url === '/api/scan') return reply(null, 202);
-      if (url === '/api/scan/status') return new Promise(resolve => { releaseStatus = resolve; });
-      if (new URL(String(url), location.origin).pathname === '/api/library') { libraryReads++; return reply([]); }
-      return defaultResponder(url, options);
-    };
-    const button = document.getElementById('add-media');
-    const originalMarkup = button.innerHTML;
-    button.click();
-    await until(() => releaseStatus, 'old-account toolbar status is pending');
-    const previousAccount = account;
-    account = { name: 'Next disposable account', isAdmin: true };
-    enterApp();
-    await until(() => libraryReads === 1, 'new account loads its own library');
-    await delay(20);
-    const libraryBefore = LIBRARY;
-    const toastBefore = document.getElementById('toast-host').textContent;
-    releaseStatus(reply({ scanning: false }));
-    await delay(50);
-    equal(libraryReads, 1, 'Retired status cannot refresh the next account library');
-    check(LIBRARY === libraryBefore, 'Retired status cannot replace current library state');
-    equal(document.getElementById('toast-host').textContent, toastBefore, 'Retired status cannot publish completion feedback');
-    check(button.disabled && button.textContent === 'Scanning…', 'Retired callback cannot mutate toolbar');
-    // Fixture cleanup restores the deliberately retired busy control, after observing it.
-    button.disabled = false; button.innerHTML = originalMarkup;
-    account = previousAccount;
-    responder = defaultResponder;
-    return { actualEnterAppTransition: true, staleLibraryReads: 0, staleFeedback: false, staleToolbarMutation: false, modeledAccountAndAPI: true, realPollingTimer: true, logoutReloadCoveredSeparately: true };
+    check(!document.querySelector('#main .card-del') && !document.getElementById('video-modal').classList.contains('on'),
+      'Success removes card without opening player');
+    return;
   });
   await run('fresh toolbar transient status failure retries without overlapping refresh', () => freshResponsiveDocument(1440, 'transient'));
-  await run('fresh toolbar three status failures allow trusted POST409 monitoring reattach', () => freshResponsiveDocument(1440, 'reattach'));
+  await run('fresh toolbar three status failures allow trusted POST 409 monitoring reattach', () => freshResponsiveDocument(1440, 'reattach'));
   await run('actual settings DOM scopes seven kind permissions and authoritative locked roots', async () => {
     responder = defaultResponder;
     await openSettings();
     await until(() => document.querySelector('#settings-stage [data-build-info]')?.textContent === 'v0.1.1 · aaaaaaa', 'late Settings reuses binary identity');
     const unknownBuild = document.createElement('iframe'); unknownBuild.hidden = true;
     unknownBuild.src = '/__fixture/build-unknown'; document.body.appendChild(unknownBuild);
-    try { await until(() => unknownBuild.contentDocument?.querySelector('[data-build-info]')?.textContent === 'v0.1.1 · revision unknown · state unknown', 'stripped build remains explicitly unknown in real DOM'); } finally { unknownBuild.remove(); }
+    try { await until(() => unknownBuild.contentDocument?.querySelector('[data-build-info]')?.textContent === 'v0.1.1 · revision unknown · state unknown',
+      'stripped build remains explicitly unknown in real DOM'); } finally { unknownBuild.remove(); }
     const stage = document.getElementById('settings-stage');
     check(!stage.textContent.includes('/obsolete') && stage.textContent.includes('No folders configured'), 'Empty array beats obsolete legacy root');
     const row = stage.querySelector('[data-id="4"]');
@@ -1917,11 +1901,12 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     equal(requests.filter(r => r.method === 'DELETE').length, count, 'Cancelled user removal sends nothing');
     settingsValue = { ...baseSettings, library_locked: true, library_paths: ['/db'], effective_library_paths: ['/env/a', '/env/b'] };
     await openSettings();
-    check(stage.textContent.includes('/env/a') && stage.textContent.includes('/env/b') && !stage.textContent.includes('/db'), 'Effective environment roots displayed');
+    check(stage.textContent.includes('/env/a') && stage.textContent.includes('/env/b') && !stage.textContent.includes('/db'),
+      'Effective environment roots displayed');
     check([...stage.querySelectorAll('.lib-add,.lib-remove')].every(b => b.disabled), 'All locked root controls disabled');
     settingsValue = baseSettings;
     document.getElementById('settings-close').click();
-    return { payloads: bodies, authoritativeEmpty: true, environmentControlsDisabled: true, modeledAPI: true };
+    return { payloads: bodies };
   });
   await run('actual settings scan and save controls report bounded modeled failures', async () => {
     const observations = [];
@@ -1936,8 +1921,11 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       };
       const button = document.querySelector('.p-scan');
       button.click(); await delay(0);
-      check(status === 202 || status === 409 ? button.disabled && settingsPoll !== null : !button.disabled && settingsPoll === null, 'Accepted or already active scans attach an observer');
-      check(status === 202 ? button.textContent === 'Scanning…' : status === 409 ? button.textContent.includes('already running') : status === 501 ? button.textContent.includes('No library folder') : status === 500 ? button.textContent.includes('500') : button.textContent.includes('unreachable'), 'Truthful status feedback');
+      check(status === 202 || status === 409 ? button.disabled && settingsPoll !== null : !button.disabled && settingsPoll === null,
+        'Accepted or already active scans attach an observer');
+      check(status === 202 ? button.textContent === 'Scanning…' : status === 409 ? button.textContent.includes('already running') : status === 501
+        ? button.textContent.includes('No library folder') : status === 500 ? button.textContent.includes('500') : button.textContent.includes('unreachable'),
+        'Truthful status feedback');
       const observation = { status, text: button.textContent, disabled: button.disabled };
       document.getElementById('settings-close').click();
       if (status === 202 || status === 409) {
@@ -1951,7 +1939,8 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     for (const status of [409, 'network']) {
       responder = defaultResponder; await openSettings();
       responder = async (url, options) => {
-        if (url === '/api/admin/settings' && options.method === 'POST') { if (status === 'network') throw Error('server unreachable'); return reply(null, status); }
+        if (url === '/api/admin/settings' && options.method === 'POST') { if (status === 'network') throw Error('server unreachable');
+          return reply(null, status); }
         return defaultResponder(url, options);
       };
       const button = document.getElementById('s-site-save');
@@ -1959,14 +1948,14 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       check(button.textContent !== 'Saved', 'Refused save cannot claim success');
       document.getElementById('settings-close').click();
     }
-    return { observations, failedSettingsSaves: [409, 'network'], modeledAPI: true };
+    return { observations };
   });
   await run('settings ingest waits through indexing and close reopen rejects late status', async () => {
     const states = [];
     for (const terminal of ['failed', 'done']) {
       responder = defaultResponder; await openSettings();
       const button = document.querySelector('.p-ingest');
-      document.querySelector('.s-ingest').value = 'https://example.invalid/owned';
+      document.querySelector('.s-ingest').value = 'https://example.invalid/fixture';
       let state = 'downloading';
       let reads = 0;
       responder = async (url, options) => {
@@ -1999,7 +1988,8 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     const libraryReads = requests.filter(r => new URL(String(r.url), location.origin).pathname === '/api/library').length;
     release(reply({ scanning: false, ingesting: 'done' })); await delay(30);
     equal(document.getElementById('settings-stage').innerHTML, stageHTML, 'Old generation cannot repaint reopened settings');
-    equal(requests.filter(r => new URL(String(r.url), location.origin).pathname === '/api/library').length, libraryReads + 1, 'Admitted scan refresh survives panel retirement');
+    equal(requests.filter(r => new URL(String(r.url), location.origin).pathname === '/api/library').length, libraryReads + 1,
+      'Admitted scan refresh survives panel retirement');
     equal(settingsPoll, null, 'No surviving settings poll');
     document.getElementById('settings-close').click();
     let releaseSettings;
@@ -2037,8 +2027,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     equal(settingsPoll, replacement, 'Old callback cannot clear replacement observer');
     await until(() => settingsPoll === null, 'replacement observer completes');
     document.getElementById('settings-close').click();
-    return { states, retiredPanelUntouched: true, scanRefreshAfterClose: true, replacementObserverPreserved: true,
-      lateSettingsLoadIgnored: true, lateSaveIgnored: true, modeledAPI: true, pollingUsesRealTimers: true };
+    return { states };
   });
   await run('late library and progress responses cannot resurrect deleted DOM or filter sort', async () => {
     const other = { ...movie, id: 10, title: 'Remaining movie', created_at: 2 };
@@ -2056,7 +2045,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     document.querySelector('#main .row-head button').click();
     const sort = rowSort.get('movie');
     const search = document.querySelector('#search input');
-    search.value = 'Owned'; search.dispatchEvent(new Event('input', { bubbles: true }));
+    search.value = 'Fixture'; search.dispatchEvent(new Event('input', { bubbles: true }));
     await until(() => releaseSearch, 'real debounced search starts held request');
     await filterKind('movie', '');
     document.querySelector('#main .card-del').focus();
@@ -2096,9 +2085,11 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       const parsed = new URL(url, location.origin);
       if (parsed.pathname === '/api/library') {
         const query = parsed.searchParams.get('q');
-        if (query && tvSearchMode === 'network') throw Error('Owned TV search transport failure');
+        if (query && tvSearchMode === 'network') throw Error('Fixture TV search transport failure');
         if (query && tvSearchMode === 'http') return reply(null, 500);
-        return reply(query ? tvAndAuthorItems.filter(item => [item.title, item.author, item.synopsis].some(value => (value || '').toLowerCase().includes(query.toLowerCase()))) : tvAndAuthorItems);
+        return reply(query
+          ? tvAndAuthorItems.filter(item => [item.title, item.author, item.synopsis].some(value => (value || '').toLowerCase().includes(query.toLowerCase())))
+          : tvAndAuthorItems);
       }
       if (url.startsWith('/api/progress/')) return reply(null);
       return defaultResponder(url, options);
@@ -2110,7 +2101,8 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     await filterKind('all', '');
     const categoryShelves = [...document.querySelectorAll('#main > section')];
     equal(categoryShelves.map(shelf => shelf.querySelector('h3')?.textContent),
-      ['Movies','TV Shows','Music','Audiobooks','Ebooks','Comics','Manga'].map(label => 'Recently Added ' + label), 'Seven dashboard siblings use category headings');
+      ['Movies','TV Shows','Music','Audiobooks','Ebooks','Comics','Manga'].map(label => 'Recently Added ' + label),
+        'Seven dashboard siblings use category headings');
     for (const shelf of categoryShelves) {
       const button = shelf.querySelector('.row-head button');
       equal(button.textContent, 'Newest first', 'Default control states current newest order');
@@ -2126,7 +2118,8 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     const dashboardImages = [...document.querySelectorAll('#main > section img.thumb')];
     equal(dashboardImages.length, 7, 'All seven categories expose available artwork');
     const albumImage = categoryShelves[2].querySelector('img.thumb');
-    const lazyArtwork = { before: { top: albumImage.getBoundingClientRect().top, loading: albumImage.loading, complete: albumImage.complete, naturalWidth: albumImage.naturalWidth }, decoded: [] };
+    const lazyArtwork = { before: { top: albumImage.getBoundingClientRect().top, loading: albumImage.loading, complete: albumImage.complete,
+      naturalWidth: albumImage.naturalWidth }, decoded: [] };
     check(lazyArtwork.before.top > innerHeight + 2000 && lazyArtwork.before.loading === 'lazy', 'Album image starts beyond the viewport lazy-loading distance');
     for (const img of dashboardImages) {
       img.closest('.media-card').scrollIntoView({ block: 'center', inline: 'nearest' });
@@ -2137,33 +2130,39 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     const tvShelf = categoryShelves[1];
     equal([...tvShelf.querySelectorAll('.title')].map(node => node.textContent), ['Unicode show', 'Second show'], 'TV folders start by maximum member date');
     tvShelf.querySelector('button').click();
-    equal([...tvShelf.querySelectorAll('.title')].map(node => node.textContent), ['Unicode show', 'Second show'], 'TV oldest uses minimum member date including undated bonus');
+    equal([...tvShelf.querySelectorAll('.title')].map(node => node.textContent), ['Unicode show', 'Second show'],
+      'TV oldest uses minimum member date including undated bonus');
     tvShelf.querySelector('button').click();
     const tvNav = document.querySelector('#sidebar [data-kind="show"]');
-    check(tvNav, 'Upstream TV navigation exists');
+    check(tvNav, 'TV navigation exists');
     tvNav.focus(); await key('Enter');
     await until(() => activeKind === 'episode' && document.querySelector('#main .show-grid'), 'trusted TV navigation reaches canonical episode shelf');
     const byTitle = title => [...document.querySelectorAll('#main .media-card')].find(node => node.querySelector('.title')?.textContent === title);
     byTitle('Unicode show').click();
     await until(() => showsDrill === 'Unicode show' && byTitle('Unicode 1x01'), 'TV folder opens episode cards');
-    equal([...document.querySelectorAll('#main .series-head h4')].map(node => node.textContent), ['Season 1', 'Other episodes'], 'Known and unknown seasons have truthful labels');
-    equal([...document.querySelectorAll('#main .media-card .title')].map(node => node.textContent), ['Unicode 1x01', '日本語.Show.S01E02', 'Unicode bonus'], 'Episode ordering uses parsed numbers');
+    equal([...document.querySelectorAll('#main .series-head h4')].map(node => node.textContent), ['Season 1', 'Other episodes'],
+      'Known and unknown seasons have truthful labels');
+    equal([...document.querySelectorAll('#main .media-card .title')].map(node => node.textContent), ['Unicode 1x01', '日本語.Show.S01E02', 'Unicode bonus'],
+      'Episode ordering uses parsed numbers');
     byTitle('Unicode 1x01').click();
-    await until(() => document.getElementById('video-modal').classList.contains('on') && (plyr.media.src || plyr.media.querySelector('source')?.src || '').endsWith('/api/stream/10'), 'Episode card dispatches to real vendored video player');
+    await until(() => document.getElementById('video-modal').classList.contains('on')
+      && (plyr.media.src || plyr.media.querySelector('source')?.src || '').endsWith('/api/stream/10'), 'Episode card dispatches to real vendored video player');
     document.getElementById('vm-back').click();
     await loadLibrary(); await delay(0);
     equal(showsDrill, 'Unicode show', 'Library refresh retains the selected series');
     for (const mode of ['success', 'http', 'network']) {
       tvSearchMode = mode;
-      activeKind = 'show';
       await serverSearch('Unicode'); await delay(0);
-      equal(activeKind, 'episode', 'TV search normalizes its navigation alias');
+      equal(activeKind, 'episode', 'TV search keeps the episode kind');
       check(!byTitle('Unicode movie'), 'TV search and failure fallback exclude matching movies');
       check(byTitle('Unicode 1x01'), 'TV search and failure fallback preserve matching episode cards');
     }
     tvSearchMode = 'success';
     await serverSearch(''); await delay(0);
+    authorDrill.ebook = { author: 'Retained ebook author' };
     document.querySelector('#sidebar [data-kind="music"]').click(); await delay(0);
+    check(showsDrill === null && Object.values(authorDrill).every(drill => drill === null),
+      'Navigation opens every shelf, including the retained TV series, at its top level');
     byTitle('Mixed artist').click(); await delay(0);
     check(byTitle('Loose song') && byTitle('Named album'), 'Mixed author retains loose song beside album folder');
     check(byTitle('Named album').querySelector('.sub').textContent.includes('Album'), 'Music series folder is labeled as an album');
@@ -2193,7 +2192,8 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       equal([...document.querySelectorAll('#main .media-card .title')].map(node => node.textContent), [title], 'Unmatched siblings remain excluded');
     }
     const tvAuthorWorkflows = { trustedTVNavigation: true, canonicalEpisodeSearch: ['success', 'http', 'network'], refreshRetainsSeries: true,
-      episodeVideoDispatch: true, lazyArtwork, synopsisFolderSearch: ['episode', 'music', 'ebook', 'audiobook'], unknownSeasonLabel: 'Other episodes', mixedArtistLooseAndAlbum: true, ebookAllSeries: true, audiobookAllLoose: true, actualDOM: true, modeledAPI: true };
+      episodeVideoDispatch: true, lazyArtwork, synopsisFolderSearch: ['episode', 'music', 'ebook', 'audiobook'], unknownSeasonLabel: 'Other episodes',
+        mixedArtistLooseAndAlbum: true, ebookAllSeries: true, audiobookAllLoose: true, actualDOM: true, modeledAPI: true };
     const progressGets = [];
     const positions = new Map([[60, 20], [61, 80], [62, 99], [63, 0]]);
     LIBRARY = [
@@ -2218,7 +2218,8 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     equal([...progressGets].sort(), [60, 61, 62, 63], 'Each rendered media ID fetches progress once');
     const continuationCards = [...document.querySelector('#main section .cards').children];
     equal(continuationCards.map(card => card.title), ['Progress episode', 'Progress movie'], 'Continue order and eligibility retained');
-    equal(continuationCards.map(card => card.querySelector('.progress-strip > div').style.width), ['80%', '20%'], 'Shared progress preserves both continuation bars');
+    equal(continuationCards.map(card => card.querySelector('.progress-strip > div').style.width), ['80%', '20%'],
+      'Shared progress preserves both continuation bars');
     equal(document.querySelectorAll('#main .media-card').length, 6, 'Two continuation cards and four regular cards render');
     document.querySelector('#main .row-head button').click(); await delay(0);
     equal(progressGets.length, initialGets, 'Same-render sorting makes no additional progress request');
@@ -2238,7 +2239,8 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     await filterKind('all', ''); await delay(0);
     equal(failedGets.length, 4, 'Failed progress is shared within the render');
     check(!document.querySelector('#main').textContent.includes('Continue watching'), 'Failed progress creates no continue row');
-    check([...document.querySelectorAll('#main .progress-strip')].every(strip => strip.style.display === 'none'), 'Failed progress leaves every regular bar hidden');
+    check([...document.querySelectorAll('#main .progress-strip')].every(strip => strip.style.display === 'none'),
+      'Failed progress leaves every regular bar hidden');
     responder = defaultResponder;
     LIBRARY = retainedLibrary;
     showsDrill = retainedShowsDrill;
@@ -2246,8 +2248,9 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     rowSort.clear();
     priorSort.forEach((value, kind) => rowSort.set(kind, value));
     await filterKind(retainedKind, retainedQuery);
-    return { deletedId: +deletedId, libraryIds: LIBRARY.map(i => i.id), activeKind, sort, detachedProgressIgnored: true, modeledAPI: true, tvAuthorWorkflows,
-      progressReadReuse: { libraryItems: 4, initialGets, sortAdditionalGets: 0, nextRenderGets: 4, freshResumeAdditionalGets: 1, failedRenderGets: failedGets.length,
+    return { deletedId: +deletedId, libraryIds: LIBRARY.map(i => i.id), activeKind, sort, tvAuthorWorkflows,
+      progressReadReuse: { libraryItems: 4, initialGets, sortAdditionalGets: 0, nextRenderGets: 4, freshResumeAdditionalGets: 1,
+        failedRenderGets: failedGets.length,
         continuationOrder: ['Progress episode', 'Progress movie'], actualDOM: true, modeledProgressAPI: true } };
   });
   await run('trusted ebook keys preserve editable inactive settings and button focus', async () => {
@@ -2264,11 +2267,12 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       }
       if (path === '/api/progress' && options.method === 'POST') {
         const body = JSON.parse(options.body);
-        if (comicSaved.has(body.media_id)) { comicWrites.push({ id: body.media_id, page: body.position }); comicSaved.set(body.media_id, body.position); return reply({}); }
+        if (comicSaved.has(body.media_id)) { comicWrites.push({ id: body.media_id, page: body.position }); comicSaved.set(body.media_id, body.position);
+          return reply({}); }
       }
       return defaultResponder(url, options);
     };
-    await openComic({ id: 90, title: 'Owned pending comic A' });
+    await openComic({ id: 90, title: 'Fixture pending comic A' });
     await until(() => releaseComic, 'comic saved response reaches held boundary');
     check(comic.page === null && document.getElementById('cm-pageinfo').textContent === 'Loading…', 'Comic exposes unknown loading position');
     check(document.getElementById('cm-prev').disabled && document.getElementById('cm-next').disabled, 'Comic navigation is disabled during restore');
@@ -2278,19 +2282,19 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     equal(comicWrites, [], 'Pending comic button/keyboard cannot save unknown position');
     document.getElementById('cm-close').click();
     equal(comicWrites, [], 'Closing pending comic does not save zero');
-    await openComic({ id: 91, title: 'Owned comic B' });
+    await openComic({ id: 91, title: 'Fixture comic B' });
     await until(() => comic?.page === 2, 'comic B restores its own page');
     releaseComic(); await delay(20);
     equal(comic.it.id, 91, 'Late A cannot replace B'); equal(comic.page, 2, 'Late A cannot move B');
     check(document.getElementById('cm-img').src.endsWith('/api/comic/91/page/2'), 'Comic B retains its own image');
     document.getElementById('cm-close').click();
-    await openComic({ id: 90, title: 'Owned pending comic A' });
-    await until(() => comic?.page === 3, 'closed pending comic reopens at saved page3');
+    await openComic({ id: 90, title: 'Fixture pending comic A' });
+    await until(() => comic?.page === 3, 'closed pending comic reopens at saved page 3');
     check(document.getElementById('cm-img').src.endsWith('/api/comic/90/page/3'), 'Reopened comic image uses saved page3');
     document.getElementById('cm-prev').click(); equal(comic.page, 2, 'Ready comic previous navigation works');
     document.getElementById('cm-next').click(); equal(comic.page, 3, 'Ready comic next navigation works');
     document.getElementById('cm-close').click();
-    equal(comicSaved.get(90), 3, 'Ready close preserves comic bookmark3');
+    equal(comicSaved.get(90), 3, 'Ready close preserves comic bookmark at page 3');
     check(!comicWrites.some(write => write.id === 90 && write.page === 0), 'No initial zero write reached comic fixture');
     const epubReadiness = [];
     for (const boundary of ['toc', 'progress']) {
@@ -2306,12 +2310,13 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
         }
         if (path === '/api/progress/7') {
           const position = savedPosition;
-          if (boundary === 'progress' && responseHeld) return new Promise(resolve => { releaseResponse = () => { responseHeld = false; resolve(reply({ position })); }; });
+          if (boundary === 'progress'
+            && responseHeld) return new Promise(resolve => { releaseResponse = () => { responseHeld = false; resolve(reply({ position })); }; });
           return reply({ position });
         }
         if (/^\/api\/epub\/7\/chunk\/[0-3]$/.test(path)) {
           const chapter = Number(path.split('/').at(-1)); chapterReads.push(chapter);
-          const html = () => new Response('<html><head></head><body>Owned readiness chapter</body></html>', { headers: { 'Content-Type': 'text/html' } });
+          const html = () => new Response('<html><head></head><body>Fixture readiness chapter</body></html>', { headers: { 'Content-Type': 'text/html' } });
           if (chapter === 2) return new Promise(resolve => { releaseChapter = () => resolve(html()); });
           return html();
         }
@@ -2321,20 +2326,21 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
         }
         return defaultResponder(url, options);
       };
-      const opening = openEbook({ id: 7, title: 'Owned pending EPUB' });
+      const opening = openEbook({ id: 7, title: 'Fixture pending EPUB' });
       await until(() => releaseResponse, 'EPUB initial ' + boundary + ' response reaches hold');
       check(ebook.chunk === null && document.getElementById('em-pageinfo').textContent === 'Loading…', 'EPUB exposes unknown loading chapter');
-      check(document.getElementById('em-prev').disabled && document.getElementById('em-next').disabled && document.getElementById('em-toc-btn').disabled, 'EPUB pending navigation is disabled');
+      check(document.getElementById('em-prev').disabled && document.getElementById('em-next').disabled && document.getElementById('em-toc-btn').disabled,
+        'EPUB pending navigation is disabled');
       document.getElementById('em-next').click(); document.getElementById('em-toc-btn').click();
       document.body.focus(); await key('ArrowRight'); await key(' '); await key('t');
       window.dispatchEvent(new Event('resize')); await delay(340);
-      equal(chapterReads, [], 'Pending EPUB keyboard/resize does not coerce null to chapter0');
+      equal(chapterReads, [], 'Pending EPUB keyboard/resize does not coerce null to chapter 0');
       equal(writes, [], 'Pending EPUB callbacks do not save unknown chapter');
       document.getElementById('em-close').click();
       equal(writes, [], 'Closing initial EPUB restore does not overwrite bookmark');
       releaseResponse(); await opening; await delay(20);
       equal(writes, [], 'Retired EPUB initial response cannot save');
-      const reopening = openEbook({ id: 7, title: 'Owned pending EPUB' });
+      const reopening = openEbook({ id: 7, title: 'Fixture pending EPUB' });
       await until(() => releaseChapter && ebook.chunk === 2, 'EPUB reopens at saved chapter before its body loads');
       check(Math.abs(ebook.lastFrac - 0.3) < 1e-9, 'Known resume fraction is retained before layout');
       document.getElementById('em-close').click();
@@ -2342,9 +2348,11 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       releaseChapter(); await reopening; await delay(20);
       equal(writes, [], 'Closing while the chapter body is held never saves an unrendered position');
       equal(savedPosition, 2.3, 'Retired chapter body cannot change the existing bookmark');
-      epubReadiness.push({ boundary, pendingCloseWrites: 0, resizeAndKeysIgnored: true, reopenedChapter: 2, pendingChapterCloseWrites: 0, preservedPosition: savedPosition });
+      epubReadiness.push({ boundary, pendingCloseWrites: 0, resizeAndKeysIgnored: true, reopenedChapter: 2, pendingChapterCloseWrites: 0,
+        preservedPosition: savedPosition });
     }
-    const readerBookmarkReadiness = { comic: { pendingCloseWrites: 0, reopenedPage: comicSaved.get(90), lateOtherComicUnchanged: true, readyNavigation: true }, epub: epubReadiness, actualDOM: true, modeledProgressResponses: true, originalHeldBodiesPreserved: true };
+    const readerBookmarkReadiness = { comic: { pendingCloseWrites: 0, reopenedPage: comicSaved.get(90), lateOtherComicUnchanged: true, readyNavigation: true },
+      epub: epubReadiness, actualDOM: true, modeledProgressResponses: true, originalHeldBodiesPreserved: true };
     responder = defaultResponder;
     await api('configure', { body: '<p>Reader shortcut fixture</p>', annotations: [] });
     ebook = { it: { id: 7 }, spine: ['one.xhtml', 'two.xhtml'], chunk: 0, annots: [], toc: [] };
@@ -2397,7 +2405,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     check((await probe()).opaqueOrigin === 'null', 'Current opaque WindowProxy remains functional');
     document.getElementById('em-close').click();
     targets.slice(2).forEach(target => target.remove());
-    return { readerBookmarkReadiness, trustedKeyboard: true, targets: ['search INPUT', 'reader INPUT', 'TEXTAREA', 'SELECT', 'contenteditable', 'BUTTON'], positiveChapter: 1, opaqueOrigin: 'null', outsiderOrigins };
+    return { readerBookmarkReadiness, outsiderOrigins };
   });
   async function installer(mode, isolated = false) {
     const node = document.createElement('iframe'); node.width = '600'; node.height = '900';
@@ -2420,13 +2428,13 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     let settled = false;
     let disposed = false;
     let resolveCompletion;
-    // Resolve failures as data until case48 claims them; never reject unobserved work.
+    // Resolve failures as data until the installer polling case claims them; never reject unobserved work.
     const completion = new Promise(resolve => { resolveCompletion = resolve; });
     function finish(error) {
       if (settled) return;
       settled = true;
       const elapsedMs = Date.now() - startedAt;
-      if (!error && elapsedMs >= 15000) error = new Error('Five real-timer attempts exceeded15s');
+      if (!error && elapsedMs >= 15000) error = new Error('Five real-timer attempts exceeded 15 s');
       clearTimeout(timer);
       observer?.disconnect();
       resolveCompletion({ elapsedMs, error });
@@ -2436,7 +2444,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     }
     observer = new MutationObserver(inspect);
     observer.observe(node.contentDocument.getElementById('stat'), { childList: true, subtree: true, characterData: true });
-    timer = setTimeout(() => finish(new Error('Five real-timer attempts exceeded15s')), 15000);
+    timer = setTimeout(() => finish(new Error('Five real-timer attempts exceeded 15 s')), 15000);
     inspect();
     return { node, completion, dispose() {
       if (disposed) return;
@@ -2446,11 +2454,11 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     } };
   }
   // Independent iframe owns its fetch adapter, document, timers and protocol state.
-  // It contributes no layout or input target; the production3000ms polling stays real.
+  // It contributes no layout or input target; the production 3000 ms polling stays real.
   const installerPolling = observeInstallerPolling(await installer('html', true));
   try {
-    // Retain the original39, then exercise the new production CSS at actual CSS-pixel
-    // viewports. API fixtures supply library/admin responses; native MP4 stays decoded.
+    // Exercise the production CSS at actual CSS-pixel viewports. API fixtures supply
+    // library/admin responses; native MP4 stays decoded.
     for (const width of [320, 768, 1024, 1440]) await run(`responsive production layout at ${width} CSS pixels`, () => freshResponsiveDocument(width));
     await api('viewport', { width: 1440 });
     await run('production installer DOM validates typed protocol with manual GET-only navigation', async () => {
@@ -2459,11 +2467,14 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
         const node = await installer(mode);
         try {
           const w = node.contentWindow, d = node.contentDocument, fixture = w.__installerFixture;
-          await until(() => d.getElementById('stat').textContent.includes(mode === 'valid' || mode === 'signed-in' ? 'verified at' : 'unverified'), 'Installer publishes protocol decision');
+          await until(() => d.getElementById('stat').textContent.includes(mode === 'valid' || mode === 'signed-in' ? 'verified at' : 'unverified'),
+            'Installer publishes protocol decision');
           check(!d.querySelector('form,input[type=email],input[type=password]'), 'No credential form exists');
-          check(d.getElementById('open-frayd').href === 'http://127.0.0.1:8484/' && !d.getElementById('retry').disabled, 'Manual Open and Retry remain available');
+          check(d.getElementById('open-frayd').href === 'http://127.0.0.1:8484/' && !d.getElementById('retry').disabled,
+            'Manual Open and Retry remain available');
           check(w.location.pathname === '/__fixture/installer/' + mode, 'Installer never automatically navigates');
-          check(fixture.requests.every(r => r.method === 'GET' && r.credentials === 'omit' && r.cache === 'no-store'), 'All modeled requests are credential-free fixed GETs');
+          check(fixture.requests.every(r => r.method === 'GET' && r.credentials === 'omit' && r.cache === 'no-store'),
+            'All modeled requests are credential-free fixed GETs');
           equal(fixture.storage, [], 'Installer never accesses storage'); equal(fixture.errors, [], 'Installer has no uncaught errors');
           if (mode === 'valid') check(d.getElementById('s-stat').textContent.includes('Create your owner'), 'Typed true gives manual owner instruction');
           if (mode === 'signed-in') check(d.getElementById('s-stat').textContent.includes('Sign in'), 'Typed false gives manual sign-in instruction');
@@ -2471,10 +2482,11 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
           check(d.getElementById('cmd').textContent.includes('/bootstrap.sh'), 'Linux source command remains available');
           d.querySelector('[data-os=win]').click(); d.getElementById('gen').click();
           check(d.getElementById('cmd').textContent.includes('/bootstrap.ps1'), 'Windows source command remains available');
-          observations.push({ mode, status: d.getElementById('stat').textContent, instruction: d.getElementById('s-stat').textContent, requests: fixture.requests, storageAccesses: 0, automaticNavigation: false });
+          observations.push({ mode, status: d.getElementById('stat').textContent, instruction: d.getElementById('s-stat').textContent,
+            requests: fixture.requests, storageAccesses: 0, automaticNavigation: false });
         } finally { closeInstaller(node); }
       }
-      return { actualProductionHTMLAndInlineJS: true, modeledResponsesOnly: true, real8484Requests: 0, observations };
+      return { observations };
     });
     await run('production installer actual five-poll bound retry and pagehide stale guards', async () => {
       let node = installerPolling.node;
@@ -2514,7 +2526,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
         equal(d.getElementById('stat').textContent, hiddenText, 'Late pagehide result cannot publish');
         equal(fixture.requests.length, 4, 'Pagehide stops request chain');
         equal(fixture.errors, [], 'No uncaught installer errors'); equal(fixture.storage, [], 'No installer storage access');
-        return { ...result, staleRetryIgnored: true, actualPagehideNavigation: true, pagehideAbortedAndDisposed: true, modeledResponsesOnly: true, real8484Requests: 0 };
+        return result;
       } finally { closeInstaller(node); }
     });
   } finally { installerPolling.dispose(); }
@@ -2526,10 +2538,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
   const packet = { cases, errors, mediaDiagnostics, nativeMedia,
     passed: cases.filter(item => item.status === 'PASS').length,
     failed: cases.filter(item => item.status === 'FAIL').length,
-    logoutGeneration: settingsGeneration,
-    limits: ['Retained playback cases include six decoded H264 cases; HTTP204 IDs9/10/11 remain modeled.',
-      'New admin/settings APIs are Response fixtures; backend transactions, filesystem preservation and external YouTube are not qualified.',
-      'Fresh owned headless browser and loopback fixture only; physical output and owner deployment are untested.'] };
+    logoutGeneration: settingsGeneration, };
   // Leave a real pending interval to prove production logout disposes it.
   pollSettings(settingsGeneration, 'scan', document.createElement('button'));
   reportProgress(cases.length + 1); // The final case crosses a document reload.

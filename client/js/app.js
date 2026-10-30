@@ -1,6 +1,5 @@
 // Frayd web client — auth, dashboard, playback
 'use strict';
-console.log('frayd app.js v4');
 
 /**
  * Return the first DOM node matching a selector.
@@ -60,14 +59,23 @@ let account = null;
 let accountGeneration = 0;
 
 /**
+ * Capture the current account; the returned check fails after sign-in, guest entry or sign-out.
+ * Each IDENTITY assignment is followed synchronously by enterApp's generation increment.
+ * @returns {function(): boolean}
+ */
+function accountGuard() {
+  const owner = accountGeneration;
+  return () => owner === accountGeneration;
+}
+
+/**
  * Restore a stored LAN identity and optional account state if the library endpoint accepts it.
  * @returns {Promise<boolean>}
  */
 async function tryResume() {
-  const owner = accountGeneration, identity = IDENTITY;
-  const current = () => owner === accountGeneration && identity === IDENTITY;
-  if (identity) {
-    const r = await fetch(`/api/library?identity=${encodeURIComponent(identity)}`, { headers: authHeaders() });
+  const current = accountGuard();
+  if (IDENTITY) {
+    const r = await fetch(`/api/library?identity=${encodeURIComponent(IDENTITY)}`, { headers: authHeaders() });
     if (!current()) return false;
     if (r.ok) {
       // restore admin flag from token (button visibility)
@@ -76,7 +84,9 @@ async function tryResume() {
           const me = await (await fetch('/api/auth/me', { headers: authHeaders() })).json();
           if (!current()) return false;
           account = { name: me.name, isAdmin: !!me.is_admin };
-        } catch {}
+        } catch {
+          // A rejected or unreachable token leaves this a LAN identity session.
+        }
       }
       if (!current()) return false;
       enterApp();
@@ -147,33 +157,42 @@ function scanFailure(status) {
     ? 'No library folder configured — set it in settings' : `Scan failed (${status})`;
 }
 /**
+ * Read job status. Transport and server failures are retryable; malformed status and 4xx are not.
+ * @returns {Promise<Object>}
+ */
+async function readScanStatus() {
+  let response;
+  try {
+    response = await fetch('/api/scan/status');
+  } catch (error) {
+    throw Object.assign(error, { retryable: true });
+  }
+  if (!response.ok) {
+    throw Object.assign(new Error(`Status failed (${response.status})`),
+      { retryable: response.status >= 500 && response.status <= 599 });
+  }
+  return response.json();
+}
+/**
  * Observe one admitted job for this account; only its current panel may publish UI.
- * Scan status tolerates two consecutive transport/server failures; ingest fails fast.
+ * Scan status tolerates two consecutive retryable failures; ingest fails fast.
  * @param {number} generation
  * @param {string} mode
  * @param {HTMLButtonElement} button
  */
 function pollSettings(generation, mode, button) {
   stopSettingsMonitor();
-  const monitor = settingsMonitor = { account: accountGeneration, identity: IDENTITY };
-  const current = () => settingsMonitor === monitor
-    && monitor.account === accountGeneration && monitor.identity === IDENTITY;
+  const monitor = settingsMonitor = {};
+  const ownsAccount = accountGuard();
+  const current = () => settingsMonitor === monitor && ownsAccount();
   const panelCurrent = () => generation === settingsGeneration;
   let pending = false;
   let failures = 0;
   settingsPoll = setInterval(async () => {
     if (pending || !current()) return;
     pending = true;
-    // Retry transport and server failures only; malformed status and 4xx fail fast.
-    let retryable = true;
     try {
-      const response = await fetch('/api/scan/status');
-      if (!response.ok) {
-        retryable = response.status >= 500 && response.status <= 599;
-        throw new Error(`Status failed (${response.status})`);
-      }
-      retryable = false;
-      const status = await response.json();
+      const status = await readScanStatus();
       if (!current()) return;
       failures = 0;
       const ingest = status.ingesting;
@@ -193,7 +212,7 @@ function pollSettings(generation, mode, button) {
       if (!failure) await loadLibrary();
     } catch (error) {
       if (!current()) return;
-      if (mode === 'scan' && retryable && ++failures < 3) return;
+      if (mode === 'scan' && error.retryable && ++failures < 3) return;
       stopSettingsMonitor();
       if (panelCurrent()) {
         button.disabled = false;
@@ -209,18 +228,18 @@ function pollSettings(generation, mode, button) {
  * @param {HTMLButtonElement} button
  */
 async function startSettingsScan(generation, button) {
-  const owner = accountGeneration, identity = IDENTITY;
+  const ownsAccount = accountGuard();
   button.disabled = true;
   button.textContent = 'Starting scan…';
   try {
     const response = await fetch('/api/scan', { method: 'POST', headers: authHeaders() });
-    if (owner !== accountGeneration || identity !== IDENTITY) return;
+    if (!ownsAccount()) return;
     if (response.status !== 202 && response.status !== 409) throw new Error(scanFailure(response.status));
     if (generation === settingsGeneration) button.textContent = response.status === 409
       ? 'Scan already running — monitoring…' : 'Scanning…';
     pollSettings(generation, 'scan', button);
   } catch (error) {
-    if (owner !== accountGeneration || identity !== IDENTITY || generation !== settingsGeneration) return;
+    if (!ownsAccount() || generation !== settingsGeneration) return;
     button.disabled = false;
     button.textContent = error.message || 'Scan failed — server unreachable';
     toast(button.textContent, true);
@@ -271,10 +290,16 @@ async function openSettings() {
         <button class="p-remove" data-name="${esc(p.key)}" title="Remove user, their progress and highlights">Remove</button>
       </div>`).join('') : '<div class="party-sec">No accounts yet</div>')
       + `<div class="party-sec">Media folders${locked ? ' — locked by FRAYD_LIBRARY' : ''}</div>`
-      + (libs.length ? libs.map((l, i) => `
-      <div class="perm-row"><span class="k">${esc(l)}</span><button class="lib-remove" ${locked ? 'disabled' : ''} data-path="${esc(l)}">Remove</button></div>`).join('') : '<div class="party-sec">No folders configured</div>')
-      + `<div class="perm-row"><span class="k">Add folder</span><input class="s-lib-add" placeholder="/path/to/more/media" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px;flex:1"><button class="lib-add" ${locked ? 'disabled' : ''}>Add + scan</button></div>`
-      + `<div class="party-sec">Server settings</div><div class="build-info" data-build-info>Build identity unavailable</div><div class="party-sec"><a href="https://github.com/kattiest/Frayd" target="_blank" rel="noopener noreferrer" title="GitHub sign-in may be required">View upstream changes</a></div>`
+      + (libs.length ? libs.map(l => `
+      <div class="perm-row"><span class="k">${esc(l)}</span>`
+        + `<button class="lib-remove" ${locked ? 'disabled' : ''} data-path="${esc(l)}">Remove</button></div>`).join('')
+        : '<div class="party-sec">No folders configured</div>')
+      + `<div class="perm-row"><span class="k">Add folder</span><input class="s-lib-add" placeholder="/path/to/more/media"`
+      + ` style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px;flex:1">`
+      + `<button class="lib-add" ${locked ? 'disabled' : ''}>Add + scan</button></div>`
+      + `<div class="party-sec">Server settings</div><div class="build-info" data-build-info>Build identity unavailable</div>`
+      + `<div class="party-sec"><a href="https://github.com/kattiest/Frayd" target="_blank" rel="noopener noreferrer"`
+      + ` title="GitHub sign-in may be required">View upstream changes</a></div>`
       + `<div class="perm-row"><span class="k">Site name</span><input class="s-site" value="${esc(settings.site_name ?? 'Frayd')}" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px"><button id="s-site-save">Save</button></div>`
       + `<div class="party-sec">Network <span class="s">(restart server to apply)</span></div>`
       + `<div class="perm-row"><span class="k">Port</span><input class="s-port" type="number" min="1024" max="65535" value="${esc(settings.port ?? 8484)}" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px;width:90px"></div>`
@@ -292,7 +317,7 @@ async function openSettings() {
       <div class="perm-row"><span class="k">Current</span><input type="password" class="pw-old" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px"></div>
       <div class="perm-row"><span class="k">New (min 4)</span><input type="password" class="pw-new" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px"></div>
       <button id="s-pw-save" style="margin-top:10px;width:100%;background:#16181E;color:#fff;border:1px solid #2a2d36;border-radius:8px;padding:10px;cursor:pointer">Change password</button>` : '');
-    window.FraydBuild?.render(stage);
+    FraydBuild.render(stage);
     stage.querySelectorAll('.p-save').forEach(b => b.onclick = async () => {
       try {
       const row = b.closest('.perm-row');
@@ -316,7 +341,6 @@ async function openSettings() {
       } catch (error) { if (current()) toast(error.message || 'Save failed — server unreachable', true); }
     };
     $('#s-net-save').onclick = async (e) => {
-      const stage = $('#settings-stage');
       const port = +stage.querySelector('.s-port').value;
       if (!Number.isInteger(port) || port < 1024 || port > 65535) { e.target.textContent = 'Bad port'; return; }
       const body = {
@@ -346,16 +370,25 @@ async function openSettings() {
     });
     const scanBtn = stage.querySelector('.p-scan');
     scanBtn.onclick = () => startSettingsScan(generation, scanBtn);
-    stage.querySelector('.lib-add').onclick = async (e) => {
+    stage.querySelector('.lib-add').onclick = async () => {
       if (locked || !current()) return;
       const path = stage.querySelector('.s-lib-add').value.trim();
       if (!path) return;
+      const ownsAccount = accountGuard();
+      let panelCurrent;
       try {
-        if (!await saveSettings({ library_paths: [...libs, path] }, generation)) return;
-        toast('Folder added');
-        await openSettings();
-        await startSettingsScan(settingsGeneration, $('#settings-stage').querySelector('.p-scan'));
-      } catch (error) { if (current()) toast(error.message || 'Add failed — server unreachable', true); }
+        panelCurrent = await saveSettings({ library_paths: [...libs, path] }, generation);
+      } catch (error) {
+        if (current()) toast(error.message || 'Add failed — server unreachable', true);
+        return;
+      }
+      if (!ownsAccount()) return;
+      toast('Folder added');
+      if (panelCurrent) await openSettings();
+      if (!ownsAccount()) return;
+      // A closed or failed panel has no scan button; the toolbar scan reports by toast.
+      const scanButton = $('#settings-modal').classList.contains('on') && $('#settings-stage').querySelector('.p-scan');
+      return scanButton ? startSettingsScan(settingsGeneration, scanButton) : $('#add-media').onclick();
     };
     stage.querySelectorAll('.lib-remove').forEach(b => b.onclick = async () => {
       if (locked || !current() || !confirm(`Stop scanning "${b.dataset.path}"? Existing items and files remain.`)) return;
@@ -381,11 +414,14 @@ async function openSettings() {
       const url = stage.querySelector('.s-ingest').value.trim();
       if (!/^https?:\/\//.test(url)) { ingestBtn.textContent = 'Invalid URL'; return; }
       ingestBtn.disabled = true;
-      const owner = accountGeneration, identity = IDENTITY;
+      const ownsAccount = accountGuard();
       try {
-        const response = await fetch('/api/ingest', { method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ url }) });
-        if (owner !== accountGeneration || identity !== IDENTITY) return;
-        if (response.status !== 202) throw new Error(response.status === 409 ? 'Download already active' : response.status === 501 ? 'Download unavailable: configure a folder and yt-dlp' : `Download failed (${response.status})`);
+        const response = await fetch('/api/ingest', {
+          method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ url }),
+        });
+        if (!ownsAccount()) return;
+        if (response.status !== 202) throw new Error(response.status === 409 ? 'Download already active'
+          : response.status === 501 ? 'Download unavailable: configure a folder and yt-dlp' : `Download failed (${response.status})`);
         if (current()) ingestBtn.textContent = 'Downloading…';
         pollSettings(generation, 'ingest', ingestBtn);
       } catch (error) {
@@ -413,8 +449,8 @@ async function doLogin(ev) {
   const email = $('#email').value.trim();
   const pw = $('#password').value;
   if (!email || !pw) return;
-  const owner = ++accountGeneration;
-  const current = () => owner === accountGeneration;
+  ++accountGeneration;
+  const current = accountGuard();
   const err = $('#auth-error');
   err.style.display = 'none';
   try {
@@ -450,6 +486,7 @@ $('#logout')?.addEventListener('click', () => {
   disposeSettings();
   ++libraryRequestGeneration;
   ++renderGeneration;
+  // The page reloads at once, so a failed logout request has nowhere to report.
   fetch('/api/auth/logout', { method: 'POST', headers: authHeaders() }).catch(() => {});
   account = null;
   delete localStorage.frayd_token;
@@ -470,24 +507,22 @@ $('#add-media').onclick = async () => {
   if (btn.disabled) return;
   btn.disabled = true;
   btn.textContent = 'Scanning…';
-  const generation = accountGeneration;
+  const ownsAccount = accountGuard();
   try {
     const r = await fetch('/api/scan', { method: 'POST', headers: authHeaders() });
-    if (generation !== accountGeneration) return;
+    if (!ownsAccount()) return;
     if (r.status === 202 || r.status === 409) {
       toast(r.status === 409 ? 'Scan already running — monitoring progress…' : 'Scanning library…');
       let pending = false;
       let failures = 0;
-      // Keep at most one request active; allow three consecutive failures before manual retry.
+      // Keep at most one request active; stop on the third consecutive retryable failure.
       const poll = setInterval(async () => {
-        if (generation !== accountGeneration) { clearInterval(poll); return; }
+        if (!ownsAccount()) { clearInterval(poll); return; }
         if (pending) return;
         pending = true;
         try {
-          const response = await fetch('/api/scan/status');
-          if (response.ok === false) throw new Error('Status unavailable');
-          const { scanning, scan_error } = await response.json();
-          if (generation !== accountGeneration) { clearInterval(poll); return; }
+          const { scanning, scan_error } = await readScanStatus();
+          if (!ownsAccount()) { clearInterval(poll); return; }
           if (scanning) { failures = 0; return; }
           if (scan_error) {
             clearInterval(poll);
@@ -497,15 +532,21 @@ $('#add-media').onclick = async () => {
             return;
           }
           const before = LIBRARY.length;
-          await loadLibrary();
+          try {
+            await loadLibrary();
+          } catch (error) {
+            // The scan finished; retry its library refresh like a transient status failure.
+            error.retryable = true;
+            throw error;
+          }
           clearInterval(poll);
-          if (generation !== accountGeneration) return;
+          if (!ownsAccount()) return;
           toast(LIBRARY.length > before ? `Scan complete — ${LIBRARY.length - before} new item(s)` : 'Scan complete');
           btn.disabled = false;
           btn.innerHTML = ADD_BTN_HTML;
-        } catch {
-          if (generation !== accountGeneration) { clearInterval(poll); return; }
-          if (++failures < 3) {
+        } catch (error) {
+          if (!ownsAccount()) { clearInterval(poll); return; }
+          if (error.retryable && ++failures < 3) {
             if (failures === 1) toast('Scan status unavailable — retrying…', true);
             return;
           }
@@ -517,17 +558,13 @@ $('#add-media').onclick = async () => {
           pending = false;
         }
       }, 1500);
-    } else if (r.status === 501) {
-      toast('No library folder configured — set it in settings', true);
-      btn.disabled = false;
-      btn.innerHTML = ADD_BTN_HTML;
     } else {
-      toast(`Scan failed (${r.status})`, true);
+      toast(scanFailure(r.status), true);
       btn.disabled = false;
       btn.innerHTML = ADD_BTN_HTML;
     }
   } catch {
-    if (generation !== accountGeneration) return;
+    if (!ownsAccount()) return;
     toast('Scan failed — server unreachable', true);
     btn.disabled = false;
     btn.innerHTML = ADD_BTN_HTML;
@@ -540,8 +577,9 @@ document.querySelectorAll('.nav-item').forEach(btn => {
     document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     filtering = btn.dataset.kind !== 'all';
-    if (btn.dataset.kind !== 'show') showsDrill = null;
-    if (authorDrill[btn.dataset.kind]) authorDrill[btn.dataset.kind] = null;
+    // Navigation opens shelves at their top level, including the dashboard's grouped shelves.
+    showsDrill = null;
+    for (const kind of Object.keys(authorDrill)) authorDrill[kind] = null;
     return filterKind(btn.dataset.kind);
   };
 });
@@ -556,17 +594,17 @@ $('#search input').addEventListener('input', (e) => {
  * @param {string} q
  */
 async function serverSearch(q) {
-  activeKind = libraryKind(activeKind);
   activeQuery = q;
   filtering = activeKind !== 'all' || !!q;
   const generation = ++searchGeneration;
   if (!q) { filterKind(activeKind, ''); return; }
   const libraryGeneration = libraryRequestGeneration;
-  const owner = accountGeneration, identity = IDENTITY;
+  const ownsAccount = accountGuard();
   const current = () => generation === searchGeneration && libraryGeneration === libraryRequestGeneration
-    && owner === accountGeneration && identity === IDENTITY;
+    && ownsAccount();
   try {
-    const response = await fetch(`/api/library?q=${encodeURIComponent(q)}${identity ? '&identity=' + encodeURIComponent(identity) : ''}`, { headers: authHeaders() });
+    const identityParam = IDENTITY ? '&identity=' + encodeURIComponent(IDENTITY) : '';
+    const response = await fetch(`/api/library?q=${encodeURIComponent(q)}${identityParam}`, { headers: authHeaders() });
     if (!response.ok) throw new Error('Search failed');
     let results = await response.json();
     if (!current()) return;
@@ -601,11 +639,11 @@ window.getLibrary = () => LIBRARY;
  */
 async function loadLibrary() {
   const generation = ++libraryRequestGeneration;
-  const owner = accountGeneration, identity = IDENTITY;
-  const current = () => generation === libraryRequestGeneration && owner === accountGeneration && identity === IDENTITY;
-  const response = await fetch(`/api/library${identity ? '?identity=' + encodeURIComponent(identity) : ''}`, { headers: authHeaders() });
+  const ownsAccount = accountGuard();
+  const current = () => generation === libraryRequestGeneration && ownsAccount();
+  const response = await fetch(`/api/library${IDENTITY ? '?identity=' + encodeURIComponent(IDENTITY) : ''}`, { headers: authHeaders() });
   if (!current()) return;
-  if (response.ok === false) throw new Error(`Library failed (${response.status})`);
+  if (!response.ok) throw new Error(`Library failed (${response.status})`);
   const items = await response.json();
   if (!current()) return;
   LIBRARY = items;
@@ -635,7 +673,8 @@ function filterKind(kind, query = activeQuery) {
   if (activeKind !== 'all') items = items.filter(i => i.kind === activeKind);
   if (activeQuery) {
     const q = activeQuery.toLowerCase();
-    items = items.filter(i => (i.title || '').toLowerCase().includes(q) || (i.author || '').toLowerCase().includes(q) || (i.synopsis || '').toLowerCase().includes(q));
+    items = items.filter(i => (i.title || '').toLowerCase().includes(q) || (i.author || '').toLowerCase().includes(q)
+      || (i.synopsis || '').toLowerCase().includes(q));
   }
   return renderRows(items);
 }
@@ -649,7 +688,8 @@ async function deleteMedia(it) {
   try {
     const response = await fetch(`/api/media/${it.id}?identity=${encodeURIComponent(IDENTITY)}`, {method:'DELETE', headers:authHeaders()});
     if (!response.ok) {
-      toast(response.status === 409 ? 'Cannot remove: media is referenced or a job is active' : response.status === 403 ? 'Admin access required' : `Remove failed (${response.status})`, true);
+      toast(response.status === 409 ? 'Cannot remove: media is referenced or a job is active'
+        : response.status === 403 ? 'Admin access required' : `Remove failed (${response.status})`, true);
       return;
     }
     ++libraryRequestGeneration;
@@ -673,10 +713,10 @@ function resumeFor(id) {
 /**
  * Build a media card and attach progress only while its render generation and DOM node remain current.
  * @param {Object} it
- * @param {function(number): Promise<Object|null>} [progressFor=resumeFor]
+ * @param {function(number): Promise<Object|null>} progressFor Render-owned progress reader.
  * @returns {HTMLElement}
  */
-function card(it, progressFor = resumeFor) {
+function card(it, progressFor) {
   const portrait = ['ebook', 'comic', 'manga', 'audiobook'].includes(it.kind);
   const c = el('div', 'media-card ' + (portrait ? 'portrait' : 'landscape'));
   c.title = `${it.title}${it.author ? ' — ' + it.author : ''}`;
@@ -695,9 +735,9 @@ function card(it, progressFor = resumeFor) {
     del.onkeydown = event => { event.stopPropagation(); };
     c.appendChild(del);
   }
-  const generation = renderGeneration, owner = accountGeneration, identity = IDENTITY;
+  const generation = renderGeneration, ownsAccount = accountGuard();
   progressFor(it.id).then(p => {
-    if (generation !== renderGeneration || owner !== accountGeneration || identity !== IDENTITY || !c.isConnected) return;
+    if (generation !== renderGeneration || !ownsAccount() || !c.isConnected) return;
     if (p && p.position > 5 && it.duration_secs) {
       const frac = Math.min(1, p.position / it.duration_secs);
       const strip = c.querySelector('.progress-strip');
@@ -711,11 +751,13 @@ function card(it, progressFor = resumeFor) {
 
 /** Use the thumbnail API only; cache filesystem paths never become browser URLs. */
 function artwork(item, portrait = false, memberOnly = false) {
-  const symbol = ['movie', 'episode'].includes(item.kind) ? '▶' : item.kind === 'music' ? '♪' : item.kind === 'audiobook' ? '🎙' : ['comic', 'manga'].includes(item.kind) ? '📄' : '📖';
+  const symbol = ['movie', 'episode'].includes(item.kind) ? '▶' : item.kind === 'music' ? '♪'
+    : item.kind === 'audiobook' ? '🎙' : ['comic', 'manga'].includes(item.kind) ? '📄' : '📖';
   const fallback = `<div class="thumb-fallback${portrait ? ' portrait' : ''}">${symbol}</div>`;
   const version = typeof item.artwork_version === 'string' ? item.artwork_version : '';
   if (!version) return fallback;
-  return `<img class="thumb" loading="lazy" src="/api/thumb/${item.id}?v=${encodeURIComponent(version)}" alt="${esc(memberOnly ? 'Artwork from ' + item.title : '')}"
+  const alt = esc(memberOnly ? 'Artwork from ' + item.title : '');
+  return `<img class="thumb" loading="lazy" src="/api/thumb/${item.id}?v=${encodeURIComponent(version)}" alt="${alt}"
     onerror="this.outerHTML='${fallback.replaceAll('"', '&quot;')}'">`;
 }
 
@@ -734,7 +776,8 @@ function categoryShelf(kind, entries, renderEntry, gridClass = 'cards') {
     button.setAttribute('aria-pressed', String(oldest));
     button.setAttribute('aria-label', `${categoryLabels[kind]} order: ${button.textContent}. Switch to ${oldest ? 'newest' : 'oldest'} first`);
     const date = entry => entry.items
-      ? entry.items.reduce((value, item) => oldest ? Math.min(value, item.created_at || 0) : Math.max(value, item.created_at || 0), oldest ? Infinity : -Infinity)
+      ? entry.items.reduce((value, item) => oldest ? Math.min(value, item.created_at || 0)
+        : Math.max(value, item.created_at || 0), oldest ? Infinity : -Infinity)
       : entry.created_at || 0;
     const ordered = [...entries].sort((a, b) => (oldest ? 1 : -1) * (date(a) - date(b))
       || (a.name === undefined ? a.id - b.id : a.name.localeCompare(b.name)));
@@ -749,7 +792,7 @@ function categoryShelf(kind, entries, renderEntry, gridClass = 'cards') {
 }
 
 /** Flat categories share the same heading, ordering and render-owned progress reader. */
-function section(kind, items, progressFor = resumeFor) {
+function section(kind, items, progressFor) {
   return categoryShelf(kind, items, item => card(item, progressFor));
 }
 
@@ -766,14 +809,13 @@ function mediaFolder(name, items, kind, label, open) {
 }
 
 /**
- * Build the in-progress row from a library snapshot; return null when empty or superseded.
- * @param {Object[]} [snapshot]
- * @param {number} [generation]
- * @param {function(number): Promise<Object|null>} [progressFor=resumeFor]
+ * Build the in-progress row from a library snapshot; return null when nothing is in progress.
+ * The rendering caller discards the row when a newer render or account supersedes it.
+ * @param {Object[]} snapshot
+ * @param {function(number): Promise<Object|null>} progressFor Render-owned progress reader.
  * @returns {Promise<HTMLElement|null>}
  */
-async function continueRow(snapshot = LIBRARY, generation = renderGeneration, progressFor = resumeFor) {
-  const owner = accountGeneration, identity = IDENTITY;
+async function continueRow(snapshot, progressFor) {
   // Timed media only; eligible items are ordered by greatest completion fraction below.
   const items = snapshot.filter(i => i.kind !== 'ebook' && i.kind !== 'comic' && i.kind !== 'manga');
   const withP = await Promise.all(items.map(async it => {
@@ -781,7 +823,6 @@ async function continueRow(snapshot = LIBRARY, generation = renderGeneration, pr
     return p && p.position > 5 && it.duration_secs && p.position < it.duration_secs * 0.95
       ? { it, frac: Math.min(1, p.position / it.duration_secs) } : null;
   }));
-  if (generation !== renderGeneration || owner !== accountGeneration || identity !== IDENTITY) return null;
   const inProgress = withP.filter(Boolean);
   if (!inProgress.length) return null;
   inProgress.sort((a, b) => b.frac - a.frac);
@@ -801,15 +842,20 @@ async function continueRow(snapshot = LIBRARY, generation = renderGeneration, pr
 // TV shelf state is separate from the canonical episode navigation kind.
 let showsDrill = null;
 
+// S01E02, 1x02 or "season 1 episode 2", bounded by non-alphanumeric characters.
+const EPISODE_TOKEN = new RegExp('(?:^|[^\\p{L}\\p{N}])'
+  + '(?:s([0-9]{1,2})e([0-9]{1,3})|([0-9]{1,2})x([0-9]{1,3})|season\\s+([0-9]{1,2})\\s+episode\\s+([0-9]{1,3}))'
+  + '(?=$|[^\\p{L}\\p{N}])', 'iu');
+
 /** Parse only bounded scanner-supported episode tokens; unknown titles remain ungrouped. */
 function episodeNumbers(title) {
-  const match = String(title || '').match(/(?:^|[^\p{L}\p{N}])(?:s([0-9]{1,2})e([0-9]{1,3})|([0-9]{1,2})x([0-9]{1,3})|season\s+([0-9]{1,2})\s+episode\s+([0-9]{1,3}))(?=$|[^\p{L}\p{N}])/iu);
+  const match = String(title || '').match(EPISODE_TOKEN);
   if (!match) return null;
   return [Number(match[1] ?? match[3] ?? match[5]), Number(match[2] ?? match[4] ?? match[6])];
 }
 
 /** Render series folders or the selected series using this render's progress reader. */
-function groupedByShow(items, progressFor = resumeFor) {
+function groupedByShow(items, progressFor) {
   if (showsDrill) return showDetail(showsDrill, items.filter(item => (item.series || 'Unknown series') === showsDrill), progressFor);
   const bySeries = new Map();
   items.forEach(item => {
@@ -823,7 +869,7 @@ function groupedByShow(items, progressFor = resumeFor) {
 }
 
 /** Group known season numbers and retain unparseable titles in a truthful final bucket. */
-function showDetail(show, episodes, progressFor = resumeFor) {
+function showDetail(show, episodes, progressFor) {
   const wrap = el('section');
   const back = el('button', 'link back-row', '← All shows');
   back.onclick = () => { showsDrill = null; return filterKind('show'); };
@@ -854,15 +900,14 @@ function showDetail(show, episodes, progressFor = resumeFor) {
  */
 async function renderRows(items) {
   const generation = ++renderGeneration;
-  const owner = accountGeneration, identity = IDENTITY;
-  const current = () => generation === renderGeneration && owner === accountGeneration && identity === IDENTITY;
+  const ownsAccount = accountGuard();
+  const current = () => generation === renderGeneration && ownsAccount();
   // Share only this render's lazy reads; player/reader opens still use fresh resumeFor calls.
+  // Consumers check ownership when a read resolves; a retired render starts no new reads.
   const progressReads = new Map();
   const progressFor = id => {
     if (!current()) return Promise.resolve(null);
-    if (!progressReads.has(id)) {
-      progressReads.set(id, resumeFor(id).then(progress => current() ? progress : null));
-    }
+    if (!progressReads.has(id)) progressReads.set(id, resumeFor(id));
     return progressReads.get(id);
   };
   const snapshot = [...LIBRARY];
@@ -872,17 +917,16 @@ async function renderRows(items) {
   const heroItem = items.find(i => i.kind === 'movie') || items[0];
   if (heroItem) renderHero(heroItem);
   if (!filtering) {
-    const cont = await continueRow(snapshot, generation, progressFor);
+    const cont = await continueRow(snapshot, progressFor);
     if (!current()) return;
     if (cont) main.appendChild(cont);
   }
   const byKind = {};
   items.forEach(i => (byKind[i.kind] ||= []).push(i));
-  const order = ['movie', 'episode', 'music', 'audiobook', 'ebook', 'comic', 'manga'];
-  for (const kind of order) {
+  for (const kind of KINDS) {
     const kindItems = byKind[kind];
     if (!kindItems?.length) continue;
-    // books/audio: author → series → books grouping
+    // TV groups by series; books and audio group by author, then series.
     if (kind === 'episode') {
       main.appendChild(groupedByShow(kindItems, progressFor));
     } else if (kind === 'audiobook' || kind === 'ebook' || kind === 'music') {
@@ -908,7 +952,7 @@ async function renderRows(items) {
 const authorDrill = { audiobook: null, ebook: null, music: null };
 
 /** Render authors, named series and loose items without dropping either path. */
-function groupedByAuthor(kind, items, progressFor = resumeFor) {
+function groupedByAuthor(kind, items, progressFor) {
   const label = categoryLabels[kind];
   const wrap = el('section');
   const drill = authorDrill[kind];
@@ -998,7 +1042,11 @@ function renderHero(it) {
   const bd = $('#hero-backdrop');
   const img = new Image();
   const generation = renderGeneration;
-  img.onload = () => { if (generation !== renderGeneration || !hero.isConnected) return; bd.style.backgroundImage = `url(${img.src})`; hero.classList.add('has-backdrop'); };
+  img.onload = () => {
+    if (generation !== renderGeneration || !hero.isConnected) return;
+    bd.style.backgroundImage = `url(${img.src})`;
+    hero.classList.add('has-backdrop');
+  };
   img.src = `/api/thumb/${it.id}`;
   $('#hero-play').onclick = () => openItem(it);
 }
@@ -1031,8 +1079,8 @@ let comicOpenGeneration = 0;
  * @returns {Promise<void>}
  */
 async function openComic(it) {
-  const opening = ++comicOpenGeneration, owner = accountGeneration;
-  const current = () => opening === comicOpenGeneration && owner === accountGeneration;
+  const opening = ++comicOpenGeneration, ownsAccount = accountGuard();
+  const current = () => opening === comicOpenGeneration && ownsAccount();
   const pages = await (await fetch(`/api/comic/${it.id}/pages`)).json();
   if (!current() || !Array.isArray(pages) || !pages.length) return;
   comic = { it, pages, page: null };
@@ -1263,22 +1311,12 @@ async function showChunk(n, opts = {}) {
                   const m = document.createElement('mark');
                   m.className = 'user-highlight';
                   m.style.setProperty('--hl', h.color);
+                  // A range that crosses element boundaries cannot be wrapped; leave it unmarked.
                   try { r.surroundContents(m); restoredHighlights.add(key); } catch {}
                   break;
                 }
               }
             }
-          }
-        });
-        // geometry readback: parent asks with {type:'geom'} → returns real numbers
-        window.addEventListener('message', (e) => {
-          if (typeof e.data === 'object' && e.data?.type === 'geom') {
-            const b = document.documentElement;
-            const lastText = [...document.body.children].filter(n => n.nodeType === 1).pop();
-            sendReader({ type: 'geom', innerWidth: window.innerWidth,
-              scrollWidth: b.scrollWidth, clientWidth: b.clientWidth,
-              scrollLeft: window.scrollX, col, STEP,
-              bodyPad: getComputedStyle(b).paddingLeft + '/' + getComputedStyle(b).paddingRight });
           }
         });
         // in-chapter search: wrap matches in <mark>, report count + positions
@@ -1310,11 +1348,10 @@ async function showChunk(n, opts = {}) {
                 range.setEnd(h.node, h.idx + h.len);
                 const mark = document.createElement('mark');
                 mark.className = 'search-hit';
-                try { range.surroundContents(mark); } catch {}
+                try { range.surroundContents(mark); } catch {} // boundary-crossing hits stay unmarked
               }
               if (hits.length) {
                 const first = document.querySelector('mark.search-hit');
-                const pw = PW;
                 window.scrollTo({ left: Math.round(first.getBoundingClientRect().left + window.scrollX - PW / 2), behavior: 'instant' });
               }
             }
@@ -1329,7 +1366,6 @@ async function showChunk(n, opts = {}) {
             marks.forEach(m => m.classList.remove('current'));
             const nx = marks[(cur + 1) % marks.length];
             nx.classList.add('current');
-            const pw = PW;
             window.scrollTo({ left: Math.round(nx.getBoundingClientRect().left + window.scrollX - PW / 2), behavior: 'instant' });
             sendReader({type:'search-hit', idx: (cur + 1) % marks.length + 1, total: marks.length});
           }
@@ -1366,7 +1402,7 @@ async function showChunk(n, opts = {}) {
         });
       <\/script></head>`);
     // re-apply saved highlights for this chapter (char-offset based)
-    const saved = (ebook.annots || []).filter(a => a.kind === 'highlight' && a.spine_idx === ebook.chunk);
+    const saved = ebook.annots.filter(a => a.kind === 'highlight' && a.spine_idx === ebook.chunk);
     const inject = saved.map(a => {
       const m = a.cfi.match(/^char:(\d+):(\d+)$/);
       return m ? { off: +m[1], len: +m[2], color: a.color || 'yellow' } : null;
@@ -1431,8 +1467,6 @@ window.addEventListener('message', async (e) => {
     if (n < 0 || n >= ebook.spine.length) return;
     // entering prev chapter from its top → land on its last real page
     showChunk(n, e.data.dir < 0 ? { atEnd: true } : {});
-  } else if (e.data?.type === 'geom') {
-    console.log('[ebook geom]', e.data);
   } else if (e.data?.type === 'highlight-selection-error') {
     $('#em-searchinfo').textContent = 'Select text without crossing formatting or paragraph breaks.';
   } else if (e.data?.type === 'highlight') {
@@ -1447,8 +1481,9 @@ window.addEventListener('message', async (e) => {
     const isCurrent = () => ebook === book && ebook.chunk === chapter
       && book.document === readerDocument && readerDocument.ready
       && $('#em-frame').contentWindow === frameWindow;
-    if ((book.annots || []).some(a => a.kind === 'highlight'
-      && a.spine_idx === chapter && a.cfi === annotation.cfi)) {
+    const saved = () => book.annots.some(a => a.kind === 'highlight'
+      && a.spine_idx === chapter && a.cfi === annotation.cfi);
+    if (saved()) {
       $('#em-searchinfo').textContent = 'Highlight saved';
       return;
     }
@@ -1464,9 +1499,7 @@ window.addEventListener('message', async (e) => {
           ? 'Sign in to save highlights' : 'Could not save highlight. Try again.';
         return;
       }
-      book.annots ??= [];
-      const exists = book.annots.some(a => a.kind === 'highlight'
-        && a.spine_idx === chapter && a.cfi === annotation.cfi);
+      const exists = saved();
       if (!exists) book.annots.push(annotation);
       if (!isCurrent()) return;
       if (!exists) {
@@ -1503,7 +1536,6 @@ window.addEventListener('message', async (e) => {
  * @param {string} q
  */
 function ebookSearch(q) {
-  if (!ebook || ebook.chunk == null) return;
   ebook.searchQuery = q;
   $('#em-frame').contentWindow?.postMessage({ type: 'search', query: q }, '*');
 }
@@ -1555,16 +1587,13 @@ $('#em-toc-btn').onclick = () => {
   renderToc();
   $('#em-toc').classList.toggle('on');
 };
-$('#em-prev').ondblclick = $('#em-next').ondblclick = () =>
-  $('#em-frame').contentWindow?.postMessage({ type: 'geom' }, '*');
 /** Render the EPUB table of contents and bind chapter navigation. */
 function renderToc() {
-  if (!ebook || ebook.chunk == null) return;
-  const el = $('#em-toc');
-  if (!ebook?.toc?.length) { el.innerHTML = '<h3>No table of contents</h3>'; return; }
-  el.innerHTML = '<h3>Contents</h3>' + ebook.toc.map((t, i) =>
+  const toc = $('#em-toc');
+  if (!ebook.toc?.length) { toc.innerHTML = '<h3>No table of contents</h3>'; return; }
+  toc.innerHTML = '<h3>Contents</h3>' + ebook.toc.map(t =>
     `<button data-i="${t.spine_idx}" class="${t.spine_idx === ebook.chunk ? 'cur' : ''}">${esc(t.title)}</button>`).join('');
-  el.querySelectorAll('button').forEach(b => b.onclick = () => {
+  toc.querySelectorAll('button').forEach(b => b.onclick = () => {
     showChunk(+b.dataset.i);
     $('#em-toc').classList.remove('on');
   });
@@ -1632,6 +1661,19 @@ function ownsNativeLoad(media, kind, id, generation) {
 }
 
 /**
+ * Report a rejected play() while its load still owns playback. An AbortError on a
+ * paused or retired load means a later pause or source change interrupted the request.
+ * @param {Error} error Rejection from HTMLMediaElement.play() or Plyr.play().
+ * @param {HTMLMediaElement} media Native element whose playback was requested.
+ * @param {boolean} current Whether the requesting load still owns playback.
+ * @param {string} message Error toast for a load that could not start.
+ */
+function reportPlayFailure(error, media, current, message) {
+  if (error?.name === 'AbortError' && (!current || media.paused)) return;
+  if (current) toast(message, true);
+}
+
+/**
  * Open an audio item and resume only if this native load still owns playback.
  * @param {Object} it
  */
@@ -1657,7 +1699,8 @@ function playAudio(it) {
         partyLoadPending = false;
         window.partySend({ type: 'load', media_id: it.id, title: it.title, position: pbAudio.currentTime });
       }
-      pbAudio.play();
+      pbAudio.play().catch(error => reportPlayFailure(error, pbAudio,
+        ownsNativeLoad(pbAudio, 'audio', it.id, generation), 'Unable to start audio playback'));
     };
     if (pbAudio.readyState >= 1) onMeta();
     else pbAudio.addEventListener('loadedmetadata', onMeta, { once: true });
@@ -1669,11 +1712,10 @@ let progressTimer = null;
 let progressGeneration = 0;
 let disposeProgressListeners = null;
 /**
- * Save only while this tracker still owns a metadata-ready matching native stream.
- * Party audio may replace src without installing a tracker; its retired local ID
- * must not receive party positions. A new tracker also retires old same-ID handlers
- * so a delayed ended event cannot clear the successor's interval. Plyr resolves its
- * current native element after source replacement before checking the stream URL.
+ * Save progress while this tracker owns a metadata-ready native stream for its item.
+ * A stream that party playback replaced without a new tracker fails the stream check.
+ * Starting a tracker removes the previous tracker's interval and listeners. Plyr
+ * replaces its native element on a source change, so each check resolves the current one.
  * @param {HTMLMediaElement|Plyr} media Native player or replacing Plyr wrapper.
  * @param {{id: number}} it Library item whose progress this tracker may save.
  */
@@ -1728,15 +1770,15 @@ const isVideoId = (id) => LIBRARY.some(x => x.id === id && (x.kind === 'movie' |
 // ---- YouTube party playback (guests + host-load mirror) ----
 // loads YT iframe API once; ytPlayer mirrors host state. Looser drift (YT seek latency ~2s).
 let ytPlayer = null, ytId = null, ytReady = false, ytPlayerReady = false, ytDesired = null;
+// Host seek mirror for the current external session; each session rebinds it.
+let ytSeekTimer = null;
 const YT_DRIFT = 3;
 /**
- * Mirror an external party stream after the iframe API and the current player are ready.
- * Player callbacks must match the active instance; late readiness cannot take playback
- * back from native media. Readiness applies the latest request for that video; queued
- * API callbacks for superseded videos cannot create players. Host events broadcast only
- * while external playback owns it. The current party sender supplies host authority
- * across role/session changes, including when the same iframe is reused. Native players
- * pause after ownership transfers so their pause events cannot overwrite external party state.
+ * Mirror an external party stream in the YouTube player once the iframe API is ready.
+ * Native players pause after external playback takes ownership, so their pause events
+ * cannot overwrite party state. Only the newest requested video may create or drive a
+ * player; callbacks from a replaced player, or after native playback takes ownership
+ * back, are ignored. Host broadcasts use the current party sender.
  * @param {string} vid YouTube video ID supplied by the party state.
  * @param {string} title Display title for the external stream.
  * @param {number} position Host position at updatedAt, in seconds.
@@ -1771,11 +1813,11 @@ window.partyFollowExternal = (vid, title, position, playing, updatedAt) => {
     if (partyPlaybackKind !== 'external' || ytDesired?.vid !== vid) return;
     const desired = ytDesired;
     // Rebind one seek mirror for the current session even when reusing the iframe.
-    clearInterval(window._ytSeekTimer);
-    window._ytSeekTimer = null;
+    clearInterval(ytSeekTimer);
+    ytSeekTimer = null;
     if (window.partySend) {
       let lastPosition = desired.position;
-      window._ytSeekTimer = setInterval(() => {
+      ytSeekTimer = setInterval(() => {
         if (!ytPlayerReady || !ytPlayer || !ytPlayer.getCurrentTime
           || !window.partySend || partyPlaybackKind !== 'external') return;
         const state = ytPlayer.getPlayerState();
@@ -1845,7 +1887,8 @@ window.partyFollowExternal = (vid, title, position, playing, updatedAt) => {
  * @param {number} position Host position at updatedAt, in seconds.
  * @param {boolean} playing Whether playback should advance after synchronization.
  * @param {number} updatedAt Unix timestamp used to compensate for transit.
- * @param {{preserveActiveVideo?: boolean}} options Legacy host-only native preservation flag.
+ * @param {{preserveLocalPlayback?: boolean}} options Host echo flag: keep a matching local
+ * native load, video or audio, with its resume position and close state.
  */
 window.partyFollow = (mediaId, title, position, playing, updatedAt, options = {}) => {
   const expected = () => position + (playing ? Math.max(0, Date.now() / 1000 - updatedAt) : 0);
@@ -1856,7 +1899,7 @@ window.partyFollow = (mediaId, title, position, playing, updatedAt, options = {}
     const video = plyr.media;
     // A host's first state echoes their local load, even after a local close.
     // Visibility is UI state; the matching native owner retains close/seek authority.
-    if (options.preserveActiveVideo && priorPlaybackKind === 'video'
+    if (options.preserveLocalPlayback && priorPlaybackKind === 'video'
       && hasNativeStream(video, mediaId)) {
       return;
     }
@@ -1878,7 +1921,8 @@ window.partyFollow = (mediaId, title, position, playing, updatedAt, options = {}
     const onMeta = () => {
       if (!ownsNativeLoad(video, 'video', mediaId, generation)) return;
       if (changed || Math.abs(video.currentTime - expected()) > 2) video.currentTime = expected();
-      if (playing && video.paused) video.play().catch(() => {});
+      if (playing && video.paused) video.play().catch(error => reportPlayFailure(error, video,
+        ownsNativeLoad(video, 'video', mediaId, generation), 'Unable to start video playback'));
       if (!playing && !video.paused) video.pause();
     };
     if (video.readyState >= 1) onMeta();
@@ -1889,7 +1933,7 @@ window.partyFollow = (mediaId, title, position, playing, updatedAt, options = {}
   // load echo, including a pending local intent or an already loaded stream.
   const pendingLocalAudio = localAudioLoad?.id === mediaId
     && localAudioLoad.generation === nativeLoadGeneration && localAudioLoad.pendingResume;
-  if (options.preserveActiveVideo && priorPlaybackKind === 'audio'
+  if (options.preserveLocalPlayback && priorPlaybackKind === 'audio'
     && (pendingLocalAudio || hasNativeStream(pbAudio, mediaId))) {
     return;
   }
@@ -1906,7 +1950,8 @@ window.partyFollow = (mediaId, title, position, playing, updatedAt, options = {}
   const onMeta = () => {
     if (!ownsNativeLoad(pbAudio, 'audio', mediaId, generation)) return;
     if (changed || Math.abs(pbAudio.currentTime - expected()) > 1.5) pbAudio.currentTime = expected();
-    if (playing && pbAudio.paused) pbAudio.play().catch(() => {});
+    if (playing && pbAudio.paused) pbAudio.play().catch(error => reportPlayFailure(error, pbAudio,
+      ownsNativeLoad(pbAudio, 'audio', mediaId, generation), 'Unable to start audio playback'));
     if (!playing && !pbAudio.paused) pbAudio.pause();
   };
   if (pbAudio.readyState >= 1) onMeta();
@@ -1966,11 +2011,15 @@ function syncProgress(mediaId, position) {
     method: 'POST',
     headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ identity: IDENTITY, media_id: mediaId, position })
-  }).then(r => { if (!r.ok) console.warn('progress save failed', r.status); }).catch(() => {});
+  }).then(r => { if (!r.ok) console.warn('progress save failed', r.status); })
+    .catch(error => console.warn('progress save failed', error));
 }
 
 // bottom bar wiring
-$('#pb-play').onclick = () => pbAudio.paused ? pbAudio.play() : pbAudio.pause();
+$('#pb-play').onclick = () => {
+  if (!pbAudio.paused) return pbAudio.pause();
+  pbAudio.play().catch(error => reportPlayFailure(error, pbAudio, true, 'Unable to start audio playback'));
+};
 pbAudio.onplay = () => $('#pb-play').textContent = '❚❚';
 pbAudio.onpause = () => $('#pb-play').textContent = '▶';
 pbAudio.ontimeupdate = () => {
@@ -2059,8 +2108,7 @@ function openVideo(it) {
     plyr.play()?.catch(error => {
       const current = videoItem === it && generation === videoOpenGeneration
         && ownsNativeLoad(media, 'video', it.id, nativeGeneration) && $('#video-modal').classList.contains('on');
-      if (error?.name === 'AbortError' && (!current || media.paused)) return;
-      if (current) toast('Unable to start video playback', true);
+      reportPlayFailure(error, media, current, 'Unable to start video playback');
     });
   });
   trackProgress(plyr, it);

@@ -10,6 +10,11 @@ const PartyUI = (() => {
   let state = null;
   let partyCode = null;
   let pendingStart = null;
+  let pending = [];
+  let members = [];
+  // Host-only markers for the media each party state has already loaded.
+  let hostLoadedMedia = null;
+  let hostLoadedExt = null;
 
   /**
    * Return the first party DOM node matching a selector.
@@ -45,8 +50,10 @@ const PartyUI = (() => {
     return localStorage.frayd_identity || 'guest-' + Math.random().toString(36).slice(2, 8);
   }
 
-  /** Start with a private proof tied to the exact creation identity; cancel both awaits on reset.
-   * Keep the proof scoped to this call and reject older create APIs without an insecure fallback.
+  /**
+   * Create a party for the current identity and connect with its private host capability.
+   * The capability stays in this call; a missing or malformed one fails the start.
+   * A session reset cancels the start across both awaits.
    */
   async function host() {
     if (pendingStart) return;
@@ -144,8 +151,6 @@ const PartyUI = (() => {
       renderEnded();
     }
   }
-  let pending = [];
-  let members = [];
 
   /**
    * Send a JSON party command only while the current socket is open.
@@ -154,17 +159,12 @@ const PartyUI = (() => {
   function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
 
   // ---- guest follow: drive local audio player from host state ----
-  let hostLoadedMedia = null;
-  const DRIFT = 1.5; // seconds — resync beyond this
-
-  /** Apply authoritative host playback to a guest player when a supported callback exists. */
+  /** Apply authoritative host playback to a guest player. */
   function followState() {
     if (state && state.external_url) {
-      if (typeof window.partyFollowExternal === 'function')
-        window.partyFollowExternal(state.external_url, state.title, state.position, state.playing, state.updated_at);
+      window.partyFollowExternal(state.external_url, state.title, state.position, state.playing, state.updated_at);
       return;
     }
-    if (typeof window.partyFollow !== 'function') return;
     if (state && state.media_id != null) {
       window.partyFollow(state.media_id, state.title, state.position, state.playing, state.updated_at);
     }
@@ -176,24 +176,23 @@ const PartyUI = (() => {
    * Load each changed external or library media identifier once for the host.
    * Local host events own play, pause, seek, and resume position, so these loads
    * start at zero instead of following the echoed server position. The library
-   * callback may preserve an already active video and its local resume position.
+   * callback keeps a matching local load and its resume position.
    * Guests use followState for authoritative position and playback updates.
    */
   function followMediaChangeOnly() {
     // external (YouTube) load → mirror into YT player, host events handled separately
     const ext = state?.external_url;
-    if (ext && ext !== hostLoadedExt && typeof window.partyFollowExternal === 'function') {
+    if (ext && ext !== hostLoadedExt) {
       hostLoadedExt = ext;
       window.partyFollowExternal(ext, state.title, 0, state.playing, state.updated_at);
       return;
     }
     const id = state?.media_id;
-    if (id != null && id !== hostLoadedMedia && typeof window.partyFollow === 'function') {
+    if (id != null && id !== hostLoadedMedia) {
       hostLoadedMedia = id;
-      window.partyFollow(id, state.title, 0, state.playing, state.updated_at, { preserveActiveVideo: true });
+      window.partyFollow(id, state.title, 0, state.playing, state.updated_at, { preserveLocalPlayback: true });
     }
   }
-  let hostLoadedExt = null;
 
   // ---- host hooks: local player actions become party state ----
   /**
@@ -212,7 +211,7 @@ const PartyUI = (() => {
     window.partySend = sendHost;
     if (hookHost.done) return;
     hookHost.done = true;
-    if (typeof window.partyHostHook === 'function') window.partyHostHook(sendHost);
+    window.partyHostHook(sendHost);
   }
 
   /**
@@ -280,9 +279,8 @@ const PartyUI = (() => {
   /** Render up to twenty items supported by the party's video and audio players. */
   function libraryPickerHtml() {
     if (isHost) return '';
-    const library = window.getLibrary?.() || [];
     return '<div class="party-sec">Request a track</div><ul class="party-queue">' +
-      library.filter(it => ['movie', 'episode', 'music', 'audiobook'].includes(it.kind)).slice(0, 20).map(it =>
+      window.getLibrary().filter(it => ['movie', 'episode', 'music', 'audiobook'].includes(it.kind)).slice(0, 20).map(it =>
         `<li>${esc(it.title)} <button data-media="${it.id}" data-title="${esc(it.title)}" class="pt-request">Request</button></li>`
       ).join('') + '</ul>';
   }
@@ -317,7 +315,6 @@ const PartyUI = (() => {
       ${libraryPickerHtml()}`;
     const bind = (id, fn) => { const b = $(id); if (b) b.onclick = fn; };
     const control = async type => {
-      if (typeof window.partyControlPlayback !== 'function') return renderError('Player is not ready');
       try { await window.partyControlPlayback(type, state); }
       catch (error) { renderError(error.message); }
     };
@@ -378,10 +375,7 @@ const PartyUI = (() => {
 })();
 
 document.addEventListener('DOMContentLoaded', () => {
-  const btn = $('#party-btn');
-  if (btn) btn.onclick = PartyUI.open;
-  const hide = $('#pt-hide');
-  if (hide) hide.onclick = PartyUI.hide;
-  const x = $('#pt-close');
-  if (x) x.onclick = PartyUI.close;
+  $('#party-btn').onclick = PartyUI.open;
+  $('#pt-hide').onclick = PartyUI.hide;
+  $('#pt-close').onclick = PartyUI.close;
 });

@@ -11,19 +11,22 @@ const { tmpdir } = require('node:os');
 const { setTimeout: delay } = require('node:timers/promises');
 
 const root = resolve(__dirname, '..');
-const evidenceDir = join(root, '.codex/evidence/pr2-real-dom');
+// The runner writes result.json here; FRAYD_DOM_RESULT_DIR overrides the temporary default.
+const defaultResultDirectory = process.env.FRAYD_DOM_RESULT_DIR || join(tmpdir(), 'frayd-dom-regression');
+// Every full run must report exactly this many uniquely named cases.
+const EXPECTED_CASES = 45;
 const productionFiles = ['client/index.html', 'client/js/app.js', 'client/js/party.js', 'client/js/build-info.js',
   'client/vendor/plyr/plyr.min.js', 'client/vendor/plyr/plyr.min.css', 'client/vendor/plyr/plyr.svg', 'client/css/frayd.css', 'client/install/index.html'];
 const harnessFiles = ['tests/browser-regression.cjs', 'tests/fixtures/browser-driver.js', 'tests/fixtures/reader-probe.js', 'tests/fixtures/native-resume.mp4', 'tests/fixtures/generate-native-resume.sh'];
 function hash(path) { return createHash('sha256').update(readFileSync(path)).digest('hex'); }
-/** Configure only the one owned app bootstrap without altering its exact cache-busted tag. */
+/** Configure only the one app bootstrap without altering its exact cache-busted tag. */
 function withLocalPlyrIcons(source) {
   const tags = source.match(/<script src="js\/app\.js(?:\?[^"<>]*)?"><\/script>/g) || [];
   if (tags.length !== 1) throw new Error('Expected exactly one production app script');
   return source.replace(tags[0], '<script>Plyr.defaults.iconUrl="/vendor/plyr/plyr.svg";</script>' + tags[0]);
 }
 function responsiveAudioFixture() {
-  // Owned deterministic120s mono PCM; no file, dependency, download or physical output.
+  // Deterministic 120 s mono PCM; no file, dependency, download or physical output.
   const samples = 120 * 8000;
   const bytes = Buffer.alloc(44 + samples * 2);
   bytes.write('RIFF'); bytes.writeUInt32LE(bytes.length - 8, 4); bytes.write('WAVEfmt ', 8);
@@ -123,7 +126,7 @@ function installerPreload() {
 }
 /**
  * Resolve an existing BROWSER_BIN or PATH browser without installing or downloading
- * software. Identity comes from the owned browser protocol after launch.
+ * software. Identity comes from the browser protocol after launch.
  */
 function browserPath() {
   if (process.env.BROWSER_BIN) return realpathSync(process.env.BROWSER_BIN);
@@ -144,7 +147,7 @@ function signalGroup(pid, signal) {
   catch (error) { if (error.code === 'ESRCH') return false; throw error; }
 }
 /**
- * Escalate TERM to KILL and confirm that the owned process group no longer exists.
+ * Escalate TERM to KILL and confirm that the process group no longer exists.
  * Reject unconfirmed shutdown so the runner retains its profile instead of deleting it.
  */
 async function stopBrowserGroup(browser) {
@@ -164,14 +167,14 @@ async function stopBrowserGroup(browser) {
   signalGroup(browser.pid, 'SIGTERM');
   if (await waitForExit(750)) return;
   signalGroup(browser.pid, 'SIGKILL');
-  if (!await waitForExit(2000)) throw new Error(`Owned browser process group ${browser.pid} did not exit after SIGKILL; profile retained`);
+  if (!await waitForExit(2000)) throw new Error(`Browser process group ${browser.pid} did not exit after SIGKILL; profile retained`);
 }
 /**
  * Remove DevTools listening lines and WebSocket capability URLs from diagnostics.
  * This targets debugger capabilities; it is not a general secret or log sanitizer.
  */
 function redactDebuggerCapabilities(message) {
-  return String(message).replace(/DevTools listening on [^\r\n]*/g, 'Owned DevTools endpoint redacted')
+  return String(message).replace(/DevTools listening on [^\r\n]*/g, 'DevTools endpoint redacted')
     .replace(/wss?:\/\/[^\s"']+/g, '[debugger endpoint redacted]');
 }
 /**
@@ -187,7 +190,7 @@ async function bounded(promise, message, milliseconds = 3000) {
   } finally { clearTimeout(timer); }
 }
 /**
- * Spend one shared startup deadline discovering the owned blank page and configuring
+ * Spend one shared startup deadline discovering the blank page and configuring
  * its cache before navigation. Retry transient HTTP readiness only; unexpected targets
  * or debugger ownership fail closed. Keep the protocol open until caller teardown.
  */
@@ -203,15 +206,15 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser, diagno
   function remainingStartupBudget() {
     diagnostics.elapsedMs = Date.now() - startedAt;
     const remaining = deadline - Date.now();
-    if (remaining <= 0) throw new Error('Owned browser startup deadline exceeded');
+    if (remaining <= 0) throw new Error('Browser startup deadline exceeded');
     return remaining;
   }
   const portFile = join(profile, 'DevToolsActivePort');
   let port;
   while (true) {
-    if (browser.exitCode !== null || browser.signalCode !== null) throw new Error('Owned browser exited before cache setup');
+    if (browser.exitCode !== null || browser.signalCode !== null) throw new Error('Browser exited before cache setup');
     diagnostics.elapsedMs = Date.now() - startedAt;
-    if (Date.now() >= deadline) throw new Error('Owned browser did not expose its cache-control endpoint');
+    if (Date.now() >= deadline) throw new Error('Browser did not expose its cache-control endpoint');
     if (existsSync(portFile)) {
       const contents = readFileSync(portFile, 'utf8');
       const firstLine = contents.split('\n')[0].trim();
@@ -228,7 +231,7 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser, diagno
   browser.once('exit', onBrowserExit);
   try {
     while (true) {
-      if (browser.exitCode !== null || browser.signalCode !== null) throw new Error('Owned browser exited before cache setup');
+      if (browser.exitCode !== null || browser.signalCode !== null) throw new Error('Browser exited before cache setup');
       // Allow a slow valid response to finish within the one startup deadline.
       // The same signal bounds headers and body and aborts immediately on browser exit.
       const signal = AbortSignal.any([AbortSignal.timeout(remainingStartupBudget()), browserExited.signal]);
@@ -243,7 +246,7 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser, diagno
           targets = await response.json();
         }
       } catch (error) {
-        if (browser.exitCode !== null || browser.signalCode !== null) throw new Error('Owned browser exited before cache setup');
+        if (browser.exitCode !== null || browser.signalCode !== null) throw new Error('Browser exited before cache setup');
         remainingStartupBudget();
         if (!['TypeError', 'AbortError', 'TimeoutError'].includes(error.name)) throw error;
         diagnostics.transientFailures++;
@@ -254,27 +257,27 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser, diagno
       if (!response.ok) {
         if (response.status === 408 || response.status === 429 || response.status >= 500) {
           if (response.body) await bounded(response.body.cancel(),
-            'Owned browser page discovery body cancellation timed out', remainingStartupBudget());
+            'Browser page discovery body cancellation timed out', remainingStartupBudget());
           diagnostics.transientFailures++;
           await delay(20);
           continue;
         }
-        throw new Error('Owned browser page discovery failed');
+        throw new Error('Browser page discovery failed');
       }
-      if (!Array.isArray(targets)) throw new Error('Invalid owned browser page discovery response');
+      if (!Array.isArray(targets)) throw new Error('Invalid browser page discovery response');
       pages = targets.filter(page => page.type === 'page');
       if (pages.length === 0) {
         diagnostics.emptyLists++;
         await delay(20);
         continue;
       }
-      if (pages.length !== 1 || pages[0].url !== 'about:blank') throw new Error('Owned browser must have exactly one blank page before navigation');
+      if (pages.length !== 1 || pages[0].url !== 'about:blank') throw new Error('Browser must have exactly one blank page before navigation');
       break;
     }
   } finally { browser.removeListener('exit', onBrowserExit); }
   const endpoint = new URL(pages[0].webSocketDebuggerUrl);
   if (endpoint.protocol !== 'ws:' || endpoint.hostname !== '127.0.0.1' || endpoint.port !== String(port)
-    || !/^\/devtools\/page\/[a-zA-Z0-9-]+$/.test(endpoint.pathname)) throw new Error('Unexpected owned browser page endpoint');
+    || !/^\/devtools\/page\/[a-zA-Z0-9-]+$/.test(endpoint.pathname)) throw new Error('Unexpected browser page endpoint');
   phase('socket-open');
   const openBudget = remainingStartupBudget();
   const socket = new WebSocket(endpoint.href);
@@ -288,12 +291,14 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser, diagno
   const canceledInterceptions = [];
   const frameStates = new Map();
   const canceledRequests = new Set();
+  // Invalid-interception errors waiting for their network request's cancellation event.
+  const unconfirmedInterceptions = new Map();
   const safeProtocolMessages = new Set(['Invalid InterceptionId.', 'Invalid parameters', 'Invalid RequestId.', 'No resource with given identifier found']);
   let shuttingDown = false;
   socket.addEventListener('message', event => {
     let message;
     try { message = JSON.parse(event.data); }
-    catch { for (const waiter of pending.values()) waiter.reject(new Error('Invalid owned browser protocol response')); return; }
+    catch { for (const waiter of pending.values()) waiter.reject(new Error('Invalid browser protocol response')); return; }
     if (message.method === 'Page.frameNavigated') {
       const frame = message.params.frame;
       const prior = frameStates.get(frame.id);
@@ -304,7 +309,16 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser, diagno
       const frame = frameStates.get(message.params.frameId);
       if (frame) frame.detached = true;
     }
-    if (message.method === 'Network.loadingFailed' && message.params.canceled === true) canceledRequests.add(message.params.requestId);
+    if (message.method === 'Network.loadingFailed' && message.params.canceled === true) {
+      canceledRequests.add(message.params.requestId);
+      const retired = unconfirmedInterceptions.get(message.params.requestId);
+      if (retired) {
+        unconfirmedInterceptions.delete(message.params.requestId);
+        protocolErrors.splice(protocolErrors.indexOf(retired), 1);
+        retired.lifecycle.matchingNetworkCanceled = true;
+        canceledInterceptions.push(retired);
+      }
+    }
     if (message.method === 'Fetch.requestPaused') {
       const { requestId, request } = message.params;
       const frame = frameStates.get(message.params.frameId);
@@ -318,11 +332,14 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser, diagno
           message: error.rpcMessage || 'protocol transport or timeout', resourceType: message.params.resourceType, ownedRequest: owned,
           lifecycle: { networkIdObserved: Boolean(networkId), matchingNetworkCanceled: canceledRequests.has(networkId),
             knownFrameAtPause: Boolean(frame), frameNavigated: frame?.navigated === true, frameDetached: frame?.detached === true } };
-        // Only this exact browser response plus the same network request's explicit
-        // canceled=true event proves that a paused interception has already retired.
-        if (error.rpcCode === -32602 && error.rpcMessage === 'Invalid InterceptionId.'
-          && networkId && canceledRequests.has(networkId)) canceledInterceptions.push(diagnostic);
-        else protocolErrors.push(diagnostic);
+        // Only this exact browser response plus the same network request's explicit canceled=true event,
+        // before or after this reply, proves that a paused interception has already retired.
+        const retiredInterception = error.rpcCode === -32602 && error.rpcMessage === 'Invalid InterceptionId.' && networkId;
+        if (retiredInterception && canceledRequests.has(networkId)) canceledInterceptions.push(diagnostic);
+        else {
+          protocolErrors.push(diagnostic);
+          if (retiredInterception) unconfirmedInterceptions.set(networkId, diagnostic);
+        }
       });
     }
     if (message.method === 'Page.javascriptDialogOpening') {
@@ -334,17 +351,17 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser, diagno
     if (message.error) {
       const code = Number.isInteger(message.error.code) ? message.error.code : 'unknown';
       const detail = safeProtocolMessages.has(message.error.message) ? message.error.message : 'unrecognized CDP message';
-      const error = new Error(`Owned browser RPC ${waiter.method} failed (${code}): ${detail}`);
+      const error = new Error(`Browser RPC ${waiter.method} failed (${code}): ${detail}`);
       Object.assign(error, { rpcMethod: waiter.method, rpcCode: code, rpcMessage: detail });
       waiter.reject(error);
     }
     else waiter.resolve(message.result);
   });
   socket.addEventListener('error', () => {
-    for (const waiter of pending.values()) waiter.reject(new Error('Owned browser cache protocol connection failed'));
+    for (const waiter of pending.values()) waiter.reject(new Error('Browser cache protocol connection failed'));
   });
   /**
-   * Send one bootstrap command on the owned protocol session and correlate its reply
+   * Send one bootstrap command on the protocol session and correlate its reply
    * by ID. Always remove the pending entry; failures propagate without command retry.
    */
   async function rpc(method, params = {}) {
@@ -354,31 +371,31 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser, diagno
     try {
       const result = new Promise((resolve, reject) => { pending.set(id, { resolve, reject, method }); });
       socket.send(JSON.stringify({ id, method, params }));
-      return await bounded(result, `Owned browser cache RPC ${method} timed out`, rpcBudget);
+      return await bounded(result, `Browser cache RPC ${method} timed out`, rpcBudget);
     } finally { pending.delete(id); }
   }
   const receipt = { cacheDisabled: false, browserCacheCleared: false, configuredBeforeFixtureNavigation: false, protocolClosed: false };
   /**
-   * Close only this owned protocol session after tests, keeping its cache overrides
+   * Close only this protocol session after tests, keeping its cache overrides
    * active until then. Teardown has a separate three-second bound, outside startup.
    */
   async function close() {
     if (socket.readyState !== WebSocket.CLOSED) {
       const closed = new Promise(resolve => socket.addEventListener('close', resolve, { once: true }));
       socket.close();
-      await bounded(closed, 'Owned browser cache protocol close timed out');
+      await bounded(closed, 'Browser cache protocol close timed out');
     }
     receipt.protocolClosed = true;
   }
   try {
     await bounded(new Promise((resolve, reject) => {
       socket.addEventListener('open', resolve, { once: true });
-      socket.addEventListener('error', () => reject(new Error('Owned browser cache protocol failed to open')), { once: true });
-    }), 'Owned browser cache protocol open timed out', openBudget);
+      socket.addEventListener('error', () => reject(new Error('Browser cache protocol failed to open')), { once: true });
+    }), 'Browser cache protocol open timed out', openBudget);
     const identity = await rpc('Browser.getVersion');
     if (typeof identity.product !== 'string' || !identity.product.trim()
       || typeof identity.revision !== 'string' || !identity.revision.trim()) {
-      throw new Error('Invalid owned browser identity response');
+      throw new Error('Invalid browser identity response');
     }
     Object.assign(receipt, { browserVersion: identity.product, browserRevision: identity.revision });
     await rpc('Page.enable');
@@ -388,7 +405,7 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser, diagno
     await rpc('Network.setCacheDisabled', { cacheDisabled: true });
     await rpc('Network.clearBrowserCache');
     const navigation = await rpc('Page.navigate', { url: fixtureUrl });
-    if (navigation.errorText) throw new Error('Owned browser fixture navigation failed');
+    if (navigation.errorText) throw new Error('Browser fixture navigation failed');
     Object.assign(receipt, { cacheDisabled: true, browserCacheCleared: true, configuredBeforeFixtureNavigation: true });
     // Keep Network overrides active until the runner finishes all media cases.
     navigated = true;
@@ -411,7 +428,7 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser, diagno
       return { width, height, cssPixels: true };
     }
     async function click(x, y) {
-      if (![x, y].every(Number.isFinite) || x < 0 || x > 1440 || y < 0 || y > 1000) throw new Error('Invalid owned fixture click coordinates');
+      if (![x, y].every(Number.isFinite) || x < 0 || x > 1440 || y < 0 || y > 1000) throw new Error('Invalid fixture click coordinates');
       await rpc('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
       await rpc('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
       await rpc('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
@@ -425,18 +442,18 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser, diagno
   }
 }
 /**
- * Run the production client against an owned loopback fixture, process group and fresh
+ * Run the production client against an loopback fixture, process group and fresh
  * profile. Record original and cleanup failures separately; remove the profile only
  * after confirmed group shutdown, retaining it when shutdown cannot be established.
  */
-async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, cacheSetup = configureOwnedBrowserCache, responsiveDiagnosticOnly = false, resultFilename = 'result.json', startupBudgetMs = 30000, caseBudgetMs = 60000 } = {}) {
-  if (!/^[a-zA-Z0-9-]+\.json$/.test(resultFilename)) throw new Error('Evidence result filename must be a simple JSON basename');
+async function main({ removeProfile = rmSync, resultDirectory = defaultResultDirectory, cacheSetup = configureOwnedBrowserCache,
+  stopGroup = stopBrowserGroup, startupBudgetMs = 30000, caseBudgetMs = 60000 } = {}) {
   if (Number(process.versions.node.split('.')[0]) < 22 || typeof WebSocket !== 'function') {
     throw new Error('Browser regressions require Node.js 22+ with the global WebSocket API');
   }
   if (!Number.isInteger(startupBudgetMs) || startupBudgetMs < 1 || startupBudgetMs > 30000
     || !Number.isInteger(caseBudgetMs) || caseBudgetMs < 1 || caseBudgetMs > 60000) {
-    throw new Error('Phase budgets must be positive milliseconds within startup30s and cases60s');
+    throw new Error('Phase budgets must be positive milliseconds, at most 30000 for startup and 60000 for cases');
   }
   let browser;
   let profile;
@@ -567,9 +584,9 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
       if (path === '/__fixture/progress' && request.method === 'POST') {
         const { completed, passed, failed, blocked, currentCase } = JSON.parse(input);
         const counts = [completed, passed, failed, blocked];
-        if (!counts.every(value => Number.isInteger(value) && value >= 0 && value <= 49)
+        if (!counts.every(value => Number.isInteger(value) && value >= 0 && value <= EXPECTED_CASES)
           || passed + failed + blocked !== completed
-          || !(currentCase === null || currentCase === completed + 1 && currentCase <= 49)) return json({}, 400);
+          || !(currentCase === null || currentCase === completed + 1 && currentCase <= EXPECTED_CASES)) return json({}, 400);
         // Requests may arrive out of order; progress never supplies terminal case evidence.
         if (completed > caseProgress.completed || completed === caseProgress.completed && currentCase !== null) {
           caseProgress = { completed, passed, failed, blocked, currentCase, elapsedMs: Date.now() - phaseStartedAt };
@@ -648,7 +665,6 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
       }
       let bytes = readFileSync(join(root, staticFile));
       if (path === '/') bytes = Buffer.from(withLocalPlyrIcons(bytes.toString())
-        .replace('<head>', '<head>' + (responsiveDiagnosticOnly ? '<script>window.__responsiveDiagnosticOnly=true</script>' : ''))
         .replace('</body>', '<script src="/__fixture/browser-driver.js"></script></body>'));
       response.writeHead(200, { 'Content-Type': contentTypes[extname(staticFile)] || 'application/octet-stream' });
       response.end(bytes);
@@ -663,12 +679,10 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
     const executable = browserPath();
     provenance = {
       capturedAt: new Date().toISOString(),
-      repository: 'ColterD/Frayd',
       head: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8', timeout: 10000 }).trim(),
       executable,
       executableSha256: hash(executable), nodeVersion: process.version,
       files: Object.fromEntries([...productionFiles, ...harnessFiles].map(file => [file, hash(join(root, file))])),
-      browserClaim: 'Observed executable identity only; browser is supplied by BROWSER_BIN or PATH, not an immutable dependency.',
     };
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
     profile = mkdtempSync(join(tmpdir(), 'frayd-browser-regression-'));
@@ -703,16 +717,11 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
     recordPhase('cases');
     const observed = await bounded(Promise.race([result, exited]),
       `Browser regression cases exceeded ${caseBudgetMs} milliseconds`, caseBudgetMs);
-    const expectedCases = responsiveDiagnosticOnly ? 1 : 47;
-    const complete = observed.cases.length === expectedCases
-      && new Set(observed.cases.map(item => item.name)).size === expectedCases
+    const complete = observed.cases.length === EXPECTED_CASES
+      && new Set(observed.cases.map(item => item.name)).size === EXPECTED_CASES
       && observed.cases.every(item => item.status === 'PASS')
-      && observed.passed === expectedCases && observed.failed === 0;
-    output = { provenance, ...observed, expectedCases, complete, unexpectedRequests, nativeRequests,
-      fixtureConfiguration: { iconUrl: '/vendor/plyr/plyr.svg', mediaResponses: 'IDs9/10/11 HTTP204; IDs20/21/22 owned120s H264 MP4 with Range support',
-        responsiveAudio: { id: 23, kind: 'generated mono8000Hz16bitPCM120s WAV', sha256: createHash('sha256').update(responsiveAudio).digest('hex') },
-        installer: 'Exact production HTML/inlineJS with preload Response adapter; CSP connect-src none; all external networking intercepted before transmission',
-        browserSandbox: 'Disabled only for this disposable headless process; EPUB iframe keeps sandbox=allow-scripts.' } };
+      && observed.passed === EXPECTED_CASES && observed.failed === 0;
+    output = { provenance, ...observed, expectedCases: EXPECTED_CASES, complete, unexpectedRequests, nativeRequests };
     if (!complete || observed.failed || observed.errors.length || unexpectedRequests.length) process.exitCode = 1;
     if (cacheControl.protocolErrors?.length || cacheControl.blockedRequests?.some(item => item.resourceType !== 'Font'
       && !item.url.startsWith('https://fonts.googleapis.com/')
@@ -725,7 +734,7 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
     // Keep interception active through group death; detaching it while a browser is
     // alive can release paused requests to operator services.
     cacheSession?.beginShutdown?.();
-    try { await stopBrowserGroup(browser); browserGroupStopped = true; }
+    try { await stopGroup(browser); browserGroupStopped = true; }
     catch (error) { cleanupErrors.push(error.stack); }
     if (browserGroupStopped) {
       try { await cacheSession?.close(); }
@@ -758,9 +767,9 @@ async function main({ removeProfile = rmSync, evidenceDirectory = evidenceDir, c
   output.cleanup = { browserExited: !browser?.pid || browser.exitCode !== null || browser.signalCode !== null,
     browserGroupStopped, profileRemoved: !profile || !existsSync(profile), serverClosed: !server.listening };
   if (runError || cleanupErrors.length || heldMedia || pendingMedia || !Object.values(output.cleanup).every(Boolean)) process.exitCode = 1;
-  mkdirSync(evidenceDirectory, { recursive: true });
-  writeFileSync(join(evidenceDirectory, resultFilename), JSON.stringify(output, null, 2) + '\n');
+  mkdirSync(resultDirectory, { recursive: true });
+  writeFileSync(join(resultDirectory, 'result.json'), JSON.stringify(output, null, 2) + '\n');
   console.log(JSON.stringify(output, null, 2));
 }
-module.exports = { main, stopBrowserGroup, withLocalPlyrIcons };
+module.exports = { main, stopBrowserGroup, withLocalPlyrIcons, EXPECTED_CASES };
 if (require.main === module) main().catch(error => { console.error(error.stack); process.exitCode = 1; });

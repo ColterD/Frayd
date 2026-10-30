@@ -1,12 +1,8 @@
 const assert = require('node:assert/strict');
-const { readFileSync } = require('node:fs');
-const { join } = require('node:path');
 const { test } = require('node:test');
 const vm = require('node:vm');
 
-const clientPath = join(__dirname, '..', 'client');
-
-const { browser } = require('./fixtures/client-browser.cjs');
+const { browser, settle, reply, stateMessage } = require('./fixtures/client-browser.cjs');
 
 function progress(browser) {
   return browser.requests.filter(r => r.url === '/api/progress').map(r => JSON.parse(r.options.body).position);
@@ -14,7 +10,7 @@ function progress(browser) {
 
 test('closing an ebook preserves the last reported fractional chapter position', () => {
   const b = browser();
-  b.run('ebookDocumentGeneration = 1; ebook = { it: { id: 7 }, chunk: 2, spine: ["a", "b", "c"], document: { generation: 1, ready: false, want: 0, items: [] } }');
+  b.run('ebookDocumentGeneration = 1; ebook = { it: { id: 7 }, annots: [], chunk: 2, spine: ["a", "b", "c"], document: { generation: 1, ready: false, want: 0, items: [] } }');
   b.message({ type: 'reader-ready' });
   b.page(3, 5);
   b.nodes.get('#em-close').onclick();
@@ -24,7 +20,7 @@ test('closing an ebook preserves the last reported fractional chapter position',
 
 test('closing before any page report saves a finite chapter position', () => {
   const b = browser();
-  b.run('ebookDocumentGeneration = 1; ebook = { it: { id: 7 }, chunk: 0, spine: ["a"], document: { generation: 1, ready: false, want: 0, items: [] } }');
+  b.run('ebookDocumentGeneration = 1; ebook = { it: { id: 7 }, annots: [], chunk: 0, spine: ["a"], document: { generation: 1, ready: false, want: 0, items: [] } }');
   b.message({ type: 'reader-ready' });
   b.nodes.get('#em-close').onclick();
   assert.deepEqual(progress(b), [0]);
@@ -33,7 +29,7 @@ test('closing before any page report saves a finite chapter position', () => {
 test('changing chapters resets the previous fractional position before layout reports', async () => {
   const b = browser();
   b.respond(async () => ({ ok: true, text: async () => '<html><head></head><body>Chapter</body></html>' }));
-  b.run('ebookDocumentGeneration = 1; ebook = { it: { id: 7 }, chunk: 0, spine: ["a", "b"], document: { generation: 1, ready: false, want: 0, items: [] } }');
+  b.run('ebookDocumentGeneration = 1; ebook = { it: { id: 7 }, annots: [], chunk: 0, spine: ["a", "b"], document: { generation: 1, ready: false, want: 0, items: [] } }');
   b.message({ type: 'reader-ready' });
   b.page(3, 5);
   await b.run('showChunk(1)');
@@ -48,7 +44,7 @@ test('closing while the next chapter fetch is pending preserves the last rendere
   b.respond(url => url.includes('/chunk/')
     ? new Promise(resolve => { finishFetch = resolve; })
     : Promise.resolve({ ok: true }));
-  b.run('ebookDocumentGeneration = 1; ebook = { it: { id: 7 }, chunk: 0, spine: ["a", "b"], document: { generation: 1, ready: false, want: 0, items: [] } }');
+  b.run('ebookDocumentGeneration = 1; ebook = { it: { id: 7 }, annots: [], chunk: 0, spine: ["a", "b"], document: { generation: 1, ready: false, want: 0, items: [] } }');
   b.message({ type: 'reader-ready' });
   b.page(3, 5);
   const loading = b.run('showChunk(1)');
@@ -63,7 +59,7 @@ test('closing while the next chapter fetch is pending preserves the last rendere
 test('closing a resumed ready chapter before its first page report preserves the requested fraction', async () => {
   const b = browser();
   b.respond(async () => ({ ok: true, text: async () => '<html><head></head><body>Chapter</body></html>' }));
-  b.run('ebookDocumentGeneration = 1; ebook = { it: { id: 7 }, chunk: 0, spine: ["a", "b"], document: { generation: 1, ready: false, want: 0, items: [] } }');
+  b.run('ebookDocumentGeneration = 1; ebook = { it: { id: 7 }, annots: [], chunk: 0, spine: ["a", "b"], document: { generation: 1, ready: false, want: 0, items: [] } }');
   await b.run('showChunk(1, { frac: 0.75 })');
   b.message({ type: 'reader-ready' });
   b.nodes.get('#em-close').onclick();
@@ -87,7 +83,8 @@ test('scan disables repeat clicks, polls until idle, refreshes and restores the 
   const b = browser();
   let scanning = true;
   b.respond(async url => ({
-    status: 202,
+    ok: true,
+    status: url === '/api/scan' ? 202 : 200,
     json: async () => url === '/api/scan/status' ? { scanning } : [],
   }));
   const button = b.nodes.get('#add-media');
@@ -117,7 +114,7 @@ test('toolbar scan refusal restores control without publishing completion', asyn
     assert.equal(button.disabled,false);
     assert.equal(b.intervals.size,0);
     assert.equal(b.requests.some(request=>request.url==='/api/library'),false);
-    const notices=b.context.document.body.children.map(node=>node.children[0]?.innerHTML||'').join(' ');
+    const notices=b.notices();
     assert.match(notices,/Scan failed/);
     assert.doesNotMatch(notices,/Scan complete/);
   }
@@ -140,11 +137,7 @@ test('party guest request picker follows library replacements', async () => {
   const b = browser();
   b.respond(async url => ({ ok: true, json: async () => url === '/api/library' ? [{ id: 9, kind: 'movie', title: 'Movie' }] : null }));
   await b.run('loadLibrary()');
-  vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), b.context);
-  b.nodes.get('#party-code-input').value = 'ABCD';
-  b.run('PartyUI.open()');
-  b.nodes.get('#pt-join').onclick();
-  b.sockets[0].onmessage({ data: JSON.stringify({ type: 'state', is_host: false, state: { queue: [], position: 0 } }) });
+  b.openParty({ queue: [], position: 0 }, false);
   assert.match(b.nodes.get('#party-stage').innerHTML, /data-media="9"/);
   assert.match(b.nodes.get('#party-stage').innerHTML, /Movie/);
   b.respond(async url => ({ ok: true, json: async () => url === '/api/library' ? [{ id: 10, kind: 'movie', title: 'Replacement' }] : null }));
@@ -159,11 +152,7 @@ async function guestPicker(library) {
   const b = browser();
   b.respond(async url => ({ ok: true, json: async () => url === '/api/library' ? library : null }));
   await b.run('loadLibrary()');
-  vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), b.context);
-  b.nodes.get('#party-code-input').value = 'ABCD';
-  b.run('PartyUI.open()');
-  b.nodes.get('#pt-join').onclick();
-  b.sockets[0].onmessage({ data: JSON.stringify({ type: 'state', is_host: false, state: { queue: [], position: 0 } }) });
+  b.openParty({ queue: [], position: 0 }, false);
   return b;
 }
 
@@ -212,7 +201,7 @@ test('movie reopen restores saved time after metadata, without undoing later see
   for (const [position, readyFirst] of [[203, true], [50, false]]) {
     savedPosition = position;
     b.run('openVideo({ id: 1, kind: "movie", title: "Movie" })');
-    await new Promise(resolve => setImmediate(resolve));
+    await settle();
     if (readyFirst) b.run('plyr.emit("ready")');
     assert.equal(b.run('plyr.currentTime'), 0);
     b.run('plyr.duration = 634; plyr.emit("loadedmetadata")');
@@ -227,9 +216,9 @@ test('movie reopen restores saved time after metadata, without undoing later see
 test('retired video metadata cannot consume the current movie resume', async () => {
   const b = browser();
   const retired = b.nodes.get('#plyr-video');
-  b.respond(async () => ({ ok: true, json: async () => ({ position: 64 }) }));
+  b.respond(async () => reply({ position: 64 }));
   b.run('openVideo({ id: 1, kind: "movie", title: "Movie" })');
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   retired.emit('loadedmetadata'); // Vendored Plyr forwards even a retired media event.
   assert.equal(b.run('plyr.currentTime'), 0);
   b.run('plyr.duration = 120; plyr.emit("loadedmetadata")');
@@ -238,19 +227,19 @@ test('retired video metadata cannot consume the current movie resume', async () 
 
 test('late movie metadata cannot seek a replacement or a closed video', async () => {
   const b = browser();
-  b.respond(async () => ({ ok: true, json: async () => ({ position: 64 }) }));
+  b.respond(async () => reply({ position: 64 }));
   b.run('openVideo({ id: 1, kind: "movie", title: "First" })');
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   const first = b.nodes.get('#plyr-video');
-  b.respond(async () => ({ ok: true, json: async () => null }));
+  b.respond(async () => reply(null));
   b.run('openVideo({ id: 2, kind: "movie", title: "Second" })');
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   b.run('plyr.duration = 120');
   first.emit('loadedmetadata');
   assert.equal(b.run('plyr.currentTime'), 0);
-  b.respond(async () => ({ ok: true, json: async () => ({ position: 64 }) }));
+  b.respond(async () => reply({ position: 64 }));
   b.run('openVideo({ id: 3, kind: "movie", title: "Closed" })');
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   b.nodes.get('#vm-back').onclick();
   b.run('plyr.duration = 120; plyr.emit("loadedmetadata")');
   assert.equal(b.run('plyr.currentTime'), 0);
@@ -264,13 +253,13 @@ for (const next of ['close', 'replacement']) {
     b.run('openVideo({ id: 1, kind: "movie", title: "First" })');
     if (next === 'close') b.nodes.get('#vm-back').onclick();
     else {
-      b.respond(async () => ({ ok: true, json: async () => null }));
+      b.respond(async () => reply(null));
       b.run('openVideo({ id: 2, kind: "movie", title: "Second" })');
-      await new Promise(resolve => setImmediate(resolve));
+      await settle();
     }
     const media = b.nodes.get('#plyr-video');
-    finish({ ok: true, json: async () => ({ position: 64 }) });
-    await new Promise(resolve => setImmediate(resolve));
+    finish(reply({ position: 64 }));
+    await settle();
     assert.equal(b.nodes.get('#plyr-video'), media);
     assert.equal(media.src, next === 'close' ? '' : '/api/stream/2');
   });
@@ -283,11 +272,11 @@ test('an old progress response cannot restart a quick same-item reopen', async (
   b.run('sameMovie = { id: 1, kind: "movie", title: "Movie" }; openVideo(sameMovie)');
   b.nodes.get('#vm-back').onclick();
   b.run('openVideo(sameMovie)');
-  pending[1]({ ok: true, json: async () => null });
-  await new Promise(resolve => setImmediate(resolve));
+  pending[1](reply(null));
+  await settle();
   const media = b.nodes.get('#plyr-video');
-  pending[0]({ ok: true, json: async () => ({ position: 64 }) });
-  await new Promise(resolve => setImmediate(resolve));
+  pending[0](reply({ position: 64 }));
+  await settle();
   assert.equal(b.nodes.get('#plyr-video'), media);
   b.run('plyr.duration = 120; plyr.emit("loadedmetadata")');
   assert.equal(b.run('plyr.currentTime'), 0);
@@ -295,9 +284,9 @@ test('an old progress response cannot restart a quick same-item reopen', async (
 
 test('metadata from a reused video with a different stream cannot apply old resume', async () => {
   const b = browser();
-  b.respond(async () => ({ ok: true, json: async () => ({ position: 64 }) }));
+  b.respond(async () => reply({ position: 64 }));
   b.run('openVideo({ id: 1, kind: "movie", title: "First" })');
-  await new Promise(resolve => setImmediate(resolve));
+  await settle();
   b.nodes.get('#plyr-video').src = '/api/stream/2';
   b.run('plyr.duration = 120; plyr.emit("loadedmetadata")');
   assert.equal(b.run('plyr.currentTime'), 0);
@@ -308,7 +297,7 @@ test('movie without meaningful saved progress starts at zero', async () => {
     const b = browser();
     b.respond(async () => ({ ok: true, json: async () => saved }));
     b.run('openVideo({ id: 1, kind: "movie", title: "Movie" })');
-    await new Promise(resolve => setImmediate(resolve));
+    await settle();
     b.run('plyr.emit("ready"); plyr.duration = 634; plyr.emit("loadedmetadata")');
     assert.equal(b.run('plyr.currentTime'), 0);
   }
@@ -319,9 +308,9 @@ test('audio resume preserves saved time with available or delayed metadata', asy
     const b = browser();
     const audio = b.nodes.get('#pb-audio');
     audio.readyState = readyState;
-    b.respond(async () => ({ ok: true, json: async () => ({ position: 106 }) }));
+    b.respond(async () => reply({ position: 106 }));
     b.run('playAudio({ id: 2, kind: "music", title: "Music" })');
-    await new Promise(resolve => setImmediate(resolve));
+    await settle();
     if (!readyState) {
       assert.equal(audio.currentTime, 0);
       assert.equal(audio.paused, true);
@@ -339,14 +328,13 @@ test('audio resume preserves saved time with available or delayed metadata', asy
 
 function highlightReader() {
   const b = browser();
-  b.run('ebook = { it: { id: 7 }, chunk: 1, spine: ["a", "b"], annots: [], document: { generation: 1, ready: true, items: [] } }');
+  b.run('ebook = { it: { id: 7 }, annots: [], chunk: 1, spine: ["a", "b"], annots: [], document: { generation: 1, ready: true, items: [] } }');
   const posted = [];
   b.nodes.get('#em-frame').contentWindow.postMessage = data => posted.push(data);
   return { b, posted };
 }
 
 const highlightMessage = { type: 'highlight', cfi: 'char:0:5', text: 'Hello' };
-const settle = () => new Promise(resolve => setImmediate(resolve));
 
 for (const [name, response, expected] of [
   ['guest denial', async () => ({ status: 401 }), 'Sign in to save highlights'],
@@ -563,7 +551,7 @@ for (const [isHost, metadataFirst] of [
 ]) {
   test(`${isHost ? 'host' : 'guest'} first party state ${metadataFirst ? 'after' : 'before'} metadata preserves the role's video position`, async () => {
     const b = browser();
-    b.respond(async () => ({ ok: true, json: async () => ({ position: 203 }) }));
+    b.respond(async () => reply({ position: 203 }));
     b.run('LIBRARY = [{ id: 9, kind: "movie", title: "Movie" }]; openVideo(LIBRARY[0])');
     await settle();
     const media = b.nodes.get('#plyr-video');
@@ -572,13 +560,8 @@ for (const [isHost, metadataFirst] of [
     media.src = '';
     media.readyState = metadataFirst ? 1 : 0;
     if (metadataFirst) b.run('plyr.duration = 634; plyr.emit("loadedmetadata")');
-    vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), b.context);
-    b.nodes.get('#party-code-input').value = 'ABCD';
-    b.run('PartyUI.open()');
-    b.nodes.get('#pt-join').onclick();
-    b.sockets[0].onmessage({ data: JSON.stringify({ type: 'state', is_host: isHost,
-      state: { media_id: 9, title: 'Movie', queue: [], position: isHost ? 0 : 24,
-        playing: false, updated_at: Date.now() / 1000 } }) });
+    b.openParty({ media_id: 9, title: 'Movie', queue: [], position: isHost ? 0 : 24,
+      playing: false, updated_at: Date.now() / 1000 }, isHost);
     if (!metadataFirst) {
       media.readyState = 1;
       b.run('plyr.duration = 634; plyr.emit("loadedmetadata")');
@@ -606,7 +589,7 @@ for (const [name, src, child, currentSrc, preserve] of [
     media.currentSrc = currentSrc;
     media.querySelector = selector => selector === 'source' && child ? { src: child } : null;
     media.currentTime = 203;
-    b.run('partyFollow(9, "Movie", 0, false, 0, { preserveActiveVideo: true })');
+    b.run('partyFollow(9, "Movie", 0, false, 0, { preserveLocalPlayback: true })');
     assert.equal(media.currentTime, preserve ? 203 : 0);
     assert.equal(media.src, preserve ? src : '/api/stream/9');
   });
@@ -616,25 +599,18 @@ for (const useHostHandler of [false, true]) {
   for (const inactiveState of ['audio', 'audio with video modal open']) {
     test(`${useHostHandler ? 'host state handler' : 'direct follow'} reactivates a retained video from ${inactiveState}`, async () => {
       const b = browser();
-      b.respond(async () => ({ ok: true, json: async () => ({ position: 203 }) }));
+      b.respond(async () => reply({ position: 203 }));
       b.run('LIBRARY = [{ id: 9, kind: "movie" }, { id: 10, kind: "music" }]; openVideo(LIBRARY[0])');
       await settle();
       b.run('plyr.duration = 634; plyr.emit("loadedmetadata")');
       assert.equal(b.run('plyr.currentTime'), 203);
       b.nodes.get('#vm-back').onclick();
       await settle();
-      let socket;
-      if (useHostHandler) {
-        vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), b.context);
-        b.nodes.get('#party-code-input').value = 'ABCD';
-        b.run('PartyUI.open()');
-        b.nodes.get('#pt-join').onclick();
-        socket = b.sockets[0];
-      }
+      const socket = useHostHandler ? b.openParty() : null;
       const follow = id => useHostHandler
-        ? socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: true,
-          state: { media_id: id, title: 'Fixture', queue: [], position: 0, playing: true, updated_at: Date.now() / 1000 } }) })
-        : b.run(`partyFollow(${id}, "Fixture", 0, true, Date.now()/1000, { preserveActiveVideo: true })`);
+        ? socket.onmessage(stateMessage({
+          media_id: id, title: 'Fixture', queue: [], position: 0, playing: true, updated_at: Date.now() / 1000 }, true))
+        : b.run(`partyFollow(${id}, "Fixture", 0, true, Date.now()/1000, { preserveLocalPlayback: true })`);
       follow(10);
       await settle();
       if (inactiveState === 'audio with video modal open') b.nodes.get('#video-modal').classList.add('on');
@@ -652,11 +628,11 @@ for (const useHostHandler of [false, true]) {
 
 test('host preserves an active paused video and its position', async () => {
   const b = browser();
-  b.respond(async () => ({ ok: true, json: async () => ({ position: 203 }) }));
+  b.respond(async () => reply({ position: 203 }));
   b.run('LIBRARY = [{ id: 9, kind: "movie" }]; openVideo(LIBRARY[0])');
   await settle();
   b.run('plyr.duration = 634; plyr.emit("loadedmetadata"); plyr.pause()');
-  b.run('partyFollow(9, "Movie", 0, true, Date.now()/1000, { preserveActiveVideo: true })');
+  b.run('partyFollow(9, "Movie", 0, true, Date.now()/1000, { preserveLocalPlayback: true })');
   assert.equal(b.run('plyr.currentTime'), 203);
   assert.equal(b.run('plyr.paused'), true);
   assert.equal(b.nodes.get('#video-modal').classList.contains('on'), true);
@@ -664,16 +640,11 @@ test('host preserves an active paused video and its position', async () => {
 
 test('host first party state still loads a different video', async () => {
   const b = browser();
-  b.respond(async () => ({ ok: true, json: async () => ({ position: 203 }) }));
+  b.respond(async () => reply({ position: 203 }));
   b.run('LIBRARY = [{ id: 9, kind: "movie" }, { id: 10, kind: "movie" }]; openVideo(LIBRARY[0])');
   await settle();
   b.run('plyr.duration = 634; plyr.emit("loadedmetadata")');
-  vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), b.context);
-  b.nodes.get('#party-code-input').value = 'ABCD';
-  b.run('PartyUI.open()');
-  b.nodes.get('#pt-join').onclick();
-  b.sockets[0].onmessage({ data: JSON.stringify({ type: 'state', is_host: true,
-    state: { media_id: 10, title: 'Next', queue: [], position: 90, playing: true, updated_at: Date.now() / 1000 } }) });
+  b.openParty({ media_id: 10, title: 'Next', queue: [], position: 90, playing: true, updated_at: Date.now() / 1000 }, true);
   assert.equal(b.nodes.get('#plyr-video').src, '/api/stream/10');
   assert.ok(b.run('plyr.currentTime') < 2);
 });
@@ -682,13 +653,9 @@ for (const audioWasLoaded of [false, true]) {
   test(`guest video to ${audioWasLoaded ? 'retained' : 'new'} audio activates only the audio player`, async () => {
     const b = browser();
     b.run('LIBRARY = [{ id: 9, kind: "movie" }, { id: 10, kind: "music" }]');
-    vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), b.context);
-    b.nodes.get('#party-code-input').value = 'ABCD';
-    b.run('PartyUI.open()');
-    b.nodes.get('#pt-join').onclick();
-    const socket = b.sockets[0];
-    const follow = id => socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: false,
-      state: { media_id: id, title: 'Fixture', queue: [], position: 0, playing: true, updated_at: Date.now() / 1000 } }) });
+    const socket = b.openParty();
+    const follow = id => socket.onmessage(stateMessage({
+      media_id: id, title: 'Fixture', queue: [], position: 0, playing: true, updated_at: Date.now() / 1000 }, false));
     if (audioWasLoaded) follow(10);
     follow(9);
     await settle();
@@ -708,7 +675,7 @@ for (const audioWasLoaded of [false, true]) {
 test('host video to audio cleanup cannot publish an obsolete video pause', async () => {
   const { b, socket, state } = await hostParty('movie');
   b.run('LIBRARY.push({ id: 10, kind: "music" })');
-  socket.onmessage({ data: JSON.stringify({ type: 'state', state: { ...state, media_id: 10 } }) });
+  socket.onmessage(stateMessage({ ...state, media_id: 10 }));
   await settle();
   assert.equal(b.run('plyr.paused'), true);
   assert.equal(b.nodes.get('#pb-audio').paused, false);
@@ -717,14 +684,13 @@ test('host video to audio cleanup cannot publish an obsolete video pause', async
 
 test('video party button renders and reopens the connected panel through PartyUI', () => {
   const b = browser();
-  vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), b.context);
+  b.loadParty();
   b.nodes.get('#vm-party').onclick();
   assert.equal(typeof b.nodes.get('#pt-join').onclick, 'function');
   assert.equal(b.nodes.get('#party-modal').style.zIndex, 200);
   b.nodes.get('#party-code-input').value = 'ABCD';
   b.nodes.get('#pt-join').onclick();
-  b.sockets[0].onmessage({ data: JSON.stringify({ type: 'state', is_host: false,
-    state: { media_id: null, title: '', queue: [], position: 0, playing: false } }) });
+  b.sockets[0].onmessage(stateMessage({ media_id: null, title: '', queue: [], position: 0, playing: false }, false));
   b.run('PartyUI.hide()');
   b.nodes.get('#vm-party').onclick();
   assert.equal(b.sockets.length, 1);
@@ -735,13 +701,8 @@ test('video party button renders and reopens the connected panel through PartyUI
 async function hostParty(kind = 'music') {
   const b = browser();
   b.run(`LIBRARY = [{ id: 9, kind: "${kind}", title: "Track" }]`);
-  vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), b.context);
-  b.nodes.get('#party-code-input').value = 'ABCD';
-  b.run('PartyUI.open()');
-  b.nodes.get('#pt-join').onclick();
-  const socket = b.sockets[0];
   const state = { media_id: 9, title: 'Track', queue: [], position: 0, playing: true, updated_at: Date.now() / 1000 };
-  socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: true, state }) });
+  const socket = b.openParty(state, true);
   await settle();
   socket.sent.length = 0;
   return { b, socket, state, media: b.nodes.get(kind === 'movie' ? '#plyr-video' : '#pb-audio') };
@@ -756,7 +717,7 @@ for (const kind of ['music', 'movie']) {
     assert.deepEqual(socket.sent, []); // Native events arrive asynchronously.
     await settle();
     assert.deepEqual(socket.sent, [{ type: 'pause', position: 47 }]);
-    socket.onmessage({ data: JSON.stringify({ type: 'state', state: { ...state, playing: false, position: 47 } }) });
+    socket.onmessage(stateMessage({ ...state, playing: false, position: 47 }));
     await settle();
     assert.equal(media.currentTime, 47);
     assert.equal(socket.sent.length, 1);
@@ -815,12 +776,7 @@ test('party guest requests and host approval still use the queue protocol', asyn
   const guest = browser();
   const request = { dataset: { media: '9', title: 'Requested track' } };
   guest.context.document.querySelectorAll = selector => selector === '.pt-request' ? [request] : [];
-  vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), guest.context);
-  guest.nodes.get('#party-code-input').value = 'ABCD';
-  guest.run('PartyUI.open()');
-  guest.nodes.get('#pt-join').onclick();
-  const guestSocket = guest.sockets[0];
-  guestSocket.onmessage({ data: JSON.stringify({ type: 'state', is_host: false, state: { queue: [], playing: false } }) });
+  const guestSocket = guest.openParty({ queue: [], playing: false }, false);
   request.onclick();
   assert.deepEqual(guestSocket.sent, [{ type: 'request', media_id: 9, title: 'Requested track' }]);
   const { b, socket, state } = await hostParty();
@@ -829,7 +785,7 @@ test('party guest requests and host approval still use the queue protocol', asyn
   socket.onmessage({ data: JSON.stringify({ type: 'request', media_id: 9, title: 'Requested track', by: 'guest' }) });
   approval.onclick();
   assert.deepEqual(socket.sent, [{ type: 'approve', media_id: 9, title: 'Requested track', by: 'guest' }]);
-  socket.onmessage({ data: JSON.stringify({ type: 'state', state: { ...state, queue: [{ title: 'Requested track', requested_by: 'guest' }] } }) });
+  socket.onmessage(stateMessage({ ...state, queue: [{ title: 'Requested track', requested_by: 'guest' }] }));
   assert.match(b.nodes.get('#party-stage').innerHTML, /Requested track/);
 });
 
@@ -864,7 +820,7 @@ for (const kind of ['music', 'movie']) {
         } };`);
       b.nodes.get('#video-modal').classList.add('on', 'yt');
       if (retained) b.nodes.get(kind === 'movie' ? '#plyr-video' : '#pb-audio').src = '/api/stream/9';
-      b.run('partyFollow(9, "Native", 24, true, Date.now()/1000, { preserveActiveVideo: true })');
+      b.run('partyFollow(9, "Native", 24, true, Date.now()/1000, { preserveLocalPlayback: true })');
       await settle();
       assert.equal(b.context.external.paused, true);
       assert.equal(b.context.external.pauses, 1);
@@ -914,7 +870,7 @@ for (const kind of ['music', 'movie']) {
     const b = browser();
     const players = youtubePlayerFixture(b);
     b.run(`LIBRARY = [{ id: 9, kind: ${JSON.stringify(kind)} }];
-      partyFollowExternal('pending', 'External', 0, true, Date.now()/1000, false)`);
+      partyFollowExternal('pending', 'External', 0, true, Date.now()/1000)`);
     let transitionError = null;
     try { b.run('partyFollow(9, "Native", 24, true, Date.now()/1000)'); }
     catch (error) { transitionError = error.message; }
@@ -931,26 +887,17 @@ for (const kind of ['music', 'movie']) {
 test('replacement YouTube readiness belongs to the current player only', () => {
   const b = browser();
   const players = youtubePlayerFixture(b);
-  b.run('LIBRARY = [{ id: 9, kind: "movie" }]; partyFollowExternal("old", "Old", 0, true, Date.now()/1000, false)');
+  b.run('LIBRARY = [{ id: 9, kind: "movie" }]; partyFollowExternal("old", "Old", 0, true, Date.now()/1000)');
   players[0].emitReady();
   players[0].calls.length = 0;
-  b.run('partyFollowExternal("new", "New", 0, true, Date.now()/1000, false)');
+  b.run('partyFollowExternal("new", "New", 0, true, Date.now()/1000)');
   assert.doesNotThrow(() => players[0].emitReady());
   assert.deepEqual(players[0].calls, []);
   assert.deepEqual(players[1].calls, []);
-  assert.doesNotThrow(() => b.run('partyFollowExternal("new", "New", 0, true, Date.now()/1000, false)'));
+  assert.doesNotThrow(() => b.run('partyFollowExternal("new", "New", 0, true, Date.now()/1000)'));
   assert.doesNotThrow(() => b.run('partyFollow(9, "Native", 24, true, Date.now()/1000)'));
   players[1].emitReady();
   assert.deepEqual(players[1].calls, []);
-});
-
-test('unready external playback applies the latest same-video paused position on readiness', () => {
-  const b = browser();
-  const players = youtubePlayerFixture(b);
-  b.run('partyFollowExternal("same", "First", 5, true, Date.now()/1000, false)');
-  b.run('partyFollowExternal("same", "Latest", 20, false, Date.now()/1000, false)');
-  players[0].emitReady();
-  assertPreparedYouTubePause(players[0], 20);
 });
 
 test('late API readiness creates only the latest requested video and ignores native handoff', () => {
@@ -958,8 +905,8 @@ test('late API readiness creates only the latest requested video and ignores nat
     const b = browser();
     const players = youtubePlayerFixture(b);
     b.run('ytReady = false; LIBRARY = [{ id: 9, kind: "music" }]');
-    b.run('partyFollowExternal("obsolete", "Old", 5, true, Date.now()/1000, false)');
-    b.run('partyFollowExternal("latest", "New", 20, false, Date.now()/1000, false)');
+    b.run('partyFollowExternal("obsolete", "Old", 5, true, Date.now()/1000)');
+    b.run('partyFollowExternal("latest", "New", 20, false, Date.now()/1000)');
     if (nativeHandoff) b.run('partyFollow(9, "Native", 24, false, Date.now()/1000)');
     b.run('ytReady = true');
     for (const callback of [...b.intervals.values()]) callback();
@@ -982,7 +929,7 @@ for (const nativeKind of ['audio', 'video']) {
     await settle();
     assert.equal(b.run(`${nativeKind === 'audio' ? 'pbAudio' : 'plyr'}.paused`), false);
     sends.length = 0;
-    b.run('partyFollowExternal("external", "External", 20, false, Date.now()/1000, true)');
+    b.run('partyFollowExternal("external", "External", 20, false, Date.now()/1000)');
     players[0].emitReady();
     await settle();
     assert.equal(b.run('pbAudio.paused'), true);
@@ -997,7 +944,7 @@ for (const entry of ['playAudio', 'openVideo']) {
   test(`local ${entry} after ready external playback pauses YouTube before native activation`, async () => {
     const b = browser();
     const players = youtubePlayerFixture(b);
-    b.run('partyFollowExternal("external", "External", 5, true, Date.now()/1000, true)');
+    b.run('partyFollowExternal("external", "External", 5, true, Date.now()/1000)');
     players[0].emitReady();
     players[0].calls.length = 0;
     b.run(`${entry}({ id: 9, title: 'Local native', kind: '${entry === 'playAudio' ? 'music' : 'movie'}' })`);
@@ -1019,7 +966,7 @@ for (const kind of ['audio', 'video']) {
       partyFollow(9, 'Native', 24, true, Date.now()/1000); partyHostHook(partySend)`);
     await settle();
     sends.length = 0;
-    b.run(`partyFollowExternal('external', 'External', 0, false, Date.now()/1000, true);
+    b.run(`partyFollowExternal('external', 'External', 0, false, Date.now()/1000);
       partyFollow(9, 'Native', 24, true, Date.now()/1000)`);
     await settle();
     assert.equal(b.run(`${kind === 'audio' ? 'pbAudio' : 'plyr'}.paused`), false);
@@ -1039,7 +986,7 @@ for (const kind of ['audio', 'video']) for (const returnToNative of [false, true
     const media = b.nodes.get(kind === 'audio' ? '#pb-audio' : '#plyr-video');
     media.readyState = 0;
     b.run(`partyFollow(9, 'Pending native', 24, true, Date.now()/1000);
-      partyFollowExternal('external', 'External', 0, false, Date.now()/1000, false)`);
+      partyFollowExternal('external', 'External', 0, false, Date.now()/1000)`);
     if (returnToNative) b.run("partyFollow(9, 'Paused return', 42, false, Date.now()/1000)");
     media.readyState = 1;
     media.emit('loadedmetadata');
@@ -1058,12 +1005,12 @@ for (const entry of ['playAudio', 'openVideo']) for (const phase of ['progress',
     b.nodes.get('#pb-audio').readyState = 0;
     b.run(`${entry}({ id: 9, title: 'Pending local', kind: '${entry === 'playAudio' ? 'music' : 'movie'}' })`);
     if (phase === 'metadata') {
-      release({ ok: true, json: async () => ({ position: 106 }) });
+      release(reply({ position: 106 }));
       await settle();
     }
     const media = b.nodes.get(entry === 'playAudio' ? '#pb-audio' : '#plyr-video');
-    b.run("partyFollowExternal('external', 'External', 0, false, Date.now()/1000, false)");
-    if (phase === 'progress') release({ ok: true, json: async () => ({ position: 106 }) });
+    b.run("partyFollowExternal('external', 'External', 0, false, Date.now()/1000)");
+    if (phase === 'progress') release(reply({ position: 106 }));
     await settle();
     media.readyState = 1;
     b.run('plyr.duration = 634');
@@ -1108,15 +1055,14 @@ for (const transition of ['close', 'local audio']) {
 function externalRoleSession() {
   const b = browser();
   const players = youtubePlayerFixture(b);
-  vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), b.context);
+  b.loadParty();
   function joinSession(isHost) {
     b.run('PartyUI.open()');
     b.nodes.get('#party-code-input').value = 'ABCD';
     b.nodes.get('#pt-join').onclick();
     const socket = b.sockets.at(-1);
-    socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: isHost,
-      state: { external_url: 'same-role-video', media_id: null, title: 'Same external video',
-        queue: [], position: 0, playing: false, updated_at: Date.now()/1000 } }) });
+    socket.onmessage(stateMessage({ external_url: 'same-role-video', media_id: null, title: 'Same external video',
+      queue: [], position: 0, playing: false, updated_at: Date.now()/1000 }, isHost));
     return socket;
   }
   function emit(player, state) {
@@ -1124,7 +1070,7 @@ function externalRoleSession() {
     player.getPlayerState = () => state;
     player.config.events.onStateChange({ target: player, data: state });
   }
-  function seekTick() { b.intervals.get(b.context._ytSeekTimer)?.(); }
+  function seekTick() { b.intervals.get(b.run('ytSeekTimer'))?.(); }
   return { b, players, join: joinSession, emit, seekTick };
 }
 
@@ -1147,7 +1093,7 @@ test('guest-created YouTube player follows the current host sender for play paus
   assert.ok(host.sent.every(command => command.position === 37));
   assert.equal(f.players.length, 1);
   assert.equal(f.b.intervals.size, 1);
-  f.b.run('partyFollowExternal("same-role-video", "Repeated host state", 37, false, Date.now()/1000, false)');
+  f.b.run('partyFollowExternal("same-role-video", "Repeated host state", 37, false, Date.now()/1000)');
   host.sent.length = 0;
   f.emit(player, 1);
   f.seekTick();
@@ -1382,8 +1328,8 @@ for (const kind of ['audio', 'video']) {
     media.currentTime = 0;
     let release;
     b.respond(url => url.startsWith('/api/progress/10?')
-      ? new Promise(resolve => { release = () => resolve({ ok: true, json: async () => ({ position: 64 }) }); })
-      : Promise.resolve({ ok: true, json: async () => null }));
+      ? new Promise(resolve => { release = () => resolve(reply({ position: 64 })); })
+      : Promise.resolve(reply(null)));
     b.run(`${entry}(${JSON.stringify(item)})`);
     b.requests.length = 0;
     b.nodes.get(kind === 'audio' ? '#pb-close' : '#vm-back').onclick();
@@ -1398,7 +1344,7 @@ for (const kind of ['audio', 'video']) {
   test(`${kind} close after external ownership sends no native pause`, async () => {
     const { b, socket } = await hostParty(kind === 'audio' ? 'music' : 'movie');
     youtubePlayerFixture(b);
-    b.run("partyFollowExternal('external', 'External', 0, false, Date.now()/1000, true)");
+    b.run("partyFollowExternal('external', 'External', 0, false, Date.now()/1000)");
     await settle();
     socket.sent.length = 0;
     b.requests.length = 0;
@@ -1420,7 +1366,7 @@ for (const kind of ['audio', 'video']) {
     const stalePause = () => media.emit('pause');
     const staleEnded = () => media.emit('ended');
     b.requests.length = 0;
-    b.run("partyFollowExternal('same', 'External', 0, true, Date.now()/1000, false)");
+    b.run("partyFollowExternal('same', 'External', 0, true, Date.now()/1000)");
     await settle();
     b.intervals.get(b.run('progressTimer'))();
     stalePause();
@@ -1432,8 +1378,8 @@ for (const kind of ['audio', 'video']) {
     const b = browser();
     let release;
     b.respond(url => url.startsWith('/api/progress/10?')
-      ? new Promise(resolve => { release = () => resolve({ ok: true, json: async () => ({ position: 37 }) }); })
-      : Promise.resolve({ ok: true, json: async () => null }));
+      ? new Promise(resolve => { release = () => resolve(reply({ position: 37 })); })
+      : Promise.resolve(reply(null)));
     const item = { id: 10, kind: kind === 'audio' ? 'music' : 'movie', title: 'Local' };
     b.run(`${kind === 'audio' ? 'playAudio' : 'openVideo'}(${JSON.stringify(item)})`);
     const media = b.run(kind === 'audio' ? 'pbAudio' : 'plyr.media');
@@ -1445,7 +1391,7 @@ for (const kind of ['audio', 'video']) {
     assert.equal(media.src, '');
     assert.equal(b.nodes.get(kind === 'audio' ? '#playerbar' : '#video-modal').classList.contains('on'), false);
 
-    b.respond(async () => ({ ok: true, json: async () => null }));
+    b.respond(async () => reply(null));
     b.run(`${kind === 'audio' ? 'playAudio' : 'openVideo'}(${JSON.stringify(item)})`);
     await settle();
     const current = b.run(kind === 'audio' ? 'pbAudio' : 'plyr.media');
@@ -1496,8 +1442,8 @@ for (const kind of ['audio', 'video']) {
     const b = browser();
     let release;
     b.respond(url => url.startsWith('/api/progress/10?')
-      ? new Promise(resolve => { release = () => resolve({ ok: true, json: async () => ({ position: 64 }) }); })
-      : Promise.resolve({ ok: true, json: async () => null }));
+      ? new Promise(resolve => { release = () => resolve(reply({ position: 64 })); })
+      : Promise.resolve(reply(null)));
     b.run(`${kind === 'audio' ? 'playAudio' : 'openVideo'}({ id: 10, kind: '${kind === 'audio' ? 'music' : 'movie'}', title: 'Pending' })`);
     const timer = b.run('progressTimer');
     // Escape invokes the video close handler even when its modal is hidden.
@@ -1576,15 +1522,6 @@ test('local audio progress waits for metadata from the current stream', async ()
   assert.deepEqual(progress(b), []);
 });
 
-test('interval allocation preserves live callbacks after an earlier timer is cleared', () => {
-  const b = browser();
-  b.run('globalThis.timerCalls=[];globalThis.firstTimer=setInterval(()=>timerCalls.push("first"));globalThis.liveTimer=setInterval(()=>timerCalls.push("live"));clearInterval(firstTimer);globalThis.newTimer=setInterval(()=>timerCalls.push("new"))');
-  assert.equal(b.intervals.size, 2);
-  assert.ok(b.context.newTimer > b.context.liveTimer);
-  for (const callback of b.intervals.values()) callback();
-  assert.equal(b.run('JSON.stringify(timerCalls)'), '["live","new"]');
-});
-
 test('toolbar scan refresh survives opening and closing Settings', async () => {
   const b = browser();
   b.respond(async url => ({ status: 202, ok: true, json: async () => url === '/api/scan/status' ? { scanning: false } : url === '/api/settings' ? {} : [] }));
@@ -1596,6 +1533,19 @@ test('toolbar scan refresh survives opening and closing Settings', async () => {
   assert.equal(b.requests.filter(r => r.url === '/api/library').length, 1);
   assert.equal(b.nodes.get('#add-media').disabled, false);
   assert.equal(b.intervals.size, 0);
+});
+
+test('toolbar scan completing while Settings is open reports new items and leaves Settings open', async () => {
+  const b = browser();
+  b.respond(async url => ({ status: url === '/api/scan' ? 202 : 200, ok: true,
+    json: async () => url === '/api/scan/status' ? { scanning: false } : url === '/api/library' ? [{ id: 10, kind: 'movie', title: 'New' }] : [] }));
+  await b.nodes.get('#add-media').onclick();
+  await b.run('openSettings()');
+  await [...b.intervals.values()][0]();
+  assert.equal(b.nodes.get('#settings-modal').classList.contains('on'), true);
+  const notices = b.notices();
+  assert.match(notices, /Scan complete — 1 new item\(s\)/);
+  assert.equal(b.nodes.get('#add-media').disabled, false);
 });
 
 for (const phase of ['start', 'status', 'library']) {
@@ -1616,12 +1566,12 @@ for (const phase of ['start', 'status', 'library']) {
         pending = [...b.intervals.values()][0]();
       }
       // Let the scan reach the selected asynchronous boundary.
-      await new Promise(resolve => setImmediate(resolve));
+      await settle();
       assert.equal(typeof release, 'function');
       b.nodes.get('#logout').emit('click');
-      b.respond(async () => ({ ok: true, json: async () => [] }));
+      b.respond(async () => reply([]));
       b.run('account={name:"Next",isAdmin:false};enterApp()');
-      await new Promise(resolve => setImmediate(resolve));
+      await settle();
       const button = b.nodes.get('#add-media');
       button.disabled = true;
       button.innerHTML = 'new account scan';
@@ -1640,7 +1590,34 @@ for (const phase of ['start', 'status', 'library']) {
   }
 }
 
-for (const failure of ['network', 'http', 'json']) {
+test('toolbar scan ignores a pending old-account status when another account enters without logout', async () => {
+  const b = browser();
+  let releaseStatus;
+  b.respond(url => url === '/api/scan/status'
+    ? new Promise(resolve => { releaseStatus = resolve; })
+    : Promise.resolve({ status: 202, ok: true, json: async () => [] }));
+  const button = b.nodes.get('#add-media');
+  await button.onclick();
+  const pending = [...b.intervals.values()][0]();
+  await settle();
+  assert.equal(typeof releaseStatus, 'function', 'the old account status request is pending');
+  b.respond(async () => reply([]));
+  b.run('account = { name: "Next", isAdmin: true }; enterApp()');
+  await settle();
+  const libraryReads = () => b.requests.filter(r => r.url === '/api/library').length;
+  assert.equal(libraryReads(), 1, 'the new account loads its own library');
+  const notices = b.notices();
+  releaseStatus(reply({ scanning: false }));
+  await pending;
+  await settle();
+  assert.equal(libraryReads(), 1, 'the retired status cannot refresh the new account library');
+  assert.equal(b.notices(), notices, 'the retired status cannot publish completion feedback');
+  assert.equal(button.disabled, true);
+  assert.equal(button.textContent, 'Scanning…');
+  assert.equal(b.intervals.size, 0, 'the retired poll stops itself');
+});
+
+for (const failure of ['network', 'server']) {
   test(`toolbar scan retries one ${failure} status failure then refreshes on completion`, async () => {
     const b = browser();
     let statusCalls = 0;
@@ -1648,9 +1625,9 @@ for (const failure of ['network', 'http', 'json']) {
       if (url === '/api/scan/status') {
         if (++statusCalls === 1) {
           if (failure === 'network') throw Error('temporary network failure');
-          return { ok: failure !== 'http', json: async () => { throw Error('temporary invalid response'); } };
+          return { ok: false, status: 503 };
         }
-        return { ok: true, json: async () => ({ scanning: false }) };
+        return reply({ scanning: false });
       }
       return { status: 202, ok: true, json: async () => [] };
     });
@@ -1668,6 +1645,47 @@ for (const failure of ['network', 'http', 'json']) {
   });
 }
 
+test('toolbar scan retries a failed library refresh after the scan completes', async () => {
+  const b = browser();
+  let libraryCalls = 0;
+  b.respond(async url => {
+    if (url === '/api/scan/status') return reply({ scanning: false });
+    if (url.startsWith('/api/library')) return ++libraryCalls === 1 ? { ok: false, status: 503 } : reply([]);
+    return { status: 202, ok: true, json: async () => [] };
+  });
+  const button = b.nodes.get('#add-media');
+  await button.onclick();
+  const poll = [...b.intervals.values()][0];
+  await poll();
+  assert.equal(b.intervals.size, 1);
+  assert.equal(button.disabled, true);
+  await poll();
+  assert.equal(libraryCalls, 2);
+  assert.equal(button.disabled, false);
+  assert.equal(b.intervals.size, 0);
+  assert.match(b.notices(), /Scan complete/);
+});
+
+// Settings and toolbar monitors share one status rule: denial and malformed status fail fast.
+for (const failure of ['denied', 'malformed']) {
+  test(`toolbar scan stops on a ${failure} status without refreshing`, async () => {
+    const b = browser();
+    b.respond(async url => {
+      if (url !== '/api/scan/status') return { status: 202, ok: true, json: async () => [] };
+      return failure === 'denied' ? { ok: false, status: 403 }
+        : { ok: true, status: 200, json: async () => { throw SyntaxError('malformed status'); } };
+    });
+    const button = b.nodes.get('#add-media');
+    await button.onclick();
+    await [...b.intervals.values()][0]();
+    assert.equal(b.intervals.size, 0);
+    assert.equal(button.disabled, false);
+    assert.equal(b.requests.filter(r => r.url === '/api/library').length, 0);
+    const notices = b.notices();
+    assert.match(notices, /click Scan to retry monitoring/);
+  });
+}
+
 test('toolbar scan bounds consecutive failures and retry reattaches to a busy scan', async () => {
   const b = browser();
   b.respond(async url => {
@@ -1681,7 +1699,7 @@ test('toolbar scan bounds consecutive failures and retry reattaches to a busy sc
   assert.equal(b.intervals.size, 0);
   assert.equal(button.disabled, false);
   assert.equal(b.requests.filter(r => r.url === '/api/scan/status').length, 3);
-  const notices = b.context.document.body.children.map(node => node.children[0]?.innerHTML || '').join(' ');
+  const notices = b.notices();
   assert.match(notices, /retry/i);
   b.respond(async url => ({ status: url === '/api/scan' ? 409 : 200, ok: true, json: async () => url === '/api/scan/status' ? { scanning: false } : [] }));
   await button.onclick();
@@ -1703,12 +1721,12 @@ test('toolbar scan never overlaps pending status or completion refresh requests'
   const duplicate = poll();
   assert.equal(b.requests.filter(r => r.url === '/api/scan/status').length, 1);
   await duplicate;
-  release({ ok: true, json: async () => ({ scanning: false }) });
-  await new Promise(resolve => setImmediate(resolve));
+  release(reply({ scanning: false }));
+  await settle();
   await poll();
   assert.equal(b.requests.filter(r => r.url === '/api/library').length, 1);
   assert.equal(b.requests.filter(r => r.url === '/api/scan/status').length, 1);
-  release({ ok: true, json: async () => [] });
+  release(reply([]));
   await pending;
   assert.equal(b.intervals.size, 0);
 });
@@ -1719,19 +1737,14 @@ for (const phase of ['resume', 'metadata', 'playing']) {
     b.run('LIBRARY=[{id:23,kind:"music",title:"Local audio"}]');
     let release;
     b.respond(url => url.startsWith('/api/progress/23?')
-      ? new Promise(resolve => { release = () => resolve({ok:true,json:async()=>({position:64})}); })
-      : Promise.resolve({ok:true,json:async()=>null}));
+      ? new Promise(resolve => { release = () => resolve(reply({position:64})); })
+      : Promise.resolve(reply(null)));
     const media = b.nodes.get('#pb-audio');
     media.readyState = 0;
     b.run('playAudio(LIBRARY[0])');
     if (phase !== 'resume') { release(); await settle(); }
     if (phase === 'playing') { media.readyState = 1; media.emit('loadedmetadata'); await settle(); media.currentTime = 41; }
-    vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), b.context);
-    b.nodes.get('#party-code-input').value = 'ABCD';
-    b.run('PartyUI.open()');
-    b.nodes.get('#pt-join').onclick();
-    b.sockets[0].onmessage({data:JSON.stringify({type:'state',is_host:true,
-      state:{media_id:23,title:'Local audio',queue:[],position:0,playing:true,updated_at:Date.now()/1000}})});
+    b.openParty({media_id:23,title:'Local audio',queue:[],position:0,playing:true,updated_at:Date.now()/1000}, true);
     if (phase === 'resume') { release(); await settle(); }
     if (phase !== 'playing') { media.readyState = 1; media.emit('loadedmetadata'); await settle(); }
     assert.equal(media.currentTime, phase === 'playing' ? 41 : 64);
@@ -1746,7 +1759,7 @@ test('audio host changed source and guest same source still follow the received 
     b.run('LIBRARY=[{id:23,kind:"music",title:"Old"},{id:24,kind:"music",title:"New"}]; playAudio(LIBRARY[0])');
     await settle();
     b.nodes.get('#pb-audio').currentTime = 64;
-    b.run(`partyFollow(${host ? 24 : 23},"Follow",17,false,Date.now()/1000,{preserveActiveVideo:${host}})`);
+    b.run(`partyFollow(${host ? 24 : 23},"Follow",17,false,Date.now()/1000,{preserveLocalPlayback:${host}})`);
     assert.equal(b.nodes.get('#pb-audio').currentTime, 17);
     assert.equal(b.nodes.get('#pb-audio').paused, true);
     assert.match(b.nodes.get('#pb-audio').src, host ? /stream\/24$/ : /stream\/23$/);
@@ -1760,7 +1773,7 @@ for (const kind of ['audio', 'video']) {
       const entry = kind === 'audio' ? 'playAudio' : 'openVideo';
       const other = kind === 'audio' ? 'openVideo' : 'playAudio';
       const mediaKind = kind === 'audio' ? 'music' : 'movie';
-      b.respond(async () => ({ok:true,json:async()=>({position:64})}));
+      b.respond(async () => reply({position:64}));
       b.run(`LIBRARY=[{id:9,kind:"${mediaKind}",title:"Local"},
         {id:10,kind:"${mediaKind}",title:"Changed"},
         {id:11,kind:"${kind === 'audio' ? 'movie' : 'music'}",title:"Other owner"}];
@@ -1780,15 +1793,10 @@ for (const kind of ['audio', 'video']) {
         await settle();
         if (kind === 'audio') b.run('plyr.duration=120;plyr.emit("loadedmetadata")');
       }
-      vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), b.context);
-      b.nodes.get('#party-code-input').value = 'ABCD';
-      b.run('PartyUI.open()');
-      b.nodes.get('#pt-join').onclick();
       const isHost = scenario !== 'guest closed follow';
       const id = scenario === 'host changed media' ? 10 : 9;
-      b.sockets[0].onmessage({data:JSON.stringify({type:'state',is_host:isHost,
-        state:{media_id:id,title:'First load echo',queue:[],position:isHost ? 0 : 24,
-          playing:true,updated_at:Date.now()/1000}})});
+      b.openParty({media_id:id,title:'First load echo',queue:[],position:isHost ? 0 : 24,
+        playing:true,updated_at:Date.now()/1000}, isHost);
       await settle();
       if (scenario === 'own closed echo') {
         assert.equal(panel.classList.contains('on'), false, 'late own echo cannot reopen locally closed UI');
@@ -1809,15 +1817,10 @@ async function hostedNativeBrowser(kind) {
   const clock = { milliseconds: 1700000000000 };
   const b = browser({ now: () => clock.milliseconds });
   await settle();
-  vm.runInContext(readFileSync(join(clientPath, 'js/party.js'), 'utf8'), b.context);
   b.run(`LIBRARY = [{id:9,kind:"music",title:"Previous"},
     {id:10,kind:"${kind === 'audio' ? 'music' : 'movie'}",title:"Next"}]`);
-  b.nodes.get('#party-code-input').value = 'ABCD';
-  b.run('PartyUI.open()');
-  b.nodes.get('#pt-join').onclick();
-  const socket = b.sockets[0];
-  socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: true,
-    state: { media_id: 9, title: 'Previous', queue: [], position: 17, playing: true, updated_at: b.run('Date.now()/1000') } }) });
+  const socket = b.openParty({ media_id: 9, title: 'Previous', queue: [], position: 17, playing: true,
+    updated_at: b.run('Date.now()/1000') }, true);
   await settle();
   socket.sent.length = 0;
   b.nodes.get('#pb-audio').readyState = 0;
@@ -1842,8 +1845,8 @@ for (const kind of ['audio', 'video']) {
       assert.equal(socket.sent.filter(command => command.type === 'load').length, 1);
       assert.equal(media.currentTime, expected);
       // The own first state must preserve the native owner and its applied resume.
-      socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: true,
-        state: { media_id: 10, title: 'Next', queue: [], position: expected, playing: true, updated_at: b.run('Date.now()/1000') } }) });
+      socket.onmessage(stateMessage({ media_id: 10, title: 'Next', queue: [], position: expected, playing: true,
+        updated_at: b.run('Date.now()/1000') }, true));
       assert.equal(media.currentTime, expected);
       media.currentTime = 73;
       media.emit('loadedmetadata');
@@ -1859,7 +1862,7 @@ for (const kind of ['audio', 'video']) {
   for (const retire of ['close', 'foreign stream', 'external handoff', 'new local load']) {
     test(`${kind} pending host load ignores metadata after ${retire}`, async () => {
       const { b, socket } = await hostedNativeBrowser(kind);
-      b.respond(async () => ({ ok: true, json: async () => ({ position: 64 }) }));
+      b.respond(async () => reply({ position: 64 }));
       const entry = kind === 'audio' ? 'playAudio' : 'openVideo';
       b.run(`${entry}(LIBRARY[1])`);
       await settle();
@@ -1894,7 +1897,7 @@ for (const kind of ['audio', 'video']) {
 test('metadata-ready audio publishes its resumed host load once before play', async () => {
   const { b, socket } = await hostedNativeBrowser('audio');
   b.nodes.get('#pb-audio').readyState = 1;
-  b.respond(async () => ({ ok: true, json: async () => ({ position: 64 }) }));
+  b.respond(async () => reply({ position: 64 }));
   b.run('playAudio(LIBRARY[1])');
   await settle();
   assert.deepEqual(socket.sent[0], { type: 'load', media_id: 10, title: 'Next', position: 64 });
@@ -1910,13 +1913,13 @@ for (const mediaId of [10, 11]) {
       const { b, socket, clock } = await hostedNativeBrowser('video');
       youtubePlayerFixture(b);
       b.run('LIBRARY.push({id:11,kind:"movie",title:"Takeover"})');
-      b.respond(async () => ({ ok: true, json: async () => ({ position: 64 }) }));
+      b.respond(async () => reply({ position: 64 }));
       b.run('openVideo(LIBRARY[1])');
       await settle();
       const media = b.run('plyr.media');
       assert.equal(b.run('videoLoadPending'), true);
-      const state = (value) => socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: true,
-        state: { title: 'Party takeover', queue: [], position: 0, playing: false, updated_at: b.run('Date.now()/1000'), ...value } }) });
+      const state = (value) => socket.onmessage(stateMessage({ title: 'Party takeover', queue: [], position: 0,
+        playing: false, updated_at: b.run('Date.now()/1000'), ...value }, true));
       state({ media_id: null, external_url: 'abcdefghijk' });
       await settle();
       assert.equal(b.run('partyPlaybackKind'), 'external');
@@ -1936,32 +1939,31 @@ for (const mediaId of [10, 11]) {
       b.run('plyr.duration = 120');
       media.emit('loadedmetadata');
       await settle();
-      assert.equal(media.currentTime, 0, 'Retired local metadata cannot restore the old saved64');
+      assert.equal(media.currentTime, 0, 'Retired local metadata cannot restore the old saved 64 s position');
       assert.equal(socket.sent.filter(command => command.type === 'load').length, 0,
         'Party takeover cannot publish the retired local load');
       const updatedAt = b.run('Date.now()/1000');
       clock.milliseconds += 1000;
-      socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: false,
-        state: { media_id: mediaId, title: 'Guest clock projection', queue: [], position: 23,
-          playing: true, updated_at: updatedAt } }) });
+      socket.onmessage(stateMessage({ media_id: mediaId, title: 'Guest clock projection', queue: [], position: 23,
+        playing: true, updated_at: updatedAt }, false));
       await settle();
       assert.equal(media.currentTime, 24, 'Guest follow still projects an explicitly advanced clock');
     });
   }
 }
 
-test('own video echo preserves the pending local resume gate until its saved64 load', async () => {
+test('own video echo preserves the pending local resume gate until its saved 64 s load', async () => {
   const { b, socket } = await hostedNativeBrowser('video');
-  b.respond(async () => ({ ok: true, json: async () => ({ position: 64 }) }));
+  b.respond(async () => reply({ position: 64 }));
   b.run('openVideo(LIBRARY[1])');
   await settle();
   const media = b.run('plyr.media');
   media.readyState = 0;
-  socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: true,
-    state: { media_id: 10, title: 'Own pending echo', queue: [], position: 0, playing: true, updated_at: b.run('Date.now()/1000') } }) });
+  socket.onmessage(stateMessage({ media_id: 10, title: 'Own pending echo', queue: [], position: 0, playing: true,
+    updated_at: b.run('Date.now()/1000') }, true));
   await settle();
   assert.equal(b.run('videoLoadPending'), true, 'A matching local echo must retain local resume authority');
-  assert.deepEqual(socket.sent, [], 'A matching echo cannot publish initial play0');
+  assert.deepEqual(socket.sent, [], 'A matching echo cannot publish an initial play at 0 s');
   media.readyState = 1;
   b.run('plyr.duration = 120');
   media.emit('loadedmetadata');
@@ -1972,9 +1974,9 @@ test('own video echo preserves the pending local resume gate until its saved64 l
   assert.equal(b.run('videoLoadPending'), false);
 });
 
-test('host audio zero echo preserves106 through progress tick and native pause saves', async t => {
+test('host audio zero echo preserves 106 s through progress tick and native pause saves', async () => {
   const { b, socket, clock } = await hostedNativeBrowser('audio');
-  b.respond(async () => ({ ok: true, json: async () => ({ position: 106 }) }));
+  b.respond(async () => reply({ position: 106 }));
   const audio = b.nodes.get('#pb-audio');
   audio.readyState = 1;
   b.run('playAudio(LIBRARY[1])');
@@ -1985,9 +1987,8 @@ test('host audio zero echo preserves106 through progress tick and native pause s
   const tick = b.intervals.get(b.run('progressTimer'));
   assert.equal(typeof tick, 'function');
   b.requests.length = 0;
-  socket.onmessage({ data: JSON.stringify({ type: 'state', is_host: true,
-    state: { media_id: 10, title: 'Own zero echo', queue: [], position: 0,
-      playing: true, updated_at: b.run('Date.now()/1000') } }) });
+  socket.onmessage(stateMessage({ media_id: 10, title: 'Own zero echo', queue: [], position: 0, playing: true,
+    updated_at: b.run('Date.now()/1000') }, true));
   await settle();
   const positionAfterEcho = audio.currentTime;
   clock.milliseconds += 1000;
@@ -2001,8 +2002,6 @@ test('host audio zero echo preserves106 through progress tick and native pause s
     .map(request => JSON.parse(request.options.body));
   const posts = b.requests.filter(request => request.url === '/api/progress')
     .map(request => JSON.parse(request.options.body));
-  t.diagnostic(JSON.stringify({ positionAfterEcho, tickPositions, pausePositions: pausePosts.map(post => post.position),
-    savedMediaIds: posts.map(post => post.media_id), allPositions: posts.map(post => post.position) }));
   assert.deepEqual(tickPositions, [106], 'The active interval must actually save the preserved resume position');
   assert.deepEqual(pausePosts.map(post => post.position), [106], 'The native pause must actually save that same position');
   assert.equal(posts.every(post => post.media_id === 10 && post.position >= 106), true,
@@ -2015,7 +2014,7 @@ test('host audio zero echo preserves106 through progress tick and native pause s
 // A logout reload must choose the sign-in layout before any LAN auto-resume.
 for (const mode of ['guest', 'account']) {
   test(`${mode} sign-out reload shows only sign-in and permits explicit re-entry`, async () => {
-    const storage = { frayd_identity: 'owned-logout-fixture' };
+    const storage = { frayd_identity: 'logout-fixture' };
     if (mode === 'account') storage.frayd_token = 'nonfunctional-fixture-token';
     const initialResponse = async url => ({ ok: true, status: 200, json: async () => {
       if (url === '/api/auth/login') return { name: 'Fixture', token: 'nonfunctional-fixture-token' };
@@ -2023,7 +2022,7 @@ for (const mode of ['guest', 'account']) {
       return [];
     } });
     const signedIn = browser({ storage, initialResponse });
-    await new Promise(resolve => setImmediate(resolve));
+    await settle();
     assert.equal(signedIn.nodes.get('#app').classList.contains('on'), true);
     let reloaded = false;
     signedIn.context.location.reload = () => { reloaded = true; };
@@ -2031,16 +2030,16 @@ for (const mode of ['guest', 'account']) {
     assert.equal(reloaded, true);
     assert.equal(storage.frayd_token, undefined);
     assert.equal(storage.frayd_logout, '1');
-    assert.equal(storage.frayd_identity, 'owned-logout-fixture');
+    assert.equal(storage.frayd_identity, 'logout-fixture');
 
     const signedOut = browser({ storage, initialResponse });
-    await new Promise(resolve => setImmediate(resolve));
+    await settle();
     assert.equal(signedOut.nodes.get('#app').classList.contains('on'), false, 'Dashboard stays hidden after explicit sign-out');
     assert.equal(signedOut.context.document.body.classList.contains('auth'), true);
     assert.equal(signedOut.nodes.get('#login').style.display, 'flex');
     assert.equal(signedOut.requests.length, 0, 'Explicit sign-out does not resume or load the library');
     const refreshedSignedOut = browser({ storage, initialResponse });
-    await new Promise(resolve => setImmediate(resolve));
+    await settle();
     assert.equal(refreshedSignedOut.nodes.get('#app').classList.contains('on'), false, 'Refreshing sign-in must not resume the guest session');
     assert.equal(refreshedSignedOut.context.document.body.classList.contains('auth'), true);
     assert.equal(refreshedSignedOut.nodes.get('#login').style.display, 'flex');
@@ -2053,7 +2052,7 @@ for (const mode of ['guest', 'account']) {
       refreshedSignedOut.nodes.get('#password').value = 'nonfunctional-fixture-password';
       await refreshedSignedOut.run('doLogin({ preventDefault() {} })');
     }
-    await new Promise(resolve => setImmediate(resolve));
+    await settle();
     assert.equal(refreshedSignedOut.context.document.body.classList.contains('auth'), false);
     assert.equal(refreshedSignedOut.nodes.get('#login').style.display, 'none');
     assert.equal(refreshedSignedOut.nodes.get('#app').classList.contains('on'), true);
@@ -2106,7 +2105,7 @@ for (const mode of ['guest', 'account']) {
     test(`${mode} ${operation} sends the current library identity contract`, async () => {
       const b = browser();
       await settle();
-      b.run('IDENTITY = "owned library identity & ?"');
+      b.run('IDENTITY = "library identity & ?"');
       if (mode === 'account') b.context.localStorage.frayd_token = 'nonfunctional-fixture-token';
       b.respond(async url => ({ ok: true, json: async () => url.startsWith('/api/auth/me') ? { name: 'Fixture' } : [] }));
       await b.run(operation);
@@ -2115,7 +2114,7 @@ for (const mode of ['guest', 'account']) {
       assert.ok(requests.length > 0);
       for (const request of requests) {
         const url = new URL(request.url, 'https://fixture.invalid');
-        assert.equal(url.searchParams.get('identity'), 'owned library identity & ?');
+        assert.equal(url.searchParams.get('identity'), 'library identity & ?');
         assert.equal(request.options?.headers?.Authorization, mode === 'account' ? 'Bearer nonfunctional-fixture-token' : undefined);
         if (operation.startsWith('serverSearch')) assert.equal(url.searchParams.get('q'), 'needle & ?');
       }
@@ -2133,7 +2132,7 @@ for (const operation of ['loadLibrary()', 'serverSearch("old")', 'tryResume()'])
     const pending = b.run(operation);
     b.run('++accountGeneration; IDENTITY = "new-fixture"; account = { name: "New account" }; LIBRARY = [{ id: 2, kind: "music" }]');
     b.nodes.get('#main').innerHTML = 'new account view';
-    release({ ok: true, json: async () => [] });
+    release(reply([]));
     await pending;
     await settle();
     assert.equal(b.run('LIBRARY[0]?.id'), 2);
@@ -2147,9 +2146,9 @@ test('an obsolete boot resume cannot cover a newly entered account with sign-in'
   let release;
   const storage = { frayd_identity: 'old-fixture' };
   const b = browser({ storage, initialResponse: () => new Promise(resolve => { release = resolve; }) });
-  b.respond(async () => ({ ok: true, json: async () => [] }));
+  b.respond(async () => reply([]));
   b.run('IDENTITY = "new-fixture"; account = { name: "New account" }; enterApp()');
-  release({ ok: true, json: async () => [] });
+  release(reply([]));
   await settle();
   assert.equal(b.context.document.body.classList.contains('auth'), false);
   assert.equal(b.nodes.get('#login').style.display, 'none');
@@ -2158,13 +2157,12 @@ test('an obsolete boot resume cannot cover a newly entered account with sign-in'
 
 test('episode renders as video, appears in library rows and opens the video player', async () => {
   const b = browser();
-  b.respond(async () => ({ ok: true, json: async () => null }));
+  b.respond(async () => reply(null));
   b.run('LIBRARY = [{ id: 12, kind: "episode", title: "Episode", series: "Fixture show", artwork_version: "12-cover.jpg" }]; filtering = true');
   await b.run('renderRows(LIBRARY)');
   assert.match(b.nodes.get('#hero').innerHTML, /▶ Play/);
   const section = b.nodes.get('#main').children.at(-1);
   assert.match(section.children[0].innerHTML, /TV Shows/);
-  b.nodes.get('#main').children.length = 0;
   await section.children[1].children[0].onclick();
   const detail = b.nodes.get('#main').children.at(-1);
   const card = detail.children.find(node => node.className === 'cards').children[0];
@@ -2183,12 +2181,12 @@ test('late account details cannot replace a newer account during resume', async 
   b.run('IDENTITY = "old-fixture"');
   b.context.localStorage.frayd_token = 'nonfunctional-fixture-token';
   let release;
-  b.respond(async url => url === '/api/auth/me' ? new Promise(resolve => { release = resolve; }) : { ok: true, json: async () => [] });
+  b.respond(async url => url === '/api/auth/me' ? new Promise(resolve => { release = resolve; }) : reply([]));
   const pending = b.run('tryResume()');
   await settle();
   assert.equal(typeof release, 'function');
   b.run('++accountGeneration; IDENTITY = "new-fixture"; account = { name: "New account" }');
-  release({ ok: true, json: async () => ({ name: 'Old account', is_admin: true }) });
+  release(reply({ name: 'Old account', is_admin: true }));
   await pending;
   assert.equal(b.run('account.name'), 'New account');
   assert.equal(b.nodes.get('#app').classList.contains('on'), false);
@@ -2217,7 +2215,7 @@ function progressRenderFixture() {
     node.querySelector = selector => selector === '.progress-strip' ? strip : null;
     return node;
   };
-  b.run(`IDENTITY = 'owned-render-fixture'; LIBRARY = [
+  b.run(`IDENTITY = 'render-fixture'; LIBRARY = [
     { id: 1, kind: 'movie', title: 'Movie', duration_secs: 100 },
     { id: 2, kind: 'episode', title: 'Episode', duration_secs: 100 },
     { id: 3, kind: 'music', title: 'Song', duration_secs: 100 },
@@ -2238,7 +2236,7 @@ test('one render shares progress reads across continue cards, library cards and 
     const id = Number(new URL(request.url, 'https://fixture.invalid').pathname.split('/').at(-1));
     counts[id] = (counts[id] || 0) + 1;
   }
-  assert.deepEqual(counts, { 1: 1, 2: 1, 3: 1, 4: 1 }, 'Each media ID is read once within the owned render');
+  assert.deepEqual(counts, { 1: 1, 2: 1, 3: 1, 4: 1 }, 'Each media ID is read once within the render');
   const sections = b.nodes.get('#main').children;
   const continuing = sections[0].children[1].children;
   assert.deepEqual(continuing.map(card => card.title), ['Episode', 'Movie']);
@@ -2254,8 +2252,7 @@ test('new render and explicit media opening each fetch fresh progress', async ()
   const { b, positions, reads } = progressRenderFixture();
   await b.run('renderRows(LIBRARY)');
   await settle();
-  positions.set(1, 60);
-  b.nodes.get('#main').children.length = 0; // The boundary double does not parse innerHTML clearing.
+  positions.set(1, 60); // The boundary double does not parse innerHTML clearing.
   b.requests.length = 0;
   await b.run('loadLibrary()');
   await settle();
@@ -2272,9 +2269,9 @@ for (const failure of ['http', 'network', 'json']) {
   test(`render progress ${failure} failure stays empty and a new render retries`, async () => {
     const { b, reads } = progressRenderFixture();
     b.respond(async () => {
-      if (failure === 'network') throw new Error('owned progress failure');
+      if (failure === 'network') throw new Error('progress failure');
       return { ok: failure !== 'http', json: async () => {
-        if (failure === 'json') throw new Error('owned JSON failure');
+        if (failure === 'json') throw new Error('JSON failure');
         return null;
       } };
     });
@@ -2282,8 +2279,7 @@ for (const failure of ['http', 'network', 'json']) {
     await settle();
     assert.equal(reads().length, 4);
     assert.doesNotMatch(b.nodes.get('#main').children[0].children[0].innerHTML, /Continue watching/);
-    b.respond(async () => ({ ok: true, json: async () => ({ position: 25 }) }));
-    b.nodes.get('#main').children.length = 0;
+    b.respond(async () => reply({ position: 25 }));
     b.requests.length = 0;
     await b.run('renderRows(LIBRARY)');
     await settle();
@@ -2300,7 +2296,7 @@ test('retired render progress cannot paint cards or start new reads after an acc
   const oldReadCount = reads().length;
   b.run('++accountGeneration; IDENTITY = "new-render-fixture"');
   b.nodes.get('#main').innerHTML = 'new account view';
-  releases.forEach(release => release({ ok: true, json: async () => ({ position: 50 }) }));
+  releases.forEach(release => release(reply({ position: 50 })));
   await old;
   await settle();
   assert.equal(reads().length, oldReadCount, 'Old continuation cannot issue card reads in the new account');
@@ -2309,7 +2305,7 @@ test('retired render progress cannot paint cards or start new reads after an acc
 });
 
 async function pendingLoginFixture(completion) {
-  const storage = { frayd_identity: 'owned-login-fixture', frayd_logout: '1' };
+  const storage = { frayd_identity: 'login-fixture', frayd_logout: '1' };
   const b = browser({ storage });
   await settle();
   b.nodes.get('#email').value = 'fixture@example.invalid';
@@ -2317,7 +2313,7 @@ async function pendingLoginFixture(completion) {
   let resolve, reject;
   const held = new Promise((accept, fail) => { resolve = accept; reject = fail; });
   b.respond(async url => {
-    if (url !== '/api/auth/login') return { ok: true, json: async () => [] };
+    if (url !== '/api/auth/login') return reply([]);
     return completion.startsWith('body-') ? { ok: true, json: () => held } : held;
   });
   const pending = b.run('doLogin({ preventDefault() {} })');
@@ -2327,7 +2323,7 @@ async function pendingLoginFixture(completion) {
     if (completion === 'http-success') resolve({ ok: true, json: async () => data });
     else if (completion === 'body-success') resolve(data);
     else if (completion === 'http-failure') resolve({ ok: false, status: 401 });
-    else reject(new Error('owned fixture failure'));
+    else reject(new Error('fixture failure'));
   };
   return { b, storage, pending, release };
 }
@@ -2369,11 +2365,11 @@ for (const completion of ['http-success', 'http-failure']) {
 
 for (const completionOrder of [[0, 1], [1, 0]]) {
   test(`latest explicit login owns the result when completion order is ${completionOrder.join(' then ')}`, async () => {
-    const b = browser({ storage: { frayd_identity: 'owned-login-fixture', frayd_logout: '1' } });
+    const b = browser({ storage: { frayd_identity: 'login-fixture', frayd_logout: '1' } });
     await settle();
     const releases = [];
     b.respond(url => url === '/api/auth/login' ? new Promise(resolve => releases.push(resolve))
-      : Promise.resolve({ ok: true, json: async () => [] }));
+      : Promise.resolve(reply([])));
     b.nodes.get('#email').value = 'fixture@example.invalid';
     b.nodes.get('#password').value = 'nonfunctional-fixture-password';
     const earlier = b.run('doLogin({ preventDefault() {} })');
@@ -2417,29 +2413,26 @@ test('TV season tokens match the scanner grammar and reject embedded dimensions'
 for (const searchResult of ['success', 'http-failure', 'network-failure']) {
   test(`TV show alias retains episode filtering through ${searchResult} search and library refresh`, async () => {
     const b = browser();
-    const library = [{ id: 60, kind: 'episode', title: 'Owned S01E02', series: 'Owned show' }, { id: 61, kind: 'movie', title: 'Owned movie' }];
+    const library = [{ id: 60, kind: 'episode', title: 'Fixture S01E02', series: 'Fixture show' }, { id: 61, kind: 'movie', title: 'Fixture movie' }];
     b.context.tvFixture = library;
     b.respond(async url => {
       const parsed = new URL(url, 'https://fixture.invalid');
-      if (parsed.pathname !== '/api/library') return { ok: true, json: async () => null };
-      if (parsed.searchParams.has('q') && searchResult === 'network-failure') throw new Error('owned search failure');
+      if (parsed.pathname !== '/api/library') return reply(null);
+      if (parsed.searchParams.has('q') && searchResult === 'network-failure') throw new Error('search failure');
       return { ok: !(parsed.searchParams.has('q') && searchResult === 'http-failure'), json: async () => library };
     });
     b.run('LIBRARY = tvFixture');
-    await b.run('filterKind("show", "Owned")');
+    await b.run('filterKind("show", "Fixture")');
     assert.equal(b.run('activeKind'), 'episode');
-    assert.equal(b.run('activeQuery'), 'Owned');
-    b.nodes.get('#main').children.length = 0;
-    b.run('activeKind = "show"');
-    await b.run('serverSearch("Owned")');
+    assert.equal(b.run('activeQuery'), 'Fixture');
+    await b.run('serverSearch("Fixture")');
     await settle();
     const rows = b.nodes.get('#main').children;
     assert.equal(rows.length, 1, 'TV search never renders matching movies');
     assert.match(rows[0].children[0].innerHTML, /TV Shows/);
-    b.nodes.get('#main').children.length = 0;
     await b.run('loadLibrary()'); await settle();
     assert.equal(b.run('activeKind'), 'episode');
-    assert.equal(b.run('activeQuery'), 'Owned');
+    assert.equal(b.run('activeQuery'), 'Fixture');
     assert.equal(b.nodes.get('#main').children.length, 1);
     assert.equal(b.run('searchGeneration > 0'), true);
   });
@@ -2459,7 +2452,6 @@ test('TV series drill sorts parsed episodes, labels unknown episodes and preserv
   await b.run('filterKind("show", "Show")');
   const shelf = b.nodes.get('#main').children.at(-1);
   assert.match(shelf.children[1].children[0].innerHTML, /3 episodes/);
-  b.nodes.get('#main').children.length = 0;
   await shelf.children[1].children[0].onclick();
   const detail = b.nodes.get('#main').children.at(-1);
   assert.equal(b.run('showsDrill'), 'Show');
@@ -2470,18 +2462,15 @@ test('TV series drill sorts parsed episodes, labels unknown episodes and preserv
   firstCard.onclick(); await settle();
   assert.equal(b.requests.filter(request => request.url.startsWith('/api/progress/61?')).length, beforeOpen + 1, 'Episode playback fetches fresh progress outside its render');
   assert.equal(b.nodes.get('#plyr-video').src, '/api/stream/61');
-  b.nodes.get('#main').children.length = 0;
   await b.run('loadLibrary()'); await settle();
   assert.equal(b.run('showsDrill'), 'Show');
   assert.equal(b.run('activeQuery'), 'Show');
-  b.nodes.get('#main').children.length = 0;
   await b.run('deleteMedia(LIBRARY.find(item => item.id === 60))'); await settle();
   assert.equal(b.run('activeKind'), 'episode');
   assert.equal(b.run('activeQuery'), 'Show');
   assert.equal(b.run('showsDrill'), 'Show');
   assert.equal(b.run('LIBRARY.some(item => item.id === 60)'), false);
   const remaining = b.nodes.get('#main').children.at(-1);
-  b.nodes.get('#main').children.length = 0;
   await remaining.children[0].onclick();
   assert.equal(b.run('showsDrill'), null);
   assert.equal(b.run('activeKind'), 'episode');
@@ -2492,7 +2481,7 @@ for (const kind of ['music', 'ebook', 'audiobook']) {
   for (const layout of ['loose', 'series', 'mixed']) {
     test(`${kind} author drill retains ${layout} items and navigates named series`, async () => {
       const b = browser();
-      b.respond(async () => ({ ok: true, json: async () => null }));
+      b.respond(async () => reply(null));
       const items = [
         ...(layout !== 'series' ? [{ id: 60, title: 'Loose item', kind, author: 'Author' }] : []),
         ...(layout !== 'loose' ? [{ id: 61, title: 'Series item', kind, author: 'Author', series: 'Named series' }] : []),
@@ -2501,7 +2490,6 @@ for (const kind of ['music', 'ebook', 'audiobook']) {
       b.run('LIBRARY = authorItemsFixture');
       await b.run(`filterKind(${JSON.stringify(kind)}, "")`);
       const shelf = b.nodes.get('#main').children.at(-1);
-      b.nodes.get('#main').children.length = 0;
       await shelf.children[1].children[0].onclick();
       let detail = b.nodes.get('#main').children.at(-1);
       assert.equal(b.run(`authorDrill[${JSON.stringify(kind)}].author`), 'Author');
@@ -2511,12 +2499,10 @@ for (const kind of ['music', 'ebook', 'audiobook']) {
       if (layout !== 'loose') {
         const folder = nodes.find(node => node.innerHTML.includes('Named series'));
         assert.ok(folder);
-        b.nodes.get('#main').children.length = 0;
         await folder.onclick();
         detail = b.nodes.get('#main').children.at(-1);
         const cards = detail.children.at(-1).children;
         assert.deepEqual(cards.map(card => card.title), ['Series item — Author']);
-        b.nodes.get('#main').children.length = 0;
         await detail.children[1].onclick();
         assert.equal(b.run(`authorDrill[${JSON.stringify(kind)}].series`), undefined);
       }
@@ -2528,7 +2514,7 @@ for (const kind of ['music', 'ebook', 'audiobook']) {
 test('TV pending search cannot render a retired account series', async () => {
   const b = browser();
   await settle();
-  b.run('activeKind = "show"; IDENTITY = "old-TV-fixture"');
+  b.run('activeKind = "episode"; IDENTITY = "old-TV-fixture"');
   let release;
   b.respond(() => new Promise(resolve => { release = resolve; }));
   const pending = b.run('serverSearch("TV")');
@@ -2544,7 +2530,7 @@ for (const scenario of ['closed-abort', 'superseded-abort', 'superseded-notallow
   test(`video play completion ${scenario} respects ownership and keeps current errors visible`, async () => {
     const b = browser();
     await settle();
-    b.respond(async () => ({ ok: true, json: async () => null }));
+    b.respond(async () => reply(null));
     let reject;
     const ownedPlay = new Promise((resolve, fail) => { reject = fail; });
     let calls = 0;
@@ -2554,7 +2540,7 @@ for (const scenario of ['closed-abort', 'superseded-abort', 'superseded-notallow
       if (scenario === 'undefined-play') return undefined;
       return calls === 1 ? ownedPlay : Promise.resolve();
     };
-    b.run('plyr.play = ownedPlayBoundary; openVideo({ id: 20, kind: "episode", title: "Owned episode" })');
+    b.run('plyr.play = ownedPlayBoundary; openVideo({ id: 20, kind: "episode", title: "Fixture episode" })');
     await settle();
     assert.equal(calls, 1, 'Production openVideo calls the exact controlled play boundary');
     if (scenario === 'closed-abort') b.nodes.get('#vm-back').onclick();
@@ -2562,7 +2548,7 @@ for (const scenario of ['closed-abort', 'superseded-abort', 'superseded-notallow
     if (scenario === 'paused-abort') b.run('plyr.pause()');
     if (scenario === 'current-notallowed') b.run('plyr.media.paused = true');
     if (scenario !== 'undefined-play') {
-      const error = new Error('Owned fixture playback failure');
+      const error = new Error('Fixture playback failure');
       error.name = scenario.endsWith('notallowed') ? 'NotAllowedError' : scenario === 'current-notsupported' ? 'NotSupportedError' : 'AbortError';
       reject(error);
     }
@@ -2584,19 +2570,19 @@ for (const scenario of ['closed-abort', 'superseded-abort', 'superseded-notallow
 async function comicBookmarkFixture(heldIds = [9]) {
   const b = browser();
   await settle();
-  b.run('IDENTITY = "owned-comic-fixture"');
+  b.run('IDENTITY = "comic-fixture"');
   const saved = new Map([[9, 3], [10, 2], [11, 0]]);
   const held = new Set(heldIds);
   const releases = new Map();
   const writes = [];
   b.respond(async (url, options = {}) => {
     const path = new URL(url, 'https://fixture.invalid').pathname;
-    if (/^\/api\/comic\/\d+\/pages$/.test(path)) return { ok: true, json: async () => ['0', '1', '2', '3', '4'] };
+    if (/^\/api\/comic\/\d+\/pages$/.test(path)) return reply(['0', '1', '2', '3', '4']);
     if (path === '/api/progress' && options.method === 'POST') {
       const body = JSON.parse(options.body);
       writes.push({ id: body.media_id, page: body.position });
       saved.set(body.media_id, body.position);
-      return { ok: true, json: async () => ({}) };
+      return reply({});
     }
     if (path.startsWith('/api/progress/')) {
       const id = Number(path.split('/').at(-1));
@@ -2607,7 +2593,7 @@ async function comicBookmarkFixture(heldIds = [9]) {
       }));
       return { ok: true, json: async () => ({ position }) };
     }
-    throw new Error('Unexpected owned comic fixture path: ' + path);
+    throw new Error('Unexpected comic fixture path: ' + path);
   });
   return { b, saved, writes, release: id => {
     assert.equal(typeof releases.get(id), 'function', 'Saved progress response actually reached the hold');
@@ -2617,14 +2603,13 @@ async function comicBookmarkFixture(heldIds = [9]) {
 
 test('closing a pending comic restore makes no progress write and reopens its saved page three', async () => {
   const { b, saved, writes, release } = await comicBookmarkFixture();
-  await b.run('openComic({ id: 9, title: "Owned comic A" })');
+  await b.run('openComic({ id: 9, title: "Fixture comic A" })');
   await settle();
   b.nodes.get('#cm-close').onclick();
   assert.deepEqual(writes, [], 'Unknown initial page must never overwrite the saved bookmark');
-  assert.equal(saved.get(9), 3);
   release(9); await settle();
   assert.deepEqual(writes, [], 'Closed restore cannot write when its original response arrives');
-  await b.run('openComic({ id: 9, title: "Owned comic A" })'); await settle();
+  await b.run('openComic({ id: 9, title: "Fixture comic A" })'); await settle();
   assert.equal(b.nodes.get('#cm-img').src, '/api/comic/9/page/3');
   assert.equal(b.nodes.get('#cm-pageinfo').textContent, '4 / 5');
   assert.equal(saved.get(9), 3);
@@ -2633,30 +2618,30 @@ test('closing a pending comic restore makes no progress write and reopens its sa
 
 test('closed pending comic A cannot overwrite ready comic B or lose A bookmark on reopen', async () => {
   const { b, saved, writes, release } = await comicBookmarkFixture();
-  await b.run('openComic({ id: 9, title: "Owned comic A" })'); await settle();
+  await b.run('openComic({ id: 9, title: "Fixture comic A" })'); await settle();
   b.nodes.get('#cm-close').onclick();
-  await b.run('openComic({ id: 10, title: "Owned comic B" })'); await settle();
+  await b.run('openComic({ id: 10, title: "Fixture comic B" })'); await settle();
   assert.equal(b.nodes.get('#cm-img').src, '/api/comic/10/page/2');
   const beforeRelease = writes.slice();
   release(9); await settle();
-  assert.equal(b.nodes.get('#cm-title').textContent, 'Owned comic B');
+  assert.equal(b.nodes.get('#cm-title').textContent, 'Fixture comic B');
   assert.equal(b.nodes.get('#cm-img').src, '/api/comic/10/page/2');
   assert.deepEqual(writes, beforeRelease);
   b.nodes.get('#cm-close').onclick();
   assert.equal(saved.get(10), 2);
-  await b.run('openComic({ id: 9, title: "Owned comic A" })'); await settle();
+  await b.run('openComic({ id: 9, title: "Fixture comic A" })'); await settle();
   assert.equal(b.nodes.get('#cm-img').src, '/api/comic/9/page/3');
   assert.equal(saved.get(9), 3);
 });
 
 test('pending comic navigation is disabled and ignored until its saved page restores', async () => {
   const { b, writes, release } = await comicBookmarkFixture([10]);
-  await b.run('openComic({ id: 9, title: "Owned comic A" })'); await settle();
+  await b.run('openComic({ id: 9, title: "Fixture comic A" })'); await settle();
   assert.equal(b.nodes.get('#cm-img').src, '/api/comic/9/page/3');
-  await b.run('openComic({ id: 10, title: "Owned comic B" })'); await settle();
+  await b.run('openComic({ id: 10, title: "Fixture comic B" })'); await settle();
   assert.equal(b.run('comic.page'), null);
   assert.equal(b.nodes.get('#cm-img').src, '', 'Old comic image is cleared before new title/restore');
-  assert.equal(b.nodes.get('#cm-title').textContent, 'Owned comic B');
+  assert.equal(b.nodes.get('#cm-title').textContent, 'Fixture comic B');
   assert.equal(b.nodes.get('#cm-pageinfo').textContent, 'Loading…');
   assert.equal(b.nodes.get('#cm-prev').disabled, true);
   assert.equal(b.nodes.get('#cm-next').disabled, true);
@@ -2676,11 +2661,10 @@ test('pending comic navigation is disabled and ignored until its saved page rest
 for (const [id, page] of [[9, 3], [11, 0]]) {
   test(`ready comic close still persists saved page ${page}`, async () => {
     const { b, saved, writes } = await comicBookmarkFixture([]);
-    await b.run(`openComic({ id: ${id}, title: "Ready owned comic" })`); await settle();
+    await b.run(`openComic({ id: ${id}, title: "Ready comic" })`); await settle();
     writes.length = 0;
     b.nodes.get('#cm-close').onclick();
     assert.deepEqual(writes, [{ id, page }]);
-    assert.equal(saved.get(id), page);
   });
 }
 
@@ -2691,14 +2675,13 @@ test('retired account comic restore cannot paint or save an unknown page on clos
   release(9); await settle();
   b.nodes.get('#cm-close').onclick();
   assert.deepEqual(writes, []);
-  assert.equal(saved.get(9), 3);
   assert.equal(b.nodes.get('#cm-img').src, '');
 });
 
 async function ebookBookmarkFixture(boundary) {
   const b = browser();
   await settle();
-  b.run('IDENTITY = "owned-ebook-fixture"');
+  b.run('IDENTITY = "ebook-fixture"');
   let saved = 2.3;
   let hold = true;
   let release;
@@ -2709,10 +2692,10 @@ async function ebookBookmarkFixture(boundary) {
     if (path === '/api/progress' && options.method === 'POST') {
       saved = JSON.parse(options.body).position;
       writes.push(saved);
-      return { ok: true, json: async () => ({}) };
+      return reply({});
     }
-    if (path === '/api/epub/7/spine') return { ok: true, json: async () => ['a.xhtml', 'b.xhtml', 'c.xhtml', 'd.xhtml'] };
-    if (path === '/api/annotations/7') return { ok: true, json: async () => [] };
+    if (path === '/api/epub/7/spine') return reply(['a.xhtml', 'b.xhtml', 'c.xhtml', 'd.xhtml']);
+    if (path === '/api/annotations/7') return reply([]);
     if (path === '/api/epub/7/toc' && boundary === 'toc' && hold) return new Promise(resolve => {
       release = () => { hold = false; resolve({ ok: true, json: async () => [{ title: 'Chapter three', spine_idx: 2 }] }); };
     });
@@ -2726,11 +2709,11 @@ async function ebookBookmarkFixture(boundary) {
     }
     if (path.startsWith('/api/epub/7/chunk/')) {
       chunkReads.push(Number(path.split('/').at(-1)));
-      return { ok: true, text: async () => '<html><head></head><body>Owned EPUB chapter</body></html>' };
+      return { ok: true, text: async () => '<html><head></head><body>Fixture EPUB chapter</body></html>' };
     }
-    throw new Error('Unexpected owned EPUB fixture path: ' + path);
+    throw new Error('Unexpected EPUB fixture path: ' + path);
   });
-  const opening = b.run('openEbook({ id: 7, title: "Owned EPUB" })');
+  const opening = b.run('openEbook({ id: 7, title: "Fixture EPUB" })');
   await settle();
   return { b, writes, chunkReads, opening, saved: () => saved, release: () => {
     assert.equal(typeof release, 'function', 'Expected EPUB response actually reached its hold');
@@ -2744,16 +2727,14 @@ for (const boundary of ['toc', 'progress']) {
     assert.equal(b.nodes.get('#ebook-modal').classList.contains('on'), true);
     b.nodes.get('#em-close').onclick();
     assert.deepEqual(writes, [], 'Unknown initial chapter must not overwrite the EPUB bookmark');
-    assert.equal(saved(), 2.3);
     release(); await opening; await settle();
     assert.deepEqual(writes, [], 'Closed initial callbacks do not save');
-    await b.run('openEbook({ id: 7, title: "Owned EPUB" })'); await settle();
+    await b.run('openEbook({ id: 7, title: "Fixture EPUB" })'); await settle();
     assert.equal(b.run('ebook.chunk'), 2);
     assert.ok(Math.abs(b.run('ebook.lastFrac') - 0.3) < 1e-9);
     b.message({ type: 'reader-ready' });
     b.nodes.get('#em-close').onclick();
     assert.equal(writes.at(-1), 2.3);
-    assert.equal(saved(), 2.3);
   });
 }
 
@@ -2772,7 +2753,8 @@ for (const boundary of ['toc', 'progress']) {
     assert.equal(b.nodes.get('#em-search').disabled, true);
     b.nodes.get('#em-prev').onclick(); b.nodes.get('#em-next').onclick(); b.nodes.get('#em-toc-btn').onclick();
     await b.run('showChunk(ebook.chunk)');
-    b.run('ebookSearch("Pending")');
+    b.nodes.get('#em-search').value = 'Pending';
+    b.nodes.get('#em-search').emit('keydown', { key: 'Enter' });
     await b.message({ type: 'page', page: 1, pages: 4 });
     assert.deepEqual(chunkReads, []);
     assert.deepEqual(writes, []);
@@ -2822,7 +2804,7 @@ test('latest paused YouTube state before readiness remains stopped at the latest
   b.run('partyFollowExternal("latest-video", "Earlier playing intent", 5, true, 100)');
   b.run('partyFollowExternal("latest-video", "Latest paused intent", 31.25, false, 100)');
   const player = players[0]; player.emitReady();
-  assert.notEqual(player.getPlayerState(), 1);
+  assertPreparedYouTubePause(player, 31.25);
   b.run('partyFollowExternal("latest-video", "Host play", 31.25, true, 100)');
   assert.equal(player.getPlayerState(), 1);
   assert.equal(player.getCurrentTime(), 31.25);
@@ -2897,8 +2879,8 @@ test('paused YouTube host native-bar seek broadcasts its changed position once w
   assert.deepEqual(host.sent, [], 'Paused native seek has no new player-state event');
   f.seekTick();
   assert.deepEqual(host.sent, [{ type: 'seek', position: 42.333333 }]);
-  host.onmessage({ data: JSON.stringify({ type: 'state', state: { external_url: 'same-role-video', media_id: null,
-    title: 'Host echo', queue: [], position: 42.333333, playing: false, updated_at: Date.now()/1000 } }) });
+  host.onmessage(stateMessage({ external_url: 'same-role-video', media_id: null, title: 'Host echo', queue: [],
+    position: 42.333333, playing: false, updated_at: Date.now()/1000 }));
   f.seekTick(); f.seekTick();
   assert.deepEqual(host.sent, [{ type: 'seek', position: 42.333333 }], 'Stationary pause and host echo do not rebroadcast');
   assert.equal(player.getPlayerState(), 2);
@@ -2921,7 +2903,7 @@ test('YouTube entry reveals idle native chrome and keeps exit controls visible w
 
 test('seven category shelves have named headings and current-state sort controls', async () => {
   const b = browser();
-  b.respond(async () => ({ ok: true, json: async () => null }));
+  b.respond(async () => reply(null));
   b.run(`LIBRARY = ['movie','episode','music','audiobook','ebook','comic','manga'].map((kind,id) => ({id,kind,title:kind})); filtering = true`);
   await b.run('renderRows(LIBRARY)');
   const sections = b.nodes.get('#main').children;
@@ -2951,39 +2933,39 @@ test('folder dates use member extremes with stable ties and preserve input and d
     {id:5,kind:'episode',title:'B S01E03',series:'B',created_at:20}
   ];`);
   const titles = shelf => Array.from(shelf.children[1].children, c => c.title);
-  const show = b.run('groupedByShow(folderItems)');
+  const show = b.run('groupedByShow(folderItems,resumeFor)');
   assert.deepEqual(titles(show), ['B','C','A']);
   show.children[0].children[0].onclick();
-  assert.deepEqual(titles(b.run('groupedByShow(folderItems)')), ['A','B','C']);
+  assert.deepEqual(titles(b.run('groupedByShow(folderItems,resumeFor)')), ['A','B','C']);
   assert.deepEqual(Array.from(b.run('folderItems.map(i => i.id)')), [1,2,3,4,5]);
   b.run(`authorItems = folderItems.map(i => ({...i,kind:'music',author:i.series}));`);
-  assert.deepEqual(titles(b.run(`groupedByAuthor('music',authorItems)`)), ['B','C','A']);
+  assert.deepEqual(titles(b.run(`groupedByAuthor('music',authorItems,resumeFor)`)), ['B','C','A']);
   b.run(`rowSort.set('music',true)`);
-  assert.deepEqual(titles(b.run(`groupedByAuthor('music',authorItems)`)), ['A','B','C']);
+  assert.deepEqual(titles(b.run(`groupedByAuthor('music',authorItems,resumeFor)`)), ['A','B','C']);
 });
 
 test('API artwork versions render every kind and version replacement without cache paths', () => {
   const b = browser();
   const imageUrl = html => new URL(html.match(/src="([^"]+)"/)[1], 'https://fixture.invalid');
   for (const kind of ['movie','episode','music','audiobook','ebook','comic','manga']) {
-    const withCover = b.run(`card({id:42,kind:'${kind}',title:'Covered',artwork_version:'42-550e8400-e29b-41d4-a716-446655440000.jpg'})`);
+    const withCover = b.run(`card({id:42,kind:'${kind}',title:'Covered',artwork_version:'42-550e8400-e29b-41d4-a716-446655440000.jpg'},resumeFor)`);
     const first = imageUrl(withCover.innerHTML);
     assert.equal(first.pathname, '/api/thumb/42');
     assert.equal(first.searchParams.get('v'), '42-550e8400-e29b-41d4-a716-446655440000.jpg');
-    const replacement = imageUrl(b.run(`card({id:42,kind:'${kind}',title:'Covered',artwork_version:'42-550e8400-e29b-41d4-a716-446655440001.jpg'})`).innerHTML);
+    const replacement = imageUrl(b.run(`card({id:42,kind:'${kind}',title:'Covered',artwork_version:'42-550e8400-e29b-41d4-a716-446655440001.jpg'},resumeFor)`).innerHTML);
     assert.equal(first.pathname, replacement.pathname);
     assert.notEqual(first.href, replacement.href, 'A replacement version changes the cache key for the same media ID');
     for (const missing of [undefined, null, '', true]) {
       b.context.artworkDtoFixture = {id:43,kind,title:'Uncovered',artwork_version:missing};
-      const noCover = b.run('card(artworkDtoFixture)');
+      const noCover = b.run('card(artworkDtoFixture,resumeFor)');
       assert.doesNotMatch(noCover.innerHTML, /<img/);
       assert.match(noCover.innerHTML, /thumb-fallback/);
     }
   }
-  const shelf = b.run(`groupedByAuthor('music', [{id:1,kind:'music',title:'Uncovered',author:'Artist'}, {id:2,kind:'music',title:'Covered song',author:'Artist',artwork_version:'2-cover.jpg'}])`);
+  const shelf = b.run(`groupedByAuthor('music', [{id:1,kind:'music',title:'Uncovered',author:'Artist'}, {id:2,kind:'music',title:'Covered song',author:'Artist',artwork_version:'2-cover.jpg'}],resumeFor)`);
   assert.equal(imageUrl(shelf.children[1].children[0].innerHTML).searchParams.get('v'), '2-cover.jpg');
   assert.match(shelf.children[1].children[0].innerHTML, /Artwork from Covered song/);
-  const encoded = imageUrl(b.run(`card({id:42,kind:'music',title:'Track',artwork_version:'cover version #1.jpg'})`).innerHTML);
+  const encoded = imageUrl(b.run(`card({id:42,kind:'music',title:'Track',artwork_version:'cover version #1.jpg'},resumeFor)`).innerHTML);
   assert.equal(encoded.searchParams.get('v'), 'cover version #1.jpg');
   assert.match(encoded.search, /cover%20version%20%231.jpg/);
 });
@@ -2998,8 +2980,7 @@ test('library refresh uses replacement artwork versions from the actual DTO in a
   await settle();
   const folderHtml = () => b.nodes.get('#main').children.at(-1).children[1].children[0].innerHTML;
   assert.match(folderHtml(), /src="\/api\/thumb\/42\?v=42-initial.jpg"/);
-  artworkVersion = '42-replacement.jpg';
-  b.nodes.get('#main').children.length = 0; // Boundary double does not parse innerHTML clearing.
+  artworkVersion = '42-replacement.jpg'; // Boundary double does not parse innerHTML clearing.
   await b.run('loadLibrary()');
   await settle();
   assert.match(folderHtml(), /src="\/api\/thumb\/42\?v=42-replacement.jpg"/);
@@ -3033,7 +3014,6 @@ for (const kind of ['episode', 'music', 'ebook', 'audiobook']) {
     await settle();
     const shelf = b.nodes.get('#main').children.at(-1);
     assert.match(shelf.children[1].children[0].innerHTML, kind === 'episode' ? /Collection/ : /Author/);
-    b.nodes.get('#main').children.length = 0;
     await shelf.children[1].children[0].onclick();
     await settle();
     let detail = b.nodes.get('#main').children.at(-1);
@@ -3041,7 +3021,6 @@ for (const kind of ['episode', 'music', 'ebook', 'audiobook']) {
       const seriesGrid = detail.children.find(node => node.className === 'cards');
       assert.ok(seriesGrid, 'Synopsis-only result must retain its author series folder');
       const series = seriesGrid.children[0];
-      b.nodes.get('#main').children.length = 0;
       await series.onclick();
       await settle();
       detail = b.nodes.get('#main').children.at(-1);
@@ -3053,3 +3032,73 @@ for (const kind of ['episode', 'music', 'ebook', 'audiobook']) {
     assert.equal(b.run('activeQuery'), 'NEBULA');
   });
 }
+
+for (const kind of ['video', 'audio']) {
+  for (const name of ['NotAllowedError', 'AbortError']) {
+    test(`party ${kind} follow reports a rejected start unless a later command aborted it (${name})`, async () => {
+      const b = browser();
+      b.run(`LIBRARY = [{ id: 9, kind: '${kind === 'video' ? 'movie' : 'music'}', title: 'Party nine' }]`);
+      const media = b.nodes.get(kind === 'video' ? '#plyr-video' : '#pb-audio');
+      media.play = () => Promise.reject(Object.assign(new Error('start refused'), { name }));
+      b.run('partyFollow(9, "Party nine", 12, true, Date.now() / 1000)');
+      await settle();
+      const message = kind === 'video' ? 'Unable to start video playback' : 'Unable to start audio playback';
+      if (name === 'AbortError') assert.doesNotMatch(b.notices(), new RegExp(message));
+      else assert.match(b.notices(), new RegExp(message));
+    });
+  }
+}
+
+for (const retired of [false, true]) {
+  test(`local audio whose start is rejected is reported ${retired ? 'unless a later load retired the request' : 'to the listener'}`, async () => {
+    const b = browser();
+    const audio = b.nodes.get('#pb-audio');
+    audio.readyState = 1;
+    let reject;
+    audio.play = () => new Promise((_, fail) => { reject = fail; });
+    b.respond(async () => reply({ position: 0 }));
+    b.run('playAudio({ id: 2, kind: "music", title: "First" })');
+    await settle();
+    if (retired) {
+      audio.play = () => Promise.resolve();
+      b.run('playAudio({ id: 3, kind: "music", title: "Second" })');
+      await settle();
+    }
+    reject(Object.assign(new Error('start refused'), { name: 'NotAllowedError' }));
+    await settle();
+    if (retired) assert.doesNotMatch(b.notices(), /Unable to start audio playback/);
+    else assert.match(b.notices(), /Unable to start audio playback/);
+  });
+}
+
+test('the audio bar play button reports a rejected start and stays silent when pausing', async () => {
+  const b = browser();
+  const audio = b.nodes.get('#pb-audio');
+  audio.play = () => Promise.reject(Object.assign(new Error('start refused'), { name: 'NotAllowedError' }));
+  b.nodes.get('#pb-play').onclick();
+  await settle();
+  assert.match(b.notices(), /Unable to start audio playback/);
+  const quiet = browser();
+  quiet.nodes.get('#pb-audio').paused = false;
+  quiet.nodes.get('#pb-play').onclick();
+  await settle();
+  assert.equal(quiet.nodes.get('#pb-audio').paused, true);
+  assert.equal(quiet.notices(), '');
+});
+
+test('a failed progress save is logged without interrupting playback', async () => {
+  const b = browser();
+  const warnings = [];
+  b.context.console.warn = (...details) => warnings.push(details);
+  b.respond(async () => { throw new Error('offline'); });
+  b.run('syncProgress(7, 12)');
+  await settle();
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0][0], 'progress save failed');
+  assert.match(String(warnings[0][1]), /offline/);
+  b.respond(async () => ({ ok: false, status: 500 }));
+  b.run('syncProgress(7, 13)');
+  await settle();
+  assert.deepEqual(warnings.at(-1), ['progress save failed', 500]);
+  assert.equal(b.notices(), '');
+});

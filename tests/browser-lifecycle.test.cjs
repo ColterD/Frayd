@@ -9,16 +9,43 @@ const { once, EventEmitter } = require('node:events');
 const { setTimeout: delay } = require('node:timers/promises');
 const { test } = require('node:test');
 const vm = require('node:vm');
-const { stopBrowserGroup, withLocalPlyrIcons } = require('./browser-regression.cjs');
+const { stopBrowserGroup, withLocalPlyrIcons, EXPECTED_CASES } = require('./browser-regression.cjs');
 const executable = join(__dirname, 'fixtures/browser-child-writer.cjs');
+const runnerSource = readFileSync(join(__dirname, 'browser-regression.cjs'), 'utf8');
+const driverSource = readFileSync(join(__dirname, 'fixtures/browser-driver.js'), 'utf8');
+
+/** Run a Node script in a child process; return its exit code and collected output. */
+async function runNode(script, env = {}) {
+  const child = spawn(process.execPath, ['-e', script], { env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', bytes => { stdout += bytes; });
+  child.stderr.on('data', bytes => { stderr += bytes; });
+  try {
+    const [code] = await once(child, 'close');
+    return { code, stdout, stderr };
+  } finally {
+    if (child.exitCode === null) child.kill('SIGKILL');
+  }
+}
+/** A spawned browser double that has not exited. */
+const runningBrowser = () => Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
+/** Evaluate the source between two markers in a fresh VM context and return one binding. */
+function loadSlice(source, from, to, name, context) {
+  const start = source.indexOf(from);
+  const end = source.indexOf(to, start);
+  assert.ok(start >= 0 && end > start, `${from} precedes ${to}`);
+  return vm.runInNewContext(source.slice(start, end) + '\n' + name + ';', context);
+}
+/** Load the runner's startup helpers with the given browser and timer doubles. */
+const loadCacheSetup = context => loadSlice(runnerSource, 'async function bounded(', 'async function main(',
+  'configureOwnedBrowserCache', context);
 
 test('interception diagnostics preserve fatal errors and safely correlate retired frames without copying payloads', async () => {
-  const source = readFileSync(join(__dirname, 'browser-regression.cjs'), 'utf8');
-  const setup = source.slice(source.indexOf('async function bounded('), source.indexOf('async function main('));
-  for (const scenario of ['active', 'canceled', 'wrong-network', 'canceled-generic', 'canceled-other-code',
+  for (const scenario of ['active', 'canceled', 'canceled-late', 'wrong-network', 'canceled-generic', 'canceled-other-code',
     'canceled-nonboolean', 'blocked-canceled', 'blocked-unrecognized']) {
     const cancellationEvent = scenario !== 'active' && scenario !== 'blocked-unrecognized';
-    const exactCancellation = scenario === 'canceled' || scenario === 'blocked-canceled';
+    const exactCancellation = scenario === 'canceled' || scenario === 'canceled-late' || scenario === 'blocked-canceled';
     class ProtocolSocket extends EventTarget {
       static CLOSED = 3;
       constructor() {
@@ -30,18 +57,21 @@ test('interception diagnostics preserve fatal errors and safely correlate retire
         const command = JSON.parse(bytes);
         queueMicrotask(() => {
           if (command.method.startsWith('Fetch.') && command.method !== 'Fetch.enable') {
-            if (cancellationEvent) {
+            const cancel = () => {
               this.receive({ method: 'Network.loadingFailed', params: { requestId: scenario === 'wrong-network' ? 'different-network' : 'owned-network',
                 canceled: scenario === 'canceled-nonboolean' ? 'true' : true } });
               this.receive({ method: 'Page.frameDetached', params: { frameId: 'owned-frame' } });
-            }
+            };
+            if (cancellationEvent && scenario !== 'canceled-late') cancel();
             this.receive({ id: command.id, error: { code: scenario === 'canceled-other-code' ? -32000 : -32602,
               message: scenario === 'blocked-unrecognized' ? 'diagnostic-payload-must-not-leak'
                 : scenario === 'canceled-generic' ? 'Invalid parameters' : 'Invalid InterceptionId.',
               data: 'diagnostic-payload-must-not-leak' } });
+            // The browser can report the cancellation after the failed continue reply.
+            if (scenario === 'canceled-late') setTimeout(cancel, 0);
             return;
           }
-          this.receive({ id: command.id, result: command.method === 'Browser.getVersion' ? { product: 'OwnedChrome/1', revision: 'owned-revision', protocolVersion: '1.3' } : {} });
+          this.receive({ id: command.id, result: command.method === 'Browser.getVersion' ? { product: 'FixtureChrome/1', revision: 'fixture-revision', protocolVersion: '1.3' } : {} });
           if (command.method === 'Page.navigate') {
             this.receive({ method: 'Page.frameNavigated', params: { frame: { id: 'owned-frame', loaderId: 'owned-loader' } } });
             this.receive({ method: 'Fetch.requestPaused', params: { requestId: 'owned-interception', networkId: 'owned-network',
@@ -52,18 +82,18 @@ test('interception diagnostics preserve fatal errors and safely correlate retire
       }
       close() { this.readyState = 3; this.dispatchEvent(new Event('close')); }
     }
-    const configure = vm.runInNewContext(setup + '\nconfigureOwnedBrowserCache;', {
+    const configure = loadCacheSetup({
       join, existsSync: () => true, readFileSync: () => '32123\n/unused',
       WebSocket: ProtocolSocket, AbortSignal, AbortController, URL, setTimeout, clearTimeout, delay,
       fetch: async () => ({ ok: true, json: async () => [{ type: 'page', url: 'about:blank',
         webSocketDebuggerUrl: 'ws://127.0.0.1:32123/devtools/page/owned-protocol' }] }),
     });
-    const browser = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
+    const browser = runningBrowser();
     const session = await configure({ profile: '/owned/profile', fixtureUrl: 'http://127.0.0.1:8080/', browser });
     try {
-      assert.equal(session.receipt.browserVersion, 'OwnedChrome/1');
-      assert.equal(session.receipt.browserRevision, 'owned-revision');
-      await delay(0);
+      assert.equal(session.receipt.browserVersion, 'FixtureChrome/1');
+      assert.equal(session.receipt.browserRevision, 'fixture-revision');
+      await delay(5);
       assert.equal(session.receipt.protocolErrors.length, exactCancellation ? 0 : 1, 'Only exact correlated cancellation retires; every other error stays fatal');
       assert.equal(session.receipt.canceledInterceptions.length, exactCancellation ? 1 : 0);
       const error = (exactCancellation ? session.receipt.canceledInterceptions : session.receipt.protocolErrors)[0];
@@ -72,13 +102,13 @@ test('interception diagnostics preserve fatal errors and safely correlate retire
       assert.equal(error.message, scenario === 'blocked-unrecognized' ? 'unrecognized CDP message'
         : scenario === 'canceled-generic' ? 'Invalid parameters' : 'Invalid InterceptionId.');
       assert.equal(error.lifecycle.matchingNetworkCanceled, cancellationEvent && scenario !== 'wrong-network' && scenario !== 'canceled-nonboolean');
-      assert.equal(error.lifecycle.frameDetached, cancellationEvent);
+      assert.equal(error.lifecycle.frameDetached, cancellationEvent && scenario !== 'canceled-late');
       assert.doesNotMatch(JSON.stringify(error), /diagnostic-payload-must-not-leak/);
     } finally { await session.close(); }
   }
 });
 
-test('PID-only cleanup leaves a profile writer; owned process-group cleanup stops it before removal', { timeout: 8000 }, async () => {
+test('PID-only cleanup leaves a profile writer; process-group cleanup stops it before removal', { timeout: 8000 }, async () => {
   const ownedParent = mkdtempSync(join(tmpdir(), 'frayd-cleanup-oracle-'));
   const profile = join(ownedParent, 'frayd=ci/profile');
   const pauseRequest = join(ownedParent, 'writer.pause');
@@ -104,7 +134,7 @@ test('PID-only cleanup leaves a profile writer; owned process-group cleanup stop
       readyTimer = setTimeout(() => reject(new Error('Child-writer fixture did not become ready within 2 seconds')), 2000);
     })]);
     clearTimeout(readyTimer);
-    assert.equal(reported.profile, profile, 'Launcher preserves the complete owned profile path');
+    assert.equal(reported.profile, profile, 'Launcher preserves the complete profile path');
     const stopped = once(browser, 'exit');
     browser.kill('SIGKILL'); // Original runner behavior: only the launcher exits.
     await stopped;
@@ -152,25 +182,21 @@ test('original browser failure remains visible alongside an injected profile-rem
   const runner = resolve(__dirname, 'browser-regression.cjs');
   const resultDirectory = mkdtempSync(join(tmpdir(), 'frayd-cleanup-result-'));
   let retainedProfile;
-  const invocation = spawn(process.execPath, ['-e', `
-    require(${JSON.stringify(runner)}).main({ evidenceDirectory: ${JSON.stringify(resultDirectory)}, cacheSetup: async () => {
+  const invocation = runNode(`
+    require(${JSON.stringify(runner)}).main({ resultDirectory: ${JSON.stringify(resultDirectory)}, cacheSetup: async () => {
       const receipt = { injectedTestDouble: true, protocolClosed: false };
       return { receipt, close: async () => { receipt.protocolClosed = true; } };
     }, removeProfile(profile) {
       throw new Error('cleanup sentinel: ' + profile);
     }}).catch(error => { console.error(error.stack); process.exitCode = 1; });
-  `], { env: { ...process.env, BROWSER_BIN: executable, FRAYD_CHILD_FIXTURE_EARLY_EXIT: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
-  let stdout = '';
-  let stderr = '';
-  invocation.stdout.on('data', bytes => { stdout += bytes; });
-  invocation.stderr.on('data', bytes => { stderr += bytes; });
+  `, { BROWSER_BIN: executable, FRAYD_CHILD_FIXTURE_EARLY_EXIT: '1' });
   try {
-    const [code] = await once(invocation, 'close');
+    const { code, stdout, stderr } = await invocation;
     assert.equal(code, 1, stderr);
     const result = JSON.parse(stdout);
     assert.match(result.runnerError, /Browser exited before result: 7\/null; original browser exit sentinel/);
     assert.equal(result.cleanupErrors.length, 1);
-    assert.equal(result.cacheControl.protocolClosed, true, 'Confirmed group shutdown closes the owned session');
+    assert.equal(result.cacheControl.protocolClosed, true, 'Confirmed group shutdown closes the session');
     assert.match(result.cleanupErrors[0], /cleanup sentinel: /);
     retainedProfile = result.cleanupErrors[0].match(/cleanup sentinel: ([^\n]+)/)[1];
     assert.equal(dirname(retainedProfile), tmpdir());
@@ -181,7 +207,6 @@ test('original browser failure remains visible alongside an injected profile-rem
   } finally {
     rmSync(resultDirectory, { recursive: true, force: true });
     if (retainedProfile) rmSync(retainedProfile, { recursive: true, force: true });
-    if (invocation.exitCode === null) invocation.kill('SIGKILL');
   }
 });
 
@@ -191,7 +216,7 @@ test('runner cleanup releases an active native stream gate after browser abort',
   const browserScript = join(fixtureDirectory, 'browser.cjs');
   const resultDirectory = join(fixtureDirectory, 'result');
   const script = `#!/usr/bin/env node
-if (process.argv.includes('--version')) { console.log('Owned native-gate abort fixture'); process.exit(0); }
+if (process.argv.includes('--version')) { console.log('Native-gate abort fixture'); process.exit(0); }
 (async () => {
   const base = process.argv.at(-1);
   await fetch(new URL('/__fixture/hold-media', base), {
@@ -212,21 +237,17 @@ if (process.argv.includes('--version')) { console.log('Owned native-gate abort f
 `;
   writeFileSync(browserScript, script, { mode: 0o700 });
   const runner = resolve(__dirname, 'browser-regression.cjs');
-  const invocation = spawn(process.execPath, ['-e', `
-    require(${JSON.stringify(runner)}).main({ evidenceDirectory: ${JSON.stringify(resultDirectory)}, cacheSetup: async () => ({ receipt: { injectedTestDouble: true }, close: async () => {} }) })
+  const invocation = runNode(`
+    require(${JSON.stringify(runner)}).main({ resultDirectory: ${JSON.stringify(resultDirectory)}, cacheSetup: async () => ({ receipt: { injectedTestDouble: true }, close: async () => {} }) })
       .catch(error => { console.error(error.stack); process.exitCode = 1; });
-  `], { env: { ...process.env, BROWSER_BIN: browserScript }, stdio: ['ignore', 'pipe', 'pipe'] });
-  let stdout = '';
-  let stderr = '';
-  invocation.stdout.on('data', bytes => { stdout += bytes; });
-  invocation.stderr.on('data', bytes => { stderr += bytes; });
+  `, { BROWSER_BIN: browserScript });
   try {
-    const [code] = await once(invocation, 'close');
+    const { code, stdout, stderr } = await invocation;
     assert.equal(code, 1, stderr);
     const result = JSON.parse(stdout);
     assert.match(result.runnerError, /Browser exited before result: 7/);
     assert.match(result.runnerError, /native held-stream abort sentinel/);
-    assert.match(result.runnerError, /Owned DevTools endpoint redacted/);
+    assert.match(result.runnerError, /DevTools endpoint redacted/);
     assert.doesNotMatch(stdout, /fixture-only-debugger-marker/);
     assert.equal(result.mediaGate.held, false);
     assert.equal(result.mediaGate.pending, 0);
@@ -238,16 +259,15 @@ if (process.argv.includes('--version')) { console.log('Owned native-gate abort f
     assert.equal(Object.values(result.cleanup).every(Boolean), true);
     assert.deepEqual(result.cleanupErrors, []);
   } finally {
-    if (invocation.exitCode === null) invocation.kill('SIGKILL');
     rmSync(fixtureDirectory, { recursive: true, force: true });
   }
 });
 
 
 test('native driver releases held bytes when retired metadata never arrives', { timeout: 8000 }, async () => {
-  const driver = readFileSync(join(__dirname, 'fixtures/browser-driver.js'), 'utf8');
-  const untilStart = driver.indexOf('  async function until(');
-  const untilEnd = driver.indexOf('  async function api(', untilStart);
+  const driver = driverSource;
+  const untilStart = driver.indexOf('\nasync function until(');
+  const untilEnd = driver.indexOf('\nasync function api(', untilStart);
   const nativeStart = driver.indexOf('  async function nativeResume(');
   const nativeEnd = driver.indexOf("  await run('native decoded plain movie", nativeStart);
   assert.ok(untilStart >= 0 && untilEnd > untilStart && nativeStart >= 0 && nativeEnd > nativeStart);
@@ -286,52 +306,44 @@ test('cache startup failure retains its cause and bounded redacted stderr', { ti
   const browserScript = join(fixtureDirectory, 'browser.cjs');
   const resultDirectory = join(fixtureDirectory, 'result');
   writeFileSync(browserScript, `#!/usr/bin/env node
-if (process.argv.includes('--version')) { console.log('Owned startup stderr fixture'); process.exit(0); }
+if (process.argv.includes('--version')) { console.log('Startup stderr fixture'); process.exit(0); }
 console.error('x'.repeat(9000));
 // A nonfunctional marker, never an actual browser debugging capability.
 console.error('DevTools listening on ws://127.0.0.1:1/devtools/browser/owned-startup-debugger-marker');
-console.error('harmless owned startup diagnostic');
+console.error('harmless startup diagnostic');
 setInterval(() => {}, 1000);
 `, { mode: 0o700 });
   const runner = resolve(__dirname, 'browser-regression.cjs');
-  const invocation = spawn(process.execPath, ['-e', `
-    require(${JSON.stringify(runner)}).main({ evidenceDirectory: ${JSON.stringify(resultDirectory)}, startupBudgetMs: 200 })
+  const invocation = runNode(`
+    require(${JSON.stringify(runner)}).main({ resultDirectory: ${JSON.stringify(resultDirectory)}, startupBudgetMs: 200 })
       .catch(error => { console.error(error.stack); process.exitCode = 1; });
-  `], { env: { ...process.env, BROWSER_BIN: browserScript }, stdio: ['ignore', 'pipe', 'pipe'] });
-  let stdout = '';
-  let stderr = '';
-  invocation.stdout.on('data', bytes => { stdout += bytes; });
-  invocation.stderr.on('data', bytes => { stderr += bytes; });
+  `, { BROWSER_BIN: browserScript });
   try {
-    const [code] = await once(invocation, 'close');
+    const { code, stdout, stderr } = await invocation;
     assert.equal(code, 1, stderr);
     const result = JSON.parse(stdout);
-    assert.match(result.runnerError, /Owned browser did not expose its cache-control endpoint|Browser startup exceeded 200 milliseconds/);
+    assert.match(result.runnerError, /Browser did not expose its cache-control endpoint|Browser startup exceeded 200 milliseconds/);
     assert.equal(result.cases.length, 0);
     assert.equal(result.complete, false);
     assert.equal(result.cacheControl, undefined);
     assert.equal(typeof result.startupStderr, 'string');
     assert.ok(result.startupStderr.length <= 8192);
-    assert.match(result.startupStderr, /harmless owned startup diagnostic/);
-    assert.match(result.startupStderr, /Owned DevTools endpoint redacted/);
+    assert.match(result.startupStderr, /harmless startup diagnostic/);
+    assert.match(result.startupStderr, /DevTools endpoint redacted/);
     assert.doesNotMatch(stdout, /owned-startup-debugger-marker|ws:\/\/127/);
     assert.equal(Object.values(result.cleanup).every(Boolean), true);
     assert.deepEqual(result.cleanupErrors, []);
   } finally {
-    if (invocation.exitCode === null) invocation.kill('SIGKILL');
     rmSync(fixtureDirectory, { recursive: true, force: true });
   }
 });
 
 
 test('cache discovery waits for a complete valid port and stops on exit or deadline', async () => {
-  const source = readFileSync(join(__dirname, 'browser-regression.cjs'), 'utf8');
-  const start = source.indexOf('async function configureOwnedBrowserCache(');
-  const end = source.indexOf('async function main(', start);
   for (const scenario of ['complete', 'exit', 'deadline']) {
     let now = 0;
     let reads = 0;
-    const browser = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
+    const browser = runningBrowser();
     const fetched = [];
     const context = {
       Date: { now: () => now }, join, AbortSignal, AbortController,
@@ -343,7 +355,7 @@ test('cache discovery waits for a complete valid port and stops on exit or deadl
       },
       async fetch(url) { fetched.push(url); throw new Error('valid discovery reached'); },
     };
-    const configure = vm.runInNewContext(source.slice(start, end) + '\nconfigureOwnedBrowserCache;', context);
+    const configure = loadCacheSetup(context);
     await assert.rejects(configure({ profile: '/owned/profile', fixtureUrl: 'unused', browser }),
       scenario === 'complete' ? /valid discovery reached/ : scenario === 'exit' ? /exited before cache setup/ : /did not expose/);
     assert.deepEqual(fetched, scenario === 'complete' ? ['http://127.0.0.1:32123/json/list'] : []);
@@ -351,13 +363,10 @@ test('cache discovery waits for a complete valid port and stops on exit or deadl
 });
 
 test('browser runner rejects unsupported Node and missing global WebSocket before starting resources', async () => {
-  const source = readFileSync(join(__dirname, 'browser-regression.cjs'), 'utf8');
-  const start = source.indexOf('async function main(');
-  const end = source.indexOf('module.exports =', start);
   for (const scenario of [{ node: '20.0.0', WebSocket: class {} }, { node: '22.0.0', WebSocket: undefined }]) {
-    const main = vm.runInNewContext(source.slice(start, end) + '\nmain;', {
+    const main = loadSlice(runnerSource, 'async function main(', 'module.exports =', 'main', {
       process: { versions: { node: scenario.node } }, WebSocket: scenario.WebSocket,
-      rmSync() {}, evidenceDir: 'unused', configureOwnedBrowserCache() {},
+      rmSync() {}, defaultResultDirectory: 'unused', configureOwnedBrowserCache() {}, stopBrowserGroup() {},
       createServer() { throw new Error('Unsupported runtime started fixture resources'); },
     });
     await assert.rejects(main(), /require Node.js 22\+ with the global WebSocket API/);
@@ -365,9 +374,6 @@ test('browser runner rejects unsupported Node and missing global WebSocket befor
 });
 
 test('browser setup shares its remaining startup budget across port and HTTP discovery', async () => {
-  const source = readFileSync(join(__dirname, 'browser-regression.cjs'), 'utf8');
-  const start = source.indexOf('async function bounded(');
-  const end = source.indexOf('async function main(', start);
   for (const expireAfterHttp of [false, true]) {
     let now = 0;
     let portReady = false;
@@ -385,8 +391,8 @@ test('browser setup shares its remaining startup budget across port and HTTP dis
       },
       WebSocket: class { constructor() { throw new Error('Expired startup opened a protocol connection'); } },
     };
-    const configure = vm.runInNewContext(source.slice(start, end) + '\nconfigureOwnedBrowserCache;', context);
-    await assert.rejects(configure({ profile: '/owned/profile', fixtureUrl: 'unused', browser: Object.assign(new EventEmitter(), { exitCode: null, signalCode: null }) }),
+    const configure = loadCacheSetup(context);
+    await assert.rejects(configure({ profile: '/owned/profile', fixtureUrl: 'unused', browser: runningBrowser() }),
       expireAfterHttp ? /startup deadline exceeded/ : /HTTP boundary reached/);
     assert.equal(httpBudget, 26000, 'Discovery uses only the startup budget remaining after port readiness');
   }
@@ -394,13 +400,11 @@ test('browser setup shares its remaining startup budget across port and HTTP dis
 
 
 test('page discovery retries temporary HTTP failures and empty lists but rejects unsafe targets', async () => {
-  const source = readFileSync(join(__dirname, 'browser-regression.cjs'), 'utf8');
-  const setupSource = source.slice(source.indexOf('async function bounded('), source.indexOf('async function main('));
   for (const scenario of ['transient', 'multiple', 'nonblank', 'foreign', 'status', 'json']) {
     let calls = 0;
     const page = { type: 'page', url: 'about:blank', webSocketDebuggerUrl: 'ws://127.0.0.1:32123/devtools/page/owned-test' };
-    const browser = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
-    const configure = vm.runInNewContext(setupSource + '\nconfigureOwnedBrowserCache;', {
+    const browser = runningBrowser();
+    const configure = loadCacheSetup({
       Date, join, URL, AbortSignal, AbortController, setTimeout, clearTimeout, delay,
       existsSync: () => true, readFileSync: () => '32123\n/unused',
       async fetch() {
@@ -415,22 +419,20 @@ test('page discovery retries temporary HTTP failures and empty lists but rejects
             : scenario === 'foreign' ? { webSocketDebuggerUrl: 'ws://example.invalid/devtools/page/owned-test' } : {}) }];
         return { ok: true, json: async () => pages };
       },
-      WebSocket: class { constructor() { throw new Error('Validated owned protocol boundary reached'); } },
+      WebSocket: class { constructor() { throw new Error('Validated protocol boundary reached'); } },
     });
     await assert.rejects(configure({ profile: '/owned/profile', fixtureUrl: 'unused', browser }),
       scenario === 'status' ? /page discovery failed/ : scenario === 'json' ? /Invalid JSON sentinel/
-        : scenario === 'transient' ? /Validated owned protocol boundary reached/ : scenario === 'foreign' ? /Unexpected owned browser page endpoint/ : /exactly one blank page/);
+        : scenario === 'transient' ? /Validated protocol boundary reached/ : scenario === 'foreign' ? /Unexpected browser page endpoint/ : /exactly one blank page/);
     assert.equal(calls, scenario === 'transient' ? 4 : 1);
     assert.equal(browser.listenerCount('exit'), 0, 'Discovery releases its exit listener');
   }
 });
 
-test('unresponsive owned discovery stops at the shared deadline or browser exit and cleans up', { timeout: 20000 }, async () => {
-  const source = readFileSync(join(__dirname, 'browser-regression.cjs'), 'utf8');
-  const setupSource = source.slice(source.indexOf('async function bounded('), source.indexOf('async function main('));
+test('unresponsive discovery stops at the shared deadline or browser exit and cleans up', { timeout: 20000 }, async () => {
   for (const scenario of ['deadline', 'body-deadline', 'exit', 'body-exit']) {
     const profile = mkdtempSync(join(tmpdir(), 'frayd-discovery-never-'));
-    const browser = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
+    const browser = runningBrowser();
     let requested = false;
     let exitTimer;
     const server = createServer((request, response) => {
@@ -444,7 +446,7 @@ test('unresponsive owned discovery stops at the shared deadline or browser exit 
     });
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
     writeFileSync(join(profile, 'DevToolsActivePort'), `${server.address().port}\n/unused`);
-    const configure = vm.runInNewContext(setupSource + '\nconfigureOwnedBrowserCache;', {
+    const configure = loadCacheSetup({
       Date, join, URL, AbortSignal, AbortController, setTimeout, clearTimeout, delay,
       existsSync, readFileSync, fetch,
       WebSocket: class { constructor() { throw new Error('Unresponsive discovery opened a protocol connection'); } },
@@ -470,12 +472,10 @@ test('unresponsive owned discovery stops at the shared deadline or browser exit 
 });
 
 
-test('owned discovery accepts slow valid HTTP headers and body within the remaining startup budget', { timeout: 8000 }, async () => {
-  const source = readFileSync(join(__dirname, 'browser-regression.cjs'), 'utf8');
-  const setupSource = source.slice(source.indexOf('async function bounded('), source.indexOf('async function main('));
+test('discovery accepts slow valid HTTP headers and body within the remaining startup budget', { timeout: 8000 }, async () => {
   for (const scenario of ['headers', 'body']) {
     let attempts = 0;
-    const browser = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
+    const browser = runningBrowser();
     const server = createServer(async (request, response) => {
       assert.equal(request.url, '/json/list');
       attempts++;
@@ -489,16 +489,16 @@ test('owned discovery accepts slow valid HTTP headers and body within the remain
       if (!response.destroyed) response.end(scenario === 'body' ? bytes.slice(1) : bytes);
     });
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-    const configure = vm.runInNewContext(setupSource + '\nconfigureOwnedBrowserCache;', {
+    const configure = loadCacheSetup({
       Date, join, URL, AbortSignal, AbortController, setTimeout, clearTimeout, delay, fetch,
       existsSync: () => true, readFileSync: () => `${server.address().port}\n/unused`,
-      WebSocket: class { constructor() { throw new Error('Validated owned protocol boundary reached'); } },
+      WebSocket: class { constructor() { throw new Error('Validated protocol boundary reached'); } },
     });
     const diagnostics = {};
     const startedAt = Date.now();
     try {
       await assert.rejects(configure({ profile: '/owned/profile', fixtureUrl: 'unused', browser, diagnostics, budgetMs: 2800 }),
-        /Validated owned protocol boundary reached/);
+        /Validated protocol boundary reached/);
       assert.equal(attempts, 1, 'A valid slow response is not discarded and restarted');
       assert.equal(diagnostics.attempts, 1);
       assert.equal(diagnostics.transientFailures, 0);
@@ -517,13 +517,13 @@ test('retry fixture HTTP renders only trusted mode literals and rejects hostile 
   const fixtureDirectory = mkdtempSync(join(tmpdir(), 'frayd-mode-input-'));
   const browserScript = join(fixtureDirectory, 'browser.cjs');
   writeFileSync(browserScript, `#!/usr/bin/env node
-if (process.argv.includes('--version')) { console.log('Owned idle input fixture'); process.exit(0); }
+if (process.argv.includes('--version')) { console.log('Idle input fixture'); process.exit(0); }
 setInterval(() => {}, 1000);
 `, { mode: 0o700 });
   const runner = resolve(__dirname, 'browser-regression.cjs');
-  const invocation = spawn(process.execPath, ['-e', `
+  const invocation = runNode(`
     const assert = require('node:assert/strict');
-    require(${JSON.stringify(runner)}).main({ evidenceDirectory: ${JSON.stringify(join(fixtureDirectory, 'result'))},
+    require(${JSON.stringify(runner)}).main({ resultDirectory: ${JSON.stringify(join(fixtureDirectory, 'result'))},
       async cacheSetup({ fixtureUrl }) {
         const controls = [
           ['responsive?width=320', 200, 'null'],
@@ -547,25 +547,20 @@ setInterval(() => {}, 1000);
           assert.ok(!body.includes('globalThis.hostileInput'), route);
         }
         console.error('Verified 11 real HTTP fixture input controls');
-        throw new Error('Owned fixture input verification complete');
+        throw new Error('Fixture input verification complete');
       }
     });
-  `], { env: { ...process.env, BROWSER_BIN: browserScript }, stdio: ['ignore', 'pipe', 'pipe'] });
-  let stdout = '';
-  let stderr = '';
-  invocation.stdout.on('data', bytes => { stdout += bytes; });
-  invocation.stderr.on('data', bytes => { stderr += bytes; });
+  `, { BROWSER_BIN: browserScript });
   try {
-    const [code] = await once(invocation, 'close');
+    const { code, stdout, stderr } = await invocation;
     assert.equal(code, 1, stderr);
     assert.match(stderr, /Verified 11 real HTTP fixture input controls/);
     const result = JSON.parse(stdout);
-    assert.match(result.runnerError, /Owned fixture input verification complete/);
+    assert.match(result.runnerError, /Fixture input verification complete/);
     assert.equal(result.cases.length, 0);
     assert.equal(Object.values(result.cleanup).every(Boolean), true);
     assert.deepEqual(result.cleanupErrors, []);
   } finally {
-    if (invocation.exitCode === null) invocation.kill('SIGKILL');
     rmSync(fixtureDirectory, { recursive: true, force: true });
   }
 });
@@ -575,14 +570,14 @@ test('startup and cases have separate finite budgets and preserve partial progre
   const fixtureDirectory = mkdtempSync(join(tmpdir(), 'frayd-phase-budgets-'));
   const browserScript = join(fixtureDirectory, 'browser.cjs');
   writeFileSync(browserScript, `#!/usr/bin/env node
-if (process.argv.includes('--version')) { console.log('Owned phase-budget fixture'); process.exit(0); }
+if (process.argv.includes('--version')) { console.log('Phase-budget fixture'); process.exit(0); }
 setInterval(() => {}, 1000);
 `, { mode: 0o700 });
   const runner = resolve(__dirname, 'browser-regression.cjs');
   try {
     for (const scenario of ['slow-success', 'startup-timeout', 'case-timeout']) {
-      const invocation = spawn(process.execPath, ['-e', `
-        require(${JSON.stringify(runner)}).main({ evidenceDirectory: ${JSON.stringify(fixtureDirectory)},
+      const invocation = runNode(`
+        require(${JSON.stringify(runner)}).main({ resultDirectory: ${JSON.stringify(fixtureDirectory)},
           startupBudgetMs: 600, caseBudgetMs: 900,
           async cacheSetup({ fixtureUrl }) {
             if (${JSON.stringify(scenario)} === 'startup-timeout') return new Promise(() => {});
@@ -591,17 +586,14 @@ setInterval(() => {}, 1000);
               completed: 1, passed: 1, failed: 0, blocked: 0, currentCase: 2 }) });
             if (${JSON.stringify(scenario)} === 'slow-success') setTimeout(() => {
               fetch(fixtureUrl + '__fixture/result', { method: 'POST', body: JSON.stringify({
-                cases: Array.from({ length: 47 }, (_, n) => ({ name: 'controlled ' + n, status: 'PASS' })),
-                passed: 47, failed: 0, errors: [] }) }).catch(() => {});
+                cases: Array.from({ length: ${EXPECTED_CASES} }, (_, n) => ({ name: 'controlled ' + n, status: 'PASS' })),
+                passed: ${EXPECTED_CASES}, failed: 0, errors: [] }) }).catch(() => {});
             }, 650);
             return { receipt: { injectedTestDouble: true }, close: async () => {} };
           }
         }).catch(error => { console.error(error.stack); process.exitCode = 1; });
-      `], { env: { ...process.env, BROWSER_BIN: browserScript }, stdio: ['ignore', 'pipe', 'pipe'] });
-      let stdout = '', stderr = '';
-      invocation.stdout.on('data', bytes => { stdout += bytes; });
-      invocation.stderr.on('data', bytes => { stderr += bytes; });
-      const [code] = await once(invocation, 'close');
+      `, { BROWSER_BIN: browserScript });
+      const { code, stdout, stderr } = await invocation;
       const result = JSON.parse(stdout);
       assert.equal(code, scenario === 'slow-success' ? 0 : 1, stderr);
       assert.equal(result.complete, scenario === 'slow-success');
@@ -612,7 +604,7 @@ setInterval(() => {}, 1000);
       assert.deepEqual(result.cleanupErrors, []);
       if (scenario === 'slow-success') {
         assert.ok(result.phaseTimeline[2].elapsedMs > 900, 'Combined work exceeds the case budget yet passes');
-        assert.equal(result.cases.length, 47);
+        assert.equal(result.cases.length, EXPECTED_CASES);
       } else {
         assert.match(result.runnerError, scenario === 'startup-timeout' ? /startup exceeded 600 milliseconds/ : /cases exceeded 900 milliseconds/);
         assert.equal(result.cases.length, 0, 'Progress never substitutes for terminal case evidence');
@@ -625,8 +617,6 @@ setInterval(() => {}, 1000);
 
 
 test('transient discovery response bodies are canceled before another attempt', { timeout: 8000 }, async () => {
-  const source = readFileSync(join(__dirname, 'browser-regression.cjs'), 'utf8');
-  const setup = source.slice(source.indexOf('async function bounded('), source.indexOf('async function main('));
   for (const status of [408, 429, 503]) {
     let attempts = 0;
     let canceled = false;
@@ -644,7 +634,7 @@ test('transient discovery response bodies are canceled before another attempt', 
         webSocketDebuggerUrl: `ws://127.0.0.1:${server.address().port}/devtools/page/owned-test` }]));
     });
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-    const configure = vm.runInNewContext(setup + '\nconfigureOwnedBrowserCache;', {
+    const configure = loadCacheSetup({
       Date, join, URL, AbortSignal, AbortController, setTimeout, clearTimeout, delay,
       existsSync: () => true, readFileSync: () => `${server.address().port}\n/unused`,
       async fetch(...args) {
@@ -656,12 +646,12 @@ test('transient discovery response bodies are canceled before another attempt', 
         }
         return response;
       },
-      WebSocket: class { constructor() { throw new Error('Validated owned protocol boundary reached'); } },
+      WebSocket: class { constructor() { throw new Error('Validated protocol boundary reached'); } },
     });
-    const browser = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
+    const browser = runningBrowser();
     try {
       await assert.rejects(configure({ profile: '/owned/profile', fixtureUrl: 'unused', browser, budgetMs: 1000 }),
-        /Validated owned protocol boundary reached/);
+        /Validated protocol boundary reached/);
       await Promise.race([closed, delay(1000).then(() => { throw new Error('Canceled response remained open'); })]);
       assert.equal(attempts, 2);
       assert.equal(canceled, true);
@@ -676,28 +666,23 @@ test('transient discovery response bodies are canceled before another attempt', 
 test('unconfirmed browser shutdown retains its active interception session and profile', { timeout: 8000 }, async () => {
   const runner = resolve(__dirname, 'browser-regression.cjs');
   const resultDirectory = mkdtempSync(join(tmpdir(), 'frayd-shutdown-held-'));
-  const invocation = spawn(process.execPath, ['-e', `
+  const invocation = runNode(`
     const assert = require('node:assert/strict');
     const fs = require('node:fs');
-    const source = fs.readFileSync(${JSON.stringify(runner)}, 'utf8').replace(/^#!.*\\n/, '');
-    const ownedModule = { exports: {} };
-    const controls = new Function('require', 'module', '__dirname', source + \`
-      const actualStop = stopBrowserGroup;
-      let ownedBrowser;
-      stopBrowserGroup = async browser => {
-        ownedBrowser = browser;
-        process.kill(-browser.pid, 0);
-        throw new Error('injected group shutdown failure');
-      };
-      return { actualStop, browser: () => ownedBrowser };
-    \`)(require, ownedModule, ${JSON.stringify(__dirname)});
+    const runner = require(${JSON.stringify(runner)});
+    let heldBrowser;
+    async function failingStop(browser) {
+      heldBrowser = browser;
+      process.kill(-browser.pid, 0);
+      throw new Error('injected group shutdown failure');
+    }
     let profile;
     let guardActive = true;
     let shutdownBegun = false;
     let removals = 0;
     (async () => {
       try {
-        await ownedModule.exports.main({ evidenceDirectory: ${JSON.stringify(resultDirectory)},
+        await runner.main({ resultDirectory: ${JSON.stringify(resultDirectory)}, stopGroup: failingStop,
           async cacheSetup(options) {
             profile = options.profile;
             return { receipt: { injectedTestDouble: true }, beginShutdown() { shutdownBegun = true; },
@@ -710,41 +695,35 @@ test('unconfirmed browser shutdown retains its active interception session and p
         assert.equal(shutdownBegun, true);
         assert.equal(removals, 0);
         assert.equal(fs.existsSync(profile), true);
-        process.kill(-controls.browser().pid, 0);
+        process.kill(-heldBrowser.pid, 0);
         assert.equal(result.cleanup.browserGroupStopped, false);
         assert.equal(result.cleanup.profileRemoved, false);
         assert.equal(result.cleanup.serverClosed, true);
         assert.equal(result.cleanupErrors.length, 1);
         assert.match(result.cleanupErrors[0], /injected group shutdown failure/);
         assert.equal(result.complete, false);
-        console.error('Verified active guard and profile held while owned group remains alive');
+        console.error('Verified active guard and profile held while the browser group remains alive');
       } finally {
-        await controls.actualStop(controls.browser());
+        await runner.stopBrowserGroup(heldBrowser);
         if (profile) fs.rmSync(profile, { recursive: true, force: true });
       }
     })().catch(error => { console.error(error.stack); process.exitCode = 2; });
-  `], { env: { ...process.env, BROWSER_BIN: executable }, stdio: ['ignore', 'pipe', 'pipe'] });
-  let stderr = '';
-  invocation.stdout.resume();
-  invocation.stderr.on('data', bytes => { stderr += bytes; });
+  `, { BROWSER_BIN: executable });
   try {
-    const [code] = await once(invocation, 'close');
+    const { code, stdout, stderr } = await invocation;
     assert.equal(code, 1, stderr); // Held cleanup must remain a failed runner outcome.
     assert.match(stderr, /Verified active guard and profile held/);
   } finally {
-    if (invocation.exitCode === null) invocation.kill('SIGKILL');
     rmSync(resultDirectory, { recursive: true, force: true });
   }
 });
 
 test('discovery cancellation failures propagate without retries or a fresh deadline', { timeout: 3000 }, async () => {
-  const source = readFileSync(join(__dirname, 'browser-regression.cjs'), 'utf8');
-  const setup = source.slice(source.indexOf('async function bounded('), source.indexOf('async function main('));
   for (const scenario of ['reject', 'stall']) {
     let attempts = 0;
     let cancellations = 0;
-    const browser = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
-    const configure = vm.runInNewContext(setup + '\nconfigureOwnedBrowserCache;', {
+    const browser = runningBrowser();
+    const configure = loadCacheSetup({
       Date, join, URL, AbortSignal, AbortController, setTimeout, clearTimeout, delay,
       existsSync: () => true, readFileSync: () => '32123\n/unused',
       async fetch() {
@@ -767,10 +746,6 @@ test('discovery cancellation failures propagate without retries or a fresh deadl
 });
 
 test('installer poll observer keeps its own deadline and retires timers, observers and frame', async () => {
-  const driver = readFileSync(join(__dirname, 'fixtures/browser-driver.js'), 'utf8');
-  const start = driver.indexOf('  function observeInstallerPolling(');
-  const end = driver.indexOf('  // Independent iframe', start);
-  assert.ok(start >= 0 && end > start);
   for (const scenario of ['complete', 'late-complete', 'deadline', 'dispose']) {
     let now = 1000;
     let inspect;
@@ -779,11 +754,11 @@ test('installer poll observer keeps its own deadline and retires timers, observe
     let timer;
     const status = { textContent: 'Checking again…' };
     const node = { contentDocument: { getElementById(id) { assert.equal(id, 'stat'); return status; } } };
-    const observe = vm.runInNewContext(driver.slice(start, end) + '\nobserveInstallerPolling;', {
+    const observe = loadSlice(driverSource, '  function observeInstallerPolling(', '  // Independent iframe', 'observeInstallerPolling', {
       Date: { now: () => now },
       MutationObserver: class {
         constructor(callback) { inspect = callback; }
-        observe(target) { assert.equal(target, status, 'Observe only the owned iframe status'); }
+        observe(target) { assert.equal(target, status, 'Observe only the iframe status'); }
         disconnect() { disconnected++; }
       },
       setTimeout(callback, milliseconds) { timer = { callback, milliseconds }; return timer; },
@@ -804,7 +779,7 @@ test('installer poll observer keeps its own deadline and retires timers, observe
     if (scenario === 'complete') {
       assert.equal(result.elapsedMs, 12000);
       assert.equal(result.error, undefined);
-    } else assert.match(result.error.message, scenario === 'dispose' ? /disposed before completion/ : /exceeded15s/);
+    } else assert.match(result.error.message, scenario === 'dispose' ? /disposed before completion/ : /exceeded 15 s/);
     assert.equal(timer, undefined, 'Settled observation retires its timer');
     assert.equal(disconnected, 1, 'Settled observation retires its observer once');
     polling.dispose();
@@ -834,7 +809,7 @@ test('local Plyr adapter fails immediately for absent or duplicate app scripts',
   }
 });
 
-test('runner obtains identity from its owned session without a separate hanging version process', { timeout: 15000 }, async () => {
+test('runner obtains identity from its session without a separate hanging version process', { timeout: 15000 }, async () => {
   const fixtureDirectory = mkdtempSync(join(tmpdir(), 'frayd-owned-identity-'));
   const browserScript = join(fixtureDirectory, 'browser.cjs');
   const versionMarker = join(fixtureDirectory, 'version-invoked');
@@ -844,31 +819,26 @@ if (process.argv.includes('--version')) {
   setInterval(() => {}, 1000);
 } else { require(${JSON.stringify(executable)}); }
 `, { mode: 0o700 });
-  const invocation = spawn(process.execPath, ['-e', `
+  const invocation = runNode(`
     require(${JSON.stringify(resolve(__dirname, 'browser-regression.cjs'))}).main({
-      evidenceDirectory: ${JSON.stringify(join(fixtureDirectory, 'result'))},
+      resultDirectory: ${JSON.stringify(join(fixtureDirectory, 'result'))},
       async cacheSetup() {
-        return { receipt: { browserVersion: 'OwnedChrome/1', browserRevision: 'owned-revision' }, async close() {} };
+        return { receipt: { browserVersion: 'FixtureChrome/1', browserRevision: 'fixture-revision' }, async close() {} };
       }
     });
-  `], { env: { ...process.env, BROWSER_BIN: browserScript, FRAYD_CHILD_FIXTURE_EARLY_EXIT: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
-  let stdout = '';
-  let stderr = '';
-  invocation.stdout.on('data', bytes => { stdout += bytes; });
-  invocation.stderr.on('data', bytes => { stderr += bytes; });
+  `, { BROWSER_BIN: browserScript, FRAYD_CHILD_FIXTURE_EARLY_EXIT: '1' });
   try {
-    const [code] = await once(invocation, 'close');
+    const { code, stdout, stderr } = await invocation;
     assert.equal(code, 1, stderr);
     const result = JSON.parse(stdout);
     assert.match(result.runnerError, /Browser exited before result: 7\/null; original browser exit sentinel/);
     assert.equal(existsSync(versionMarker), false, 'No extra browser process runs for provenance');
-    assert.equal(result.provenance.browserVersion, 'OwnedChrome/1');
-    assert.equal(result.provenance.browserRevision, 'owned-revision');
+    assert.equal(result.provenance.browserVersion, 'FixtureChrome/1');
+    assert.equal(result.provenance.browserRevision, 'fixture-revision');
     assert.equal(result.timeBudgets.casesMs, 60000);
     assert.equal(Object.values(result.cleanup).every(Boolean), true);
     assert.deepEqual(result.cleanupErrors, []);
   } finally {
-    if (invocation.exitCode === null) invocation.kill('SIGKILL');
     rmSync(fixtureDirectory, { recursive: true, force: true });
   }
 });

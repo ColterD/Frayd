@@ -138,7 +138,7 @@ test('POSIX generated commands preserve configured values at the actual shell ar
   b.nodes.get('#tunnel').value=tunnel;
   for(const os of ['linux','mac']){
     b.run(`os=${JSON.stringify(os)};gen()`);
-    // Owned shell functions replace both commands; no downloader or installer executes.
+    // Fixture shell functions replace both commands; no downloader or installer executes.
     const stubs='curl() { return 0; }\nbash() { printf "%s\\0" "$@"; }\n';
     const result=spawnSync('/bin/sh',['-c',stubs+b.nodes.get('#cmd').textContent],{encoding:'utf8',env:{Library:'must-not-expand',Tunnel:'must-not-expand'}});
     assert.equal(result.status,0,result.stderr);

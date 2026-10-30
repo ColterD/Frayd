@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 // Controllable lifecycle fixture: a launcher with a child that ignores TERM and
-// keeps writing its owned disposable profile after the launcher has exited.
+// keeps writing its disposable profile after the launcher has exited.
 const { spawn } = require('node:child_process');
 if (process.argv.includes('--version')) {
   console.log('Frayd controlled child-writer fixture');

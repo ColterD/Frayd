@@ -13,8 +13,12 @@ function browser({ now, storage = {}, initialResponse } = {}) {
     const classes = new Set();
     const attributes = new Map();
     const events = new Map();
+    let markup = '';
     return {
-      style: {}, dataset: {}, children: [], value: '', type: '', innerHTML: '', textContent: '',
+      style: {}, dataset: {}, children: [], value: '', type: '', textContent: '',
+      // Like the DOM, assigning markup replaces appended children; markup itself is not parsed.
+      get innerHTML() { return markup; },
+      set innerHTML(value) { markup = value; this.children.length = 0; },
       src: '', paused: true, readyState: 1, currentTime: 0, clientWidth: 760, clientHeight: 600,
       classList: {
         add: (...names) => names.forEach(name => classes.add(name)),
@@ -43,11 +47,11 @@ function browser({ now, storage = {}, initialResponse } = {}) {
         events.set(name, (events.get(name) || []).filter(handler => handler.callback !== callback));
       },
       listenerCount(name) { return (events.get(name) || []).length; },
-      emit(name) {
-        for (const handler of documentCaptures.get(name) || []) handler({ target: this, type: name });
+      emit(name, detail = {}) {
+        for (const handler of documentCaptures.get(name) || []) handler({ target: this, type: name, ...detail });
         const handlers = events.get(name) || [];
         events.set(name, handlers.filter(handler => !handler.once));
-        for (const handler of handlers) handler.callback({ target: this, type: name, preventDefault() {} });
+        for (const handler of handlers) handler.callback({ target: this, type: name, preventDefault() {}, ...detail });
         this['on' + name]?.();
       },
       appendChild(child) { this.children.push(child); },
@@ -86,7 +90,7 @@ function browser({ now, storage = {}, initialResponse } = {}) {
   const sockets = [];
   const context = vm.createContext({
     document, localStorage: storage, URL, location: { hostname: 'test.invalid', origin: 'https://test.invalid' },
-    console: { log() {}, warn() {} }, innerWidth: 1000, innerHeight: 800,
+    console: { warn() {} }, innerWidth: 1000, innerHeight: 800,
     fetch: async (url, options) => { requests.push({ url, options }); return response(url, options); },
     addEventListener: (name, fn) => listeners.set(name, fn),
     scrollTo() {},
@@ -130,11 +134,29 @@ function browser({ now, storage = {}, initialResponse } = {}) {
   context.window = context;
   // Date is this VM's intrinsic; the host clock and other browser contexts stay independent.
   if (now) vm.runInContext('Date', context).now = now;
+  // index.html loads build-info.js before app.js; its identity request is not under test here.
+  vm.runInContext(readFileSync(join(clientPath, 'js/build-info.js'), 'utf8'), context);
+  requests.length = 0;
   vm.runInContext(readFileSync(join(clientPath, 'js/app.js'), 'utf8'), context);
+  const run = source => vm.runInContext(source, context);
+  // index.html loads party.js after app.js; party tests load it on demand.
+  const loadParty = () => run(readFileSync(join(clientPath, 'js/party.js'), 'utf8'));
   return {
-    context, nodes, requests, intervals, sockets,
+    context, nodes, requests, intervals, sockets, run, loadParty,
+    // Load party.js, join party ABCD through the panel and answer the join with `state` (none: leave it
+    // unanswered, for tests that send their own states). Returns the joined socket.
+    openParty(state, isHost) {
+      loadParty();
+      nodes.get('#party-code-input').value = 'ABCD';
+      run('PartyUI.open()');
+      nodes.get('#pt-join').onclick();
+      const socket = sockets.at(-1);
+      if (state) socket.onmessage(stateMessage(state, isHost));
+      return socket;
+    },
+    // Each toast creates its own host because the double does not register #toast-host.
+    notices: () => document.body.children.map(node => node.children[0]?.innerHTML || '').join(' '),
     captureCount: name => (documentCaptures.get(name) || []).length,
-    run: source => vm.runInContext(source, context),
     respond: fn => { response = fn; },
     dispatchMessage: event => listeners.get('message')(event),
     message: (data, overrides = {}) => listeners.get('message')({ data: { generation: vm.runInContext('ebook?.document?.generation', context), ...data }, origin: 'null', source: nodes.get('#em-frame').contentWindow, ...overrides }),
@@ -144,4 +166,13 @@ function browser({ now, storage = {}, initialResponse } = {}) {
   };
 }
 
-module.exports = { browser };
+// The socket message event for a party `state`; is_host is left out when not given, as in later echoes.
+const stateMessage = (state, isHost) => ({ data: JSON.stringify({ type: 'state', is_host: isHost, state }) });
+
+// Let pending promise callbacks and timers queued with setImmediate run.
+const settle = () => new Promise(resolve => setImmediate(resolve));
+
+// A successful fetch response whose JSON body is the given value.
+const reply = value => ({ ok: true, json: async () => value });
+
+module.exports = { browser, settle, reply, stateMessage };
