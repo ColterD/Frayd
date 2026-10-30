@@ -217,6 +217,24 @@ def scan_status():
     return json.loads(request('/api/scan/status'))
 
 
+def delete_media(media_id, token, expected):
+    """DELETE one media row, retrying only the server's transient 409 refusal.
+
+    After a scan, its conversion worker holds the global conversion slot while it checks whether a
+    video needs converting, even when it will convert nothing. Deletion refuses with 409 meanwhile
+    and changes nothing, so a retry is safe; any other status must match at once.
+    """
+    def attempt():
+        try:
+            request(f'/api/media/{media_id}', token=token, method='DELETE', expected=expected)
+        except AssertionError as error:
+            if error.args and isinstance(error.args[0], tuple) and error.args[0][1:] == (409, expected):
+                return False
+            raise
+        return True
+    wait_until(attempt, f'media {media_id} delete stayed refused with 409', 10, 0.2)
+
+
 def wait_for_scan_idle():
     """Retry only scan-status transport failures within the disposable scan budget."""
     wait_until(lambda: not json.loads(request('/api/scan/status', timeout=2))['scanning'],
@@ -568,7 +586,7 @@ def upstream_contract_qualification(args):
                 with path.open('xb') as artifact:
                     artifact.write(content)
             sql("CREATE TRIGGER qa_media_failure BEFORE DELETE ON media BEGIN SELECT RAISE(ABORT,'owned QA'); END")
-            request(f'/api/media/{media_id}', token=token, method='DELETE', expected=500)
+            delete_media(media_id, token, 500)
             assert sql('SELECT path,thumb_path FROM media WHERE id=?', (media_id,)) == [('/roots/a/first.cbz', saved_thumbnail)]
             for source in (roots / 'a/first.cbz', roots / 'b/second.cbz'):
                 assert source.read_bytes() == source_bytes
@@ -576,7 +594,7 @@ def upstream_contract_qualification(args):
             for path, content in retained_artwork.items():
                 assert path.read_bytes() == content
             sql('DROP TRIGGER qa_media_failure')
-            request(f'/api/media/{media_id}', token=token, method='DELETE', expected=204)
+            delete_media(media_id, token, 204)
             assert sql('SELECT id FROM media WHERE id=?', (media_id,)) == []
             assert not thumbnail.exists() and not thumbnail.is_symlink(), 'selected UUID thumbnail was not removed'
             for source in (roots / 'a/first.cbz', roots / 'b/second.cbz'):

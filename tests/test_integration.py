@@ -380,6 +380,41 @@ class CleanupInventoryTests(unittest.TestCase):
                          ('container', 'frayd-cleanup-fixture', b'stopped-fixture'))
 
 
+class DeleteMediaTests(unittest.TestCase):
+    """Media deletion waits out only the conversion worker's transient 409 refusal."""
+
+    @staticmethod
+    def responses(*codes):
+        """Fake request(): each code is the status the server answers, against the caller's expectation."""
+        outcomes = iter(codes)
+
+        def fake(path, token=None, method=None, expected=200, **_):
+            code = next(outcomes)
+            if code != expected:
+                raise AssertionError((path, code, expected))
+            return b''
+        return fake
+
+    def test_transient_refusal_is_retried_until_the_expected_status(self):
+        fake = self.responses(409, 409, 500)
+        with fake_clock(), patch.object(integration, 'request', side_effect=fake) as request:
+            integration.delete_media(1, 'token', 500)
+        self.assertEqual(request.call_count, 3)
+
+    def test_lasting_refusal_fails_at_the_deadline(self):
+        with fake_clock() as clock, patch.object(integration, 'request', side_effect=self.responses(*[409] * 100)), \
+                self.assertRaises(AssertionError) as caught:
+            integration.delete_media(1, 'token', 204)
+        self.assertIn('stayed refused', str(caught.exception))
+        self.assertGreaterEqual(clock.now, 10)
+
+    def test_other_mismatch_fails_without_retrying(self):
+        with fake_clock() as clock, patch.object(integration, 'request', side_effect=self.responses(404)), \
+                self.assertRaises(AssertionError):
+            integration.delete_media(1, 'token', 500)
+        self.assertEqual(clock.now, 0)
+
+
 class WaitUntilTests(unittest.TestCase):
     """Cover the shared polling primitive behind every bounded wait."""
 
