@@ -1124,7 +1124,7 @@ class NativeOwnership(unittest.TestCase):
                             os.kill(process.pid, interrupt)
                             os.kill(process.pid, signal.SIGCONT)
                         _, stderr = process.communicate(timeout=10)
-                        self.assertFalse(marker.exists(), 'normal interruption must clear uncertainty after reaping')
+                        self.assertFalse(marker.exists(), f'normal interruption must clear uncertainty after reaping; helper_exit={process.returncode}; stderr={stderr!r}')
                         with self.assertRaises(ProcessLookupError):
                             os.kill(child, 0)
                         data_before = [(p.relative_to(self.data), p.read_bytes()) for p in self.data.rglob('*') if p.is_file()]
