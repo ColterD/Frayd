@@ -1,14 +1,14 @@
 """Failure-boundary regressions for the disposable Docker integration runner."""
-import contextlib
-import ast
 import base64
+import contextlib
+import fcntl
 import hashlib
 import http.client
 import http.server
 import importlib.util
 import io
-import fcntl
 import json
+import math
 import os
 import secrets
 import signal
@@ -25,6 +25,50 @@ from unittest.mock import patch
 SPEC = importlib.util.spec_from_file_location('integration', Path(__file__).parents[1] / 'scripts/integration.py')
 integration = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(integration)
+
+
+class FakeClock:
+    """Deterministic time source: only sleeping advances it, so deadlines are exact."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+@contextlib.contextmanager
+def fake_clock():
+    """Replace the harness's monotonic clock and sleep with a FakeClock."""
+    clock = FakeClock()
+    with (patch.object(integration.time, 'monotonic', clock.monotonic),
+          patch.object(integration.time, 'sleep', clock.sleep)):
+        yield clock
+
+
+class QuietHandler(http.server.BaseHTTPRequestHandler):
+    """Fixture handler that never logs requests, which may carry test capabilities."""
+
+    def log_message(self, *args):
+        pass
+
+
+@contextlib.contextmanager
+def serve(handler):
+    """Run an owned loopback HTTP server and yield its base URL."""
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f'http://127.0.0.1:{server.server_port}'
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
 
 
 class ThumbnailOracleTests(unittest.TestCase):
@@ -90,45 +134,39 @@ class ThumbnailOracleTests(unittest.TestCase):
                 integration.qualified_thumbnail(data, 7, saved)
 
 
-class CurlHttpTests(unittest.TestCase):
-    """Execute the credential-safe curl -i adapter against an owned HTTP server."""
+class RequestAdapterTests(unittest.TestCase):
+    """Execute the HTTP adapter against an owned server."""
 
-    def test_real_http_status_body_and_in_memory_authorization(self):
-        """Prove curl returns a conflict body while keeping the bearer capability out of logs."""
+    def test_methods_error_bodies_and_in_memory_authorization(self):
+        """Return a conflict body, send the bearer capability and print nothing."""
         observed = []
         capability = 'ephemeral-fixture-only'
 
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def do_POST(self):
-                """Capture the submitted path, bearer header and body before returning HTTP 409."""
-                observed.append((self.path, self.headers.get('Authorization'),
-                                 self.rfile.read(int(self.headers['Content-Length']))))
-                self.send_response(409)
+        class Handler(QuietHandler):
+            def respond(self, status, body):
+                """Capture the method, path, bearer header and body, then reply."""
+                observed.append((self.command, self.path, self.headers.get('Authorization'),
+                                 self.rfile.read(int(self.headers.get('Content-Length', 0)))))
+                self.send_response(status)
                 self.end_headers()
-                self.wfile.write(b'{"reason":"busy"}')
+                self.wfile.write(body)
 
-            def log_message(self, *args):
-                """Suppress fixture access logs that could expose the test capability."""
-                pass
+            def do_POST(self):
+                self.respond(409, b'{"reason":"busy"}')
 
-        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
+            def do_DELETE(self):
+                self.respond(204, b'')
+
         output = io.StringIO()
-        try:
-            with patch.object(integration, 'base', f'http://127.0.0.1:{server.server_port}'), contextlib.redirect_stdout(output):
-                result = integration.curl_request('/owned-settings', {'library_paths': []},
-                                                  capability, 'POST', 409)
-            self.assertEqual(result, b'{"reason":"busy"}')
-            self.assertEqual(observed, [('/owned-settings', 'Bearer ' + capability,
-                                         b'{"library_paths": []}')])
-            self.assertNotIn(capability, output.getvalue())
-            self.assertIn('HTTP curl-i POST /owned-settings: 409 expected 409', output.getvalue())
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=2)
-        self.assertFalse(thread.is_alive())
+        with serve(Handler) as url, patch.object(integration, 'base', url), contextlib.redirect_stdout(output):
+            conflict = integration.request('/owned-settings', {'library_paths': []}, capability,
+                                           expected=409, method='POST')
+            integration.request('/owned-user', token=capability, expected=204, method='DELETE')
+        self.assertEqual(conflict, b'{"reason":"busy"}')
+        bearer = 'Bearer ' + capability
+        self.assertEqual(observed, [('POST', '/owned-settings', bearer, b'{"library_paths": []}'),
+                                    ('DELETE', '/owned-user', bearer, b'')])
+        self.assertEqual(output.getvalue(), '')
 
 
 class WebSocketIdentityWireTests(unittest.TestCase):
@@ -140,7 +178,7 @@ class WebSocketIdentityWireTests(unittest.TestCase):
         proof = secrets.token_hex(16)
         observations = []
 
-        class Handler(http.server.BaseHTTPRequestHandler):
+        class Handler(QuietHandler):
             protocol_version = 'HTTP/1.1'
 
             def do_GET(self):
@@ -164,13 +202,6 @@ class WebSocketIdentityWireTests(unittest.TestCase):
                 self.end_headers()
                 self.close_connection = True
 
-            def log_message(self, *args):
-                """Suppress fixture access logs containing identity and protocol details."""
-                pass
-
-        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
         output = io.StringIO()
 
         def create_party(path, data, supplied_token):
@@ -179,66 +210,29 @@ class WebSocketIdentityWireTests(unittest.TestCase):
             self.assertTrue(supplied_token == token, 'Party creation uses the same in-memory account capability')
             return json.dumps({'code': 'ABCD', 'host_capability': proof}).encode()
 
-        try:
-            with (patch.object(integration, 'base', f'http://127.0.0.1:{server.server_port}'),
-                  patch.object(integration, 'request', side_effect=create_party),
-                  contextlib.redirect_stdout(output)):
-                integration.websocket_upgrade(token)
-            self.assertEqual(observations, [{'canonicalAccount': False, 'proofMatches': True},
-                                            {'canonicalAccount': True, 'proofMatches': True}])
-            self.assertTrue(token not in output.getvalue() and proof not in output.getvalue(),
-                            'Credential and proof stay out of public diagnostics')
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=2)
-        self.assertFalse(thread.is_alive())
+        with (serve(Handler) as url,
+              patch.object(integration, 'base', url),
+              patch.object(integration, 'request', side_effect=create_party),
+              contextlib.redirect_stdout(output)):
+            integration.websocket_upgrade(token)
+        self.assertEqual(observations, [{'canonicalAccount': False, 'proofMatches': True},
+                                        {'canonicalAccount': True, 'proofMatches': True}])
+        self.assertTrue(token not in output.getvalue() and proof not in output.getvalue(),
+                        'Credential and proof stay out of public diagnostics')
 
 
-class DockerTimeoutTests(unittest.TestCase):
-    """Prove control/lifecycle/media budgets and timeout descendant ownership."""
+class DockerDeadlineTests(unittest.TestCase):
+    """Prove every Docker call is bounded and a timeout stops descendants."""
 
-    def test_operation_budgets_and_unknown_operations(self):
-        """Assign finite budgets to supported Docker verbs and reject unknown operations."""
-        cases = [
-            (('inspect', 'owned'), ('metadata', 20)),
-            (('build', '-t', 'owned-probe', '/owned-context'), ('context-build', 600)),
-            (('create', 'owned-probe', '/unused'), ('container-create', 30)),
-            (('export', 'owned-container'), ('container-export', 60)),
-            (('rm', '-f', 'owned-container'), ('cleanup', 60)),
-            (('image', 'rm', '-f', 'owned-probe'), ('cleanup', 60)),
-            (('container', 'ls', '-a'), ('metadata', 20)),
-            (('network', 'inspect', 'owned'), ('metadata', 20)),
-            (('volume', 'ls'), ('metadata', 20)),
-            (('compose', '-p', 'owned', '-f', '-', 'config'), ('metadata', 20)),
-            (('compose', '-p', 'owned', '-f', '-', 'up', '--wait', '--wait-timeout', '90'), ('compose-up', 120)),
-            (('compose', '-f', '-', 'restart', 'app'), ('lifecycle', 60)),
-            (('compose', '-f', '-', 'down', '--volumes'), ('cleanup', 60)),
-            (('exec', '-i', 'owned', 'sh', '-c', 'cat'), ('exec', 30)),
-            (('exec', 'owned', 'ffmpeg', '-v', 'error'), ('media-conversion', 120)),
-            (('exec', 'owned', '/usr/bin/ffprobe', '-v', 'error'), ('exec', 30)),
-        ]
-        for arguments, expected in cases:
-            with self.subTest(operation=expected[0]):
-                self.assertEqual(integration.docker_timeout(arguments), expected)
-        for arguments in [(), ('unknown',), ('image', 'prune'), ('compose', '-f', '-', 'unknown')]:
-            with self.assertRaises(ValueError):
-                integration.docker_timeout(arguments)
-
-    def test_context_probe_shared_helper_operations_have_budgets(self):
-        """Cover every Docker call made by the build-context probe with an operation budget."""
-        # Inspect the actual importing caller, so an added operation cannot silently
-        # escape coverage by changing only this test's representative argv list.
-        source = Path(__file__).parents[1] / 'scripts/check-build-context.py'
-        calls = [node for node in ast.walk(ast.parse(source.read_text()))
-                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'docker']
-        self.assertEqual(len(calls), 5)
-        for call in calls:
-            args = tuple(node.value if isinstance(node, ast.Constant) else 'owned-fixture' for node in call.args)
-            with self.subTest(operation=args[:2]):
-                operation, timeout = integration.docker_timeout(args)
-                self.assertIn(operation, ('context-build', 'container-create', 'container-export', 'cleanup'))
-                self.assertGreater(timeout, 0)
+    def test_default_and_explicit_deadlines_reach_the_runner(self):
+        """Calls get the default deadline unless the caller passes its own finite one."""
+        with patch.object(integration, 'run_docker',
+                          return_value=subprocess.CompletedProcess([], 0)) as run:
+            integration.docker('inspect', 'owned')
+            integration.docker('build', '-t', 'owned-probe', '/owned-context', timeout=600)
+        self.assertEqual([call.args[1] for call in run.call_args_list],
+                         [integration.DOCKER_TIMEOUT, 600])
+        self.assertTrue(0 < integration.DOCKER_TIMEOUT < math.inf)
 
     def test_compose_exec_build_info_reaches_bounded_cli_with_stdin_config(self):
         """Dispatch the exact provenance command through a real disposable CLI adapter."""
@@ -254,9 +248,8 @@ class DockerTimeoutTests(unittest.TestCase):
                 result = integration.docker(*arguments, input=b'{"services":{"app":{}}}')
             self.assertEqual(result.returncode, 0)
             self.assertEqual(json.loads(result.stdout), {'version': '0.1.1', 'commit': 'fixture'})
-            self.assertEqual(integration.docker_timeout(arguments), ('compose-exec', 30))
 
-    def test_timeout_override_is_finite_and_diagnostics_are_public(self):
+    def test_timeout_override_must_be_finite_and_positive(self):
         """Reject zero, negative and non-finite Docker timeout overrides."""
         for timeout in [0, -1, float('inf'), float('nan')]:
             with self.subTest(timeout=timeout), self.assertRaises(ValueError):
@@ -289,7 +282,7 @@ class DockerTimeoutTests(unittest.TestCase):
                 self.assertTrue(ready.exists(), 'Owned child actually started and held its lease')
                 with lease.open('a') as handle:
                     fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                self.assertEqual(caught.exception.cmd, ['docker', 'metadata'])
+                self.assertEqual(caught.exception.cmd, ['docker', 'inspect'])
                 self.assertIsNone(caught.exception.output)
                 self.assertIsNone(caught.exception.stderr)
                 self.assertNotIn('private', str(caught.exception) + output.getvalue())
@@ -387,6 +380,50 @@ class CleanupInventoryTests(unittest.TestCase):
                          ('container', 'frayd-cleanup-fixture', b'stopped-fixture'))
 
 
+class WaitUntilTests(unittest.TestCase):
+    """Cover the shared polling primitive behind every bounded wait."""
+
+    def test_first_truthy_result_returns_without_sleeping(self):
+        """A probe that succeeds immediately never waits."""
+        with fake_clock() as clock:
+            self.assertEqual(integration.wait_until(lambda: 'ready', 'never', 5), 'ready')
+        self.assertEqual(clock.now, 0)
+
+    def test_unlisted_errors_propagate_immediately(self):
+        """Only the declared transient errors are retried."""
+        with fake_clock() as clock, self.assertRaises(ValueError):
+            integration.wait_until(self.fail_with(ValueError('bad payload')), 'never', 5, transient=(OSError,))
+        self.assertEqual(clock.now, 0)
+
+    def test_deadline_names_the_last_transient_error(self):
+        """A persistent transient failure ends exactly at the deadline with its cause."""
+        with fake_clock() as clock, self.assertRaises(AssertionError) as caught:
+            integration.wait_until(self.fail_with(OSError('refused')), 'slow', 3, 1, transient=(OSError,))
+        self.assertEqual(str(caught.exception), "slow: OSError('refused')")
+        self.assertEqual(clock.now, 3)
+
+    def test_clean_falsy_result_forgets_an_earlier_error(self):
+        """The failure text reports only the latest observation."""
+        outcomes = iter([OSError('refused'), False, False, False])
+
+        def probe():
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        with fake_clock(), self.assertRaises(AssertionError) as caught:
+            integration.wait_until(probe, 'slow', 3, 1, transient=(OSError,))
+        self.assertEqual(str(caught.exception), 'slow')
+
+    @staticmethod
+    def fail_with(error):
+        """Build a probe that always raises error."""
+        def probe():
+            raise error
+        return probe
+
+
 class ReadinessTests(unittest.TestCase):
     """Keep transient network recovery bounded without hiding terminal failures."""
 
@@ -407,11 +444,11 @@ class ReadinessTests(unittest.TestCase):
             with (
                 self.subTest(error_type=type(error).__name__),
                 patch.object(integration, 'request', side_effect=[error, b'{"status":"ok"}']) as request,
-                patch.object(integration.time, 'monotonic', side_effect=[0, 0, 0.5]),
-                patch.object(integration.time, 'sleep'),
+                fake_clock() as clock,
             ):
                 integration.ready()
                 self.assertEqual(request.call_count, 2)
+                self.assertEqual(clock.now, 0.5)
 
     def test_deadline_exhaustion_reports_the_last_failure(self):
         """A persistent failure terminates at the 20-second deadline with its cause."""
@@ -421,17 +458,17 @@ class ReadinessTests(unittest.TestCase):
             with self.subTest(error_type=type(error).__name__):
                 with (
                     patch.object(integration, 'request', side_effect=error) as request,
-                    patch.object(integration.time, 'monotonic', side_effect=[10, 10, 29.5, 30]),
-                    patch.object(integration.time, 'sleep'),
+                    fake_clock() as clock,
                     self.assertRaises(AssertionError) as caught,
                 ):
                     integration.ready()
-                self.assertEqual(str(caught.exception), f'QA server did not become ready: {error}')
-                self.assertEqual(request.call_count, 2)
+                self.assertEqual(str(caught.exception), f'QA server did not become ready: {error!r}')
+                self.assertEqual(clock.now, 20)
+                self.assertEqual({call.kwargs['timeout'] for call in request.call_args_list}, {2})
 
     def test_dns_diagnostics_preserve_original_readiness_failure(self):
         """Unavailable diagnostic commands cannot replace a proxy readiness timeout."""
-        original = AssertionError('persistent proxy502')
+        original = AssertionError('persistent proxy 502')
         output = io.StringIO()
         with (
             patch.object(integration, 'ready', side_effect=original),
@@ -463,24 +500,20 @@ class ScanStatusPollingTests(unittest.TestCase):
                 raise urllib.error.URLError('temporary disconnect')
             return b'{"scanning":false}'
 
-        with (patch.object(integration, 'request', side_effect=response),
-              patch.object(integration.time, 'sleep')):
+        with patch.object(integration, 'request', side_effect=response), fake_clock():
             integration.request('/api/scan', {}, expected=202)
             integration.wait_for_scan_idle()
         self.assertEqual(paths, ['/api/scan', '/api/scan/status', '/api/scan/status'])
 
     def test_persistent_transport_failure_stops_at_deadline(self):
-        """The last transport failure is named after a finite number of polls."""
+        """The last transport failure is named when the 30-second wait ends."""
         with (patch.object(integration, 'request', side_effect=TimeoutError('timed out')) as request,
-              patch.object(integration.time, 'monotonic', side_effect=[0, 0, 29.25, 29.5, 29.75, 30]),
-              patch.object(integration.time, 'sleep') as sleep,
+              fake_clock() as clock,
               self.assertRaisesRegex(AssertionError, 'scan.*TimeoutError')):
             integration.wait_for_scan_idle()
-        self.assertEqual(request.call_count, 2)
-        self.assertEqual([call.args for call in request.call_args_list],
-                         [('/api/scan/status',), ('/api/scan/status',)])
-        self.assertEqual([call.kwargs['timeout'] for call in request.call_args_list], [2, 0.5])
-        self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.5, 0.25])
+        self.assertEqual(clock.now, 30)
+        self.assertEqual({call.args for call in request.call_args_list}, {('/api/scan/status',)})
+        self.assertEqual({call.kwargs['timeout'] for call in request.call_args_list}, {2})
 
     def test_scan_post_transport_failure_is_not_replayed(self):
         """The request adapter leaves a failed mutation to its caller."""
@@ -492,17 +525,15 @@ class ScanStatusPollingTests(unittest.TestCase):
 
     def test_http_denial_and_invalid_json_fail_fast(self):
         """Unexpected status and invalid payload are application failures, not retryable transport."""
-        for failure in (AssertionError('status 403'),
-                        urllib.error.HTTPError('/api/scan/status', 403, 'denied', None, None)):
-            with (self.subTest(failure=type(failure).__name__),
-                  patch.object(integration, 'request', side_effect=failure) as request,
-                  patch.object(integration.time, 'sleep') as sleep,
-                  self.assertRaises(type(failure))):
-                integration.wait_for_scan_idle()
-            request.assert_called_once()
-            sleep.assert_not_called()
-            if isinstance(failure, urllib.error.HTTPError):
-                failure.close()
+        denied = urllib.error.HTTPError('/api/scan/status', 403, 'denied', None, None)
+        self.addCleanup(denied.close)
+        with (patch.object(integration, 'base', 'http://127.0.0.1:1'),
+              patch.object(integration.urllib.request, 'urlopen', side_effect=denied) as open_url,
+              patch.object(integration.time, 'sleep') as sleep,
+              self.assertRaises(AssertionError)):
+            integration.wait_for_scan_idle()
+        open_url.assert_called_once()
+        sleep.assert_not_called()
         with (patch.object(integration, 'request', return_value=b'not JSON') as request,
               patch.object(integration.time, 'sleep') as sleep,
               self.assertRaises(json.JSONDecodeError)):

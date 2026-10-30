@@ -1,6 +1,8 @@
 """Real nginx recovery oracle for one transient DNS SERVFAIL after app replacement."""
 import argparse
+import functools
 import hashlib
+import importlib.util
 import json
 import secrets
 import socket
@@ -9,7 +11,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -18,9 +19,18 @@ PYTHON_IMAGE = 'python@sha256:1b668429b3511ab407d8e00648891631b0b1a4d7e15e3ca70f
 CLEANUP_TIMEOUT = 5
 
 
+@functools.cache
+def harness():
+    """Load the shared Docker harness on demand; the container-side --serve mode has only this file."""
+    spec = importlib.util.spec_from_file_location('integration', ROOT / 'scripts/integration.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def docker(*args):
-    """Run fixture-only Docker commands and retain bounded command diagnostics."""
-    return subprocess.check_output(['docker', *args], stderr=subprocess.STDOUT, text=True, timeout=120).strip()
+    """Run one fixture Docker command under the harness deadline and return its stripped stdout."""
+    return harness().docker(*args).stdout.decode().strip()
 
 
 def write_control(path, state):
@@ -67,44 +77,39 @@ def health(url):
 def wait_health(url, seconds):
     """Return elapsed recovery time without relaxing the caller's deadline."""
     started = time.monotonic()
-    while time.monotonic() - started < seconds:
-        if health(url):
-            return time.monotonic() - started
-        time.sleep(0.2)
-    raise AssertionError(f'health remained unavailable for {seconds}s')
+    harness().wait_until(lambda: health(url), f'health remained unavailable for {seconds}s', seconds, 0.2)
+    return time.monotonic() - started
 
 
 def cleanup_fixture(project, names, failing):
     """Bound every cleanup attempt and preserve an existing scenario failure."""
-    label = 'com.docker.compose.project=' + project
+    integration = harness()
     commands = [('diagnostic', ('logs', '--tail', '200', name)) for name in names[1:3]]
     commands += [('remove', ('rm', '-f', name)) for name in names]
     commands.append(('remove', ('network', 'rm', project)))
-    commands += [('inventory', (resource, 'ls', '-q', *(['-a'] if resource == 'container' else []),
-                                '--filter', f'label={label}'))
-                 for resource in ('container', 'network', 'volume')]
+    commands += [('inventory', integration.inventory_command(project, resource))
+                 for resource in integration.INVENTORY_RESOURCES]
     failures = []
     for phase, args in commands:
         try:
-            result = subprocess.run(['docker', *args], capture_output=True, text=True,
-                                    check=True, timeout=CLEANUP_TIMEOUT)
+            result = integration.docker(*args, timeout=CLEANUP_TIMEOUT)
         except (subprocess.SubprocessError, OSError) as error:
             print(f'QA {phase} unavailable: {args[0]} {type(error).__name__}', file=sys.stderr)
             if phase != 'diagnostic':
                 failures.append((phase, args[0], type(error).__name__))
             continue
         if phase == 'diagnostic':
-            lines = (result.stdout + result.stderr).splitlines()
+            lines = (result.stdout + result.stderr).decode(errors='replace').splitlines()
             selected = [line for line in lines[:-10] if 'could not be resolved' in line] + lines[-10:]
             print(f'DIAGNOSTIC {args[-1]}:\n' + '\n'.join(selected), flush=True)
         elif phase == 'inventory' and result.stdout.strip():
-            failures.append((args[0], result.stdout.strip()))
+            failures.append((args[0], result.stdout.decode().strip()))
     if failures:
         print(f'QA cleanup failed: {failures}', file=sys.stderr)
         if not failing:
             raise AssertionError(f'QA cleanup failed: {failures}')
     else:
-        print(f'PASS: task-owned {project} containers, networks and volumes removed', flush=True)
+        print(f'PASS: {project} resources removed', flush=True)
 
 
 def run_fixture(args):
@@ -132,10 +137,7 @@ def run_fixture(args):
             docker('run', '-d', '--name', dns, '--label', label, '--network', project,
                    '-v', f'{folder}:/control', '-v', f'{Path(__file__).resolve()}:/fixture/test_dns_recovery.py:ro',
                    args.dns_image, 'python', '/fixture/test_dns_recovery.py', '--serve', '/control/state.json')
-            deadline = time.monotonic() + 10
-            while 'DNS ready' not in docker('logs', dns):
-                assert time.monotonic() < deadline, 'DNS fixture did not start'
-                time.sleep(0.1)
+            harness().wait_until(lambda: 'DNS ready' in docker('logs', dns), 'DNS fixture did not start', 10)
             dns_ip = docker('inspect', '--format', '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}', dns)
             config = Path(args.config).read_text().replace('resolver 127.0.0.11 ', f'resolver {dns_ip} ')
             assert config != Path(args.config).read_text(), 'fixture must override only the resolver address'
@@ -151,24 +153,18 @@ def run_fixture(args):
                    '--entrypoint', 'sleep', args.proxy_image, '120')
             new_ip = start_app()
             assert new_ip != old_ip, (old_ip, new_ip)
-            deadline = time.monotonic() + 10
-            while True:
-                try:
-                    direct = docker('exec', proxy, 'wget', '-T', '1', '-qO-', f'http://{new_ip}:8484/api/health')
-                    break
-                except subprocess.CalledProcessError:
-                    assert time.monotonic() < deadline, 'replacement app never became directly healthy'
-                    time.sleep(0.1)
+            direct = harness().wait_until(
+                lambda: docker('exec', proxy, 'wget', '-T', '1', '-qO-', f'http://{new_ip}:8484/api/health'),
+                'replacement app never became directly healthy', 10, transient=(subprocess.CalledProcessError,))
             assert json.loads(direct) == {'status': 'ok'}
             write_control(state, {'ip': new_ip, 'fail_next': True})
-            started = time.monotonic()
-            while json.loads(state.read_text()).get('fail_next'):
-                assert time.monotonic() - started < 10, 'nginx never refreshed DNS'
-                time.sleep(0.1)
-            print(f'PROBE: real app IP {old_ip}->{new_ip}; direct health200; one SERVFAIL delivered', flush=True)
+            harness().wait_until(lambda: not json.loads(state.read_text()).get('fail_next'),
+                                 'nginx never refreshed DNS', 10)
             recovered = wait_health(endpoint, 20)
             assert before == docker('inspect', '--format', '{{.Id}} {{.State.StartedAt}}', proxy)
-            print(f'PASS: unchanged proxy recovered after SERVFAIL in {recovered:.2f}s; configSHA256={hashlib.sha256(Path(args.config).read_bytes()).hexdigest()}', flush=True)
+            digest = hashlib.sha256(Path(args.config).read_bytes()).hexdigest()
+            print(f'PASS: app IP {old_ip} -> {new_ip}; unchanged proxy recovered after one SERVFAIL in {recovered:.2f}s; '
+                  f'config sha256 {digest}', flush=True)
         finally:
             cleanup_fixture(project, names, sys.exc_info()[0] is not None)
 

@@ -1,7 +1,14 @@
 """Freshness oracles use disposable Git histories, never authenticated/live remotes."""
+import contextlib
 import importlib.util
+import io
+import itertools
+import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -14,6 +21,37 @@ spec.loader.exec_module(freshness)
 
 def git(repo, *args):
     return subprocess.check_output(['git', '-C', str(repo), *args], stderr=subprocess.DEVNULL, text=True).strip()
+
+
+class FakeClock:
+    """Deterministic monotonic time that advances only when a test moves it."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+
+class BuildResponse:
+    """Context-manager response whose body arrives through read1()."""
+
+    def __init__(self, chunks, on_read=None):
+        self.chunks = iter(chunks)
+        self.on_read = on_read
+        self.reads = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        pass
+
+    def read1(self, _size):
+        self.reads += 1
+        if self.on_read:
+            self.on_read()
+        return next(self.chunks, b'')
 
 
 class Freshness(unittest.TestCase):
@@ -47,66 +85,90 @@ class Freshness(unittest.TestCase):
             git(repo, 'checkout', '--detach', tip)
             git(repo, 'commit', '--allow-empty', '-m', 'ahead')
             self.assertEqual(freshness.probe(repo)['status'], 'ahead')
-            self.assertEqual(freshness.probe(repo, remote='missing')['status'], 'unknown')
+            missing = freshness.probe(repo, remote='missing')
+            self.assertEqual(missing['status'], 'unknown')
+            self.assertIn('missing named remote', missing['reason'])
             shallow = Path(directory) / 'shallow'
             git(repo, 'clone', '--depth=1', '--branch', 'main', remote.as_uri(), str(shallow))
-            self.assertEqual(freshness.probe(shallow, remote='origin')['status'], 'unknown')
+            truncated = freshness.probe(shallow, remote='origin')
+            self.assertEqual(truncated['status'], 'unknown')
+            self.assertIn('shallow or unavailable history', truncated['reason'])
             with patch.object(freshness, 'git', side_effect=subprocess.TimeoutExpired('git', 45)):
-                self.assertEqual(freshness.probe(repo)['status'], 'unknown')
+                timed_out = freshness.probe(repo)
+            self.assertEqual(timed_out['status'], 'unknown')
+            self.assertIn('deadline exceeded', timed_out['reason'])
 
     def test_secret_bearing_remote_is_refused_before_fetch(self):
+        outputs = {('rev-parse', '--is-shallow-repository'): 'false', ('remote',): 'upstream',
+                   ('remote', 'get-url', 'upstream'): 'https://fixture-user:NONSECRET_FIXTURE@example.invalid/repo'}
+
         def response(_repo, *args, **_kwargs):
-            text = 'false' if args == ('rev-parse', '--is-shallow-repository') else 'upstream' if args == ('remote',) else 'https://fixture-user:NONSECRET_FIXTURE@example.invalid/repo' if args[:2] == ('remote', 'get-url') else 'a' * 40
-            return subprocess.CompletedProcess([], 0, text, '')
+            return subprocess.CompletedProcess([], 0, outputs.get(args, 'a' * 40), '')
         with patch.object(freshness, 'git', side_effect=response) as calls:
             result = freshness.probe(ROOT)
         self.assertEqual(result['status'], 'unknown')
-        self.assertNotIn('NONSECRET_FIXTURE', str(result))
+        self.assertIn('credential-bearing remote URL refused', result['reason'])
+        for private in ('NONSECRET_FIXTURE', 'fixture-user', 'example.invalid'):
+            self.assertNotIn(private, str(result))
         self.assertFalse(any('fetch' in call.args for call in calls.call_args_list))
 
     def test_dripping_build_body_stops_at_checked_deadline(self):
-        class Response:
-            reads = 0
-            def __enter__(self):
-                return self
-            def __exit__(self, *_args):
-                pass
-            def read1(self, _size):
-                self.reads += 1
-                return b' '
-        response = Response()
-        with patch.object(freshness.urllib.request, 'build_opener') as opener, patch.object(freshness.time, 'monotonic', side_effect=[0, 0, 0, 6, 6, 12]):
+        clock = FakeClock()
+
+        def drip():
+            clock.now += 6
+
+        response = BuildResponse(itertools.repeat(b' '), on_read=drip)
+        with patch.object(freshness.urllib.request, 'build_opener') as opener, patch.object(freshness.time, 'monotonic', clock.monotonic):
             opener.return_value.open.return_value = response
             result = freshness.probe(ROOT, build_url='http://127.0.0.1:3100')
         self.assertEqual(result['status'], 'unknown')
+        self.assertIn('build body deadline exceeded', result['reason'])
         self.assertEqual(response.reads, 2)
 
     def test_installed_identity_is_selected_instead_of_checkout(self):
-        class Response:
-            def __enter__(self):
-                return self
-            def __exit__(self, *_args):
-                pass
-            def read1(self, _size):
-                chunk, self.payload = self.payload, b''
-                return chunk
-        for payload in [b'null', b'[]', b'{"commit":null,"dirty":null}', b'{"commit":false,"dirty":{"unexpected":"NONSECRET_FIXTURE"}}']:
-            with patch.object(freshness.urllib.request, 'build_opener') as opener:
-                response = Response()
-                response.payload = payload
-                opener.return_value.open.return_value = response
+        for payload, reason in [(b'null', 'invalid build metadata'), (b'[]', 'invalid build metadata'),
+                                (b'{', 'invalid build metadata'), (b'\xff', 'invalid build metadata'),
+                                (b'{"commit":null,"dirty":null}', 'unknown installed commit'),
+                                (b'{"commit":false,"dirty":{"unexpected":"NONSECRET_FIXTURE"}}', 'unknown installed commit')]:
+            with self.subTest(payload=payload), patch.object(freshness.urllib.request, 'build_opener') as opener:
+                opener.return_value.open.return_value = BuildResponse([payload])
                 result = freshness.probe(ROOT, build_url='http://127.0.0.1:3100')
             self.assertEqual(result['status'], 'unknown')
             self.assertEqual(result['selection'], 'installed build')
             self.assertIsNone(result['selected_commit'])
+            self.assertIn(reason, result['reason'])
             self.assertNotIn('NONSECRET_FIXTURE', str(result))
+
+    def test_unexpected_exception_yields_unknown_without_exception_text(self):
+        """Any unexpected exception ends as the JSON unknown result with a fixed reason and exit status 2."""
+        secret = 'NONSECRET_FIXTURE https://fixture-user:NONSECRET_PASSWORD@example.invalid/repo'
+        for error in (TypeError(secret), KeyError(secret), AttributeError(secret), RuntimeError(secret)):
+            with self.subTest(error=type(error).__name__), patch.object(freshness, 'git', side_effect=error):
+                result = freshness.probe(ROOT)
+            self.assertEqual(result['status'], 'unknown')
+            self.assertEqual(result['reason'], 'Check unavailable: internal error; no update performed')
+            for private in ('NONSECRET', 'fixture-user', 'example.invalid'):
+                self.assertNotIn(private, str(result))
+        with patch.object(freshness, 'git', side_effect=TypeError(secret)), patch.object(sys, 'argv', ['check-upstream.py']), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            status = freshness.main()
+        self.assertEqual(status, 2)
+        self.assertEqual(json.loads(output.getvalue())['status'], 'unknown')
+        self.assertNotIn('NONSECRET', output.getvalue())
+
+    def test_unreachable_endpoint_names_no_address(self):
+        with patch.object(freshness.urllib.request, 'build_opener') as opener:
+            opener.return_value.open.side_effect = OSError('connect to user:NONSECRET_FIXTURE@127.0.0.1 failed')
+            result = freshness.probe(ROOT, build_url='http://127.0.0.1:3100')
+        self.assertEqual(result['status'], 'unknown')
+        self.assertIn('could not be reached', result['reason'])
+        self.assertNotIn('NONSECRET_FIXTURE', str(result))
+        self.assertNotIn('127.0.0.1', result['reason'])
 
 
 class LocalBuildMetadata(unittest.TestCase):
     def test_cargo_refreshes_head_dirty_clean_and_refuses_ancestor_git(self):
-        import json
-        import os
-        import shutil
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / 'source'
             server = root / 'server'
@@ -152,7 +214,10 @@ class LocalBuildMetadata(unittest.TestCase):
                 self.assertEqual(metadata.capture()['FRAYD_BUILD_COMMITS_SINCE_TAG'], 'unknown')
             with patch.object(metadata, 'ROOT', copied.parent):
                 self.assertEqual(set(metadata.capture().values()), {'unknown'})
-            with patch.object(metadata, 'git', side_effect=['bad\nLINE', 'v0', 'false', '2\nSECRET', '']):
+            outputs = {('rev-parse', 'HEAD'): 'bad\nLINE', ('describe', '--tags', '--abbrev=0'): 'v0',
+                       ('rev-parse', '--is-shallow-repository'): 'false', ('rev-list', '--count', 'v0..HEAD'): '2\nSECRET',
+                       ('status', '--porcelain', '--untracked-files=normal'): ''}
+            with patch.object(metadata, 'git', side_effect=lambda *args: outputs[args]):
                 captured = metadata.capture()
                 self.assertEqual(captured['FRAYD_BUILD_COMMIT'], 'unknown')
                 self.assertEqual(captured['FRAYD_BUILD_COMMITS_SINCE_TAG'], 'unknown')

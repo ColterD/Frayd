@@ -27,6 +27,8 @@ def gnu_tool(name):
 
 
 class ImportRecipeTests(unittest.TestCase):
+    """Check the documented import recipe's path validation and tool calls."""
+
     def setUp(self):
         """Build a source with spaces and inert destination wrappers for the published recipe."""
         self.fixture = tempfile.TemporaryDirectory(prefix='frayd-import-recipe-')
@@ -42,16 +44,21 @@ class ImportRecipeTests(unittest.TestCase):
         tools.mkdir()
         self.bash = shutil.which('bash')
         self.assertIsNotNone(self.bash)
-        for name in ('find', 'tar', 'docker'):
-            executable = (gnu_tool(name) if name != 'docker' else shutil.which('cat'))
-            if name != 'docker' and executable is None:
-                self.skipTest(f'GNU {name} required for documented import recipe')
-            self.assertIsNotNone(executable)
-            action = ('exec ' + shlex.quote(executable) + ' "$@"'
-                      if name != 'docker' else 'exec ' + shlex.quote(executable) + ' > /dev/null')
+
+        def wrap(name, action):
+            """Install a PATH wrapper that records its invocation before running action."""
             wrapper = tools / name
             wrapper.write_text('#!/bin/sh\nprintf "%s\\n" ' + name + ' >> "$IMPORT_MARKERS"\n' + action + '\n')
             wrapper.chmod(0o700)
+
+        for name in ('find', 'tar'):
+            executable = gnu_tool(name)
+            if executable is None:
+                self.skipTest(f'GNU {name} required for documented import recipe')
+            wrap(name, 'exec ' + shlex.quote(executable) + ' "$@"')
+        cat = shutil.which('cat')
+        self.assertIsNotNone(cat)
+        wrap('docker', 'exec ' + shlex.quote(cat) + ' > /dev/null')
         self.environment = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH'],
                                 IMPORT_MARKERS=str(self.markers))
         operations = Path(__file__).resolve().parents[1] / 'docs' / 'operations.md'
@@ -86,13 +93,10 @@ class ImportRecipeTests(unittest.TestCase):
         self.assertEqual((self.source / 'payload').read_text(), 'exact fixture bytes\n')
 
     def test_absolute_source_with_spaces_reaches_synthetic_destination(self):
-        """Accept an absolute source containing spaces and invoke the expected four tools."""
+        """Accept an absolute source containing spaces and make the expected four tool calls."""
         result, markers = self.run_recipe(self.source)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(markers.count('find'), 1)
-        self.assertEqual(markers.count('tar'), 1)
-        self.assertEqual(markers.count('docker'), 2)
-        self.assertEqual(len(markers), 4)
+        self.assertEqual(sorted(markers), ['docker', 'docker', 'find', 'tar'])
         self.assertEqual((self.source / 'payload').read_text(), 'exact fixture bytes\n')
 
 

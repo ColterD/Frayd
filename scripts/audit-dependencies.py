@@ -11,7 +11,6 @@ DISPUTED_FINDING = ('block-buffer', '0.10.4', 'GHSA-qwgh-2vcv-g2f7')
 
 
 def fetch_json(request):
-    """Read one JSON response with a bounded network timeout."""
     with urllib.request.urlopen(request, timeout=45) as response:
         return json.load(response)
 
@@ -49,7 +48,6 @@ def classify(packages, results, primary_fetch=fetch_json):
 
 
 def main():
-    """Audit registry packages from the lockfile and fail on applicable advisories."""
     root = Path(__file__).resolve().parents[1]
     packages = tomllib.loads((root / 'server/Cargo.lock').read_text())['package']
     packages = [package for package in packages if package.get('source', '').startswith('registry+')]

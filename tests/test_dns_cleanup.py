@@ -54,7 +54,7 @@ class DNSCleanupTests(unittest.TestCase):
         with (
             fake_docker(mode) as trace,
             patch.object(fixture, 'docker', side_effect=fail_scenario),
-            patch.object(fixture, 'CLEANUP_TIMEOUT', 0.2, create=True),
+            patch.object(fixture, 'CLEANUP_TIMEOUT', 0.2),
             contextlib.redirect_stdout(output),
             contextlib.redirect_stderr(output),
         ):
