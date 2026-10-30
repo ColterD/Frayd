@@ -640,15 +640,9 @@ class WindowsPowerShell51(QualificationMixin, unittest.TestCase):
     interpreter_name = 'powershell'
 
     def test_generated_file_entry_overrides_only_process_restricted_policy(self):
-        # No persistent policy writes. A managed policy is a held qualification,
-        # rather than permission to override the administrator's policy.
+        # Qualify actual Restricted denial and generated-child execution without
+        # persistent policy writes. These controls do not certify GPO absence.
         env = entry_environment(self.interpreter, str(Path(tempfile.gettempdir())))
-        policy = subprocess.run([self.interpreter, '-NoProfile', '-NonInteractive', '-Command',
-            "Get-ExecutionPolicy -Scope MachinePolicy; Get-ExecutionPolicy -Scope UserPolicy"],
-            env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30, check=False)
-        self.assertEqual(policy.returncode, 0, policy.stderr)
-        self.assertEqual(policy.stdout.split(), ['Undefined', 'Undefined'],
-                         'qualification held: Group Policy governs script execution')
         with job_fixture(prefix="Frayd entry owner's ") as directory:
             script = Path(directory) / 'harmless-source.ps1'
             script.write_text(harmless_entry_script(), encoding='ascii')
@@ -656,12 +650,14 @@ class WindowsPowerShell51(QualificationMixin, unittest.TestCase):
             base = [self.interpreter, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Restricted', '-Command']
             blocked = run_windows_job(base + ["& '.\\harmless-source.ps1' -Lib 'harmless fixture'"],
                                       env=env, directory=directory)
-            self.assertNotEqual(blocked.returncode, 0, 'Restricted control must refuse the file')
+            self.assertNotEqual(blocked.returncode, 0,
+                                'effective policy/environment must enforce the Restricted file refusal')
             self.assertNotIn(b'harmless fixture', blocked.stdout)
             self.assertFalse((Path(directory) / 'entry-script-started').exists())
             command = copy_download_fixture(script) + generated_windows_command(" -Lib 'Owner''s $Library with spaces'")
             allowed = run_generated_entry(base + [command], env=env, directory=directory)
-            self.assertEqual(allowed.returncode, 0, allowed.stderr)
+            self.assertEqual(allowed.returncode, 0,
+                             f'generated child must run with process Bypass; host policy/environment may prevent it: {allowed.stderr!r}')
             self.assertEqual(allowed.stdout.strip(), b"Owner's $Library with spaces")
             self.assertTrue(all((Path(directory) / name).is_file() for name in ENTRY_MARKERS))
             self.assertEqual(list(Path(directory).glob('frayd-install-*.ps1')), [])

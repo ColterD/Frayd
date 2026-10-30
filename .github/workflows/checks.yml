@@ -50,3 +50,37 @@ jobs:
           if not result.wasSuccessful() or result.skipped:
               raise SystemExit(1)
           '@ | python
+
+  windows-full-suite:
+    needs: windows-bootstrap
+    runs-on: windows-2025
+    timeout-minutes: 20
+    env:
+      FRAYD_WINDOWS_REQUIRE_QUALIFICATION: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Record Windows qualification environment
+        shell: pwsh
+        run: |
+          git rev-parse HEAD
+          python --version
+          $PSVersionTable
+          powershell.exe -NoProfile -NonInteractive -Command '$PSVersionTable'
+          Write-Output "Runner image: $env:ImageOS / $env:ImageVersion"
+      - name: Execute installer and startup regressions without installing software
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath tests/test_bootstrap_windows.py -PathType Leaf)) {
+            throw 'Required Windows qualification suite is missing'
+          }
+          @'
+          import unittest
+          suite = unittest.defaultTestLoader.discover('tests', pattern='test_bootstrap_windows.py')
+          if suite.countTestCases() == 0:
+              raise SystemExit('No Windows bootstrap tests were discovered')
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          if not result.wasSuccessful() or result.skipped:
+              raise SystemExit(1)
+          '@ | python
