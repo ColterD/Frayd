@@ -28,4 +28,4 @@ jobs:
           if (-not (Test-Path -LiteralPath tests/test_bootstrap_windows.py -PathType Leaf)) {
             throw 'Required Windows qualification suite is missing'
           }
-          python tests/diagnose_windows_entry.py --tests-dir tests
+          python tests/diagnose_windows_entry.py --tests-dir tests --profile-control

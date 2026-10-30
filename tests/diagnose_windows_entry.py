@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 EXPECTED_HASHES = {
@@ -98,7 +99,7 @@ def report_phases(directory):
     try:
         if not path.exists():
             print('phase_events=[]', flush=True)
-            return
+            return []
         with path.open('rb') as stream:
             data = stream.read(8193)
         if len(data) > 8192:
@@ -114,40 +115,94 @@ def report_phases(directory):
             events.append(dict(zip(('stage', 'utc_ticks', 'pid', 'exe_basename', 'has_userprofile',
                                     'has_appdata', 'has_localappdata', 'has_psmodulepath'), fields, strict=True)))
         print('phase_events=' + json.dumps(events), flush=True)
+        return events
     except (OSError, ValueError, UnicodeError) as error:
         # Reporting must never replace a primary JobCleanupError.
         print('phase_report_error=' + type(error).__name__, flush=True)
+        return None
 
 
-def run_case(engine, interpreter, fixtures, controller):
+def profile_environment(base, directory, condition):
+    if condition not in {'A', 'B'}:
+        raise ProbeSetupError('profile-environment', 'invalid_profile_condition')
+    profile = Path(directory) / 'profile'
+    roaming = profile / 'AppData' / 'Roaming'
+    local = profile / 'AppData' / 'Local'
+    for folder in (roaming, local):
+        folder.mkdir(parents=True, exist_ok=True)
+    env = dict(base)
+    if condition == 'B':
+        env.update(USERPROFILE=str(profile), APPDATA=str(roaming), LOCALAPPDATA=str(local))
+    return env
+
+
+def phase_before_deadline(case, stage):
+    start = case['launch_utc_ticks']
+    return any(event['stage'] == stage and start <= int(event['utc_ticks']) < start + 300_000_000
+               for event in case['events'] or [])
+
+
+def profile_bundle_oracle(cases):
+    comparisons = []
+    for engine in ('pwsh', 'powershell'):
+        original = cases[(engine, 'A')]
+        treatment = cases[(engine, 'B')]
+        flags_valid = all(
+            case['events'] and all(all(event[key] == expected for key in (
+                'has_userprofile', 'has_appdata', 'has_localappdata')) for event in case['events'])
+            for case, expected in ((original, '0'), (treatment, '1')))
+        original_reached_boundary = phase_before_deadline(original, 'before-join-path')
+        original_progress = all(phase_before_deadline(original, stage) for stage in ('after-join-path', 'before-sleep'))
+        treatment_progress = all(phase_before_deadline(treatment, stage) for stage in ('after-join-path', 'before-sleep'))
+        comparisons.append({'engine': engine, 'profile_flags_valid': bool(flags_valid),
+                            'original_reached_boundary': original_reached_boundary,
+                            'original_progress_before_30': original_progress,
+                            'treatment_progress_before_30': treatment_progress,
+                            'bundle_supported': bool(flags_valid and original_reached_boundary
+                                                     and treatment_progress and not original_progress)})
+    supported = all(item['bundle_supported'] for item in comparisons)
+    print('profile_bundle_oracle=' + json.dumps({'comparisons': comparisons, 'supported': supported,
+          'individual_variable_causality': 'unverified', 'production_acceptance': 'unverified'}), flush=True)
+    return supported
+
+
+def run_case(engine, interpreter, fixtures, controller, condition=None):
     with controller.job_fixture(prefix='Frayd startup probe ') as directory:
         source = Path(directory) / 'harmless-source.ps1'
         setup_stage('construct-child')
         source.write_text(instrument_child(fixtures), encoding='ascii')
         setup_stage('construct-parent')
         command = instrument_parent(fixtures, source)
-        print('case=' + engine, flush=True)
+        env = fixtures.entry_environment(interpreter, directory)
+        if condition is not None:
+            env = profile_environment(env, directory, condition)
+        print('case=' + engine + (':' + condition if condition is not None else ''), flush=True)
+        # .NET ticks since year1; the slightly earlier timestamp is conservative.
+        launch_utc_ticks = time.time_ns() // 100 + 621_355_968_000_000_000
+        print('case_launch_utc_ticks=' + str(launch_utc_ticks), flush=True)
+        cleanup_ok = False
         try:
             result = controller.run_windows_job(
                 [interpreter, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command],
-                env=fixtures.entry_environment(interpreter, directory), directory=directory)
+                env=env, directory=directory)
+            print('unexpected_completion=' + str(result.returncode), flush=True)
         except controller.JobTimeout as error:
             print('cleanup=' + json.dumps({'status': 'JobTimeout', 'active': error.job_active_processes,
                   'total': error.job_total_processes, 'host_exited': error.host_exited,
                   'elapsed': error.elapsed}), flush=True)
-            return error.job_active_processes == 0 and error.host_exited and 30 <= error.elapsed < 36
+            cleanup_ok = error.job_active_processes == 0 and error.host_exited and 30 <= error.elapsed < 36
         except controller.JobCleanupError:
             print('cleanup_unverified_fixture=' + directory, flush=True)
             raise
         finally:
-            report_phases(directory)
-        print('unexpected_completion=' + str(result.returncode), flush=True)
-        return False
+            events = report_phases(directory)
+        return {'cleanup_ok': cleanup_ok, 'events': events, 'launch_utc_ticks': launch_utc_ticks}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--tests-dir', type=Path, default=Path.cwd() / 'tests')
+    parser.add_argument('--profile-control', action='store_true', help='run B then A per engine; test private profile bundle')
     args = parser.parse_args()
     setup_stage('platform')
     if os.name != 'nt':
@@ -157,12 +212,20 @@ def main():
     verified = verify_sources(tests)
     controller, fixtures = load_verified_modules(tests, verified)
     succeeded = True
+    cases = {}
     for engine in ('pwsh', 'powershell'):
         setup_stage('resolve-' + engine)
         interpreter = shutil.which(engine)
         if interpreter is None:
             raise ProbeSetupError('resolve-' + engine, 'required_interpreter_missing')
-        succeeded = run_case(engine, interpreter, fixtures, controller) and succeeded
+        for condition in (('B', 'A') if args.profile_control else (None,)):
+            case = run_case(engine, interpreter, fixtures, controller, condition)
+            cases[(engine, condition)] = case
+            succeeded = case['cleanup_ok'] and succeeded
+    if args.profile_control:
+        supported = profile_bundle_oracle(cases)
+        print('diagnostic_cleanup_verified=' + json.dumps(succeeded), flush=True)
+        return 0 if succeeded and supported else 1
     # A diagnostic exit0 proves bounded ownership cleanup only, not startup acceptance.
     return 0 if succeeded else 1
 
