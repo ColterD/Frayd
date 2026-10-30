@@ -15,7 +15,6 @@ class AuditPolicyTests(unittest.TestCase):
     """Keep incomplete scans and unverified exceptions from reporting a clean audit."""
 
     def setUp(self):
-        """Build the exact disputed finding and publisher evidence fixtures."""
         self.packages = [{'name': 'block-buffer', 'version': '0.10.4'}]
         self.results = [{'vulns': [{'id': 'GHSA-qwgh-2vcv-g2f7'}]}]
         self.primary = {'ghsa_id': 'GHSA-qwgh-2vcv-g2f7', 'vulnerabilities': [
@@ -24,11 +23,9 @@ class AuditPolicyTests(unittest.TestCase):
              'vulnerable_functions': []}]}
 
     def classify(self, primary=None):
-        """Classify the fixture with the selected publisher evidence."""
         return audit.classify(self.packages, self.results, lambda url: self.primary if primary is None else primary)
 
     def test_verified_publisher_range_resolves_only_exact_finding(self):
-        """Accept the disputed finding only with verified publisher provenance."""
         report = self.classify()
         self.assertEqual(report['affected'], [])
         self.assertEqual(report['resolved'][0]['source'], audit.PRIMARY_URL)
@@ -65,7 +62,6 @@ class AuditPolicyTests(unittest.TestCase):
 
     def test_unavailable_publisher_fails_closed(self):
         def unavailable(url):
-            """Simulate failure to retrieve publisher evidence."""
             raise OSError('offline')
         report = audit.classify(self.packages, self.results, unavailable)
         self.assertEqual(report['affected'][0]['classification_error'], 'offline')
