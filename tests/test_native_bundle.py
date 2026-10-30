@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import socket
@@ -75,6 +76,15 @@ def running_child_pid(prefix):
     return document['pid'] if document.get('state') == 'running' else None
 
 
+def shared_running_child_pid(*roots):
+    """Return the server's pid once every root's child receipt says running with that same pid.
+
+    The helper writes the prefix receipt before the data receipt, so a missing or partly written second one reads as not yet.
+    """
+    pids = {running_child_pid(root) for root in roots}
+    return pids.pop() if len(pids) == 1 and None not in pids else None
+
+
 def snapshot(root):
     """Names, modes and bytes (or symlink targets) of everything under root."""
     return [(str(p.relative_to(root)), p.lstat().st_mode, os.readlink(p) if p.is_symlink() else p.read_bytes() if p.is_file() else None) for p in sorted(root.rglob('*'))]
@@ -94,28 +104,76 @@ def setUpModule():
 
 
 class RunBounded(unittest.TestCase):
-    def test_timeout_kills_descendants(self):
-        grandchild = "import fcntl,pathlib,sys,time; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); pathlib.Path(sys.argv[2]).touch(); time.sleep(20)"
-        driver = "import subprocess,sys,time; subprocess.Popen([sys.executable,'-c',*sys.argv[1:]]); time.sleep(20)"
-        with tempfile.TemporaryDirectory() as directory:
-            lease = Path(directory) / 'lease'
-            ready = Path(directory) / 'ready'
-            with self.assertRaises(subprocess.TimeoutExpired):
-                run_bounded([sys.executable, '-c', driver, grandchild, str(lease), str(ready)], timeout=3)
-            self.assertTrue(ready.exists(), 'grandchild never took its lease')
+    # The grandchild sleeps argv[3] seconds, takes the lease, then marks itself ready and holds the lease.
+    GRANDCHILD = ("import fcntl,pathlib,sys,time; time.sleep(float(sys.argv[3])); f=open(sys.argv[1],'w'); "
+                  "fcntl.flock(f,fcntl.LOCK_EX); pathlib.Path(sys.argv[2]).touch(); time.sleep(60)")
+    DRIVER = "import subprocess,sys,time; subprocess.Popen([sys.executable,'-c',*sys.argv[1:]]); time.sleep(60)"
 
-            def lease_released():
-                with lease.open('a') as handle:
-                    try:
-                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    except BlockingIOError:
-                        return False
+    def run_after_handshake(self, startup_delay, ready_timeout):
+        """Call run_bounded with a 1 s timeout that starts only once the grandchild holds its lease.
+
+        The handshake has its own ready_timeout, so a slow interpreter start cannot consume the timeout under
+        test. Returns the process group and a probe that reports whether the lease is still held.
+        """
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        lease, ready = Path(directory.name) / 'lease', Path(directory.name) / 'ready'
+        groups = []
+        communicate = subprocess.Popen.communicate
+
+        def lease_held():
+            with lease.open('a') as handle:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
                     return True
+                fcntl.flock(handle, fcntl.LOCK_UN)
+                return False
 
-            wait_for(lease_released, 'the killed grandchild to release its lease', timeout=5)
+        def communicate_after_handshake(process, *arguments, **options):
+            groups.append(process.pid)
+            wait_for(lambda: ready.exists() and lease_held(), 'the grandchild to hold its lease', ready_timeout)
+            return communicate(process, *arguments, **options)
+
+        command = [sys.executable, '-c', self.DRIVER, self.GRANDCHILD, str(lease), str(ready), str(startup_delay)]
+        try:
+            with mock.patch.object(subprocess.Popen, 'communicate', communicate_after_handshake):
+                run_bounded(command, timeout=1)
+        finally:
+            self.group = groups[0]
+            self.lease_held = lease_held
+
+    def assert_group_gone(self):
+        def gone():
+            try:
+                os.killpg(self.group, 0)
+            except ProcessLookupError:
+                return True
+            return False
+        wait_for(gone, 'the killed process group to exit', timeout=5)
+        self.assertFalse(self.lease_held(), 'a descendant still holds the lease')
+
+    def test_timeout_kills_descendants_even_after_a_slow_start(self):
+        for startup_delay in (0, 3.2):
+            with self.subTest(startup_delay=startup_delay):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    self.run_after_handshake(startup_delay, ready_timeout=30)
+                self.assert_group_gone()
+
+    def test_grandchild_that_never_gets_ready_fails_at_its_deadline_and_is_killed(self):
+        started = time.monotonic()
+        with self.assertRaisesRegex(AssertionError, 'the grandchild to hold its lease'):
+            self.run_after_handshake(startup_delay=60, ready_timeout=1)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assert_group_gone()
 
 
 KEY = r'(\s*(?:- )?\s*){}:(?:\s+(.*?))?(?:\s+#.*)?$'
+# Rosetta passes an x86_64 uname check; only sysctl.proc_translated=1 reveals translation.
+ROSETTA_CHECK = 'test "$(sysctl -n sysctl.proc_translated 2>/dev/null || true)" != 1'
+# An --exact cargo filter that matches nothing exits 0; its teed log must show exactly one passed test.
+EXACT_TEE = '| tee "$RUNNER_TEMP/frayd-retained-job-test.log"'
+EXACT_RESULT = 'grep -F \'test result: ok. 1 passed; 0 failed;\' "$RUNNER_TEMP/frayd-retained-job-test.log"'
 
 
 def entries(lines, key):
@@ -139,7 +197,7 @@ def children(body):
 
 
 def workflow_policy_violations(text):
-    """List every way the macOS workflow stops being manual, read-only, non-publishing and locked."""
+    """Check known policy invariants in this repository's block-style macOS workflow."""
     lines, problems = text.splitlines(), []
     triggers = [(inline, children(body)) for column, inline, body in entries(lines, 'on') if column == 0]
     if len(triggers) != 1 or triggers[0][0] or set(triggers[0][1]) != {'workflow_dispatch'}:
@@ -164,6 +222,11 @@ def workflow_policy_violations(text):
     cargo = [line.strip() for line in scripts if re.search(r'(?<![\w./-])cargo\s', line)]
     if any(re.search(r'\blipo\b|brew install', line) for line in scripts):
         problems.append('universal binaries and brew installs are not part of the native qualification')
+    if ROSETTA_CHECK not in [line.strip() for line in scripts]:
+        problems.append(f'no step rejects Rosetta translation with exactly: {ROSETTA_CHECK}')
+    exact = [line.strip() for line in cargo if '--exact' in line]
+    if exact and (EXACT_RESULT not in [line.strip() for line in scripts] or not all(line.endswith(EXACT_TEE) for line in exact)):
+        problems.append('a cargo --exact filter must tee its log and assert exactly one passed test')
     problems += [f'cargo without --locked: {line}' for line in cargo if '--locked' not in line]
     if not any('--bin frayd-native' in line for line in cargo):
         problems.append('no cargo invocation builds --bin frayd-native')
@@ -214,6 +277,12 @@ class NativeSourceContract(unittest.TestCase):
             'flow-style trigger': ('on:\n  workflow_dispatch:\n', 'on: [push, workflow_dispatch]\n', 'triggers'),
             'inline write-all': ('permissions:\n  contents: read', 'permissions: write-all', 'permission'),
             'job-level write': ('    timeout-minutes: 35\n', '    timeout-minutes: 35\n    permissions:\n      contents: write\n', 'permission scope can write'),
+            'Rosetta check removed': ('          ' + ROSETTA_CHECK + '\n', '', 'Rosetta'),
+            'Rosetta check commented out': ('          ' + ROSETTA_CHECK, '          # ' + ROSETTA_CHECK, 'Rosetta'),
+            'Rosetta check neutralized': (ROSETTA_CHECK, ROSETTA_CHECK + ' || true', 'Rosetta'),
+            'zero-test exact filter': ('          ' + EXACT_RESULT + '\n', '', 'exactly one passed test'),
+            'exact filter log not kept': (' ' + EXACT_TEE, '', 'exactly one passed test'),
+            'any passed count accepted': ("ok. 1 passed; 0 failed;'", "ok.'", 'exactly one passed test'),
         }
         for name, (old, new, expected) in mutations.items():
             with self.subTest(name):
@@ -276,6 +345,26 @@ class NativeSourceContract(unittest.TestCase):
                     else:
                         self.assertEqual((len(result.skipped), result.errors, result.failures), (1, [], []))
 
+    def test_required_qualification_fails_instead_of_skipping(self):
+        """With FRAYD_NATIVE_REQUIRE_QUALIFICATION=1, missing inputs fail the module before any class skip,
+        and a root run fails the one scenario that otherwise skips for root."""
+        with mock.patch.dict(os.environ, {'FRAYD_NATIVE_REQUIRE_QUALIFICATION': '1'}):
+            for name in ['FRAYD_NATIVE_HELPER', 'FRAYD_NATIVE_ARCHIVE', 'FRAYD_NATIVE_BUILD_SOURCE']:
+                os.environ.pop(name, None)
+            with self.assertRaisesRegex(RuntimeError, 'missing: FRAYD_NATIVE_HELPER, FRAYD_NATIVE_ARCHIVE, FRAYD_NATIVE_BUILD_SOURCE'):
+                setUpModule()
+        root_only = 'test_final_removal_failure_after_confirmation_restores_retry_metadata'
+        for required, outcome in [('1', 'failures'), (None, 'skipped')]:
+            with self.subTest(required=required), mock.patch.dict(os.environ), mock.patch('os.geteuid', return_value=0), \
+                    mock.patch.object(NativeOwnership, 'setUp', lambda test: None):
+                os.environ.pop('FRAYD_NATIVE_REQUIRE_QUALIFICATION', None)
+                if required:
+                    os.environ['FRAYD_NATIVE_REQUIRE_QUALIFICATION'] = required
+                result = unittest.TestResult()
+                NativeOwnership(root_only).run(result)
+                counts = {kind: len(getattr(result, kind)) for kind in ['failures', 'errors', 'skipped']}
+                self.assertEqual(counts, {'failures': 0, 'errors': 0, 'skipped': 0, outcome: 1}, result.failures + result.errors)
+
 
 class NativeOwnership(unittest.TestCase):
     @classmethod
@@ -315,8 +404,8 @@ class NativeOwnership(unittest.TestCase):
             entries.append({'path': p.relative_to(self.bundle).as_posix(), 'kind': 'dir' if p.is_dir() else 'file', 'mode': stat.S_IMODE(p.stat().st_mode), 'size': p.stat().st_size if p.is_file() else 0, 'sha256': hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else ''})
         (self.bundle / 'manifest.json').write_text(json.dumps({'schema': 1, 'version': '0.1.1', 'source': 'a' * 40, 'target': 'fixture', 'toolchain': 'fixture', 'entries': entries}))
 
-    def run_helper(self, command, *args, code=0, answer='', environment=None):
-        result = run_bounded([str(HELPER), command, '--prefix', str(self.prefix), *args], input=answer, text=True, capture_output=True, env=environment)
+    def run_helper(self, command, *args, code=0, answer='', environment=None, timeout=60):
+        result = run_bounded([str(HELPER), command, '--prefix', str(self.prefix), *args], input=answer, text=True, capture_output=True, env=environment, timeout=timeout)
         self.assertEqual(result.returncode, code, result.stderr)
         return result
 
@@ -325,6 +414,29 @@ class NativeOwnership(unittest.TestCase):
 
     def snapshot(self):
         return snapshot(self.base)
+
+    def prompt(self, command, *args):
+        """Start a helper command, wait at its consent prompt and return the process and the prompt bytes."""
+        process = subprocess.Popen([str(HELPER), command, '--prefix', str(self.prefix), *args],
+                                   stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
+        self.addCleanup(self.stop_helper, process)
+        os.set_blocking(process.stderr.fileno(), False)
+        prompt = bytearray()
+
+        def prompted():
+            prompt.extend(process.stderr.read() or b'')
+            return prompt.endswith(b'[y/N] ') or process.poll() is not None
+        wait_for(prompted, f'{command} consent prompt')
+        self.assertTrue(prompt.endswith(b'[y/N] '), prompt)
+        os.set_blocking(process.stderr.fileno(), True)
+        return process, bytes(prompt)
+
+    @staticmethod
+    def stop_helper(process):
+        """Kill the helper's own session only while it is unreaped, so its pid cannot name another process."""
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+        process.communicate(timeout=10)
 
     def test_package_complete_manifest_and_architecture(self):
         output = self.base / 'package output'
@@ -600,7 +712,10 @@ class NativeOwnership(unittest.TestCase):
 
     def test_final_removal_failure_after_confirmation_restores_retry_metadata(self):
         if os.geteuid() == 0:
-            self.skipTest('root bypasses the parent mode that makes the final prefix removal fail')
+            reason = 'root bypasses the parent mode that makes the final prefix removal fail'
+            if os.environ.get('FRAYD_NATIVE_REQUIRE_QUALIFICATION') == '1':
+                self.fail(reason + '; required qualification must run unprivileged')
+            self.skipTest(reason)
         self.install('--yes')
         receipt = (self.prefix / '.frayd-install.json').read_bytes()
         # The parent-mode preflight passes; the parent becomes read-only while the helper waits for consent.
@@ -708,7 +823,7 @@ class NativeOwnership(unittest.TestCase):
         process = subprocess.Popen([str(HELPER), 'start', '--prefix', str(self.prefix)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         try:
             marker = self.prefix / '.frayd-child.json'
-            child = wait_for(lambda: running_child_pid(self.prefix), 'fixture child start')
+            child = wait_for(lambda: shared_running_child_pid(self.prefix, self.data), 'prefix and data child receipts')
             before = self.snapshot()
             self.run_helper('uninstall', '--yes', code=2)
             self.run_helper('start', code=2)
@@ -739,6 +854,69 @@ class NativeOwnership(unittest.TestCase):
         before = self.snapshot()
         self.install('--yes', code=2)
         self.assertEqual(self.snapshot(), before)
+
+    def test_shared_writable_ancestor_refused_without_writes(self):
+        self.addCleanup(self.base.chmod, 0o700)
+        for mode in [0o775, 0o777]:
+            with self.subTest(mode=oct(mode)):
+                self.base.chmod(mode)
+                before = self.snapshot()
+                result = self.install('--yes', code=2)
+                self.assertIn('group/other-writable non-sticky target ancestor refused', result.stderr)
+                self.assertEqual(self.snapshot(), before)
+        self.base.chmod(0o700)
+        self.install('--yes')
+
+    def test_data_directory_appearing_during_consent_is_not_adopted(self):
+        process, _ = self.prompt('install', '--bundle', str(self.bundle), '--data-dir', str(self.data))
+        self.data.mkdir(mode=0o700)
+        sentinel = self.data / 'unowned'
+        sentinel.write_bytes(b'preserve')
+        _, stderr = process.communicate(b'y\n', timeout=10)
+        self.assertEqual(process.returncode, 2, stderr)
+        self.assertEqual(sentinel.read_bytes(), b'preserve')
+        self.assertFalse((self.data / '.frayd-data.json').exists())
+        self.assertFalse(self.prefix.exists())
+
+    def test_uninstall_prompt_identifies_the_locked_installation(self):
+        self.install('--yes')
+        before = self.snapshot()
+        process, prompt = self.prompt('uninstall')
+        expected = f'Remove unchanged owned installation version 0.1.1 at {self.prefix}; keep all data at {self.data}? [y/N] '
+        self.assertTrue(prompt.endswith(expected.encode()), prompt)
+        busy = self.run_helper('uninstall', '--yes', code=2)
+        self.assertIn('installation active or lifecycle busy', busy.stderr)
+        process.communicate(b'n\n', timeout=10)
+        self.assertEqual(process.returncode, 0)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_shared_data_refuses_a_second_prefix_while_the_first_runs_and_after_its_supervisor_crashes(self):
+        # The fixture server exits by itself once cleanup creates the stop file; no cleanup signals its pid.
+        stop, exited = self.base / 'stop fixture server', self.base / 'fixture server exited'
+        (self.bundle / 'frayd-server').write_text(
+            f'#!/bin/sh\ni=0\nwhile [ ! -e {shlex.quote(str(stop))} ] && [ "$i" -lt 600 ]; do sleep 0.1; i=$((i + 1)); done\n'
+            f': > {shlex.quote(str(exited))}\n')
+        self.manifest()
+        self.install('--yes')
+        first, self.prefix = self.prefix, self.base / 'second prefix'
+        self.install('--yes')
+        supervisor = subprocess.Popen([str(HELPER), 'start', '--prefix', str(first)],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        self.addCleanup(self.stop_helper, supervisor)
+        child = wait_for(lambda: shared_running_child_pid(first, self.data), 'first prefix and data child receipts')
+        self.addCleanup(wait_for, exited.exists, 'fixture server exit after its stop file')
+        self.addCleanup(stop.touch)
+        before = self.snapshot()
+        refused = self.run_helper('start', code=2, timeout=10)
+        self.assertIn('data directory active or lifecycle busy', refused.stderr)
+        self.assertEqual(self.snapshot(), before)
+        os.kill(supervisor.pid, signal.SIGKILL)  # Unreaped, so the pid is still the supervisor's.
+        supervisor.wait(timeout=10)
+        before = self.snapshot()
+        refused = self.run_helper('start', code=2, timeout=10)
+        self.assertIn(f'active or uncertain data child receipt at {self.data / ".frayd-child.json"}', refused.stderr)
+        self.assertEqual(self.snapshot(), before)
+        os.kill(child, 0)  # The orphaned first server still runs: the refused start neither stops nor adopts it.
 
 
 @unittest.skipUnless(

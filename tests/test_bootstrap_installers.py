@@ -161,10 +161,52 @@ class BootstrapShell(unittest.TestCase):
 
     def test_unknown_flag_stops_before_any_install(self):
         """Guards against an unknown flag becoming the library path and failing only after installs and clone."""
-        run = self.run_bootstrap('--bogus')
-        self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
-        self.assertIn('Unknown option: --bogus', run.stderr)
-        self.assertEqual(run.calls, [])
+        for arguments, flag in ((('--bogus',), '--bogus'), (('-x',), '-x'), (('--tunnel', 'tailscale', '--bogus'), '--bogus'),
+                                (('--bogus', '--', 'media'), '--bogus')):
+            with self.subTest(arguments=arguments):
+                self.setUp()
+                run = self.run_bootstrap(*arguments)
+                self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+                self.assertIn(f'Unknown option: {flag}', run.stderr)
+                self.assertEqual(run.calls, [])
+
+    def installed_library(self, run):
+        match = re.search(r'(?m)^FRAYD_LIBRARY=(.*)$', self.env_file(run))
+        self.assertIsNotNone(match, self.env_file(run))
+        return Path(match.group(1))
+
+    def test_double_dash_makes_a_leading_dash_library_positional(self):
+        """Guards against a library path that begins with '-' being rejected as an unknown option."""
+        run = self.run_bootstrap('--', '-weird-dir')
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn('Media folder: -weird-dir', run.stdout)
+        library = self.installed_library(run)
+        self.assertEqual(library.name, '-weird-dir')
+        self.assertTrue(library.is_dir())
+        self.assertIn('Local network only', run.stdout)
+
+    def test_double_dash_after_tunnel_keeps_the_tunnel(self):
+        run = self.run_bootstrap('--tunnel', 'tailscale', '--', '-weird-dir')
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(self.installed_library(run).name, '-weird-dir')
+        self.assertIn('Tailscale remote access', run.stdout)
+        self.assertTrue(run.called('sudo tailscale up'))
+
+    def test_everything_after_double_dash_is_positional(self):
+        """Guards against '--tunnel' after the terminator still being parsed as an option."""
+        run = self.run_bootstrap('--', '--tunnel')
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn('Media folder: --tunnel', run.stdout)
+        self.assertEqual(self.installed_library(run).name, '--tunnel')
+        self.assertIn('Local network only', run.stdout)
+        self.assertFalse(run.called('sudo tailscale'))
+
+    def test_leading_dash_library_typed_at_the_prompt_is_created(self):
+        run = self.run_bootstrap(stdin='-typed-dir\n')
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        library = self.installed_library(run)
+        self.assertEqual(library.name, '-typed-dir')
+        self.assertTrue(library.is_dir())
 
     def test_failed_pipeline_download_stops_the_script(self):
         """Guards against a failed curl feeding 'sudo tee' going unnoticed when pipefail is off."""
@@ -241,9 +283,19 @@ class BootstrapShell(unittest.TestCase):
         self.assertFalse(manual.called('systemctl'))
         self.assertFalse(manual.called('launchctl'))
 
+    def test_inherited_started_variable_does_not_claim_a_running_service(self):
+        """Guards against STARTED from the caller's environment passing as proof that a service started."""
+        run = self.run_bootstrap(str(self.library), tools=('cargo',), environment={'STARTED': '1'})
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn('start manually', run.stdout)
+        self.assertNotIn('Frayd running', run.stdout)
+        self.assertIn('once started it serves http://localhost:8484', run.stdout)
+        self.assertFalse(run.called('systemctl'))
+        self.assertFalse(run.called('launchctl'))
+
 
 class BootstrapPowerShellStatic(unittest.TestCase):
-    """Static checks only. ps1 behavior is not executed here: pwsh is not required to run the suite."""
+    """Static text checks only; ps1 is never executed here. tests/test_bootstrap_windows.py runs it on Windows."""
 
     @classmethod
     def setUpClass(cls):

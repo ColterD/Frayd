@@ -11,7 +11,7 @@ pub static BUSY: AtomicBool = AtomicBool::new(false);
 /// Release admission even when a worker unwinds.
 struct JobReset;
 impl Drop for JobReset {
-    /// Make the next queued job admissible after every worker exit.
+    /// Make the next worker admissible after every worker exit or failed start.
     fn drop(&mut self) { BUSY.store(false, Ordering::SeqCst); }
 }
 
@@ -343,10 +343,14 @@ pub fn recover_pending_jobs_with_roots(db_path: &str, roots: &[PathBuf]) {
 pub fn maybe_enqueue_with_roots(db_path: String, media_id: i64, src: PathBuf, roots: Vec<PathBuf>) {
     let _admission=crate::ROOT_ADMISSION.lock().unwrap();
     if BUSY.swap(true, Ordering::SeqCst) { return; }
-    std::thread::spawn(move || {
-        let _reset = JobReset;
+    // The closure owns admission before spawning: an OS refusal drops it and releases BUSY.
+    let reset=JobReset;
+    if let Err(error)=std::thread::Builder::new().spawn(move || {
+        let _reset=reset;
         run_job_with_roots(&db_path, media_id, &src, &roots);
-    });
+    }) {
+        tracing::warn!(%error,"conversion worker unavailable; source retained for a later scan");
+    }
 }
 
 /// Look up an unconverted indexed source on a dedicated connection and queue it like a new item.
@@ -443,6 +447,36 @@ mod tests {
         /// Remove only the UUID-scoped fixture tree owned by this test.
         fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
     }
+    /// An actual OS thread-start refusal must release conversion admission without poisoning its mutex.
+    #[test]
+    fn conversion_spawn_failure_releases_admission() {
+        if std::env::var_os("FRAYD_TEST_SPAWN_FAILURE").is_none() {
+            assert_child_passes(child("transcode::tests::conversion_spawn_failure_releases_admission")
+                .env("FRAYD_TEST_SPAWN_FAILURE","1"));
+            return;
+        }
+        let fixture=Fixture::new();
+        let database=fixture.0.join("missing/db.sqlite").to_string_lossy().into_owned();
+        let source=fixture.source("source.mkv");let roots=vec![fixture.0.join("library")];
+        let mut original=libc::rlimit {rlim_cur:0,rlim_max:0};
+        assert_eq!(unsafe {libc::getrlimit(libc::RLIMIT_AS,&mut original)},0);
+        let limited=libc::rlimit {rlim_cur:1,rlim_max:original.rlim_max};
+        assert_eq!(unsafe {libc::setrlimit(libc::RLIMIT_AS,&limited)},0);
+        let result=std::panic::catch_unwind(||maybe_enqueue_with_roots(database.clone(),1,source.clone(),roots.clone()));
+        assert_eq!(unsafe {libc::setrlimit(libc::RLIMIT_AS,&original)},0);
+        assert!(result.is_ok(),"OS spawn refusal unwound through ROOT_ADMISSION");
+        assert!(!BUSY.load(Ordering::SeqCst),"failed spawn stranded BUSY");
+        assert!(!crate::ROOT_ADMISSION.is_poisoned(),"failed spawn poisoned ROOT_ADMISSION");
+        // The restored process can admit and finish another worker; its intentionally absent DB fails closed.
+        maybe_enqueue_with_roots(database,1,source.clone(),roots);
+        for _ in 0..400 {
+            if !BUSY.load(Ordering::SeqCst) {break;}
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!BUSY.load(Ordering::SeqCst),"later worker never released admission");
+        assert_eq!(std::fs::read(source).unwrap(),b"original");
+    }
+
     /// Seed an explicit media identity independently of scanner metadata probing.
     fn insert(db: &Connection,id:i64,path:&Path) {
         db.execute("INSERT INTO media(id,kind,path,title) VALUES(?1,'movie',?2,'fixture')",rusqlite::params![id,path.to_str().unwrap()]).unwrap();

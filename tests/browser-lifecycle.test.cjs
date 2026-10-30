@@ -2,7 +2,7 @@
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
 const { createServer } = require('node:http');
-const { mkdtempSync, readFileSync, existsSync, rmSync, writeFileSync, mkdirSync, unlinkSync } = require('node:fs');
+const { mkdtempSync, readFileSync, readdirSync, existsSync, rmSync, writeFileSync, mkdirSync, unlinkSync } = require('node:fs');
 const { join, resolve, dirname } = require('node:path');
 const { tmpdir } = require('node:os');
 const { once, EventEmitter } = require('node:events');
@@ -207,6 +207,29 @@ test('original browser failure remains visible alongside an injected profile-rem
   } finally {
     rmSync(resultDirectory, { recursive: true, force: true });
     if (retainedProfile) rmSync(retainedProfile, { recursive: true, force: true });
+  }
+});
+
+test('loading the runner creates no result directory; a run that writes results creates exactly one', { timeout: 8000 }, async () => {
+  const runner = resolve(__dirname, 'browser-regression.cjs');
+  const privateTmp = mkdtempSync(join(tmpdir(), 'frayd-result-directory-oracle-'));
+  const resultDirectories = () => readdirSync(privateTmp).filter(name => name.startsWith('frayd-dom-regression-'));
+  // An empty FRAYD_DOM_RESULT_DIR selects the default per-run directory under the private TMPDIR.
+  const environment = { TMPDIR: privateTmp, FRAYD_DOM_RESULT_DIR: '' };
+  try {
+    const loaded = await runNode(`require(${JSON.stringify(runner)});`, environment);
+    assert.equal(loaded.code, 0, loaded.stderr);
+    assert.deepEqual(resultDirectories(), [], 'Loading the runner creates no result directory');
+    const run = await runNode(`
+      require(${JSON.stringify(runner)}).main({ cacheSetup: async () => ({ receipt: { injectedTestDouble: true }, close: async () => {} }) })
+        .catch(error => { console.error(error.stack); process.exitCode = 1; });
+    `, { ...environment, BROWSER_BIN: executable, FRAYD_CHILD_FIXTURE_EARLY_EXIT: '1' });
+    assert.equal(run.code, 1, run.stderr);
+    const written = resultDirectories();
+    assert.equal(written.length, 1, 'A run that writes results creates exactly one result directory');
+    assert.deepEqual(JSON.parse(readFileSync(join(privateTmp, written[0], 'result.json'), 'utf8')), JSON.parse(run.stdout));
+  } finally {
+    rmSync(privateTmp, { recursive: true, force: true });
   }
 });
 

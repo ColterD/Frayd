@@ -2011,6 +2011,45 @@ test('host audio zero echo preserves 106 s through progress tick and native paus
   assert.equal(audio.paused, true);
 });
 
+// The browser may unload before the server receives a logout POST.
+test('sign-out admits logout beyond reload while purging local account state immediately', async () => {
+  const storage = { frayd_identity: 'logout-fixture', frayd_token: 'nonfunctional-fixture-token' };
+  const b = browser({ storage, initialResponse: async () => reply([]) });
+  await settle();
+  let reloaded = false;
+  b.respond(url => url === '/api/auth/logout' ? new Promise(() => {}) : reply([]));
+  b.context.location.reload = () => { reloaded = true; };
+  b.nodes.get('#logout').emit('click');
+  assert.equal(reloaded, true, 'A pending server response cannot delay local sign-out');
+  assert.equal(storage.frayd_token, undefined);
+  assert.equal(storage.frayd_logout, '1');
+  assert.equal(storage.frayd_identity, 'logout-fixture', 'The progress identity survives sign-out');
+  const request = b.requests.find(request => request.url === '/api/auth/logout');
+  assert.equal(request.options.keepalive, true, 'The logout POST must survive document unload');
+  assert.equal(request.options.headers.Authorization, 'Bearer nonfunctional-fixture-token', 'Revocation retains the outgoing bearer before local purge');
+});
+
+for (const failure of ['offline', 'server']) {
+  test(`sign-out preserves explicit sign-in after ${failure} logout failure`, async () => {
+    const storage = { frayd_identity: 'logout-fixture', frayd_token: 'nonfunctional-fixture-token' };
+    const b = browser({ storage, initialResponse: async () => reply([]) });
+    await settle();
+    b.respond(async () => {
+      if (failure === 'offline') throw new TypeError('Fixture network unavailable');
+      return { ok: false, status: 503 };
+    });
+    let reloaded = false;
+    b.context.location.reload = () => { reloaded = true; };
+    b.nodes.get('#logout').emit('click');
+    await settle();
+    assert.equal(reloaded, true);
+    assert.equal(storage.frayd_token, undefined);
+    assert.equal(storage.frayd_logout, '1');
+    assert.equal(storage.frayd_identity, 'logout-fixture');
+    assert.equal(b.run('account'), null);
+  });
+}
+
 // A logout reload must choose the sign-in layout before any LAN auto-resume.
 for (const mode of ['guest', 'account']) {
   test(`${mode} sign-out reload shows only sign-in and permits explicit re-entry`, async () => {

@@ -111,8 +111,8 @@ function gen() {
     cmd = `cd $env:TEMP; irm "${base}/bootstrap.ps1" -OutFile frayd-install.ps1; & .\\frayd-install.ps1${argStr}`;
   } else {
     const args = [];
-    if (l) args.push(quotePosixArgument(l));
     if (tunnel()) args.push(`--tunnel ${quotePosixArgument(tunnel())}`);
+    if (l) args.push(`-- ${quotePosixArgument(l)}`);
     const argStr = args.length ? ' ' + args.join(' ') : '';
     cmd = `curl -fsSL "${base}/bootstrap.sh" -o frayd-install.sh && bash frayd-install.sh${argStr}`;
   }

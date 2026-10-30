@@ -174,8 +174,7 @@ pub fn delete_session(db: &Connection, token: &str) {
 mod tests {
     use super::*;
 
-    /// A per-run password, so no credential literal lives in the test source.
-    fn fixture_password() -> String { uuid::Uuid::new_v4().to_string() }
+    use crate::test_support::fixture_password;
 
     /// IPv6 peers share one key per /64; IPv4 and IPv4-mapped IPv6 peers key by the single IPv4 address.
     #[test]

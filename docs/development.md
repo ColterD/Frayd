@@ -142,7 +142,7 @@ The browser reader waits for fonts and a positive layout before it reports a pag
 
 ### Unwired UI design fragments
 
-[docs/design/unwired-ui-fragments.html](design/unwired-ui-fragments.html) holds the markup for five controls that Frayd does not implement. `client/index.html` ships no `<template>`, no disabled control and no `UNWIRED` comment. Nothing serves or loads the fragments page. Each fragment is a `<template>` with disabled `type="button"` controls, no control IDs and no event handlers, and a comment naming where it belonged. They are design notes, not features.
+[docs/design/unwired-ui-fragments.html](design/unwired-ui-fragments.html) holds the markup for five controls that Frayd does not implement. The shipped UI contains none of them. Nothing serves or loads the fragments page. Each fragment is a `<template>` whose controls are disabled, have no IDs and no event handlers, with a comment naming where it belonged. They are design notes, not features.
 
 | Fragment | Contract to define before activation |
 | --- | --- |
@@ -154,7 +154,7 @@ The browser reader waits for fonts and a positive layout before it reports a pag
 
 To activate a fragment, implement its contract and an accessible interaction, add tests for the paths it touches, move the control into the live UI, and check the workflow in a real browser. Git history holds the original markup and styling.
 
-`python3 -m unittest discover -s tests -p 'test_unwired_ui.py'` asserts that `client/index.html` ships no templates, disabled controls or `UNWIRED` comments. Python discovery in CI runs it, and the real DOM suite separately checks the default auth and audio controls.
+`python3 -m unittest discover -s tests -p 'test_unwired_ui.py'` asserts that element IDs in `client/index.html` are unique, that every fragment has a row in the table above, and that the fragments stay inert: their controls are disabled, have no IDs or event handlers, and `client/index.html` does not link the fragments page. The real DOM suite checks the default auth and audio controls.
 
 ### Party protocol
 

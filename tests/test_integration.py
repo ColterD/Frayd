@@ -168,6 +168,36 @@ class RequestAdapterTests(unittest.TestCase):
                                     ('DELETE', '/owned-user', bearer, b'')])
         self.assertEqual(output.getvalue(), '')
 
+    def test_unexpected_status_raises_typed_error_with_headers_and_body(self):
+        """Error and success mismatches carry path, status, expectation, headers and body."""
+        class Handler(QuietHandler):
+            def reply(self, status, headers, body):
+                """Send one status with the given headers and body."""
+                self.send_response(status)
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_DELETE(self):
+                self.reply(409, {'Retry-After': '1'}, b'held')
+
+            def do_GET(self):
+                self.reply(200, {}, b'served')
+
+        with serve(Handler) as url, patch.object(integration, 'base', url):
+            for method, status, headers, body in [('DELETE', 409, {'Retry-After': '1'}, b'held'),
+                                                  ('GET', 200, {}, b'served')]:
+                with self.subTest(method=method):
+                    with self.assertRaises(integration.HTTPStatusError) as caught:
+                        integration.request('/owned-media', method=method, expected=404)
+                    error = caught.exception
+                    self.assertIsInstance(error, AssertionError)
+                    self.assertEqual((error.path, error.status, error.expected, error.body),
+                                     ('/owned-media', status, 404, body))
+                    self.assertEqual(error.headers.get('Retry-After'), headers.get('Retry-After'))
+
 
 class WebSocketIdentityWireTests(unittest.TestCase):
     """Check actual upgrade bytes against an independent creator-account wire oracle."""
@@ -279,7 +309,7 @@ class DockerDeadlineTests(unittest.TestCase):
                       self.assertRaises(subprocess.TimeoutExpired) as caught):
                     integration.docker('inspect', 'private-argv', input=b'private stdin', timeout=1)
                 self.assertLess(time.monotonic() - started, 4)
-                self.assertTrue(ready.exists(), 'Owned child actually started and held its lease')
+                self.assertTrue(ready.exists(), 'Descendant started and held its lease before the timeout')
                 with lease.open('a') as handle:
                     fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 self.assertEqual(caught.exception.cmd, ['docker', 'inspect'])
@@ -380,39 +410,86 @@ class CleanupInventoryTests(unittest.TestCase):
                          ('container', 'frayd-cleanup-fixture', b'stopped-fixture'))
 
 
+BUSY = (409, {'Retry-After': '1'})
+REFERENCED = (409, {})
+
+
+def media_server(replies):
+    """Build a handler answering each DELETE with the next (status, headers) reply; record paths."""
+    replies = iter(replies)
+    paths = []
+
+    class Handler(QuietHandler):
+        def do_DELETE(self):
+            status, headers = next(replies)
+            paths.append(self.path)
+            self.send_response(status)
+            for name, value in headers.items():
+                self.send_header(name, value)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+    return Handler, paths
+
+
 class DeleteMediaTests(unittest.TestCase):
-    """Media deletion waits out only the conversion worker's transient 409 refusal."""
+    """Media deletion waits out only the 409 that names itself transient with Retry-After."""
 
-    @staticmethod
-    def responses(*codes):
-        """Fake request(): each code is the status the server answers, against the caller's expectation."""
-        outcomes = iter(codes)
+    def delete(self, replies, expected):
+        """Run the real delete_media() and request() against an owned server under a fake clock."""
+        handler, paths = media_server(replies)
+        output = io.StringIO()
+        with (serve(handler) as url, patch.object(integration, 'base', url), fake_clock() as clock,
+              contextlib.redirect_stdout(output)):
+            try:
+                integration.delete_media(1, 'token', expected)
+            finally:
+                self.paths, self.now, self.output = paths, clock.now, output.getvalue()
 
-        def fake(path, token=None, method=None, expected=200, **_):
-            code = next(outcomes)
-            if code != expected:
-                raise AssertionError((path, code, expected))
-            return b''
-        return fake
+    def test_transient_refusals_are_retried_and_counted(self):
+        """Two Retry-After 409s are retried, then the expected status ends the wait."""
+        self.delete([BUSY, BUSY, (500, {})], 500)
+        self.assertEqual(self.paths, ['/api/media/1'] * 3)
+        self.assertEqual(self.output, 'delete media 1: 2 transient 409 retries\n')
 
-    def test_transient_refusal_is_retried_until_the_expected_status(self):
-        fake = self.responses(409, 409, 500)
-        with fake_clock(), patch.object(integration, 'request', side_effect=fake) as request:
-            integration.delete_media(1, 'token', 500)
-        self.assertEqual(request.call_count, 3)
+    def test_permanent_conflict_fails_without_retrying(self):
+        """A 409 without Retry-After is a lasting refusal and fails on the first answer."""
+        with self.assertRaises(integration.HTTPStatusError) as caught:
+            self.delete([REFERENCED], 204)
+        self.assertEqual((caught.exception.status, caught.exception.expected), (409, 204))
+        self.assertEqual((len(self.paths), self.now), (1, 0))
+        self.assertEqual(self.output, 'delete media 1: 0 transient 409 retries\n')
 
-    def test_lasting_refusal_fails_at_the_deadline(self):
-        with fake_clock() as clock, patch.object(integration, 'request', side_effect=self.responses(*[409] * 100)), \
-                self.assertRaises(AssertionError) as caught:
-            integration.delete_media(1, 'token', 204)
+    def test_lasting_transient_refusal_fails_at_the_deadline(self):
+        """Transient refusals stop at the 10-second deadline and report every retry."""
+        with self.assertRaises(AssertionError) as caught:
+            self.delete([BUSY] * 100, 204)
         self.assertIn('stayed refused', str(caught.exception))
-        self.assertGreaterEqual(clock.now, 10)
+        self.assertGreaterEqual(self.now, 10)
+        self.assertLess(self.now, 10.5)
+        self.assertEqual(self.output, f'delete media 1: {len(self.paths)} transient 409 retries\n')
 
     def test_other_mismatch_fails_without_retrying(self):
-        with fake_clock() as clock, patch.object(integration, 'request', side_effect=self.responses(404)), \
-                self.assertRaises(AssertionError):
-            integration.delete_media(1, 'token', 500)
-        self.assertEqual(clock.now, 0)
+        """Any non-409 mismatch fails on the first answer."""
+        with self.assertRaises(integration.HTTPStatusError) as caught:
+            self.delete([(404, {})], 500)
+        self.assertEqual(caught.exception.status, 404)
+        self.assertEqual((len(self.paths), self.now), (1, 0))
+
+
+class DeleteConflictTests(unittest.TestCase):
+    """Read a refused deletion's Retry-After so the harness can tell busy from referenced."""
+
+    def test_refusal_reports_retry_after_and_other_statuses_fail(self):
+        """Busy and referenced 409s differ only in Retry-After; a deletion or other status fails."""
+        handler, paths = media_server([BUSY, REFERENCED, (204, {}), (404, {})])
+        with serve(handler) as url, patch.object(integration, 'base', url):
+            self.assertEqual(integration.conflict_retry_after(7, 'token'), '1')
+            self.assertIsNone(integration.conflict_retry_after(7, 'token'))
+            with self.assertRaisesRegex(AssertionError, 'media 7 was deleted'):
+                integration.conflict_retry_after(7, 'token')
+            with self.assertRaises(integration.HTTPStatusError):
+                integration.conflict_retry_after(7, 'token')
+        self.assertEqual(paths, ['/api/media/7'] * 4)
 
 
 class WaitUntilTests(unittest.TestCase):

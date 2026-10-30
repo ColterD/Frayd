@@ -1,11 +1,13 @@
 //! Native lifecycle authority: no guessed ownership, recursive deletion, or service control.
+//! Path checks exclude untrusted Unix ancestors; they do not reserve names against
+//! concurrent changes by the invoking user or root, and do not inspect ACL grants.
 #[cfg(unix)]
 mod native {
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs::{self, DirBuilder, File, OpenOptions};
-    use std::io::{self, Read, Write};
+    use std::io::{self, Read, Seek, Write};
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     use std::os::unix::process::ExitStatusExt;
     use std::path::{Component, Path, PathBuf};
@@ -78,7 +80,7 @@ mod native {
     /// Create a new private metadata file from caller-serialized receipt bytes.
     /// Existing paths are never replaced. A write/sync failure removes only the
     /// same newly opened inode when possible, otherwise reports retained metadata.
-    fn private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    fn private_file(path: &Path, bytes: &[u8]) -> Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         let mut file = OpenOptions::new()
             .write(true)
@@ -98,6 +100,26 @@ mod native {
             }
             return Err(error.into());
         }
+        Ok(file)
+    }
+    /// Remove metadata only while the path still names the inode this attempt created.
+    fn remove_private_file(path: &Path, file: &File) -> Result<()> {
+        let opened = file.metadata()?;
+        let current = fs::symlink_metadata(path)?;
+        if current.dev() != opened.dev() || current.ino() != opened.ino() {
+            return reject("private metadata changed; retained for inspection");
+        }
+        fs::remove_file(path)?;
+        Ok(())
+    }
+    /// Update the originally created child marker without reopening its pathname.
+    fn record_child(file: &mut File, pid: Option<u32>) -> Result<()> {
+        file.rewind()?;
+        file.set_len(0)?;
+        file.write_all(&serde_json::to_vec(
+            &serde_json::json!({"pid": pid, "state": "running"}),
+        )?)?;
+        file.sync_all()?;
         Ok(())
     }
     /// Compare containment in both directions for already validated absolute paths.
@@ -207,6 +229,14 @@ mod native {
                     if meta.file_type().is_symlink() || !meta.is_dir() {
                         return reject("symlink or non-directory target ancestor refused");
                     }
+                    // SAFETY: geteuid has no preconditions and cannot fail.
+                    let current_uid = unsafe { libc::geteuid() };
+                    if meta.uid() != 0 && meta.uid() != current_uid {
+                        return reject("target ancestor owned by another user refused");
+                    }
+                    if meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0 {
+                        return reject("group/other-writable non-sticky target ancestor refused");
+                    }
                     if ancestor.join(".git").exists() {
                         return reject("source checkout target refused");
                     }
@@ -268,7 +298,11 @@ mod native {
         };
         Ok(Entry {
             path: relative.to_owned(),
-            kind: if meta.is_file() { Kind::File } else { Kind::Dir },
+            kind: if meta.is_file() {
+                Kind::File
+            } else {
+                Kind::Dir
+            },
             mode: meta.mode() & 0o777,
             size: if meta.is_file() { meta.len() } else { 0 },
             sha256: hash,
@@ -308,20 +342,15 @@ mod native {
                     "unexpected bundle payload; configuration and data are not install-owned",
                 );
             }
-            if item.path.is_empty()
-                || path.is_absolute()
-                || path
-                    .components()
-                    .any(|c| !matches!(c, Component::Normal(_)))
+            if path
+                .components()
+                .any(|c| !matches!(c, Component::Normal(_)))
                 || item.path.contains('\\')
                 || path.components().count() != item.path.split('/').count()
                 || item.mode > 0o777
                 || !names.insert(item.path.clone())
             {
                 return reject("invalid, duplicate or redirecting manifest path/type/mode");
-            }
-            if ["manifest.json", RECEIPT, LOCK, CHILD, DATA_RECEIPT].contains(&item.path.as_str()) {
-                return reject("reserved manifest path");
             }
             if item.kind == Kind::Dir
                 && (item.size != 0 || !item.sha256.is_empty() || item.mode & 0o700 != 0o700)
@@ -516,6 +545,18 @@ mod native {
             .map_err(|_| "installation active or lifecycle busy")?;
         Ok(file)
     }
+    /// Share one launch exclusion across all prefixes that reuse a data identity.
+    fn lock_data(path: &Path) -> Result<File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path.join(DATA_RECEIPT))?;
+        file.try_lock()
+            .map_err(|_| "data directory active or lifecycle busy")?;
+        Ok(file)
+    }
     /// Install a validated bundle into a new prefix with separate app-owned data.
     /// All path, manifest and reuse checks precede consent and creation. Reserve a
     /// private prefix, verify a sibling stage and publish atomically; on failure
@@ -537,7 +578,8 @@ mod native {
             return reject("target parents must already exist");
         }
         let (manifest, manifest_file) = load_bundle(&bundle)?;
-        let data_record = if data.try_exists()? {
+        let reuse_data = data.try_exists()?;
+        let data_record = if reuse_data {
             data_receipt(data)?
         } else {
             DataReceipt {
@@ -562,7 +604,9 @@ mod native {
             .ok_or("missing parent")?
             .join(format!(".frayd-stage-{}", uuid::Uuid::new_v4()));
         if let Err(error) = private_dir(&stage) {
-            fs::remove_dir(prefix)?;
+            remove_reservation(prefix, &reservation).map_err(|cleanup| {
+                format!("stage creation failed: {error}; prefix reservation retained: {cleanup}")
+            })?;
             return Err(error);
         }
         let mut created_data = false;
@@ -606,13 +650,17 @@ mod native {
             }
             verify_tree(&stage, &manifest, &["manifest.json"], false)?;
             verify_entry(&stage, &manifest_file, false)?;
-            if !data.try_exists()? {
+            if !reuse_data {
                 private_dir(data)?;
                 created_data = true;
                 private_file(
                     &data.join(DATA_RECEIPT),
                     &serde_json::to_vec_pretty(&data_record)?,
                 )?;
+            }
+            let current_data = data_receipt(data)?;
+            if current_data.id != data_record.id {
+                return reject("data ownership changed during installation");
             }
             private_file(&stage.join(LOCK), b"")?;
             created_files.push(stage.join(LOCK));
@@ -657,6 +705,18 @@ mod native {
         println!("Installed owned prefix; data is preserved independently.");
         Ok(())
     }
+    /// Remove an empty reservation only while it still has the recorded identity.
+    fn remove_reservation(prefix: &Path, reservation: &fs::Metadata) -> Result<()> {
+        let current = fs::symlink_metadata(prefix)?;
+        if !current.is_dir()
+            || current.dev() != reservation.dev()
+            || current.ino() != reservation.ino()
+        {
+            return reject("prefix reservation changed; refusing cleanup");
+        }
+        fs::remove_dir(prefix)?;
+        Ok(())
+    }
     /// Clean only attempt-owned paths; uncertainty retains paths without hiding the failure.
     fn rollback_install(
         prefix: &Path,
@@ -688,17 +748,8 @@ mod native {
         if fs::remove_dir(stage).is_err() {
             retained.push(stage.display().to_string());
         }
-        match fs::symlink_metadata(prefix) {
-            Ok(current)
-                if current.is_dir()
-                    && current.dev() == reservation.dev()
-                    && current.ino() == reservation.ino() =>
-            {
-                if fs::remove_dir(prefix).is_err() {
-                    retained.push(prefix.display().to_string());
-                }
-            }
-            _ => retained.push(prefix.display().to_string()),
+        if remove_reservation(prefix, reservation).is_err() {
+            retained.push(prefix.display().to_string());
         }
         retained
     }
@@ -712,6 +763,11 @@ mod native {
         let _lock = locked(prefix)?;
         let receipt = load_prefix(prefix, false)?;
         validate_start_data(&receipt)?;
+        let _data_lock = lock_data(&receipt.data)?;
+        validate_start_data(&receipt)?;
+        if fs::symlink_metadata(receipt.data.join(CHILD)).is_ok() {
+            return Err(format!("active or uncertain data child receipt at {}; verify the old server has stopped before operator recovery; no automatic termination or marker removal", receipt.data.join(CHILD).display()).into());
+        }
         for found in WalkDir::new(&receipt.data).follow_links(false) {
             let found = found?;
             if found.file_type().is_symlink()
@@ -733,7 +789,18 @@ mod native {
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
             let mut terminate =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-            private_file(&prefix.join(CHILD), b"{\"state\":\"spawning-or-unknown\"}")?;
+            let mut child_record =
+                private_file(&prefix.join(CHILD), b"{\"state\":\"spawning-or-unknown\"}")?;
+            let mut data_child_record = match private_file(
+                &receipt.data.join(CHILD),
+                b"{\"state\":\"spawning-or-unknown\"}",
+            ) {
+                Ok(file) => file,
+                Err(error) => {
+                    remove_private_file(&prefix.join(CHILD), &child_record)?;
+                    return Err(error);
+                }
+            };
             let child = tokio::process::Command::new(prefix.join("frayd-server"))
                 .current_dir(&receipt.data)
                 .env("FRAYD_DB", receipt.data.join("frayd.db"))
@@ -746,14 +813,13 @@ mod native {
             let mut child = match child {
                 Ok(child) => child,
                 Err(error) => {
-                    fs::remove_file(prefix.join(CHILD))?;
+                    remove_private_file(&receipt.data.join(CHILD), &data_child_record)?;
+                    remove_private_file(&prefix.join(CHILD), &child_record)?;
                     return Err(error.into());
                 }
             };
-            fs::write(
-                prefix.join(CHILD),
-                serde_json::to_vec(&serde_json::json!({"pid": child.id(), "state": "running"}))?,
-            )?;
+            record_child(&mut child_record, child.id())?;
+            record_child(&mut data_child_record, child.id())?;
             let (status, interrupted) = tokio::select! {
                 // Foreground signals can make both the signal and child wait ready.
                 // Prefer the explicit interruption; a child-only INT/TERM is also
@@ -767,7 +833,8 @@ mod native {
                     (status, interrupted)
                 },
             };
-            fs::remove_file(prefix.join(CHILD))?;
+            remove_private_file(&receipt.data.join(CHILD), &data_child_record)?;
+            remove_private_file(&prefix.join(CHILD), &child_record)?;
             if !status.success() && !interrupted {
                 return Err(format!("server exited with {status}; data preserved").into());
             }
@@ -797,14 +864,19 @@ mod native {
     fn uninstall(prefix: &Path, yes: bool) -> Result<()> {
         load_prefix(prefix, true)?;
         removal_parent_writable(prefix)?;
+        let _lock = locked(prefix)?;
+        let receipt = load_prefix(prefix, true)?;
         if !confirm(
             yes,
-            "Remove only unchanged owned installation files; keep all data",
+            &format!(
+                "Remove unchanged owned installation version {} at {}; keep all data at {}",
+                receipt.manifest.version,
+                prefix.display(),
+                receipt.data.display()
+            ),
         )? {
             return Ok(());
         }
-        let _lock = locked(prefix)?;
-        let receipt = load_prefix(prefix, true)?;
         for item in receipt
             .manifest
             .entries
@@ -850,13 +922,20 @@ mod native {
         if let Err(error) = cleanup {
             // Reconstitute removal authority when final directory cleanup fails.
             // Never replace an existing metadata path or adopt a substituted prefix.
-            let current = fs::symlink_metadata(prefix)?;
+            let current = fs::symlink_metadata(prefix).map_err(|metadata| {
+                format!(
+                    "final removal failed: {error}; cannot inspect retained prefix {}: {metadata}",
+                    prefix.display()
+                )
+            })?;
             if current.is_dir()
                 && current.dev() == identity.dev()
                 && current.ino() == identity.ino()
             {
                 for (name, bytes) in [(LOCK, b"".as_slice()), (RECEIPT, receipt_bytes.as_slice())] {
-                    if !prefix.join(name).try_exists()? {
+                    if !prefix.join(name).try_exists().map_err(|metadata| {
+                        format!("final removal failed: {error}; cannot inspect recovery metadata {}: {metadata}", prefix.join(name).display())
+                    })? {
                         private_file(&prefix.join(name), bytes).map_err(|restore| format!("final removal \
                             failed: {error}; metadata recovery failed at {}: {restore}; retained prefix \
                             requires inspection", prefix.display()))?;
@@ -1011,6 +1090,53 @@ mod native {
         }
 
         #[test]
+        fn cleanup_refuses_substituted_reservation() {
+            let fixture = Fixture(
+                Path::new("/var/tmp")
+                    .join(format!("frayd-native-identity-{}", uuid::Uuid::new_v4())),
+            );
+            private_dir(&fixture.0).unwrap();
+            let prefix = fixture.0.join("prefix");
+            private_dir(&prefix).unwrap();
+            let identity = fs::symlink_metadata(&prefix).unwrap();
+            fs::rename(&prefix, fixture.0.join("original")).unwrap();
+            private_dir(&prefix).unwrap();
+            let error = remove_reservation(&prefix, &identity)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("reservation changed"), "{error}");
+            assert!(prefix.is_dir());
+            assert!(fixture.0.join("original").is_dir());
+        }
+
+        #[test]
+        fn child_marker_update_never_follows_replacement_symlink() {
+            let fixture = Fixture(
+                Path::new("/var/tmp").join(format!("frayd-native-child-{}", uuid::Uuid::new_v4())),
+            );
+            private_dir(&fixture.0).unwrap();
+            let path = fixture.0.join(CHILD);
+            let sentinel = fixture.0.join("sentinel");
+            fs::write(&sentinel, b"preserve").unwrap();
+            let mut file = private_file(&path, b"unknown").unwrap();
+            fs::rename(&path, fixture.0.join("original")).unwrap();
+            symlink(&sentinel, &path).unwrap();
+            record_child(&mut file, Some(42)).unwrap();
+            assert_eq!(fs::read(&sentinel).unwrap(), b"preserve");
+            let document: serde_json::Value =
+                serde_json::from_slice(&fs::read(fixture.0.join("original")).unwrap()).unwrap();
+            assert_eq!(document["pid"], 42);
+            assert!(remove_private_file(&path, &file)
+                .unwrap_err()
+                .to_string()
+                .contains("metadata changed"));
+            assert!(fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+
+        #[test]
         fn marked_data_is_reported() {
             scenario("marked", false);
         }
@@ -1033,31 +1159,79 @@ mod native {
 
         #[test]
         fn manifest_refuses_empty_absolute_reserved_and_redirecting_paths() {
-            let file = |path: &str| Entry { path: path.into(), kind: Kind::File, mode: 0o644, size: 0, sha256: "0".repeat(64) };
-            let dir = |path: &str| Entry { path: path.into(), kind: Kind::Dir, mode: 0o755, size: 0, sha256: String::new() };
-            let executable = |path: &str| Entry { mode: 0o755, ..file(path) };
+            let file = |path: &str| Entry {
+                path: path.into(),
+                kind: Kind::File,
+                mode: 0o644,
+                size: 0,
+                sha256: "0".repeat(64),
+            };
+            let dir = |path: &str| Entry {
+                path: path.into(),
+                kind: Kind::Dir,
+                mode: 0o755,
+                size: 0,
+                sha256: String::new(),
+            };
+            let executable = |path: &str| Entry {
+                mode: 0o755,
+                ..file(path)
+            };
             let complete = || {
-                let mut entries: Vec<Entry> = ["frayd-server", "frayd-native", "install.sh", "start.sh", "uninstall.sh"]
-                    .into_iter().map(executable).collect();
+                let mut entries: Vec<Entry> = [
+                    "frayd-server",
+                    "frayd-native",
+                    "install.sh",
+                    "start.sh",
+                    "uninstall.sh",
+                ]
+                .into_iter()
+                .map(executable)
+                .collect();
                 entries.extend([file("README.md"), dir("client"), file("client/index.html")]);
-                Manifest { schema: 1, version: "1".into(), source: "a".repeat(40), target: "t".into(), toolchain: "t".into(), entries }
+                Manifest {
+                    schema: 1,
+                    version: "1".into(),
+                    source: "a".repeat(40),
+                    target: "t".into(),
+                    toolchain: "t".into(),
+                    entries,
+                }
             };
             assert!(entry_names(&complete()).is_ok());
-            for path in ["", "/frayd-server", "manifest.json", RECEIPT, LOCK, CHILD, DATA_RECEIPT,
-                "client/../README.md", "client//index.html", "client/./index.html", "README.md/x", "client\\x"] {
+            for path in [
+                "",
+                "/frayd-server",
+                "client/../README.md",
+                "client//index.html",
+                "client/./index.html",
+                "README.md/x",
+                "client\\x",
+            ] {
                 let mut manifest = complete();
                 manifest.entries.push(file(path));
                 assert!(entry_names(&manifest).is_err(), "{path:?} accepted");
+            }
+            for reserved in ["manifest.json", RECEIPT, LOCK, CHILD, DATA_RECEIPT] {
+                let mut manifest = complete();
+                manifest.entries.push(file(reserved));
+                assert_eq!(
+                    entry_names(&manifest).unwrap_err().to_string(),
+                    "unexpected bundle payload; configuration and data are not install-owned"
+                );
             }
             let mut duplicate = complete();
             duplicate.entries.push(file("README.md"));
             assert!(entry_names(&duplicate).is_err());
             // Only the exact lowercase kinds deserialize; entry_names does not check kind.
             let mut document = serde_json::to_value(complete()).unwrap();
-            assert!(serde_json::from_slice::<Manifest>(&serde_json::to_vec(&document).unwrap()).is_ok());
+            assert!(
+                serde_json::from_slice::<Manifest>(&serde_json::to_vec(&document).unwrap()).is_ok()
+            );
             for kind in ["symlink", "File"] {
                 document["entries"][0]["kind"] = kind.into();
-                let parsed = serde_json::from_slice::<Manifest>(&serde_json::to_vec(&document).unwrap());
+                let parsed =
+                    serde_json::from_slice::<Manifest>(&serde_json::to_vec(&document).unwrap());
                 assert!(parsed.is_err(), "kind {kind:?} accepted");
             }
         }

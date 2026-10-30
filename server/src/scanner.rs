@@ -362,7 +362,7 @@ struct ScanRefresh {
 
 /// Update scan fingerprints and reader caches; clear converted playback only for known replacements.
 /// Preserve identity, user metadata, unchanged order and version-unqualified legacy playback.
-/// Known unchanged fingerprints permit only kind changes and NULL episode-series backfill, without media work.
+/// Known unchanged fingerprints permit kind changes and NULL episode-series backfill without metadata probes.
 fn upsert_item_with_roots(
     db: &Connection,
     db_path: String,
@@ -505,8 +505,8 @@ fn upsert_item_with_roots(
             }
         }
     }
-    // Classification remains probe-free; unchanged episode artwork repair is separate from metadata.
-    if metadata_only || !video {return updated;}
+    // Classification remains probe-free. Unchanged episodes still retry conversion skipped while BUSY.
+    if classification_only || !video {return updated;}
 
     match new_id {
         // Background conversion when the audio codec is not browser-playable.
@@ -1020,6 +1020,71 @@ mod tests {
         }
     }
 
+    /// Unchanged rescans retry an episode skipped while BUSY, including a failed conversion attempt.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unchanged_episode_rescan_retries_busy_conversion() {
+        if std::env::var_os("FRAYD_TEST_EPISODE_RETRY").is_none() {
+            assert_child_passes(child("scanner::tests::unchanged_episode_rescan_retries_busy_conversion")
+                .env("FRAYD_TEST_EPISODE_RETRY","1").env_remove("FRAYD_TRANSCODES").env_remove("FRAYD_THUMBS"));
+            return;
+        }
+        use std::sync::atomic::Ordering;
+        let fixture=Library::new(&[]);
+        let library=fixture.0.join("library");std::fs::create_dir(&library).unwrap();
+        let first=library.join("Show.S01E01.mkv");let second=library.join("Show.S01E02.mkv");
+        let ffmpeg=std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|directory|directory.join("ffmpeg")).find(|path|path.is_file()).unwrap();
+        let ffprobe=std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|directory|directory.join("ffprobe")).find(|path|path.is_file()).unwrap();
+        assert!(Command::new(&ffmpeg).args(["-v","error","-nostdin","-f","lavfi","-i","color=s=16x16:r=10",
+            "-f","lavfi","-i","sine=frequency=440","-t","0.2","-c:v","mpeg4","-threads","1","-c:a","ac3"])
+            .arg(&first).status().unwrap().success());
+        let source_bytes=std::fs::read(&first).unwrap();
+        let bin=fixture.0.join("bin");std::fs::create_dir(&bin).unwrap();
+        let started=fixture.0.join("started");let release=fixture.0.join("release");let probes=fixture.0.join("probes");let fail_next=fixture.0.join("fail-next");
+        write_executable(&bin.join("ffmpeg"),format!("#!/bin/sh\ntouch '{}'\nfor i in $(seq 1 1000); do\n  if test -f '{}'; then\n    if test -f '{}'; then rm '{}'; exit 1; fi\n    exec '{}' \"$@\"\n  fi\n  sleep 0.01\ndone\nexit 1\n",started.display(),release.display(),fail_next.display(),fail_next.display(),ffmpeg.display()));
+        write_executable(&bin.join("ffprobe"),format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",probes.display(),ffprobe.display()));
+        std::env::set_var("PATH",path_with(&bin));
+        let database=fixture.0.join("db.sqlite");let db=open(database.to_str().unwrap());
+        assert_eq!(scan(&db,database.to_string_lossy().into_owned(),library.clone(),None),1);
+        let wait=|ready:&dyn Fn()->bool| {
+            for _ in 0..1000 {
+                if ready() {return;}
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("conversion state deadline exceeded");
+        };
+        wait(&||started.exists());
+        std::fs::write(&second,&source_bytes).unwrap();
+        assert_eq!(scan(&db,database.to_string_lossy().into_owned(),library.clone(),None),1);
+        let id:i64=db.query_row("SELECT id FROM media WHERE path=?1",[second.to_string_lossy()],|row|row.get(0)).unwrap();
+        let saved=||db.query_row("SELECT transcode_path FROM media WHERE id=?1",[id],|row|row.get::<_,Option<String>>(0)).unwrap();
+        assert!(crate::transcode::BUSY.load(Ordering::SeqCst));assert_eq!(saved(),None);
+        db.execute_batch("INSERT INTO identities(id,kind,key) VALUES(1,'device','retry');").unwrap();
+        db.execute("INSERT INTO progress(identity_id,media_id,position) VALUES(1,?1,42)",[id]).unwrap();
+        std::fs::write(&release,b"release").unwrap();
+        wait(&||!crate::transcode::BUSY.load(Ordering::SeqCst));
+        std::fs::write(&probes,b"").unwrap();
+        std::fs::write(&fail_next,b"fail once").unwrap();
+        assert_eq!(scan(&db,database.to_string_lossy().into_owned(),library.clone(),None),0);
+        wait(&||!crate::transcode::BUSY.load(Ordering::SeqCst));
+        assert!(!fail_next.exists(),"unchanged episode never reached the converter after BUSY admission");
+        assert_eq!(saved(),None,"failed conversion published playback");
+        assert_eq!(scan(&db,database.to_string_lossy().into_owned(),library.clone(),None),0);
+        wait(&||!crate::transcode::BUSY.load(Ordering::SeqCst));
+        let output=saved().expect("unchanged episode was never retried after BUSY admission");
+        assert!(Path::new(&output).is_file());
+        let codec=Command::new(&ffprobe).args(["-v","error","-select_streams","a","-show_entries","stream=codec_name","-of","csv=p=0"])
+            .arg(&output).output().unwrap();
+        assert!(codec.status.success());assert_eq!(String::from_utf8(codec.stdout).unwrap().trim(),"aac");
+        assert_eq!(std::fs::read(&first).unwrap(),source_bytes);assert_eq!(std::fs::read(&second).unwrap(),source_bytes);
+        assert_eq!(db.query_row("SELECT media.id,position FROM media JOIN progress ON media.id=progress.media_id WHERE media.path=?1",
+            [second.to_string_lossy()],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,f64>(1)?))).unwrap(),(id,42.0));
+        let retried=std::fs::read_to_string(&probes).unwrap();
+        assert!(retried.contains("stream=codec_name"));assert!(!retried.contains("format=duration"),"unchanged scan reprobed metadata: {retried}");
+    }
+
     /// Reclassification and NULL-only show backfills retain all other rows and bytes without media work.
     #[cfg(unix)]
     #[test]
@@ -1099,6 +1164,8 @@ mod tests {
                 row
             })
         };
+        // Isolate metadata work from the separately tested asynchronous conversion retry.
+        crate::transcode::BUSY.store(true,std::sync::atomic::Ordering::SeqCst);
         let before=snapshot();
         let artifacts_before = artifact_rows(&db);
         let bytes:Vec<_>=files.iter().map(|file|(std::fs::read(file).unwrap(),std::fs::metadata(file).unwrap().modified().unwrap())).collect();
@@ -1131,7 +1198,7 @@ mod tests {
                     *modified
                 );
             }
-            assert!(!crate::transcode::BUSY.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(crate::transcode::BUSY.load(std::sync::atomic::Ordering::SeqCst));
             assert!(
                 !std::path::PathBuf::from(std::env::var_os("FRAYD_TEST_EPISODE_PROBES").unwrap())
                     .exists(),

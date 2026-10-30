@@ -55,7 +55,9 @@ jobs:
         shell: bash
         run: |
           cargo +1.99.1 test --locked --manifest-path "$RUNNER_TEMP/frayd-build-source/server/Cargo.toml" --bin frayd-native --target '${{ matrix.target }}'
-          cargo +1.99.1 test --locked --manifest-path "$RUNNER_TEMP/frayd-build-source/server/Cargo.toml" --bin frayd-server --target '${{ matrix.target }}' -- transcode::retained_job_tests::unqualified_rescans_hold_one_job_and_preserve_other_media --exact --nocapture
+          cargo +1.99.1 test --locked --manifest-path "$RUNNER_TEMP/frayd-build-source/server/Cargo.toml" --bin frayd-server --target '${{ matrix.target }}' -- transcode::retained_job_tests::unqualified_rescans_hold_one_job_and_preserve_other_media --exact --nocapture | tee "$RUNNER_TEMP/frayd-retained-job-test.log"
+          # An obsolete exact filter must fail qualification instead of passing zero tests.
+          grep -F 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/frayd-retained-job-test.log"
           cargo +1.99.1 clippy --locked --manifest-path "$RUNNER_TEMP/frayd-build-source/server/Cargo.toml" --bin frayd-native --target '${{ matrix.target }}' -- -D warnings
           cargo +1.99.1 build --locked --release --manifest-path "$RUNNER_TEMP/frayd-build-source/server/Cargo.toml" --bin frayd-server --bin frayd-native --target '${{ matrix.target }}'
 
@@ -71,7 +73,15 @@ jobs:
       - name: Actual helper and server lifecycle, HTTP reader and persistence
         shell: bash
         run: |
-          python3 -m unittest discover -s tests -p test_native_bundle.py -v
+          python3 - <<'PY'
+          import unittest
+          suite = unittest.defaultTestLoader.discover('tests', pattern='test_native_bundle.py')
+          if suite.countTestCases() == 0:
+              raise SystemExit('No native qualification tests were discovered')
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          if not result.wasSuccessful() or result.skipped:
+              raise SystemExit(1)
+          PY
 
       - name: Nonsecret package provenance in retained job logs
         shell: bash

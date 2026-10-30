@@ -764,11 +764,9 @@ fn run_scan(state: Arc<App>, first: ScanRequest) {
             let ScanRequest{roots,for_ingest}=request;
             *state.scan_error.lock().unwrap()=None;
             let mut n=0;
-            for (index,root) in roots.iter().enumerate() {
+            for root in &roots {
                 match scanner::scan_with_roots(&db,state.db_path.clone(),root.clone(),Some(&thumbs),&roots) {
                     Ok(count)=>n+=count,
-                    // A root that vanished after the pass began skips the rest of the pass; its rows stay indexed.
-                    Err(scanner::ScanError::RootUnavailable) if index>0 => {}
                     Err(error)=>{*state.scan_error.lock().unwrap()=Some(error.reason());return;}
                 }
             }
@@ -1143,11 +1141,19 @@ fn cleanup_owned_thumbnail(db: &mut Connection, thumbs: &StdPath, roots: &[PathB
 async fn delete_media(
     State(app): State<Arc<App>>, headers: axum::http::HeaderMap,
     Query(q): Query<std::collections::HashMap<String,String>>, Path(id): Path<i64>,
-) -> StatusCode {
+) -> axum::response::Response {
+    tokio::task::spawn_blocking(move ||delete_media_blocking(app,headers,q,id)).await
+        .unwrap_or_else(|_|StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Keep SQLite waits and filesystem cleanup on the blocking pool under the existing admission order.
+fn delete_media_blocking(app:Arc<App>,headers:axum::http::HeaderMap,
+    q:std::collections::HashMap<String,String>,id:i64) -> axum::response::Response {
     // Serialize conversion admission and retain one complete root snapshot through cleanup.
     let _admission=ROOT_ADMISSION.lock().unwrap();
     let config=app.library.read().unwrap();
     let mut db=app.db.lock().unwrap();
+    let mut retryable_busy=false;
     let result=(|| -> Result<(String,Option<String>),StatusCode> {
         let tx=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?;
         require_admin(&tx,&headers,q.get("identity").map(String::as_str))?;
@@ -1160,7 +1166,7 @@ async fn delete_media(
             .optional()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let Some((source,thumbnail,conversion))=row else {return Err(StatusCode::NOT_FOUND);};
-        if conversion.is_some() || transcode::BUSY.load(std::sync::atomic::Ordering::SeqCst) {
+        if conversion.is_some() {
             return Err(StatusCode::CONFLICT);
         }
         let referenced: bool = tx
@@ -1178,13 +1184,18 @@ async fn delete_media(
         if referenced {
             return Err(StatusCode::CONFLICT);
         }
+        if transcode::BUSY.load(std::sync::atomic::Ordering::SeqCst) {
+            retryable_busy=true;
+            return Err(StatusCode::CONFLICT);
+        }
         let deleted=tx.execute("DELETE FROM media WHERE id=?1",[id]).map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?;
         if deleted!=1 {return Err(StatusCode::INTERNAL_SERVER_ERROR);}
         tx.commit().map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?;
         Ok((source,thumbnail))
     })();
     match result {
-        Err(status)=>status,
+        Err(status) if retryable_busy=>(status,[(axum::http::header::RETRY_AFTER,"1")]).into_response(),
+        Err(status)=>status.into_response(),
         Ok((source,thumbnail))=>{
             // An admitted scan may regenerate the same ID's cache; leave optional bytes alone.
             if !app.scanning.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1192,7 +1203,7 @@ async fn delete_media(
                     tracing::warn!(id,%error,"media deletion committed; thumbnail cleanup held");
                 }
             }
-            StatusCode::NO_CONTENT
+            StatusCode::NO_CONTENT.into_response()
         }
     }
 }
@@ -1657,6 +1668,13 @@ async fn set_setting(
     State(app): State<Arc<App>>, headers: axum::http::HeaderMap,
     Query(q): Query<std::collections::HashMap<String,String>>, Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
+    tokio::task::spawn_blocking(move ||set_setting_blocking(app,headers,q,body)).await
+        .unwrap_or_else(|_|StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Validate and commit settings on the blocking pool; publish roots only after the transaction succeeds.
+fn set_setting_blocking(app:Arc<App>,headers:axum::http::HeaderMap,
+    q:std::collections::HashMap<String,String>,body:serde_json::Value) -> axum::response::Response {
     // Global order: admission -> config -> database -> ingest. Workers never hold
     // application database/config locks during filesystem traversal.
     let _admission=ROOT_ADMISSION.lock().unwrap();
@@ -1666,11 +1684,6 @@ async fn set_setting(
     let Some(mut map)=body.as_object().cloned() else { return StatusCode::BAD_REQUEST.into_response(); };
     let paths_changed=map.contains_key("library_path") || map.contains_key("library_paths");
     if map.contains_key("library_path") && map.contains_key("library_paths") { return StatusCode::BAD_REQUEST.into_response(); }
-    if paths_changed && (config.locked || app.scanning.load(std::sync::atomic::Ordering::SeqCst)
-        || transcode::BUSY.load(std::sync::atomic::Ordering::SeqCst)
-        || matches!(app.ingest_status.lock().unwrap().as_deref(),Some("downloading"|"indexing"))) {
-        return StatusCode::CONFLICT.into_response();
-    }
     if map.keys().any(|k| {
         matches!(
             k.as_str(),
@@ -1697,6 +1710,11 @@ async fn set_setting(
             _=>true,
         };
         if !valid { return StatusCode::BAD_REQUEST.into_response(); }
+    }
+    if paths_changed && (config.locked || app.scanning.load(std::sync::atomic::Ordering::SeqCst)
+        || transcode::BUSY.load(std::sync::atomic::Ordering::SeqCst)
+        || matches!(app.ingest_status.lock().unwrap().as_deref(),Some("downloading"|"indexing"))) {
+        return StatusCode::CONFLICT.into_response();
     }
     let result=(|| -> rusqlite::Result<()> {
         let tx=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1815,6 +1833,7 @@ mod test_support {
             if !app.scanning.load(std::sync::atomic::Ordering::SeqCst) { break; }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
+        assert!(!app.scanning.load(std::sync::atomic::Ordering::SeqCst),"scan worker did not release admission before the deadline");
     }
 }
 
@@ -2786,6 +2805,25 @@ mod roots_scan_ingest_tests {
         let app=test_support::app(db,root.join("db.sqlite").to_string_lossy().into_owned(),Vec::new());
         (root,app)
     }
+    /// Payload errors stay 400 during conversion; a valid root change remains temporarily held.
+    #[tokio::test]
+    async fn settings_validate_payload_before_conversion_busy() {
+        if std::env::var_os("FRAYD_TEST_SETTING_BUSY").is_none() {
+            test_support::assert_child_passes(test_support::child("roots_scan_ingest_tests::settings_validate_payload_before_conversion_busy")
+                .env("FRAYD_TEST_SETTING_BUSY","1"));return;
+        }
+        let (root,app)=fixture();
+        transcode::BUSY.store(true,std::sync::atomic::Ordering::SeqCst);
+        for body in [serde_json::json!({"library_paths":[],"port":0}),serde_json::json!({"library_paths":"invalid"}),
+            serde_json::json!({"library_paths":[],"server_version":"invalid"})] {
+            assert_eq!(setting(&app,body).await,StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(setting(&app,serde_json::json!({"library_paths":[]})).await,StatusCode::CONFLICT);
+        transcode::BUSY.store(false,std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(setting(&app,serde_json::json!({"library_paths":[]})).await,StatusCode::NO_CONTENT);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn roots_array_replaces_legacy() {
         let (root,app)=fixture();
@@ -2976,42 +3014,59 @@ mod roots_scan_ingest_tests {
         assert_eq!(app.db.lock().unwrap().query_row("SELECT position FROM progress WHERE media_id=?1",[id],|r|r.get::<_,f64>(0)).unwrap(),42.0);
         std::fs::remove_dir_all(root).unwrap();
     }
-    /// A root that vanishes mid-pass is skipped: the scan reports no error, still finishes its
-    /// ingest check and keeps the vanished root's indexed rows.
+    /// A required root lost after admission fails both ordinary scans and ingest, retaining its sources and rows.
     #[cfg(unix)]
     #[tokio::test]
-    async fn root_vanishing_mid_pass_is_skipped_and_keeps_rows() {
+    async fn root_vanishing_mid_pass_reports_failure_and_keeps_rows() {
         if std::env::var_os("FRAYD_TEST_VANISH_CHILD").is_none() {
-            test_support::assert_child_passes(test_support::child("roots_scan_ingest_tests::root_vanishing_mid_pass_is_skipped_and_keeps_rows")
+            test_support::assert_child_passes(test_support::child("roots_scan_ingest_tests::root_vanishing_mid_pass_reports_failure_and_keeps_rows")
                 .env("FRAYD_TEST_VANISH_CHILD","1").env_remove("FRAYD_TRANSCODES").env_remove("FRAYD_THUMBS"));
             return;
         }
         let (root,app)=fixture();
         let roots=vec![root.join("a"),root.join("b")];
-        // Probing the new video in root a removes root b, between its scan and the scan of b.
+        *app.library.write().unwrap()=LibraryConfig {roots:roots.clone(),locked:false};
         let bin=root.join("bin");std::fs::create_dir(&bin).unwrap();
-        test_support::write_executable(&bin.join("ffprobe"),
-            format!("#!/bin/sh\ncase \"$*\" in *clip.mp4*) rm -rf '{}';; esac\nexit 1\n",root.join("b").display()));
+        let started=root.join("started");let release=root.join("release");
+        test_support::write_executable(&bin.join("ffprobe"),format!(
+            "#!/bin/sh\ntouch '{}'\nfor i in $(seq 1 500); do\n  if test -f '{}'; then exit 1; fi\n  sleep 0.01\ndone\nexit 1\n",started.display(),release.display()));
         test_support::write_executable(&bin.join("ffmpeg"),"#!/bin/sh\nexit 1\n");
-        std::env::set_var("PATH",test_support::path_with(&bin));
         transcode::BUSY.store(true,std::sync::atomic::Ordering::SeqCst);
         std::fs::write(root.join("b/retained.cbz"),b"source").unwrap();
         app.scanning.store(true,std::sync::atomic::Ordering::SeqCst);
         run_scan(app.clone(),ScanRequest{roots:roots.clone(),for_ingest:false});
         test_support::scan_idle(&app).await;
-        std::fs::write(root.join("a/clip.mp4"),b"video").unwrap();
-        std::fs::create_dir(root.join("a/Internet")).unwrap();std::fs::write(root.join("a/Internet/download.cbz"),b"download").unwrap();
-        *app.ingest_status.lock().unwrap()=Some("indexing".into());
-        app.scanning.store(true,std::sync::atomic::Ordering::SeqCst);
-        run_scan(app.clone(),ScanRequest{roots,for_ingest:true});
-        test_support::scan_idle(&app).await;
-        assert!(!root.join("b").exists());
-        let status=scan_status(State(app.clone())).await.0;
-        assert!(status["scan_error"].is_null(),"{status}");
-        assert_eq!(app.ingest_status.lock().unwrap().as_deref(),Some("done"));
-        let indexed=|path:PathBuf| app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM media WHERE path=?1",
-            [path.to_string_lossy()],|r|r.get::<_,i64>(0)).unwrap();
-        assert_eq!([indexed(root.join("b/retained.cbz")),indexed(root.join("a/clip.mp4"))],[1,1]);
+        std::env::set_var("PATH",test_support::path_with(&bin));
+        std::fs::create_dir(root.join("a/Internet")).unwrap();
+        std::fs::write(root.join("a/Internet/download.cbz"),b"download").unwrap();
+        for for_ingest in [true,false] {
+            std::fs::write(root.join(format!("a/clip-{for_ingest}.mp4")),b"video").unwrap();
+            if for_ingest { *app.ingest_status.lock().unwrap()=Some("indexing".into()); }
+            app.scanning.store(true,std::sync::atomic::Ordering::SeqCst);
+            run_scan(app.clone(),ScanRequest{roots:roots.clone(),for_ingest});
+            for _ in 0..800 {
+                if started.exists() {break;}
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert!(started.exists(),"first root scan did not reach blocked probe");
+            std::fs::rename(root.join("b"),root.join("b-away")).unwrap();
+            std::fs::write(&release,b"release").unwrap();
+            test_support::scan_idle(&app).await;
+            let status=scan_status(State(app.clone())).await.0;
+            assert_eq!(library_roots(&app),roots);
+            assert!(!app.scanning.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(status["scan_error"],"Library root unavailable","{status}");
+            if for_ingest {assert_eq!(app.ingest_status.lock().unwrap().as_deref(),Some("failed"));}
+            assert_eq!(std::fs::read(root.join("b-away/retained.cbz")).unwrap(),b"source");
+            assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM media WHERE path=?1",
+                [root.join("b/retained.cbz").to_string_lossy()],|row|row.get::<_,i64>(0)).unwrap(),1);
+            std::fs::rename(root.join("b-away"),root.join("b")).unwrap();
+            app.scanning.store(true,std::sync::atomic::Ordering::SeqCst);
+            run_scan(app.clone(),ScanRequest{roots:roots.clone(),for_ingest:false});
+            test_support::scan_idle(&app).await;
+            assert!(scan_status(State(app.clone())).await.0["scan_error"].is_null());
+            std::fs::remove_file(&started).unwrap();std::fs::remove_file(&release).unwrap();
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -3116,11 +3171,13 @@ mod roots_scan_ingest_tests {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
+            assert!(!transcode::BUSY.load(std::sync::atomic::Ordering::SeqCst),"prior conversion worker did not become idle");
             std::fs::remove_file(root.join("probe-ready")).unwrap();std::fs::remove_file(root.join("probe-release")).unwrap();
             let movie=roots[1].join("blocking.mkv");
             let id=app.db.lock().unwrap().query_row("SELECT id FROM media WHERE path=?1",[movie.to_str().unwrap()],|r|r.get::<_,i64>(0)).unwrap();
             transcode::maybe_enqueue_with_roots(app.db_path.clone(),id,movie,roots.clone());
             for _ in 0..400 {if root.join("probe-ready").exists(){break;}tokio::time::sleep(std::time::Duration::from_millis(5)).await;}
+            assert!(root.join("probe-ready").exists(),"new worker did not reach its codec probe");
             assert!(transcode::BUSY.load(std::sync::atomic::Ordering::SeqCst));
             assert_eq!(setting(&app,serde_json::json!({"library_paths":[],"port":9999})).await,StatusCode::CONFLICT);
             std::fs::write(root.join("probe-release"),[]).unwrap();
@@ -3353,8 +3410,56 @@ mod integration_regressions {
             "fixture-admin".into(),
         )]))
     }
+    /// Retry hints identify only temporary conversion admission, with permanent references still unhinted.
+    #[tokio::test]
+    async fn admin_busy_delete_exposes_retry_after_only_for_transient_conflict() {
+        if std::env::var_os("FRAYD_TEST_DELETE_RETRY").is_none() {
+            test_support::assert_child_passes(test_support::child("integration_regressions::admin_busy_delete_exposes_retry_after_only_for_transient_conflict")
+                .env("FRAYD_TEST_DELETE_RETRY","1"));return;
+        }
+        let (root,app)=fixture();seed_media(&root,&app);
+        transcode::BUSY.store(true,std::sync::atomic::Ordering::SeqCst);
+        let response=delete_media(State(app.clone()),axum::http::HeaderMap::new(),query(),Path(1)).await.into_response();
+        assert_eq!(response.status(),StatusCode::CONFLICT);
+        assert_eq!(response.headers().get("retry-after").and_then(|value|value.to_str().ok()),Some("1"));
+        app.db.lock().unwrap().execute_batch("INSERT INTO progress(identity_id,media_id,position) VALUES(2,1,42)").unwrap();
+        let response=delete_media(State(app.clone()),axum::http::HeaderMap::new(),query(),Path(1)).await.into_response();
+        assert_eq!(response.status(),StatusCode::CONFLICT);assert!(!response.headers().contains_key("retry-after"));
+        transcode::BUSY.store(false,std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(std::fs::read(root.join("library/source.cbz")).unwrap(),b"original");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A held SQLite writer must not stop a current-thread Tokio timer while an admin operation waits.
+    #[tokio::test(flavor="current_thread")]
+    async fn admin_database_wait_keeps_async_runtime_responsive() {
+        for operation in ["settings","media"] {
+            let (root,app)=fixture();seed_media(&root,&app);
+            let writer=store::connect(&app.db_path).unwrap();writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let (progress_tx,progress_rx)=std::sync::mpsc::channel();
+            let release=std::thread::spawn(move || {
+                let responsive=progress_rx.recv_timeout(std::time::Duration::from_millis(300)).is_ok();
+                writer.execute_batch("COMMIT").unwrap();responsive
+            });
+            let request=async {
+                if operation=="media" {media(&app,1).await} else {
+                    set_setting(State(app.clone()),axum::http::HeaderMap::new(),query(),Json(serde_json::json!({"port":8989}))).await.status()
+                }
+            };
+            let timer=async {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                let _=progress_tx.send(());
+            };
+            let (status,())=tokio::join!(request,timer);
+            assert_eq!(status,StatusCode::NO_CONTENT);
+            assert!(release.join().unwrap(),"{operation} blocked the async runtime while waiting for SQLite");
+            assert_eq!(std::fs::read(root.join("library/source.cbz")).unwrap(),b"original");
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     /// Exercise the real media deletion handler with the fixture administrator and target ID.
-    async fn media(app:&Arc<App>,id:i64)->StatusCode {delete_media(State(app.clone()),axum::http::HeaderMap::new(),query(),Path(id)).await}
+    async fn media(app:&Arc<App>,id:i64)->StatusCode {delete_media(State(app.clone()),axum::http::HeaderMap::new(),query(),Path(id)).await.status()}
     /// Exercise the real account deletion handler through its administrative identity boundary.
     async fn user(app:&Arc<App>,id:i64)->StatusCode {remove_user(State(app.clone()),axum::http::HeaderMap::new(),query(),Path(id)).await}
     /// Exercise validated permission writes through the production transaction path.
@@ -3917,7 +4022,7 @@ mod integration_regressions {
     async fn admin_denials_last_admin_missing_and_query_failures() {
         let (root,app)=fixture();seed_media(&root,&app);
         let empty=||Query(std::collections::HashMap::new());
-        assert_eq!(delete_media(State(app.clone()),axum::http::HeaderMap::new(),empty(),Path(1)).await,StatusCode::FORBIDDEN);
+        assert_eq!(delete_media(State(app.clone()),axum::http::HeaderMap::new(),empty(),Path(1)).await.status(),StatusCode::FORBIDDEN);
         assert_eq!(remove_user(State(app.clone()),axum::http::HeaderMap::new(),empty(),Path(2)).await,StatusCode::FORBIDDEN);
         assert_eq!(
             set_perm(
@@ -3946,7 +4051,7 @@ mod integration_regressions {
             StatusCode::CONFLICT
         );
         app.db.lock().unwrap().execute_batch("DROP TABLE user_perms").unwrap();
-        assert_eq!(delete_media(State(app.clone()),headers.clone(),empty(),Path(1)).await,StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(delete_media(State(app.clone()),headers.clone(),empty(),Path(1)).await.status(),StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(remove_user(State(app.clone()),headers.clone(),empty(),Path(2)).await,StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
             set_perm(

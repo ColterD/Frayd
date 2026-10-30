@@ -486,8 +486,8 @@ $('#logout')?.addEventListener('click', () => {
   disposeSettings();
   ++libraryRequestGeneration;
   ++renderGeneration;
-  // The page reloads at once, so a failed logout request has nowhere to report.
-  fetch('/api/auth/logout', { method: 'POST', headers: authHeaders() }).catch(() => {});
+  // Keep revocation alive across the immediate local sign-out reload.
+  fetch('/api/auth/logout', { method: 'POST', headers: authHeaders(), keepalive: true }).catch(() => {});
   account = null;
   delete localStorage.frayd_token;
   // force login screen: tryResume() would otherwise auto-resume as LAN guest

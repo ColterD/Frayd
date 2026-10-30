@@ -44,10 +44,10 @@ Install exits with code 2 and changes nothing when it finds:
 - an unsupported flag, including any purge flag
 - a relative path, the filesystem root, or a shared toolchain path
 - a checkout path, or overlapping bundle, prefix, data and library paths
-- a symlink in an ancestor path
+- an ancestor that is a symlink or not a directory, is owned by neither root nor the invoking user, or is writable by group or others without the sticky bit (a sticky `/tmp` stays allowed)
 - an existing prefix, or existing data that Frayd did not create
 
-Declining the prompt returns 0. Upgrading an existing prefix is not supported.
+Start and removal repeat the ancestor checks. Declining the prompt returns 0. Upgrading an existing prefix is not supported.
 
 The helper checks the whole bundle before it creates anything. It reserves a new prefix with mode 0700, stages the files in a private sibling directory, verifies the copied bytes, and renames the staged tree over its own empty reservation. It writes ownership receipts for the prefix and the data directory. Existing data is reused only when it carries the private Frayd data marker, and no other existing file is adopted.
 
@@ -61,9 +61,13 @@ Library roots normally come from the database configuration. An inherited `FRAYD
 
 While the server runs, a private receipt marks it as owned, and start and removal refuse to run against an active one. Ctrl-C or SIGTERM in the foreground stops and reaps only that server and removes the receipt. If the supervisor crashes or is killed with SIGKILL, the receipt stays and blocks start and removal even after the server exits. Inspect that installation by hand. The helper never kills a process because its PID was reused. Keep the foreground supervisor alive until its server exits.
 
+The running server also records itself in `.frayd-child.json` in the data directory, in the same pid-and-state format as the prefix receipt. If two prefixes share one data directory, the second refuses to start while the first server runs and after a supervisor crash. A crash leaves both receipts. Before you recover by hand, verify that the old server has stopped. The helper never kills a process by PID and never adopts an existing one.
+
 ### Remove
 
 Uninstall verifies every remaining owned entry and rejects modified or extra files before it deletes anything. It removes only the recorded unchanged payload and the empty directories it owns. It never removes data, environment files, configuration, databases, libraries, source checkouts or shared Rust installations.
+
+Any entry the receipt does not list is unowned and stops removal. On macOS, Finder can add a `.DS_Store` file to the prefix when you browse it, and that file blocks removal with an `unowned entry: .DS_Store` error. Delete only that file yourself, then run uninstall again.
 
 Removal does not need the data directory. If the data is missing or moved, or its marker is missing or malformed, the prefix receipt and the unchanged payload still authorize removal. A recorded data path that is redirected or overlaps still blocks it. Start keeps requiring a valid data marker. Removal never recreates or reads the data location.
 
@@ -71,7 +75,7 @@ A failed removal keeps the receipt until the payload is gone. A retry accepts ow
 
 ### Limits
 
-The private prefix protects against other Unix users. It is not a sandbox against malicious code running as the same account, or against filesystem administrators. Concurrent edits can block publication or leave a partial removal. Keep the error and the receipt, inspect, and retry.
+The private prefix and the ancestor checks keep other Unix users out. The checks read owner and mode on each ancestor path. They do not walk the path atomically relative to a directory handle. A race by the same user or by root, and access granted through ACLs, are outside the guarantee. The bundle is not a sandbox against malicious code running as the same account, or against filesystem administrators. Concurrent edits can block publication or leave a partial removal. Keep the error and the receipt, inspect, and retry.
 
 The helper binary is Unix-only. Non-Unix builds keep an explicit unsupported-platform entry point, so the Windows source bootstrap build still compiles. Windows is not supported.
 
@@ -89,12 +93,12 @@ shellcheck scripts/native/install.sh scripts/native/start.sh scripts/uninstall.s
 CARGO_BUILD_JOBS=2 cargo +1.99.1 clippy --locked --manifest-path server/Cargo.toml \
   --bin frayd-native --target-dir target/native-qualification -- -D warnings
 CARGO_BUILD_JOBS=2 cargo +1.99.1 build --locked --manifest-path server/Cargo.toml \
-  --bin frayd-native --target-dir target/native-qualification
+  --bin frayd-native --bin frayd-server --target-dir target/native-qualification
 FRAYD_NATIVE_HELPER="$PWD/target/native-qualification/debug/frayd-native" \
 python3 -m unittest discover -s tests -p test_native_bundle.py -v
 ```
 
-The default suite runs the real helper in owned temporary directories against a short-lived synthetic server. Tests that need the real server require these inputs:
+The package tests use the `frayd-server` binary beside the helper, so the build step builds both binaries. The default suite runs the real helper in owned temporary directories against a short-lived synthetic server. Tests that need the real server require these inputs:
 
 ```sh
 FRAYD_NATIVE_HELPER=/absolute/qualified/frayd-native \

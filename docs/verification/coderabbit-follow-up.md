@@ -9,9 +9,10 @@ Navigation: [source boundaries](#source-and-delivery-boundaries),
 [recovery receipts](#same-image-recovery-receipts),
 [historical commands and gates](#historical-commands-and-acceptance-gates),
 [EPUB follow-up](#epub-replacement-coherence-follow-up),
-[comic cache follow-up](#optional-comic-page-cache-write-follow-up).
+[comic cache follow-up](#optional-comic-page-cache-write-follow-up),
+[security alert dispositions](#security-alert-dispositions).
 
-The disposition table tracks original and later CodeRabbit findings, outside-diff comments, nitpicks and published tool diagnostics. Summary-only risks and GitHub CodeQL alerts have separate sections.
+The disposition table tracks original and later CodeRabbit findings, outside-diff comments, nitpicks and published tool diagnostics. Summary-only risks have a separate section, and [GitHub CodeQL alert dispositions](#security-alert-dispositions) have their own.
 
 ## Source and delivery boundaries
 
@@ -192,7 +193,7 @@ A resolved review thread and a passing check are separate evidence.
 | [PARTIAL-CHILD-MARKER-POLL](https://github.com/ColterD/Frayd/pull/2#discussion_r4411053341) | Minor, full review 5696020097 | The orphan-receipt marker can be empty/partial or disappear after the existence check. The original comment requested both temporary `JSONDecodeError` and `FileNotFoundError`; the earlier JSON-only correction missed the latter race. | The completed test-only catch handles both exceptions under the existing ten-second deadline. Injected disappearance after exists=True raises `FileNotFoundError` before correction and succeeds after; transient invalid JSON still succeeds. Persistent disappearance refuses after 10.030 seconds and 498 retries rather than passing. Current native-harness SHA-256 `9cd1dff2aa7c376b1060579d4109bf1116693ff6402195c2cf2428ec26eeaccc` passes 23 Linux x86_64 archive tests with zero skips, Ruff and Python compilation against the unchanged b755e6f archive SHA-256 `cf5f2ad01a06d2a9837e380bf1a70a0e1102756ae2c7d00ed0bb13dfa0d7704b`. This remains the same finding, not a 129th disposition. The thread was reopened for final commit/CI verification; final-head hosted and Mac status belongs to the PR description. |
 | [INSTALLER-BROWSER-CASE-BUDGET](https://github.com/ColterD/Frayd/actions/runs/40857799994/job/123393074707) | Local CI reliability follow-up after `b755e6f` | The PR browser job reached case 48 after 48.103 seconds of its 60-second case phase, leaving 11.897 seconds for a real five-poll installer case that needs about 12 seconds; it timed out with 47 preceding cases passing and no assertion failure. | The test driver begins the isolated own five-poll iframe before independent responsive cases 43–46, preserving its actual production 3-second × four-gap schedule and a separate 15-second completion deadline. A paired local Chrome run changed total case time 55.383 → 48.114 seconds and installer wait 12.279 → 5.017 seconds; all 49 cases pass with cleanup. Focused 26 and full Node 266 pass. This is a test-only schedule correction with one paired timing observation, not a product or general performance guarantee. New committed-head hosted browser acceptance remains pending. |
 | [WIRE-ZERO-ELAPSED-TEST-CLOCK](https://github.com/ColterD/Frayd/actions/runs/40859778643/job/123399781440) | Local CI reliability follow-up after `4d3c988` | The PR Node job passed 265/266 tests and failed an audio wire assertion expecting exactly zero after asynchronous settle; the observed projected position was about 0.001 seconds. The [push job](https://github.com/ColterD/Frayd/actions/runs/40859771442/job/123399757611) failed a different new party-video zero assertion with the same near-zero projection. The tests stamp authoritative packets from wall-clock `Date.now()` then await settlement, allowing legitimate elapsed playback time. | The test-only `tests/client.test.cjs` correction supplies an optional clock to the browser VM before production code loads, then stamps authoritative wire packets from that same VM clock. A forced 1 ms tick reproduces both exact-zero failures before the change; after it, focused 20/20 passes in ten separate invocations and full Node 266/266 passes. A separate realm probe keeps host and unrelated VM clocks unchanged; takeover tests explicitly advance one second to retain elapsed-position coverage. No production, browser-driver, native or workflow input changes. Both `4d3c988` hosted Checks remain red; a new committed-head run is required. |
-| [NATIVE-RUNTIME-INPUT-GUARD](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5697906709) | Minor, outside diff | Optional NativeRuntime discovery checked only FRAYD_NATIVE_ARCHIVE, then unconditionally read FRAYD_NATIVE_BUILD_SOURCE; archive-only discovery reproduced KeyError before runtime validation. | The guard now requires both inputs. Permanent NativeSourceContract.test_runtime_discovery_requires_both_inputs loads the test module in-process in four mocked environments (neither input, archive only, source only, both) and asserts that the runtime class is skipped unless both inputs are present, with exactly one explicit skip when it is skipped. It originally ran child unittest discovery processes. When the guard was fixed, full required-input Linux native qualification passed 24/24 with zero skips; the suite now has 22 tests under full qualification. Ruff and Python compilation exited 0, source SHA-256 `8f12ac8b066a1886c55520c0e63da89ef79c0a59212d8c397db9c4950cf6b23a`, against unchanged b755e6f archive. This is a new finding, separate from the completed marker-race disposition. Prior 12d99b9 CI and fresh Mac 23-per-architecture results are historical; the changed harness requires new committed-head CI/Mac and semantic review verification. |
+| [NATIVE-RUNTIME-INPUT-GUARD](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5697906709) | Minor, outside diff | Optional NativeRuntime discovery checked only FRAYD_NATIVE_ARCHIVE, then unconditionally read FRAYD_NATIVE_BUILD_SOURCE; archive-only discovery reproduced KeyError before runtime validation. | The guard now requires both inputs. Permanent NativeSourceContract.test_runtime_discovery_requires_both_inputs loads the test module in-process in four mocked environments (neither input, archive only, source only, both) and asserts that the runtime class is skipped unless both inputs are present, with exactly one explicit skip when it is skipped. It originally ran child unittest discovery processes. When the guard was fixed, full required-input Linux native qualification passed 24/24 with zero skips; the suite then had 22 tests under full qualification. Later heads add tests; the [changelog](pr-2-changelog.md#native-runtime-discovery-follow-up) records the current count. Ruff and Python compilation exited 0, source SHA-256 `8f12ac8b066a1886c55520c0e63da89ef79c0a59212d8c397db9c4950cf6b23a`, against unchanged b755e6f archive. This is a new finding, separate from the completed marker-race disposition. Prior 12d99b9 CI and fresh Mac 23-per-architecture results are historical; the changed harness requires new committed-head CI/Mac and semantic review verification. |
 
 
 Browser budget follow-up to `abceebf923841c956d8f69a8353785fbd9118fdd`: the hosted PR attempt exhausted its 15-second startup deadline before any case; the push attempt reached readiness after 13,423 ms, then exhausted the shared 60-second timer during cases. A scaled controlled reproduction confirms that startup consumed case time. The corrected harness gives startup 30 seconds and starts the unchanged 60-second case budget only after setup/navigation acknowledgment. Existing bounded cleanup and per-case oracles remain unchanged. Independent startup/case timeout controls pass; all 183 Node tests and 49 actual-browser cases pass locally, with approximately 204 ms startup, 49,809 ms cases and successful cleanup. Completed/current progress remains separate from the terminal result. This qualifies the recorded harness inputs, not a fresh hosted run or an explanation for the underlying header delay. Native source, package, tests and workflow remain byte-identical to `abceebf9`; earlier native platform executions retain their actual source identities.
@@ -475,10 +476,66 @@ on fork main at `a7a6dab`; its separate eight-test Rust suite, Clippy, release a
 all hosted workflow jobs pass. GitHub marks alerts 11-12 fixed. Alert 13 still flags
 the literal option terminator and effective argument controls; it was dismissed
 as false positive with explicit owner approval, recorded separately
-from the source-fixed alerts. The PR body records the approved full rationale
-and current GitHub state. These are separate from the four
+from the source-fixed alerts. [Security alert dispositions](#security-alert-dispositions)
+records the approved full rationale and current GitHub state. These are separate from the four
 EPUB findings already fixed on fork main. No query/code suppression was added;
 alert 13 received the separately approved false-positive disposition.
+
+## Security alert dispositions
+
+This section is the durable record of the CodeQL alerts on `ColterD/Frayd` that were dismissed or are still open. Alert state was read from the code-scanning API on 2026-10-30 UTC at PR head `602230f` and is provisional until the final SHA. The GitHub dismissal comments point at the PR description, which no longer holds the rationale, so the full text is here.
+
+### Alert 13: owner-approved false positive
+
+[Alert 13](https://github.com/ColterD/Frayd/security/code-scanning/13) (`rust/command-line-injection`, fork main `server/src/main.rs`) was dismissed as a false positive on 2026-10-28T05:09:13Z. The dismissal comment on GitHub reads "False positive: admin-only HTTP(S) URL is one argv value after literal --; fixed yt-dlp executable, no shell. Recorder verifies exact args/rejections. Parser stops options at --. Full approved rationale/tests: https://github.com/ColterD/Frayd/pull/2".
+
+The paragraphs below are the full rationale, copied exactly from the section "Historical approved alert 13 disposition" of the PR #2 description before it was shortened. They describe fork main `a7a6dab`. The test counts in them are historical.
+
+> Owner-approved rationale retained verbatim once; historical test counts are not current-head qualification.
+>
+> False positive for command/option injection at fork main a7a6dab. Ingestion is admin-gated and accepts only HTTP(S). The fixed yt-dlp executable is invoked through separate std::process::Command arguments without a shell; a literal -- precedes the single URL argument. Source: https://github.com/ColterD/Frayd/blob/a7a6dabccce971992d1ed47b00ef66f74811e6e7/server/src/main.rs#L606-L648 . The official parser consumes -- and stops option parsing: https://github.com/yt-dlp/yt-dlp/blob/f264a6cbd1f630894da0f368df00f8aae50140e0/yt_dlp/options.py#L188-L190 . ingest_preserves_admin_guards_and_literal_downloader_arguments verifies rejection before execution and exact argv with spaces/metacharacters in an isolated recorder. Main Rust 8/8 and PR2 28/28 pass. No actual download or broader downloader/SSRF assessment is claimed. No query exclusion or code suppression is added.
+
+### Alerts 19 to 23: false-positive dispositions
+
+All five were dismissed as false positives with the owner's approval on 2026-10-29. Each GitHub comment is quoted below. The alerts add no code or query suppression and do not replace fresh analysis. Alerts 19 and 21 cover integer-derived thumbnail paths, alerts 20 and 23 the fixed downloader argv, and alert 22 operator-origin cache configuration.
+
+- [Alert 19](https://github.com/ColterD/Frayd/security/code-scanning/19), `rust/path-injection`, fork main `server/src/main.rs`, dismissed 2026-10-29T04:02:41Z:
+  > False positive: `Path<i64>` becomes only a decimal "{id}.jpg" basename under the operator-configured thumbnail directory; it cannot encode separators or traversal. Admin and row-existence checks precede deletion. Static conclusion; no malformed-path runtime test claimed.
+- [Alert 20](https://github.com/ColterD/Frayd/security/code-scanning/20), `rust/command-line-injection`, fork main `server/src/main.rs`, dismissed 2026-10-29T04:02:42Z:
+  > False positive: ingest requires admin and HTTP(S), invokes fixed yt-dlp with separate argv and literal "--" before the URL. No shell interprets the URL or treats it as an option. Existing recorder checks argv/admin behavior; external downloader behavior is unqualified.
+- [Alert 21](https://github.com/ColterD/Frayd/security/code-scanning/21), `rust/path-injection`, PR merge ref `server/src/main.rs`, dismissed 2026-10-29T04:02:44Z:
+  > False positive: delete_media parses `Path<i64>`; cleanup builds only "{id}.jpg". Checks prove cache ownership, reject symlinks and exclude source/library paths after row deletion. Recorded thumbnail-refusal tests pass; no malformed-path runtime test claimed.
+- [Alert 22](https://github.com/ColterD/Frayd/security/code-scanning/22), `rust/path-injection`, PR merge ref `server/src/transcode.rs`, dismissed 2026-10-29T04:02:45Z:
+  > False positive: traced cache paths derive from operator environment or app.db_path initialized at startup, not settings JSON. validate_cache reads ancestors and rejects cache/library overlap. Recorded overlap tests pass; hostile concurrent filesystem writers unqualified.
+- [Alert 23](https://github.com/ColterD/Frayd/security/code-scanning/23), `rust/command-line-injection`, PR merge ref `server/src/main.rs`, dismissed 2026-10-29T04:02:47Z:
+  > False positive: ingest requires admin and HTTP(S), uses fixed yt-dlp, separate argv and "--" before the URL. No shell/option interpretation of URL. Source-matched recorded build passes argv/admin recorder; external downloader behavior remains unqualified.
+
+The downloader recorder tests prove argv and guard behavior. They do not prove external downloads or a broad SSRF assessment. Markdown code spans were added around `Path<i64>` in the quotes above; the wording is unchanged.
+
+### Alerts 25 to 33: fixed in test code
+
+These nine alerts appeared on the PR merge ref after the cleanup pass. All are fixed, not dismissed. GitHub's fixed time is when the analysis finished, so it trails the commit.
+
+| Alert | Rule and location | Fixed (UTC) | Fix |
+|---|---|---|---|
+| [25](https://github.com/ColterD/Frayd/security/code-scanning/25) | `js/bad-tag-filter`, `tests/epub-message.test.cjs` | 2026-10-30T02:09:38Z | `4c32c19`: the test bridge extractor matches `<script>` case-insensitively. It extracts the bridge for VM execution and is not an HTML sanitizer. |
+| [26](https://github.com/ColterD/Frayd/security/code-scanning/26) | `py/incomplete-url-substring-sanitization`, `tests/test_bootstrap_installers.py` | 2026-10-30T01:48:14Z | `eec67ff` (GitHub autofix) compared a parsed host. `570dead` replaced that with an exact match on the installer URL token, so the test no longer searches for a substring. |
+| [27](https://github.com/ColterD/Frayd/security/code-scanning/27) | `js/insecure-temporary-file`, `tests/browser-regression.cjs` | 2026-10-30T01:48:37Z | `a06179a` (GitHub autofix) made the default result directory a `mkdtempSync` directory. `570dead` creates it only when a run writes `result.json`. |
+| [28](https://github.com/ColterD/Frayd/security/code-scanning/28) to [33](https://github.com/ColterD/Frayd/security/code-scanning/33) | `rust/hard-coded-cryptographic-value`, `server/src/auth.rs` (28, 29) and `server/src/main.rs` (30 to 33) | 2026-10-30T02:13:12Z | `4c32c19`: tests take a per-run UUID password from `fixture_password()` instead of the `fixture-secret` literal. |
+
+### Alert 34: dismissed as a false positive
+
+[Alert 34](https://github.com/ColterD/Frayd/security/code-scanning/34) (`rust/command-line-injection`, `server/src/main.rs:891` at `602230f`) is open. GitHub created it on the PR merge ref at 2026-10-30T01:50:43Z, the same second at which alerts 22 and 23 show a fixed time. It flags the `yt-dlp` invocation in the ingest handler: the fixed executable, `-f mp4 --no-playlist -o <output>`, a literal `--`, then the request URL as one argument. That is the invocation covered by alerts 13, 20 and 23, and the code still matches their rationale: ingestion is admin-gated, accepts only HTTP(S) and runs no shell. The recorder test `ingest_preserves_admin_guards_and_literal_downloader_arguments` covers it.
+
+Status: dismissed as a false positive on 2026-10-30T03:34:12Z by the owner, after the downloader sink at the final working source matched the earlier triage (sink sha256 `5ac1b09b30fcc93c689fd6b5d50f2b399135a24833b60e52a5270f239587c6b4`) and the exact recorder test `ingest_tests::ingest_preserves_admin_guards_and_literal_downloader_arguments` passed 1/1. The owner-approved dismissal comment, verbatim:
+
+> False positive for URL shell/option injection: fixed yt-dlp uses separate argv, with literal "--" before the single HTTP(S) URL. No shell evaluates it; its parser stops options at "--". Recorder verifies literal argv. Downloader-wide safety is unqualified.
+
+Limit: this covers the pinned invocation and its argument parsing only. The downloader's own behavior, external downloads and a broad SSRF assessment are not qualified.
+
+### Earlier fixed alerts
+
+GitHub reports alerts 1 to 12, 14 to 18 and 24 as `fixed`, not dismissed. Alerts 1 to 4 (EPUB message sender checks), 11 and 12 (ingestion destination and output), 16 (test logging) and 24 (fixture response) are described in [Summary-only risks and separate security work](#summary-only-risks-and-separate-security-work) and [Inherited ingestion diagnostics](#inherited-ingestion-diagnostics).
 
 ## Real-browser and archive-replacement proof
 
@@ -531,7 +588,8 @@ unsuccessful harness attempts remain failed evidence; this fresh scoped approach
 passed and both attempts' disposable resources were removed.
 
 Remote acceptance metadata is recorded in the PR body, including full-review
-publication, check results and the owner-authorized alert 13 disposition. This
+publication and check results. The owner-authorized alert 13 disposition is in
+[Security alert dispositions](#security-alert-dispositions). This
 source ledger preserves immutable test boundaries and never treats a skipped
 review as acceptance.
 
@@ -612,7 +670,8 @@ metadata-only correction does not change any runtime/build verification input.
 
 The `5451980` whole-PR review did not repeat the converted-source freshness risk.
 It raised three Minor items, all tracked above. Alert 13 is absent from active
-acceptance gates; its approved false-positive rationale and history are retained.
+acceptance gates; its approved false-positive rationale and history are retained in
+[Security alert dispositions](#security-alert-dispositions).
 QA image defaults, CI build tags and repeatable commands use neutral names. The
 README checkout continues to target the actual fork branch under the owner's
 explicit fork-only work order. Current upstream `540b87a` lacks this PR's cache

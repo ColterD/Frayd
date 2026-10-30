@@ -90,8 +90,16 @@ def cleanup_project(compose):
             print('QA cleanup failed; original scenario failure retained', file=sys.stderr)
 
 
+class HTTPStatusError(AssertionError):
+    """A response whose status differs from the caller's expectation, with its headers and body."""
+
+    def __init__(self, path, status, expected, headers, body):
+        super().__init__((path, status, expected))
+        self.path, self.status, self.expected, self.headers, self.body = path, status, expected, headers, body
+
+
 def request(path, data=None, token=None, headers=None, expected=200, timeout=15, method=None):
-    """Issue an HTTP request, assert its status and return the body, error bodies included."""
+    """Issue an HTTP request, require its status and return the body, error bodies included."""
     fields = dict(headers or {})
     if token:
         fields['Authorization'] = 'Bearer ' + token
@@ -102,12 +110,12 @@ def request(path, data=None, token=None, headers=None, expected=200, timeout=15,
     try:
         response = urllib.request.urlopen(req, timeout=timeout)
     except urllib.error.HTTPError as error:
-        with closing(error):
-            assert error.code == expected, (path, error.code, expected)
-            return error.read()
+        response = error
     with closing(response):
-        assert response.status == expected, (path, response.status, expected)
-        return response.read()
+        body = response.read()
+        if response.status != expected:
+            raise HTTPStatusError(path, response.status, expected, response.headers, body)
+        return body
 
 
 def wait_until(probe, failure, timeout, interval=0.1, transient=()):
@@ -218,21 +226,40 @@ def scan_status():
 
 
 def delete_media(media_id, token, expected):
-    """DELETE one media row, retrying only the server's transient 409 refusal.
+    """DELETE one media row, retrying only the server's transient 409 refusal; print the retry count.
 
     After a scan, its conversion worker holds the global conversion slot while it checks whether a
-    video needs converting, even when it will convert nothing. Deletion refuses with 409 meanwhile
-    and changes nothing, so a retry is safe; any other status must match at once.
+    video needs converting, even when it will convert nothing. When that slot is the only conflict,
+    deletion answers 409 with Retry-After and changes nothing, so a retry is safe. A 409 without
+    Retry-After (a referenced item) and any other status must match at once.
     """
+    retries = 0
+
     def attempt():
+        nonlocal retries
         try:
             request(f'/api/media/{media_id}', token=token, method='DELETE', expected=expected)
-        except AssertionError as error:
-            if error.args and isinstance(error.args[0], tuple) and error.args[0][1:] == (409, expected):
-                return False
-            raise
+        except HTTPStatusError as error:
+            if error.status != 409 or error.headers.get('Retry-After') is None:
+                raise
+            retries += 1
+            return False
         return True
-    wait_until(attempt, f'media {media_id} delete stayed refused with 409', 10, 0.2)
+    try:
+        wait_until(attempt, f'media {media_id} delete stayed refused with transient 409', 10, 0.2)
+    finally:
+        print(f'delete media {media_id}: {retries} transient 409 retries')
+
+
+def conflict_retry_after(media_id, token):
+    """DELETE media whose deletion must be refused with 409; return the refusal's Retry-After, if any."""
+    try:
+        request(f'/api/media/{media_id}', token=token, method='DELETE', expected=204)
+    except HTTPStatusError as error:
+        if error.status != 409:
+            raise
+        return error.headers.get('Retry-After')
+    raise AssertionError(f'media {media_id} was deleted while its deletion had to be refused')
 
 
 def wait_for_scan_idle():
@@ -430,7 +457,10 @@ def upstream_contract_qualification(args):
         (tools / 'yt-dlp').write_text('#!/bin/sh\nif [ "$1" = --version ]; then echo owned-fixture; exit 0; fi\n'
                                     'cp /qa/comic.cbz /roots/a/Internet/queued.cbz\n')
         (tools / 'ffprobe').write_text('#!/bin/sh\nif [ -e /data/hold-probe ]; then touch /data/probe-entered; '
-                                     'while [ -e /data/hold-probe ]; do sleep 0.05; done; fi\nexec /usr/bin/ffprobe "$@"\n')
+                                     'while [ -e /data/hold-probe ]; do sleep 0.05; done; fi\n'
+                                     'case "$*" in *stream=codec_name*) if [ -e /data/hold-conversion ]; then '
+                                     'touch /data/conversion-entered; while [ -e /data/hold-conversion ]; do sleep 0.05; done; '
+                                     'fi;; esac\nexec /usr/bin/ffprobe "$@"\n')
         for command in ('yt-dlp', 'ffprobe'):
             (tools / command).chmod(0o755)
         app = config['services']['app']
@@ -534,7 +564,9 @@ def upstream_contract_qualification(args):
 
             # An actual scan blocks in our owned probe while the fake downloader exits.
             # Indexing must queue behind that scan, never advertise completion early.
+            # The new video's conversion check then holds the conversion slot in its own probe.
             (data / 'hold-probe').touch()
+            (data / 'hold-conversion').touch()
             (roots / 'b/block.mp4').write_bytes(b'owned invalid probe input')
             request('/api/scan', token=token, method='POST', expected=202)
             wait_until(lambda: (data / 'probe-entered').exists(), 'scan never reached owned blocking probe', 10, 0.05)
@@ -544,18 +576,26 @@ def upstream_contract_qualification(args):
             request('/api/ingest', {'url': 'https://example.invalid/owned-queue'}, token, expected=409, method='POST')
             request('/api/scan', token=token, method='POST', expected=409)
             post_settings({'library_paths': []}, 409)
-            request(f'/api/media/{media_id}', token=token, method='DELETE', expected=409)
             (data / 'hold-probe').unlink()
+            wait_until(lambda: (data / 'conversion-entered').exists(),
+                       'conversion worker never reached owned blocking probe', 10, 0.05)
+            idle_id = ids['/roots/b/second.cbz']
+            assert conflict_retry_after(idle_id, token) == '1'
+            assert sql('SELECT id FROM media WHERE id=?', (idle_id,)) == [(idle_id,)]
+            assert conflict_retry_after(media_id, token) is None
+            (data / 'hold-conversion').unlink()
             status = wait_until(lambda: ingest_status('done', 'failed'), 'ingest did not finish', 30)
             assert status['ingesting'] == 'done', status
             queued_id = sql("SELECT id FROM media WHERE path='/roots/a/Internet/queued.cbz'")[0][0]
             assert queued_id in {item['id'] for item in library()}
             wait_for_scan_idle()
             print('PASS: ingest queues behind a running scan and is indexed before done; busy requests get 409')
+            print('PASS: held conversion slot refuses an unreferenced delete with Retry-After; '
+                  'a referenced delete answers 409 without it')
 
             request('/api/media/999999', token=token, method='DELETE', expected=404)
             request(f'/api/media/{media_id}?identity=qa-nonadmin', method='DELETE', expected=403)
-            request(f'/api/media/{media_id}', token=token, method='DELETE', expected=409)
+            assert conflict_retry_after(media_id, token) is None
             own_id = sql("SELECT id FROM identities WHERE key='upstream-qa@example.invalid'")[0][0]
             target = 10001
             sql("INSERT INTO identities(id,kind,key) VALUES(?,'account','qa-target'),(10002,'account','qa-unrelated')", (target,))
