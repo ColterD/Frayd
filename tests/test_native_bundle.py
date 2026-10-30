@@ -967,8 +967,16 @@ class NativeOwnership(unittest.TestCase):
         self.install('--yes')
         process = subprocess.Popen([str(HELPER), 'start', '--prefix', str(self.prefix)],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
+        primary_error = None
         try:
-            child = wait_for(lambda: shared_running_child_pid(self.prefix, self.data), 'child receipts')
+            def child_receipts():
+                child = shared_running_child_pid(self.prefix, self.data)
+                if child is None and process.poll() is not None:
+                    stdout, stderr = process.communicate(timeout=2)
+                    self.fail(f'helper exited before child receipts: exit={process.returncode}; '
+                              f'stdout={stdout!r}; stderr={stderr!r}')
+                return child
+            child = wait_for(child_receipts, 'child receipts')
             wait_for(ready.exists, 'fixture child group change')
             self.assertEqual(os.getpgid(child), process.pid)
             process.send_signal(signal.SIGTERM)
@@ -978,16 +986,29 @@ class NativeOwnership(unittest.TestCase):
             self.run_helper('start', code=2)
             self.run_helper('uninstall', '--yes', code=2)
             self.assertFalse(done.exists(), 'refusal must not signal the shared group')
+        except BaseException as error:
+            primary_error = error
+            raise
         finally:
-            # This deliberately escaped fixture has a bounded self-exit oracle.
-            # Never signal its old PID or process group after helper exit.
-            stop.touch()
-            wait_for(done.exists, 'escaped fixture self-exit', timeout=25)
-            if process.poll() is None:
-                process.send_signal(signal.SIGTERM)
-                process.wait(timeout=10)
-            _, stderr = process.communicate(timeout=10)
-            self.assertIn(b'owned child group identity uncertain', stderr)
+            # Always request cooperative stop; never signal the escaped PID/group.
+            try:
+                stop.touch()
+                if process.poll() is None:
+                    process.send_signal(signal.SIGTERM)
+                    process.wait(timeout=10)
+                if ready.exists():
+                    wait_for(done.exists, 'escaped fixture self-exit', timeout=25)
+                elif any((root / '.frayd-child.json').exists() for root in [self.prefix, self.data]):
+                    self.fail('escaped fixture readiness unknown; retain fixture for inspection')
+                stdout, stderr = process.communicate(timeout=10)
+                if primary_error is None:
+                    self.assertIn(b'owned child group identity uncertain', stderr,
+                                  f'stdout={stdout!r}; stderr={stderr!r}')
+            except BaseException as cleanup_error:
+                self.preserve_fixture = True
+                if primary_error is None:
+                    raise
+                primary_error.add_note(f'cleanup uncertain; fixture retained at {self.base}: {cleanup_error}')
             process.stderr.close()
 
     def test_owned_server_group_stops_descendants_and_preserves_foreign_group(self):
