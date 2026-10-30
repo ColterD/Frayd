@@ -12,7 +12,7 @@ const { setTimeout: delay } = require('node:timers/promises');
 
 const root = resolve(__dirname, '..');
 // The runner writes result.json here; FRAYD_DOM_RESULT_DIR overrides the temporary default.
-const defaultResultDirectory = process.env.FRAYD_DOM_RESULT_DIR || join(tmpdir(), 'frayd-dom-regression');
+const defaultResultDirectory = process.env.FRAYD_DOM_RESULT_DIR || mkdtempSync(join(tmpdir(), 'frayd-dom-regression-'));
 // Every full run must report exactly this many uniquely named cases.
 const EXPECTED_CASES = 45;
 const productionFiles = ['client/index.html', 'client/js/app.js', 'client/js/party.js', 'client/js/build-info.js',
