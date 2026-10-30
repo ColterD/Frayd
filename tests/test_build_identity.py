@@ -17,6 +17,9 @@ ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('freshness', ROOT / 'scripts/check-upstream.py')
 freshness = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(freshness)
+metadata_spec = importlib.util.spec_from_file_location('metadata', ROOT / 'scripts/build-metadata.py')
+metadata = importlib.util.module_from_spec(metadata_spec)
+metadata_spec.loader.exec_module(metadata)
 
 
 def git(repo, *args):
@@ -168,6 +171,31 @@ class Freshness(unittest.TestCase):
 
 
 class LocalBuildMetadata(unittest.TestCase):
+    def test_git_unavailable_keeps_metadata_unknown_and_runs_requested_build(self):
+        run = subprocess.run
+        for error in (subprocess.TimeoutExpired('git', 15), OSError('git unavailable')):
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / 'build.json'
+
+                def git_unavailable(command, **kwargs):
+                    if command[0] == 'git':
+                        self.assertGreater(kwargs.get('timeout', 0), 0)
+                        self.assertLessEqual(kwargs['timeout'], 45)
+                        raise error
+                    self.assertNotIn('timeout', kwargs, 'the build itself must retain its own deadline policy')
+                    return run(command, **kwargs)
+
+                command = ('import json, os, pathlib, sys; '
+                           'keys=("FRAYD_BUILD_COMMIT", "FRAYD_BUILD_COMMITS_SINCE_TAG", "FRAYD_BUILD_DIRTY"); '
+                           'pathlib.Path(sys.argv[1]).write_text(json.dumps({key: os.environ[key] for key in keys}))')
+                with patch.object(metadata.subprocess, 'run', side_effect=git_unavailable), \
+                        patch.object(sys, 'argv', ['build-metadata.py', '--', sys.executable, '-c', command, str(output)]):
+                    self.assertEqual(set(metadata.capture().values()), {'unknown'})
+                    with self.assertRaises(SystemExit) as exit_status:
+                        metadata.main()
+                self.assertEqual(exit_status.exception.code, 0)
+                self.assertEqual(set(json.loads(output.read_text()).values()), {'unknown'})
+
     def test_cargo_refreshes_head_dirty_clean_and_refuses_ancestor_git(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / 'source'
@@ -203,9 +231,6 @@ class LocalBuildMetadata(unittest.TestCase):
             copied = root / 'archive/server'
             shutil.copytree(server, copied, ignore=shutil.ignore_patterns('target'))
             self.assertEqual(build(copied), ['unknown', 'unknown', 'unknown'])
-            metadata_spec = importlib.util.spec_from_file_location('metadata', ROOT / 'scripts/build-metadata.py')
-            metadata = importlib.util.module_from_spec(metadata_spec)
-            metadata_spec.loader.exec_module(metadata)
             git(root, 'tag', 'v0.1.1')
             shallow = Path(directory) / 'shallow'
             git(root, 'clone', '--depth=1', root.as_uri(), str(shallow))

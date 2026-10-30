@@ -6,6 +6,26 @@ Net inventory against synced fork main `21b2e9b6bf4cff26254f5dfcec9deecd02453718
 
 PR #2 is an unmerged, unreleased draft on the fork. The local deployment at `http://127.0.0.1:3101` passed the operational verification in [Verified local rollout](#verified-local-rollout).
 
+## Workflow follow-up checkpoint (2026-10-30)
+
+This checkpoint starts from `cd92f3028d2052337c0f9e92eb2aa59d2acc12c6` with concurrent, uncommitted workflow fixes. It does not replace the source-bound `9bc322a` and `a2473d` qualification below. Final source hashes, current-image execution and hosted checks for these changes remain pending. No deployment or upstream publication is authorized by these results.
+
+### Fixed
+
+- Signed-in non-administrators have an **Account** entry for the shared password form. Administrators retain that form in Settings. This exposes the existing password-change API; it adds no session-invalidation policy.
+- URL ingestion stages downloads outside the library roots and validates video metadata before publication. The destination keeps the downloader filename. An owned partial file and a same-filesystem hard link prevent replacement of an existing destination. Valid existing video stays intact; invalid collisions fail. The destination must support hard links. Repeated requests can download again before deduplication. Validation is a metadata probe, not a full-file decode. Job-owned staging cleanup and the download-to-index handoff retain separate ownership, so an old guard cannot fail a new download. Redirected or non-directory destinations and missing roots are refused.
+- Native packaging checks distinct server/helper bytes, the helper role and matching compile-time version, commit, dirty state and tag distance before creating output. The helper adds a read-only `--build-info` command. This detects accidental substitution; it does not authenticate supplied binaries. Final archive qualification is pending.
+- Build metadata Git probes have 15-second deadlines and retain unknown identity on timeout or command failure. The Docker context sentinel covers state files inside allowed source subdirectories. Windows fixture changes cover relative library paths and explicit UTF-8 reads; current Windows execution remains pending.
+- The Docker cleanup guide now states the actual failure boundary: `finally` attempts cleanup and preserves the original error. Resource-inventory assertions run after successful scenarios only. This addresses [CodeRabbit comment 4423490029](https://github.com/ColterD/Frayd/pull/2#discussion_r4423490029) without changing runtime behavior.
+
+### Verification and held gates
+
+The disposable actual-server API matrix records 39 passing scenarios, each with command exit 0 and explicit expected/actual observations. Password cases reject the old password after a valid change, accept the new password and retain both existing sessions, including after restart. Account deletion removes the target account and all seeded child rows, rejects its old token and preserves unrelated users. Media deletion removes the database row and its owned thumbnail while preserving original source bytes and unrelated records. The matrix separately marks direct last-administrator deletion as not applicable in its valid fixture state and active-conversion deletion as held; neither is counted as passing.
+
+These results establish API/database behavior at the tested runtime checkpoint. They do not qualify the new Account form submission or final workflow source. Actual GUI deletion of user 5 and media 4 remains pending at the native confirmation bridge. The new password form still needs a real user submission. Concurrent client monitor changes require a fresh final Node run; intermediate counts are not final qualification. Downloader runtime retest and native server/helper pair qualification remain pending.
+
+CodeRabbit was resumed for the current owner-requested review: [resume request](https://github.com/ColterD/Frayd/pull/2#issuecomment-6522239332), [bot response](https://github.com/ColterD/Frayd/pull/2#issuecomment-6522243230). Earlier pause statements below describe their historical checkpoints. A resumed review is not a completed review or approval; final findings and their source binding require readback.
+
 ## Upstream integration
 
 The branch includes [upstream `dd8eaf42d692dee118525b6d98d883cbe76967f4`](https://github.com/kattiest/Frayd/tree/dd8eaf42d692dee118525b6d98d883cbe76967f4): TV shelves, author/series folders and absolute native-player sizing after the earlier `ea29a5c43b3fe973bbaef667138debde4364f832` integration. Provenance: pinned upstream history; disposition: ADOPT. No root/package license declaration exists in this snapshot; no repository license is inferred.

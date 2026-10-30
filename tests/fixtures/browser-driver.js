@@ -645,13 +645,13 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       return;
     }
     sessionStorage.removeItem('frayd-qa-logout');
-    check(settingsPoll === null && !document.getElementById('settings-modal').classList.contains('on'), 'new document owns no old settings poll or modal');
+    check(settingsMonitors.scan === null && settingsMonitors.ingest === null && !document.getElementById('settings-modal').classList.contains('on'), 'new document owns no old settings poll or modal');
     document.getElementById('guest').click();
     await until(() => document.getElementById('app').classList.contains('on') && document.getElementById('login').style.display === 'none',
       'explicit guest re-entry after repeated sign-in refresh');
     check(localStorage.frayd_logout === undefined, 'Explicit re-entry clears sign-out marker');
     packet.cases.push({ name: 'settings logout repeated reload retains sign-in until guest re-entry and retires old poll', status: 'PASS',
-      observed: { actualReload: true, repeatedRefreshSignInOnly: true, explicitGuestReentry: true, settingsPoll: null,
+      observed: { actualReload: true, repeatedRefreshSignInOnly: true, explicitGuestReentry: true, settingsMonitors: { scan: null, ingest: null },
         previousDocumentGeneration: packet.logoutGeneration } });
     delete packet.logoutGeneration;
     delete packet.logoutRefreshed;
@@ -1921,7 +1921,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       };
       const button = document.querySelector('.p-scan');
       button.click(); await delay(0);
-      check(status === 202 || status === 409 ? button.disabled && settingsPoll !== null : !button.disabled && settingsPoll === null,
+      check(status === 202 || status === 409 ? button.disabled && settingsMonitors.scan !== null : !button.disabled && settingsMonitors.scan === null,
         'Accepted or already active scans attach an observer');
       check(status === 202 ? button.textContent === 'Scanning…' : status === 409 ? button.textContent.includes('already running') : status === 501
         ? button.textContent.includes('No library folder') : status === 500 ? button.textContent.includes('500') : button.textContent.includes('unreachable'),
@@ -1929,12 +1929,31 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       const observation = { status, text: button.textContent, disabled: button.disabled };
       document.getElementById('settings-close').click();
       if (status === 202 || status === 409) {
-        check(settingsPoll !== null, 'Closing retains account-owned scan completion');
-        await until(() => settingsPoll === null, 'closed scan completes and retires observer');
+        check(settingsMonitors.scan !== null, 'Closing retains account-owned scan completion');
+        await until(() => settingsMonitors.scan === null, 'closed scan completes and retires observer');
         equal(button.textContent, observation.text, 'Retired scan control is untouched');
         equal(statusReads, status === 202 ? 2 : 1, 'Transient server error retries once; busy admission observes completion');
-      } else equal(settingsPoll, null, 'Refused scan has no observer');
+      } else equal(settingsMonitors.scan, null, 'Refused scan has no observer');
       observations.push({ ...observation, statusReads });
+    }
+    const refreshFailures = [];
+    for (const mode of ['scan', 'ingest']) {
+      responder = defaultResponder; await openSettings();
+      document.querySelector('.s-ingest').value = 'https://example.invalid/fixture';
+      responder = async (url, options) => {
+        if (url === '/api/scan' || url === '/api/ingest') return reply(null, 202);
+        if (url === '/api/scan/status') return reply({ scanning: false, ingesting: 'done' });
+        if (new URL(String(url), location.origin).pathname === '/api/library') return reply(null, 500);
+        return defaultResponder(url, options);
+      };
+      const button = document.querySelector(mode === 'scan' ? '.p-scan' : '.p-ingest');
+      button.click();
+      await until(() => /complete.*refresh failed/i.test(button.textContent), `${mode} refresh failure is visible`);
+      check(!button.disabled && settingsMonitors[mode] === null, 'Completed job releases its control and observer');
+      check(!/Scan failed|Download failed|Status unavailable/.test(button.textContent), 'Refresh refusal does not misreport job failure');
+      check(document.getElementById('toast-host').textContent.includes('Library failed (500)'), 'Refresh failure reports HTTP cause');
+      refreshFailures.push({ mode, text: button.textContent, disabled: button.disabled });
+      document.getElementById('settings-close').click();
     }
     for (const status of [409, 'network']) {
       responder = defaultResponder; await openSettings();
@@ -1948,7 +1967,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
       check(button.textContent !== 'Saved', 'Refused save cannot claim success');
       document.getElementById('settings-close').click();
     }
-    return { observations };
+    return { observations, refreshFailures };
   });
   await run('settings ingest waits through indexing and close reopen rejects late status', async () => {
     const states = [];
@@ -1963,14 +1982,14 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
         if (url === '/api/scan/status') { reads++; return reply({ scanning: state === 'indexing', ingesting: state }); }
         return defaultResponder(url, options);
       };
-      button.click(); await until(() => settingsPoll !== null, 'ingest starts poll');
+      button.click(); await until(() => settingsMonitors.ingest !== null, 'ingest starts poll');
       await until(() => reads >= 1, 'downloading status read');
       equal(button.textContent, 'Downloading…', 'Downloading remains active');
       state = 'indexing';
       await until(() => button.textContent === 'Indexing…', 'indexing status read');
-      check(button.disabled && settingsPoll !== null, 'Indexing is still busy');
+      check(button.disabled && settingsMonitors.ingest !== null, 'Indexing is still busy');
       state = terminal;
-      await until(() => settingsPoll === null, 'terminal status ends poll');
+      await until(() => settingsMonitors.ingest === null, 'terminal status ends poll');
       equal(button.textContent, terminal === 'done' ? 'Download complete' : 'Download failed', 'Terminal feedback');
       states.push({ terminal, reads, text: button.textContent });
       document.getElementById('settings-close').click();
@@ -1990,7 +2009,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     equal(document.getElementById('settings-stage').innerHTML, stageHTML, 'Old generation cannot repaint reopened settings');
     equal(requests.filter(r => new URL(String(r.url), location.origin).pathname === '/api/library').length, libraryReads + 1,
       'Admitted scan refresh survives panel retirement');
-    equal(settingsPoll, null, 'No surviving settings poll');
+    equal(settingsMonitors.scan, null, 'No surviving settings poll');
     document.getElementById('settings-close').click();
     let releaseSettings;
     responder = async (url, options) => url === '/api/admin/settings'
@@ -2021,13 +2040,45 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     pollSettings(settingsGeneration, 'scan', document.querySelector('.p-scan'));
     await until(() => releaseOld, 'old observer status pending');
     pollSettings(settingsGeneration, 'scan', document.querySelector('.p-scan'));
-    const replacement = settingsPoll;
+    const replacement = settingsMonitors.scan;
     responder = defaultResponder;
     releaseOld(reply({scanning:false})); await delay(20);
-    equal(settingsPoll, replacement, 'Old callback cannot clear replacement observer');
-    await until(() => settingsPoll === null, 'replacement observer completes');
+    equal(settingsMonitors.scan, replacement, 'Old callback cannot clear replacement observer');
+    await until(() => settingsMonitors.scan === null, 'replacement observer completes');
     document.getElementById('settings-close').click();
-    return { states };
+    const overlapOrders = [];
+    for (const first of ['scan', 'ingest']) {
+      responder = defaultResponder; await openSettings();
+      const scanButton = document.querySelector('.p-scan');
+      const ingestButton = document.querySelector('.p-ingest');
+      document.querySelector('.s-ingest').value = 'https://example.invalid/fixture';
+      let status = { scanning: true, ingesting: 'downloading' };
+      responder = async (url, options) => {
+        if (url === '/api/scan' || url === '/api/ingest') return reply(null, 202);
+        if (url === '/api/scan/status') return reply(status);
+        return defaultResponder(url, options);
+      };
+      const libraryReads = requests.filter(r => new URL(String(r.url), location.origin).pathname === '/api/library').length;
+      ingestButton.click(); await until(() => settingsMonitors.ingest !== null, 'download observer starts');
+      scanButton.click(); await until(() => settingsMonitors.scan !== null, 'scan observer starts alongside download');
+      check(settingsMonitors.ingest !== null && ingestButton.disabled && scanButton.disabled, 'Scan preserves the download observer');
+      status = { scanning: first !== 'scan', ingesting: first === 'ingest' ? 'done' : 'indexing' };
+      await until(() => settingsMonitors[first] === null, `${first} completes first`);
+      const second = first === 'scan' ? 'ingest' : 'scan';
+      check(settingsMonitors[second] !== null, 'First completion preserves the other observer');
+      check(first === 'scan' ? !scanButton.disabled && ingestButton.disabled : !ingestButton.disabled && scanButton.disabled,
+        'Only the completed job releases its button');
+      status = { scanning: false, ingesting: 'done' };
+      await until(() => settingsMonitors[second] === null, `${second} completes second`);
+      equal(scanButton.textContent, 'Scan complete', 'Overlapping scan has terminal feedback');
+      equal(ingestButton.textContent, 'Download complete', 'Overlapping download has terminal feedback');
+      check(!scanButton.disabled && !ingestButton.disabled, 'Neither job leaves a disabled control');
+      equal(requests.filter(r => new URL(String(r.url), location.origin).pathname === '/api/library').length, libraryReads + 2,
+        'Each completed job refreshes the library');
+      overlapOrders.push({ first, scan: scanButton.textContent, ingest: ingestButton.textContent });
+      document.getElementById('settings-close').click();
+    }
+    return { states, overlapOrders };
   });
   await run('late library and progress responses cannot resurrect deleted DOM or filter sort', async () => {
     const other = { ...movie, id: 10, title: 'Remaining movie', created_at: 2 };

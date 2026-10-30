@@ -309,6 +309,21 @@ class QualificationMixin:
         self.assertEqual(raw.decode('utf-8').splitlines(), [f'FRAYD_LIBRARY={case.library}', *ENV_COMMENTS])
         self.assertIn(str(case.library).encode('utf-8'), raw)
 
+    def test_relative_library_is_absolute_for_initial_and_startup_launch(self):
+        case = self.make_case(profile=UNICODE_PROFILE)
+        relative = Path(UNICODE_LIBRARY) / 'nested'
+        case.library = case.profile / relative
+        run = self.install(case, library=relative)
+        self.assert_installed(run, case)
+        raw = (case.profile / 'Frayd/server/.env').read_bytes()
+        self.assertFalse(raw.startswith(b'\xef\xbb\xbf'))
+        self.assertEqual(raw.decode('utf-8').splitlines(), [f'FRAYD_LIBRARY={case.library}', *ENV_COMMENTS])
+        result, directory, variables, pages = self.run_startup_batch(case, case.startup / 'frayd.bat')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(pages, (LEGACY_CODE_PAGE, '65001'))
+        self.assertEqual(os.path.normcase(directory), os.path.normcase(str(case.profile / 'Frayd/server')))
+        self.assertEqual(variables.get('FRAYD_LIBRARY'), str(case.library))
+
     def test_native_failures_stop_every_later_action(self):
         rows = (
             ('clone', {}, {'FAKE_GIT_CLONE_EXIT': '128'}, 'git clone failed (exit 128)', ('cargo',), False),

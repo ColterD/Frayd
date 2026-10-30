@@ -469,6 +469,75 @@ class NativeOwnership(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.snapshot(), before)
 
+    def test_package_refuses_server_as_helper_before_execution_or_output(self):
+        # A copied or hardlinked server has the right architecture and server identity.
+        server = self.base / 'server'
+        shutil.copy2(SERVER, server)
+        copied = self.base / 'copied server'
+        linked = self.base / 'hardlinked server'
+        shutil.copy2(SERVER, copied)
+        os.link(server, linked)
+        spec = importlib.util.spec_from_file_location('native_packager', PACKAGE)
+        packager = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(packager)
+        for helper in [server, copied, linked]:
+            output = self.base / 'rejected duplicate'
+            with self.subTest(helper=helper), mock.patch.object(sys, 'argv', [str(PACKAGE), str(output), TARGET, str(server), str(helper)]), \
+                    mock.patch.object(packager.subprocess, 'check_output', side_effect=AssertionError('binary or git executed before duplicate rejection')):
+                with self.assertRaisesRegex(SystemExit, 'Server and helper binaries must differ'):
+                    packager.main()
+            self.assertFalse(output.exists())
+            rejected = package(output, server=server, helper=helper, capture_output=True, text=True)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn('Server and helper binaries must differ', rejected.stderr)
+            self.assertFalse(output.exists())
+
+    def test_package_rejects_invalid_helper_identity_without_output(self):
+        identity = json.loads(run_bounded([str(SERVER), '--build-info'], check=True, capture_output=True, text=True).stdout)
+        valid = dict(identity, role='frayd-native')
+        invalid = [
+            ('wrong role', dict(valid, role='frayd-server')),
+            ('missing role', identity),
+            ('version mismatch', dict(valid, version='999.0.0')),
+            ('commit mismatch', dict(valid, commit='0' * 40)),
+            ('unknown commit', dict(valid, commit=None)),
+            ('dirty mismatch', dict(valid, dirty=not identity['dirty'])),
+            ('malformed dirty', dict(valid, dirty=1)),
+            ('tag distance mismatch', dict(valid, commits_since_tag=(identity['commits_since_tag'] or 0) + 1)),
+            ('malformed count', dict(valid, commits_since_tag=True)),
+            ('missing count', {key: value for key, value in valid.items() if key != 'commits_since_tag'}),
+            ('array', []),
+            ('malformed JSON', None),
+        ]
+        spec = importlib.util.spec_from_file_location('native_packager', PACKAGE)
+        packager = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(packager)
+        helper = self.base / 'identity fixture'
+        for name, document in invalid:
+            text = 'not JSON' if document is None else json.dumps(document)
+            helper.write_text('#!/bin/sh\nprintf %s ' + shlex.quote(text) + '\n')
+            helper.chmod(0o755)
+            output = self.base / ('rejected identity ' + name)
+            with self.subTest(name=name), mock.patch.object(sys, 'argv', [str(PACKAGE), str(output), TARGET, str(SERVER), str(helper)]), \
+                    mock.patch.object(packager, 'check_binary'):
+                # Only bypass architecture for the shell identity fixture; execute its real CLI.
+                with self.assertRaisesRegex(SystemExit, 'Helper binary'):
+                    packager.main()
+            self.assertFalse(output.exists())
+
+    def test_helper_build_info_is_read_only_and_strict(self):
+        before = self.snapshot()
+        environment = dict(os.environ, FRAYD_DB=str(self.base / 'must not create.db'), FRAYD_LIBRARY=str(self.base / 'must not create library'))
+        result = run_bounded([str(HELPER), '--build-info'], cwd=self.base, env=environment, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        identity = json.loads(result.stdout)
+        self.assertEqual(identity.pop('role'), 'frayd-native')
+        server_identity = json.loads(run_bounded([str(SERVER), '--build-info'], check=True, capture_output=True, text=True).stdout)
+        self.assertEqual(identity, server_identity)
+        rejected = run_bounded([str(HELPER), '--build-info', '--prefix', str(self.prefix)], cwd=self.base, env=environment, capture_output=True)
+        self.assertEqual(rejected.returncode, 2)
+        self.assertEqual(self.snapshot(), before)
+
     def test_tar_preserved_modes_under_restrictive_umask(self):
         output = self.base / 'umask package'
         package(output, check=True, capture_output=True)

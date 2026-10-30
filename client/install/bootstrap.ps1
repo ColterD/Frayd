@@ -40,6 +40,7 @@ if (-not $Lib) {
   if (-not $Lib) { $Lib = "$env:USERPROFILE\Media" }
 }
 New-Item -ItemType Directory -Force -Path $Lib | Out-Null
+$Lib = (Resolve-Path -LiteralPath $Lib).ProviderPath
 
 # --- build ---
 Write-Host "[*] Building (first build takes a few minutes)..."

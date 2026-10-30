@@ -1,13 +1,16 @@
 """Exercise Docker package-step deadlines without host APT or network access."""
 import os
+import importlib.util
 from pathlib import Path
 import re
 import shutil
 import shlex
 import signal
 import subprocess
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 DOCKERFILE = Path(__file__).resolve().parents[1] / "Dockerfile"
@@ -35,6 +38,24 @@ def package_commands():
     source = DOCKERFILE.read_text().replace("\\\n", " ")
     transport = re.search(r'^ARG APT_TRANSPORT="([^"]*)"$', source, re.MULTILINE).group(1)
     return transport, re.findall(r"^RUN (.*apt-get.*)$", source, re.MULTILINE)
+
+
+class BuildContextFixtures(unittest.TestCase):
+    def test_synthetic_files_refuse_existing_paths(self):
+        scripts = DOCKERFILE.parent / 'scripts'
+        integration_spec = importlib.util.spec_from_file_location('integration', scripts / 'integration.py')
+        integration = importlib.util.module_from_spec(integration_spec)
+        integration_spec.loader.exec_module(integration)
+        spec = importlib.util.spec_from_file_location('context_probe', scripts / 'check-build-context.py')
+        probe = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, integration=integration):
+            spec.loader.exec_module(probe)
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory) / 'sentinel'
+            probe.write_fixture(fixture, 'first synthetic marker')
+            with self.assertRaises(FileExistsError):
+                probe.write_fixture(fixture, 'replacement marker')
+            self.assertEqual(fixture.read_text(encoding='utf-8'), 'first synthetic marker')
 
 
 @unittest.skipUnless(

@@ -110,23 +110,34 @@ function enterApp() {
   $('#user-name').textContent = account?.name || 'Local user';
   $('#user-status').textContent = account ? 'signed in' : 'LAN · hostname key';
   $('#settings-btn').style.display = account?.isAdmin ? '' : 'none';
+  $('#account-btn').style.display = account ? '' : 'none';
   loadLibrary();
 }
 
 // ---------- settings (admin) ----------
 const KINDS = ['movie', 'episode', 'music', 'audiobook', 'ebook', 'comic', 'manga'];
 let settingsGeneration = 0;
-let settingsPoll = null;
-let settingsMonitor = null;
+const settingsMonitors = { scan: null, ingest: null };
 /** Retire panel callbacks without abandoning an admitted account-owned job. */
 function disposeSettings() {
   ++settingsGeneration;
+  const stage = $('#settings-stage');
+  for (const selector of ['.pw-old', '.pw-new']) {
+    const input = stage.querySelector(selector);
+    if (input) input.value = '';
+  }
+  stage.innerHTML = '';
+  $('#settings-modal').classList.remove('on');
 }
-/** Stop the account's job observer; retired callbacks cannot clear its successor. */
-function stopSettingsMonitor() {
-  clearInterval(settingsPoll);
-  settingsPoll = null;
-  settingsMonitor = null;
+/** Stop one mode, or both on account teardown; retired callbacks cannot clear successors. */
+function stopSettingsMonitor(mode) {
+  if (mode === undefined) {
+    stopSettingsMonitor('scan');
+    stopSettingsMonitor('ingest');
+    return;
+  }
+  clearInterval(settingsMonitors[mode]?.timer);
+  settingsMonitors[mode] = null;
 }
 /**
  * Return effective locked roots or editable persisted roots, including the legacy single path.
@@ -181,16 +192,18 @@ async function readScanStatus() {
  * @param {HTMLButtonElement} button
  */
 function pollSettings(generation, mode, button) {
-  stopSettingsMonitor();
-  const monitor = settingsMonitor = {};
+  stopSettingsMonitor(mode);
+  const monitor = settingsMonitors[mode] = {};
   const ownsAccount = accountGuard();
-  const current = () => settingsMonitor === monitor && ownsAccount();
+  const current = () => settingsMonitors[mode] === monitor && ownsAccount();
   const panelCurrent = () => generation === settingsGeneration;
   let pending = false;
   let failures = 0;
-  settingsPoll = setInterval(async () => {
+  monitor.timer = setInterval(async () => {
     if (pending || !current()) return;
     pending = true;
+    let completed = false;
+    const label = mode === 'scan' ? 'Scan complete' : 'Download complete';
     try {
       const status = await readScanStatus();
       if (!current()) return;
@@ -201,25 +214,38 @@ function pollSettings(generation, mode, button) {
         return;
       }
       if (mode === 'scan' && status.scanning) return;
-      stopSettingsMonitor();
       const failure = mode === 'scan' ? status.scan_error : ingest !== 'done';
+      if (failure) {
+        stopSettingsMonitor(mode);
+        if (panelCurrent()) {
+          button.disabled = false;
+          button.textContent = mode === 'scan' ? 'Scan failed' : 'Download failed';
+          toast(mode === 'scan' ? `Scan failed — ${status.scan_error}` : 'Download or indexing failed', true);
+        }
+        return;
+      }
+      completed = true;
+      if (panelCurrent()) button.textContent = `${label} — refreshing…`;
+      await loadLibrary();
+      if (!current()) return;
       if (panelCurrent()) {
         button.disabled = false;
-        button.textContent = failure ? (mode === 'scan' ? 'Scan failed' : 'Download failed')
-          : mode === 'scan' ? 'Scan complete' : 'Download complete';
-        if (failure) toast(mode === 'scan' ? `Scan failed — ${status.scan_error}` : 'Download or indexing failed', true);
+        button.textContent = label;
       }
-      if (!failure) await loadLibrary();
     } catch (error) {
       if (!current()) return;
-      if (mode === 'scan' && error.retryable && ++failures < 3) return;
-      stopSettingsMonitor();
+      if (!completed && mode === 'scan' && error.retryable && ++failures < 3) return;
+      stopSettingsMonitor(mode);
       if (panelCurrent()) {
         button.disabled = false;
-        button.textContent = 'Status unavailable';
-        toast(error.message || 'Status unavailable', true);
+        button.textContent = completed ? `${label}; refresh failed` : 'Status unavailable';
+        toast(completed ? `${label}; refresh failed — ${error.message || 'Server unreachable'}`
+          : error.message || 'Status unavailable', true);
       }
-    } finally { pending = false; }
+    } finally {
+      if (completed && current()) stopSettingsMonitor(mode);
+      pending = false;
+    }
   }, 1000);
 }
 /**
@@ -259,12 +285,62 @@ async function saveSettings(payload, generation) {
     ? 'Settings refused: library override or active job' : `Settings failed (${response.status})`);
   return generation === settingsGeneration;
 }
+/** Render the same own-password controls in either signed-in panel. */
+function passwordMarkup() {
+  return account ? `<div class="party-sec">Your password</div>
+      <div class="perm-row"><label class="k" for="account-pw-old">Current</label><input id="account-pw-old" autocomplete="current-password" type="password" class="pw-old" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px"></div>
+      <div class="perm-row"><label class="k" for="account-pw-new">New (min 4)</label><input id="account-pw-new" autocomplete="new-password" type="password" class="pw-new" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px"></div>
+      <button id="s-pw-save" style="margin-top:10px;width:100%;background:#16181E;color:#fff;border:1px solid #2a2d36;border-radius:8px;padding:10px;cursor:pointer">Change password</button>` : '';
+}
+/** Bind one panel's password submission to its account and panel lifetime. */
+function bindPassword(stage, generation) {
+  const ownsAccount = accountGuard();
+  const current = () => ownsAccount() && generation === settingsGeneration;
+  const button = stage.querySelector('#s-pw-save');
+  if (!account || !button) return;
+  button.onclick = async () => {
+    if (!current() || button.disabled) return;
+    const oldInput = stage.querySelector('.pw-old'), newInput = stage.querySelector('.pw-new');
+    if (newInput.value.length < 4) { button.textContent = 'Too short (min 4)'; return; }
+    button.disabled = true;
+    try {
+      const r = await fetch('/api/auth/password', {
+        method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ old: oldInput.value, new: newInput.value }),
+      });
+      if (!current()) return;
+      if (r.ok) {
+        button.textContent = '✓ Changed';
+        oldInput.value = newInput.value = '';
+      } else {
+        const j = await r.json().catch(() => ({}));
+        if (!current()) return;
+        button.textContent = j.error || '✗ Failed';
+      }
+      setTimeout(() => { if (current()) button.textContent = 'Change password'; }, 2500);
+    } catch { if (current()) toast('Password change failed — server unreachable', true); }
+    finally { if (current()) button.disabled = false; }
+  };
+}
+/** Open only the signed-in account controls; this panel needs no admin requests. */
+function openAccount() {
+  if (!account) return;
+  disposeSettings();
+  $('#settings-title').textContent = 'Account';
+  $('#settings-scope').textContent = '';
+  $('#settings-modal').classList.add('on');
+  const stage = $('#settings-stage');
+  stage.innerHTML = passwordMarkup();
+  bindPassword(stage, settingsGeneration);
+}
 /**
  * Fetch permissions and library settings, then render controls guarded by a panel generation.
  * @returns {Promise<void>}
  */
 async function openSettings() {
   disposeSettings();
+  $('#settings-title').textContent = 'Settings';
+  $('#settings-scope').textContent = 'admin';
   const generation = settingsGeneration;
   const current = () => generation === settingsGeneration;
   $('#settings-modal').classList.add('on');
@@ -313,10 +389,7 @@ async function openSettings() {
       + `<div class="perm-row" style="border:none"><span class="s">Suggested layout (any subset):</span></div>`
       + `<div class="perm-row" style="border:none"><pre class="s" style="color:#8A8F9E;font-size:12px;margin:0;line-height:1.5">Media/\n  Movies/    *.mp4 *.mkv\n  Shows/     S01E01 files\n  Music/     *.mp3 *.flac\n  Audiobooks/ *.m4b *.mp3\n  Ebooks/    *.epub\n  Comics/    *.cbz *.cbr\n  Manga/     folder of images under a *manga* dir</pre></div>`
       + `<button id="s-net-save" style="margin-top:10px;width:100%;background:#5B46F6;color:#fff;border:none;border-radius:8px;padding:10px;cursor:pointer">Save network settings</button>`
-      + (account ? `<div class="party-sec">Your password</div>
-      <div class="perm-row"><span class="k">Current</span><input type="password" class="pw-old" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px"></div>
-      <div class="perm-row"><span class="k">New (min 4)</span><input type="password" class="pw-new" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px"></div>
-      <button id="s-pw-save" style="margin-top:10px;width:100%;background:#16181E;color:#fff;border:1px solid #2a2d36;border-radius:8px;padding:10px;cursor:pointer">Change password</button>` : '');
+      + passwordMarkup();
     FraydBuild.render(stage);
     stage.querySelectorAll('.p-save').forEach(b => b.onclick = async () => {
       try {
@@ -354,20 +427,7 @@ async function openSettings() {
         if (await saveSettings(body, generation)) e.target.textContent = 'Saved — restart to apply port/TLS';
       } catch (error) { if (current()) toast(error.message || 'Save failed — server unreachable', true); }
     };
-    $('#s-pw-save')?.addEventListener('click', async (e) => {
-      try {
-      const old_ = stage.querySelector('.pw-old').value, nw = stage.querySelector('.pw-new').value;
-      if (nw.length < 4) { e.target.textContent = 'Too short (min 4)'; return; }
-      const r = await fetch('/api/auth/password', {
-        method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ old: old_, new: nw }),
-      });
-      if (!current()) return;
-      if (r.ok) { e.target.textContent = '✓ Changed'; stage.querySelector('.pw-old').value = stage.querySelector('.pw-new').value = ''; }
-      else { const j = await r.json().catch(() => ({})); e.target.textContent = j.error || '✗ Failed'; }
-      setTimeout(() => { if (current()) e.target.textContent = 'Change password'; }, 2500);
-      } catch { if (current()) toast('Password change failed — server unreachable', true); }
-    });
+    bindPassword(stage, generation);
     const scanBtn = stage.querySelector('.p-scan');
     scanBtn.onclick = () => startSettingsScan(generation, scanBtn);
     stage.querySelector('.lib-add').onclick = async () => {
@@ -438,7 +498,8 @@ async function openSettings() {
   }
 }
 $('#settings-btn')?.addEventListener('click', openSettings);
-$('#settings-close')?.addEventListener('click', () => { disposeSettings(); $('#settings-modal').classList.remove('on'); });
+$('#account-btn')?.addEventListener('click', openAccount);
+$('#settings-close')?.addEventListener('click', disposeSettings);
 
 /**
  * Submit the login form, store its bearer token and identity, or show the returned error.

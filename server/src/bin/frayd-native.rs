@@ -1,6 +1,13 @@
 //! Native lifecycle authority: no guessed ownership, recursive deletion, or service control.
 //! Path checks exclude untrusted Unix ancestors; they do not reserve names against
 //! concurrent changes by the invoking user or root, and do not inspect ACL grants.
+// Share the server's compile-time identity without changing its API. The helper
+// does not expose the HTTP handler from this module.
+#[cfg(unix)]
+#[path = "../build_info.rs"]
+#[allow(dead_code)]
+mod build_info;
+
 #[cfg(unix)]
 mod native {
     use serde::{Deserialize, Serialize};
@@ -960,7 +967,18 @@ mod native {
     /// individual operations enforce path, ownership and confirmation boundaries.
     fn run() -> Result<()> {
         let mut args = std::env::args().skip(1);
-        let command = args.next().ok_or("expected install, start or uninstall")?;
+        let command = args
+            .next()
+            .ok_or("expected --build-info, install, start or uninstall")?;
+        if command == "--build-info" {
+            if args.next().is_some() {
+                return reject("--build-info accepts no additional arguments");
+            }
+            let mut identity = super::build_info::metadata();
+            identity["role"] = "frayd-native".into();
+            println!("{identity}");
+            return Ok(());
+        }
         let mut flags = BTreeMap::new();
         let mut yes = false;
         while let Some(flag) = args.next() {

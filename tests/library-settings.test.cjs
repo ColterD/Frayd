@@ -309,11 +309,11 @@ test('retired settings status cannot clear a replacement monitor', async () => {
   b.run('pollSettings(settingsGeneration,"scan",{})');
   const old = [...b.intervals.values()][0]();
   b.run('pollSettings(settingsGeneration,"scan",{})');
-  const replacement = b.run('settingsPoll');
+  const replacement = [...b.intervals.keys()][0];
   release(reply({scanning:false}));
   await old;
   assert.equal(b.intervals.has(replacement), true);
-  assert.equal(b.run('settingsPoll'), replacement);
+  assert.equal([...b.intervals.keys()][0], replacement);
 });
 
 for (const phase of ['admission', 'status']) {
@@ -458,11 +458,11 @@ test('settings retired scan retry cannot clear a replacement observer or mutate 
   b.run('pollSettings(settingsGeneration,"scan",button)');
   const pending=[...b.intervals.values()][0]();
   b.run('disposeSettings();pollSettings(settingsGeneration,"scan",{})');
-  const replacement=b.run('settingsPoll');
+  const replacement=[...b.intervals.keys()][0];
   reject(Error('retired connection'));
   await pending;
   assert.equal(b.intervals.has(replacement),true);
-  assert.equal(b.run('settingsPoll'),replacement);
+  assert.equal([...b.intervals.keys()][0],replacement);
   assert.equal(b.context.button.disabled,true);
   assert.equal(b.context.button.textContent,'Scanning…');
 });
@@ -492,3 +492,232 @@ test('closed settings scan exhausts retry budget without mutating its retired bu
   assert.equal(b.context.document.body.children.length,children);
   assert.equal(b.requests.filter(r=>r.url==='/api/scan/status').length,3);
 });
+
+// Dynamic DOM is the browser boundary; the complete application and fetch handlers run unchanged.
+function passwordPanel(b) {
+  b.respond(async url => reply(url.startsWith('/api/library') ? [] : null));
+  const controls = new Map();
+  const control = selector => {
+    if (!controls.has(selector)) controls.set(selector, b.context.document.createElement('input'));
+    return controls.get(selector);
+  };
+  const stage = b.nodes.get('#settings-stage');
+  stage.querySelector = control;
+  stage.querySelectorAll = () => [];
+  for (const selector of ['#s-site-save', '#s-net-save', '#s-pw-save']) b.nodes.set(selector, control(selector));
+  return { stage, control };
+}
+
+test('signed-in nonadmin can open own password panel without admin requests; guest has no entry', async () => {
+  const b = browser();
+  await settle();
+  const { stage } = passwordPanel(b);
+  b.run('account={name:"Member",isAdmin:false};enterApp()');
+  await settle();
+  assert.equal(b.nodes.get('#settings-btn').style.display, 'none');
+  assert.equal(b.nodes.get('#account-btn').style.display, '');
+  b.requests.length = 0;
+  b.nodes.get('#account-btn').emit('click');
+  assert.equal(b.requests.length, 0);
+  assert.equal(b.nodes.get('#settings-modal').classList.contains('on'), true);
+  assert.equal(b.nodes.get('#settings-title').textContent, 'Account');
+  assert.match(stage.innerHTML, /Your password/);
+  assert.doesNotMatch(stage.innerHTML, /Library folders|Accounts & permissions|s-net-save|p-admin/);
+  b.run('account=null;enterApp()');
+  await settle();
+  assert.equal(b.nodes.get('#account-btn').style.display, 'none');
+  assert.equal(b.nodes.get('#settings-btn').style.display, 'none');
+  b.requests.length = 0;
+  b.nodes.get('#account-btn').emit('click');
+  assert.equal(b.requests.length, 0);
+  assert.equal(b.nodes.get('#settings-modal').classList.contains('on'), false);
+});
+
+test('admin settings and account reentry share password submission and reset modal title', async () => {
+  const b = browser({ storage: { frayd_token: 'public-test-token' } });
+  await settle();
+  const { stage, control } = passwordPanel(b);
+  b.run('account={name:"Admin",isAdmin:true};enterApp()');
+  await settle();
+  assert.equal(b.nodes.get('#settings-btn').style.display, '');
+  b.nodes.get('#account-btn').emit('click');
+  b.respond(async url => reply(url.endsWith('/perms') ? [] : { library_paths: [] }));
+  await b.run('openSettings()');
+  assert.equal(b.nodes.get('#settings-title').textContent, 'Settings');
+  assert.match(stage.innerHTML, /s-net-save/);
+  assert.ok(b.requests.some(r => r.url === '/api/admin/settings'));
+  assert.ok(b.requests.some(r => r.url === '/api/admin/perms'));
+  for (const panel of ['settings', 'account']) {
+    if (panel === 'account') b.nodes.get('#account-btn').emit('click');
+    control('.pw-old').value = 'public-old-password';
+    control('.pw-new').value = 'public-new-password';
+    b.respond(async () => ({ ok: false, json: async () => ({ error: 'Current password incorrect' }) }));
+    control('#s-pw-save').emit('click');
+    await settle();
+    assert.equal(control('#s-pw-save').textContent, 'Current password incorrect');
+    assert.equal(control('.pw-new').value, 'public-new-password', 'failure does not claim success or clear input');
+    b.respond(async () => reply({}));
+    control('#s-pw-save').emit('click');
+    await settle();
+    const request = b.requests.at(-1);
+    assert.equal(request.url, '/api/auth/password');
+    assert.equal(request.options.method, 'POST');
+    assert.equal(request.options.headers.Authorization, 'Bearer public-test-token');
+    assert.deepEqual(JSON.parse(request.options.body), { old: 'public-old-password', new: 'public-new-password' });
+    assert.equal(control('.pw-old').value, '');
+    assert.equal(control('.pw-new').value, '');
+    assert.equal(control('#s-pw-save').textContent, '✓ Changed');
+  }
+  assert.equal(b.nodes.get('#settings-title').textContent, 'Account');
+});
+
+for (const retirement of ['close', 'account switch', 'settings switch']) {
+  for (const responsePhase of ['success', 'error body']) {
+    test(`password ${responsePhase} cannot publish after ${retirement}`, async () => {
+      const b = browser();
+      await settle();
+      const { control } = passwordPanel(b);
+      b.run('account={name:"Member",isAdmin:false};enterApp()');
+      await settle();
+      b.nodes.get('#account-btn').emit('click');
+      control('.pw-old').value = 'public-old-password';
+      control('.pw-new').value = 'public-new-password';
+      let release;
+      b.respond(url => url.startsWith('/api/library') ? Promise.resolve(reply([])) : responsePhase === 'success'
+        ? new Promise(resolve => { release = () => resolve(reply({})); })
+        : Promise.resolve({ ok: false, json: () => new Promise(resolve => { release = () => resolve({ error: 'Late error' }); }) }));
+      control('#s-pw-save').emit('click');
+      await settle();
+      if (retirement === 'close') b.nodes.get('#settings-close').emit('click');
+      if (retirement === 'account switch') b.run('account={name:"Successor",isAdmin:false};enterApp()');
+      if (retirement === 'settings switch') {
+        b.respond(async url => reply(url.endsWith('/perms') ? [] : { library_paths: [] }));
+        await b.run('openSettings()');
+      }
+      assert.equal(control('.pw-old').value, '');
+      assert.equal(control('.pw-new').value, '');
+      b.nodes.get('#account-btn').emit('click');
+      control('.pw-new').value = 'successor-unsent-password';
+      control('#s-pw-save').textContent = 'Successor panel';
+      release();
+      await settle();
+      assert.equal(control('.pw-new').value, 'successor-unsent-password');
+      assert.equal(control('#s-pw-save').textContent, 'Successor panel');
+    });
+  }
+}
+
+for (const retirement of ['close', 'account panel']) {
+  test(`pending admin settings cannot replace ${retirement}`, async () => {
+    const b = browser();
+    await settle();
+    const { stage } = passwordPanel(b);
+    b.run('account={name:"Admin",isAdmin:true}');
+    let release;
+    b.respond(url => url.endsWith('/settings') ? new Promise(resolve => { release = resolve; }) : Promise.resolve(reply([])));
+    const opening = b.run('openSettings()');
+    if (retirement === 'close') b.nodes.get('#settings-close').emit('click');
+    else b.nodes.get('#account-btn').emit('click');
+    const markup = stage.innerHTML;
+    release(reply({ library_paths: [] }));
+    await opening;
+    assert.equal(stage.innerHTML, markup);
+    assert.equal(b.nodes.get('#settings-modal').classList.contains('on'), retirement !== 'close');
+    if (retirement === 'account panel') assert.equal(b.nodes.get('#settings-title').textContent, 'Account');
+  });
+}
+
+for (const first of ['scan', 'ingest']) {
+  test(`overlapping scan and download both finish when ${first} completes first`, async () => {
+    const b = browser();
+    b.context.scanButton = { disabled: true, textContent: 'Scanning…' };
+    b.context.ingestButton = { disabled: true, textContent: 'Downloading…' };
+    b.run('pollSettings(settingsGeneration,"ingest",ingestButton)');
+    const ingestPoll = [...b.intervals.values()][0];
+    b.run('pollSettings(settingsGeneration,"scan",scanButton)');
+    const scanPoll = [...b.intervals.values()].at(-1);
+    assert.equal(b.intervals.size, 2, 'scan admission preserves the older download observer');
+    let status = { scanning: first !== 'scan', ingesting: first === 'ingest' ? 'done' : 'indexing' };
+    b.respond(async url => reply(url === '/api/scan/status' ? status : []));
+    await (first === 'scan' ? scanPoll : ingestPoll)();
+    assert.equal(b.intervals.size, 1, 'completing either mode preserves the other observer');
+    assert.equal(b.context[first + 'Button'].disabled, false);
+    assert.equal(b.context[first === 'scan' ? 'ingestButton' : 'scanButton'].disabled, true);
+    status = { scanning: false, ingesting: 'done' };
+    await (first === 'scan' ? ingestPoll : scanPoll)();
+    assert.equal(b.intervals.size, 0);
+    assert.equal(b.context.scanButton.textContent, 'Scan complete');
+    assert.equal(b.context.ingestButton.textContent, 'Download complete');
+    assert.equal(b.context.scanButton.disabled, false);
+    assert.equal(b.context.ingestButton.disabled, false);
+    assert.equal(b.requests.filter(r => r.url === '/api/library').length, 2);
+  });
+}
+
+test('same-mode replacement retires only that mode and rejects its late status', async () => {
+  const b = browser();
+  b.context.oldButton = { disabled: true, textContent: 'Old scan' };
+  let release;
+  b.respond(url => url === '/api/scan/status' ? new Promise(resolve => { release = resolve; }) : Promise.resolve(reply([])));
+  b.run('pollSettings(settingsGeneration,"ingest",{})');
+  const ingestTimer = [...b.intervals.keys()][0];
+  b.run('pollSettings(settingsGeneration,"scan",oldButton)');
+  const oldTimer = [...b.intervals.keys()].at(-1);
+  const pending = b.intervals.get(oldTimer)();
+  b.run('pollSettings(settingsGeneration,"scan",{})');
+  const replacement = [...b.intervals.keys()].at(-1);
+  assert.equal(b.intervals.size, 2);
+  assert.equal(b.intervals.has(ingestTimer), true);
+  assert.equal(b.intervals.has(oldTimer), false);
+  release(reply({ scanning: false, ingesting: 'done' }));
+  await pending;
+  assert.equal(b.intervals.has(replacement), true);
+  assert.equal(b.intervals.has(ingestTimer), true);
+  assert.equal(b.context.oldButton.textContent, 'Old scan');
+  assert.equal(b.requests.filter(r => r.url === '/api/library').length, 0);
+});
+
+for (const mode of ['scan', 'ingest']) {
+  test(`completed ${mode} reports library refresh failure and releases its button`, async () => {
+    const b = browser();
+    b.context.button = { disabled: true, textContent: 'Busy' };
+    b.respond(async url => url === '/api/scan/status' ? reply({ scanning: false, ingesting: 'done' }) : { ok: false, status: 500 });
+    b.run(`pollSettings(settingsGeneration,"${mode}",button)`);
+    await [...b.intervals.values()][0]();
+    assert.equal(b.intervals.size, 0);
+    assert.equal(b.context.button.disabled, false);
+    assert.match(b.context.button.textContent, /complete.*refresh failed/i);
+    assert.doesNotMatch(b.context.button.textContent, /Scan failed|Download failed|Status unavailable/);
+    assert.match(b.notices(), /refresh failed.*Library failed \(500\)/i);
+  });
+}
+
+for (const retirement of ['panel close', 'account switch', 'same-mode replacement']) {
+  test(`completion refresh ownership survives until response and rejects stale publication after ${retirement}`, async () => {
+    const b = browser();
+    b.context.button = { disabled: true, textContent: 'Scanning…' };
+    let release;
+    b.respond(url => url === '/api/scan/status' ? Promise.resolve(reply({ scanning: false }))
+      : new Promise(resolve => { release = resolve; }));
+    b.run('pollSettings(settingsGeneration,"ingest",{});pollSettings(settingsGeneration,"scan",button)');
+    const pending = [...b.intervals.values()].at(-1)();
+    await settle();
+    assert.equal(b.intervals.size, 2, 'completion retains ownership while refresh is pending');
+    assert.equal(b.context.button.disabled, true);
+    if (retirement === 'panel close') b.nodes.get('#settings-close').emit('click');
+    if (retirement === 'account switch') {
+      b.respond(async () => reply([]));
+      b.run('IDENTITY="successor-account";enterApp()');
+      await settle();
+    }
+    if (retirement === 'same-mode replacement') b.run('pollSettings(settingsGeneration,"scan",{})');
+    const notices = b.notices();
+    const text = b.context.button.textContent;
+    release({ ok: false, status: 500 });
+    await pending;
+    assert.equal(b.context.button.textContent, text);
+    assert.equal(b.context.button.disabled, true);
+    assert.equal(b.notices(), notices);
+    assert.equal(b.intervals.size, retirement === 'account switch' ? 0 : retirement === 'panel close' ? 1 : 2);
+  });
+}

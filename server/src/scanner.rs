@@ -335,6 +335,22 @@ pub fn scan_with_roots(db: &Connection, db_path: String, root: std::path::PathBu
     Ok(count)
 }
 
+/// Ingest requires a successful container probe with a real video stream, independent of duration.
+/// Ordinary library metadata probing deliberately remains tolerant.
+pub(crate) fn ingest_video_valid(path: &Path) -> bool {
+    let Ok(output)=Command::new("ffprobe").args(["-v","error","-show_entries",
+        "format=format_name:stream=codec_type,codec_name,width,height","-of","json"])
+        .arg(path).output() else {return false;};
+    if !output.status.success() {return false;}
+    let Ok(probe)=serde_json::from_slice::<serde_json::Value>(&output.stdout) else {return false;};
+    probe.get("format").and_then(|format|format.get("format_name")).and_then(|name|name.as_str()).is_some_and(|name|!name.is_empty())
+        && probe.get("streams").and_then(|streams|streams.as_array()).is_some_and(|streams|streams.iter().any(|stream|
+            stream.get("codec_type").and_then(|value|value.as_str())==Some("video")
+                && stream.get("codec_name").and_then(|value|value.as_str()).is_some_and(|codec|!codec.is_empty() && codec!="unknown")
+                && stream.get("width").and_then(|value|value.as_u64()).is_some_and(|width|width>0)
+                && stream.get("height").and_then(|value|value.as_u64()).is_some_and(|height|height>0)))
+}
+
 /// Confirm downloaded supported files reached their current source-version rows.
 /// A successful downloader exit alone does not prove indexing or database publication.
 pub(crate) fn ingest_indexed(db: &Connection, directory: &Path) -> bool {
@@ -660,6 +676,25 @@ mod tests {
         let value = tracing::subscriber::with_default(subscriber, body);
         let text = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
         (value, text)
+    }
+
+    /// Container/stream validation accepts unknown duration and rejects mislabeled or audio-only output.
+    #[test]
+    fn ingest_video_validation_uses_real_streams_without_requiring_duration() {
+        let root=std::env::temp_dir().join(format!("frayd-ingest-probe-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let video=root.join("video.mp4");
+        assert!(Command::new("ffmpeg").args(["-v","error","-f","lavfi","-i","color=size=16x16:rate=1","-t","1","-c:v","libx264","-f","h264"])
+            .arg(&video).status().unwrap().success());
+        assert!(ffprobe_metadata(video.to_str().unwrap()).unwrap().duration.is_none());
+        assert!(ingest_video_valid(&video));
+        let invalid=root.join("invalid.mp4");std::fs::write(&invalid,b"not media").unwrap();
+        assert!(!ingest_video_valid(&invalid));
+        let audio=root.join("audio.mp4");
+        assert!(Command::new("ffmpeg").args(["-v","error","-f","lavfi","-i","anullsrc","-t","0.1","-f","wav"])
+            .arg(&audio).status().unwrap().success());
+        assert!(!ingest_video_valid(&audio));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// Reconcile reports retained ownership conflicts and kept artifact media rows in one warning.

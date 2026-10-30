@@ -12,7 +12,10 @@ ROOT = Path(__file__).resolve().parents[1]
 def git(*args):
     if not (ROOT / '.git').exists():
         return None
-    result = subprocess.run(['git', '-C', str(ROOT), *args], capture_output=True, text=True, check=False)
+    try:
+        result = subprocess.run(['git', '-C', str(ROOT), *args], capture_output=True, text=True, check=False, timeout=15)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
     return result.stdout.strip() if result.returncode == 0 else None
 
 

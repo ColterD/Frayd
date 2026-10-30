@@ -824,18 +824,88 @@ async fn trigger_scan(State(app): State<std::sync::Arc<App>>) -> StatusCode {
 }
 
 /// Fail an abandoned downloader without overwriting a successful handoff to queued indexing.
-struct IngestReset(Arc<App>);
+struct IngestReset { app: Arc<App>, staging: Option<PathBuf>, downloading: bool }
+impl IngestReset {
+    /// Transfer status ownership before the scan can finish and admit a later downloader.
+    fn handoff(&mut self) {
+        let mut status=self.app.ingest_status.lock().unwrap();
+        self.downloading=false;
+        *status=Some("indexing".into());
+    }
+}
 impl Drop for IngestReset {
+    /// Remove only this job's create_dir-owned staging after its child completes, on every exit.
     /// Only downloading belongs to this guard; indexing has transferred to the scan coordinator.
     fn drop(&mut self) {
-        let mut status=self.0.ingest_status.lock().unwrap_or_else(|e|e.into_inner());
-        if status.as_deref()==Some("downloading") { *status=Some("failed".into()); }
+        if let Some(staging)=&self.staging {
+            if let Err(error)=std::fs::remove_dir_all(staging) {tracing::warn!(%error,path=%staging.display(),"ingest staging cleanup failed");}
+        }
+        if self.downloading {
+            let mut status=self.app.ingest_status.lock().unwrap_or_else(|e|e.into_inner());
+            if status.as_deref()==Some("downloading") { *status=Some("failed".into()); }
+        }
     }
 }
 
 #[derive(serde::Deserialize)]
 struct IngestReq {
     url: String,
+}
+
+/// A configured canonical root grants only a single child-directory creation, never root recreation.
+fn ingest_destination(root: &StdPath) -> std::io::Result<PathBuf> {
+    if !std::fs::symlink_metadata(root)?.file_type().is_dir() || root.canonicalize()?!=root {
+        return Err(std::io::Error::other("library root is not its configured canonical directory"));
+    }
+    let destination=root.join("Internet");
+    match std::fs::create_dir(&destination) {
+        Ok(())=>(),
+        Err(error) if error.kind()==std::io::ErrorKind::AlreadyExists=>(),
+        Err(error)=>return Err(error),
+    }
+    if !std::fs::symlink_metadata(&destination)?.file_type().is_dir() || destination.canonicalize()?!=destination {
+        return Err(std::io::Error::other("ingest destination is not a direct library directory"));
+    }
+    Ok(destination)
+}
+
+/// Publish only one validated video from this job. Partial copies keep an unsupported extension.
+/// No preexisting library file is replaced; the caller owns staging cleanup on every exit.
+fn publish_ingest(staging: &StdPath, destination: &StdPath) -> std::io::Result<()> {
+    let mut videos=Vec::new();
+    for entry in std::fs::read_dir(staging)? {
+        let entry=entry?;
+        if !entry.file_type()?.is_file() || entry.path().extension().is_none_or(|ext| ext!="mp4") {
+            return Err(std::io::Error::other("unexpected downloader output"));
+        }
+        videos.push(entry.path());
+    }
+    if videos.len()!=1 || !scanner::ingest_video_valid(&videos[0]) {
+        return Err(std::io::Error::other("downloaded media validation failed"));
+    }
+    let source=&videos[0];
+    let target=destination.join(source.file_name().ok_or_else(||std::io::Error::other("missing media name"))?);
+    let partial=destination.join(format!("{}.part",staging.file_name().ok_or_else(||std::io::Error::other("missing job name"))?.to_string_lossy()));
+    let mut output=std::fs::OpenOptions::new().write(true).create_new(true).open(&partial)?;
+    let result=(|| {
+        std::io::copy(&mut std::fs::File::open(source)?,&mut output)?;
+        output.sync_all()?;
+        // Both names are in the destination filesystem. Linking creates atomically without clobbering.
+        match std::fs::hard_link(&partial,&target) {
+            Ok(())=>Ok(()),
+            Err(error) if error.kind()==std::io::ErrorKind::AlreadyExists=>{
+                if std::fs::symlink_metadata(&target)?.file_type().is_file() && scanner::ingest_video_valid(&target) {
+                    Ok(())
+                } else {Err(std::io::Error::other("existing destination is not valid video"))}
+            }
+            Err(error)=>Err(error),
+        }
+    })();
+    drop(output);
+    // Only the create_new temporary file belongs to this job.
+    if let Err(error)=std::fs::remove_file(&partial) {tracing::warn!(%error,"ingest partial cleanup failed");}
+    result?;
+    Ok(())
 }
 
 /// POST /api/ingest { url } → download via yt-dlp into <library>/Internet/, then rescan.
@@ -862,7 +932,6 @@ async fn ingest(
         return StatusCode::NOT_IMPLEMENTED; // yt-dlp not installed
     }
     let libs;
-    let dest;
     {
         let _admission=ROOT_ADMISSION.lock().unwrap();
         libs=library_roots(&app);
@@ -873,15 +942,21 @@ async fn ingest(
         let mut st=app.ingest_status.lock().unwrap();
         if matches!(st.as_deref(),Some("downloading"|"indexing")) { return StatusCode::CONFLICT; }
         *st=Some("downloading".into());
-        dest=libs[0].join("Internet");
-        if std::fs::create_dir_all(&dest).is_err() { *st=Some("failed".into());return StatusCode::INTERNAL_SERVER_ERROR; }
+        if let Err(error)=ingest_destination(&libs[0]) {
+            tracing::warn!(%error,"ingest destination unavailable");
+            *st=Some("failed".into());return StatusCode::SERVICE_UNAVAILABLE;
+        }
     }
     let state = app.clone();
     let url = body.url;
     // spawn detached: download can take minutes; rescan after success
     tokio::task::spawn_blocking(move || {
-        let _reset=IngestReset(state.clone());
-        let out = dest.join("%(title)s.%(ext)s");
+        let mut reset=IngestReset {app:state.clone(),staging:None,downloading:true};
+        let cache=transcodes_dir_for(&state.db_path);
+        let staging=cache.join(format!("ingest-{}",uuid::Uuid::new_v4()));
+        if std::fs::create_dir_all(&cache).is_err() || std::fs::create_dir(&staging).is_err() { return; }
+        reset.staging=Some(staging.clone());
+        let out = staging.join("%(title)s.%(ext)s");
         let ok = std::process::Command::new("yt-dlp")
             .args(["-f", "mp4", "--no-playlist", "-o"])
             .arg(out)
@@ -891,8 +966,12 @@ async fn ingest(
             .map(|s| s.success())
             .unwrap_or(false);
         // A failed download stays "downloading" here, and IngestReset marks it failed.
+        let ok=ok && match ingest_destination(&libs[0]).and_then(|destination|publish_ingest(&staging,&destination)) {
+            Ok(())=>true,
+            Err(error)=>{tracing::warn!(%error,path=%staging.display(),"ingest publication held");false}
+        };
         if ok {
-            *state.ingest_status.lock().unwrap()=Some("indexing".into());
+            reset.handoff();
             queue_ingest_scan(state.clone(),libs);
         }
         tracing::info!("ingest yt-dlp {url}: {}", if ok { "ok" } else { "failed" });
@@ -2729,7 +2808,7 @@ mod ingest_tests {
         db.execute_batch("INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture-admin'),(2,'device','fixture-reader');
             INSERT INTO user_perms(identity_id,is_admin) VALUES(1,1),(2,0);").unwrap();
         let library=root.join("library with spaces"); std::fs::create_dir_all(&library).unwrap();
-        test_support::app(db,String::new(),vec![library])
+        test_support::app(db,root.join("db.sqlite").to_string_lossy().into_owned(),vec![library])
     }
 
     /// Exercise the real handler's authorization and argument construction without a network downloader.
@@ -2737,6 +2816,118 @@ mod ingest_tests {
         ingest(State(app.clone()),axum::http::HeaderMap::new(),
             Query(std::collections::HashMap::from([("identity".to_string(),identity.to_string())])),
             Json(IngestReq { url:url.to_string() })).await
+    }
+
+    /// An old downloader guard must not fail a newly admitted download after indexing completes.
+    #[test]
+    fn handed_off_ingest_guard_cannot_fail_next_download() {
+        let root=std::env::temp_dir().join(format!("frayd-ingest-guard-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();let app=fixture_app(&root);
+        *app.ingest_status.lock().unwrap()=Some("downloading".into());
+        let stage=root.join("owned-stage");std::fs::create_dir(&stage).unwrap();
+        let mut reset=IngestReset {app:app.clone(),staging:Some(stage.clone()),downloading:true};
+        reset.handoff();
+        // Deterministically schedule scan completion and B admission before A's destructor.
+        *app.ingest_status.lock().unwrap()=Some("done".into());
+        *app.ingest_status.lock().unwrap()=Some("downloading".into());
+        drop(reset);
+        assert_eq!(app.ingest_status.lock().unwrap().as_deref(),Some("downloading"));
+        assert!(!stage.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Ingest must refuse a preexisting redirect before any downloader or publication writes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ingest_rejects_redirected_destination_without_touching_outside() {
+        if let Some(root)=std::env::var_os("FRAYD_TEST_DEST_ROOT") {
+            let root=PathBuf::from(root);let app=fixture_app(&root);
+            let library=root.join("library with spaces");let outside=root.join("outside");
+            std::fs::create_dir(&outside).unwrap();std::fs::write(outside.join("sentinel"),b"preserved").unwrap();
+            std::os::unix::fs::symlink(&outside,library.join("Internet")).unwrap();
+            assert_eq!(submit(&app,"fixture-admin","https://example.invalid/video").await,StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!root.join("download-started").exists());
+            assert_eq!(std::fs::read_dir(&outside).unwrap().count(),1);
+            assert_eq!(std::fs::read(outside.join("sentinel")).unwrap(),b"preserved");
+            std::fs::remove_file(library.join("Internet")).unwrap();
+            std::fs::write(library.join("Internet"),b"existing non-directory").unwrap();
+            assert_eq!(submit(&app,"fixture-admin","https://example.invalid/video").await,StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(std::fs::read(library.join("Internet")).unwrap(),b"existing non-directory");
+            std::fs::remove_file(library.join("Internet")).unwrap();std::fs::remove_dir(&library).unwrap();
+            assert!(ingest_destination(&library).is_err());
+            assert_eq!(submit(&app,"fixture-admin","https://example.invalid/video").await,StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!library.exists());assert!(!root.join("download-started").exists());
+            return;
+        }
+        let root=std::env::temp_dir().join(format!("frayd-ingest-dest-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        test_support::write_executable(&root.join("bin/yt-dlp"),"#!/bin/sh\n[ \"$1\" = --version ] && exit 0\ntouch \"$FRAYD_TEST_DEST_ROOT/download-started\"\nexit 1\n");
+        test_support::assert_child_passes(test_support::child("ingest_tests::ingest_rejects_redirected_destination_without_touching_outside")
+            .env("FRAYD_TEST_DEST_ROOT",&root).env("PATH",test_support::path_with(&root.join("bin"))));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A zero-exit downloader must not publish invalid bytes; a later valid job remains admissible.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invalid_download_fails_before_indexing_and_next_valid_job_succeeds() {
+        if let Some(root)=std::env::var_os("FRAYD_TEST_MEDIA_ROOT") {
+            let root=PathBuf::from(root);
+            let library=root.join("library");std::fs::create_dir(&library).unwrap();
+            let db_path=root.join("db.sqlite");let db=store::open(db_path.to_str().unwrap());
+            db.execute_batch("INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture-admin'); INSERT INTO user_perms(identity_id,is_admin) VALUES(1,1);").unwrap();
+            let app=test_support::app(db,db_path.to_string_lossy().into_owned(),vec![library.clone()]);
+            let preserved=library.join("unrelated.cbz");std::fs::write(&preserved,b"original").unwrap();
+            let cache=root.join("transcodes");std::fs::create_dir(&cache).unwrap();
+            let unowned=cache.join("unowned.txt");std::fs::write(&unowned,b"preserve cache neighbor").unwrap();
+            let mut original=None;
+            for (url,expected) in [("https://example.invalid/bad","failed"),("https://example.invalid/partial","failed"),("https://example.invalid/good","done"),("https://example.invalid/good","done"),("https://example.invalid/different","done")] {
+                assert_eq!(submit(&app,"fixture-admin",url).await,StatusCode::ACCEPTED);
+                for _ in 0..1200 {
+                    if matches!(app.ingest_status.lock().unwrap().as_deref(),Some("done"|"failed")) {break;}
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                assert_eq!(app.ingest_status.lock().unwrap().as_deref(),Some(expected));
+                test_support::scan_idle(&app).await;
+                for _ in 0..200 {
+                    if std::fs::read_dir(&cache).unwrap().all(|entry|!entry.unwrap().file_name().to_string_lossy().starts_with("ingest-")) {break;}
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                assert!(std::fs::read_dir(&cache).unwrap().all(|entry|!entry.unwrap().file_name().to_string_lossy().starts_with("ingest-")));
+                assert_eq!(std::fs::read(&unowned).unwrap(),b"preserve cache neighbor");
+                let db=app.db.lock().unwrap();
+                assert_eq!(db.query_row("SELECT COUNT(*) FROM media WHERE path LIKE '%wrong.mp4'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+                assert_eq!(std::fs::read(&preserved).unwrap(),b"original");
+                if expected=="failed" {
+                    assert_eq!(db.query_row("SELECT COUNT(*) FROM media",[],|row|row.get::<_,i64>(0)).unwrap(),0);
+                    assert_eq!(std::fs::read_dir(library.join("Internet")).unwrap().count(),0);
+                }
+                if expected=="done" {
+                    let published=library.join("Internet/good.mp4");
+                    let id=db.query_row("SELECT id FROM media WHERE path=?1",[published.to_str().unwrap()],|row|row.get::<_,i64>(0)).unwrap();
+                    let bytes=std::fs::read(&published).unwrap();
+                    let mtime=std::fs::metadata(&published).unwrap().modified().unwrap();
+                    if let Some((prior_id,prior_bytes,prior_mtime))=&original {
+                        assert_eq!(id,*prior_id);assert_eq!(&bytes,prior_bytes);assert_eq!(&mtime,prior_mtime);
+                        assert_eq!(db.query_row("SELECT position FROM progress WHERE identity_id=1 AND media_id=?1",[id],|row|row.get::<_,f64>(0)).unwrap(),0.5);
+                    } else {
+                        db.execute("INSERT INTO progress(identity_id,media_id,position) VALUES(1,?1,0.5)",[id]).unwrap();
+                        original=Some((id,bytes,mtime));
+                    }
+                }
+            }
+            assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM media WHERE kind='movie'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+            return;
+        }
+        let root=std::env::temp_dir().join(format!("frayd-invalid-ingest-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        assert!(Command::new("ffmpeg").args(["-v","error","-f","lavfi","-i","color=size=16x16:rate=1","-t","1","-c:v","libx264"]).arg(root.join("good.mp4")).status().unwrap().success());
+        let mut different=std::fs::read(root.join("good.mp4")).unwrap();different.extend_from_slice(b"different output");
+        std::fs::write(root.join("different.mp4"),different).unwrap();
+        test_support::write_executable(&root.join("bin/yt-dlp"),"#!/bin/sh\n[ \"$1\" = --version ] && exit 0\nout=$5\ndest=${out%/*}\nfor arg do url=$arg; done\ncase \"$url\" in */bad) printf 'not an mp4' > \"$dest/wrong.mp4\";; */partial) cp \"$FRAYD_TEST_MEDIA_ROOT/good.mp4\" \"$dest/good.mp4\"; printf 'partial' > \"$dest/unfinished.mp4.part\";; */different) cp \"$FRAYD_TEST_MEDIA_ROOT/different.mp4\" \"$dest/good.mp4\";; *) cp \"$FRAYD_TEST_MEDIA_ROOT/good.mp4\" \"$dest/good.mp4\";; esac\n");
+        test_support::assert_child_passes(test_support::child("ingest_tests::invalid_download_fails_before_indexing_and_next_valid_job_succeeds")
+            .env("FRAYD_TEST_MEDIA_ROOT",&root).env("PATH",test_support::path_with(&root.join("bin"))));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// Keep HTTP authorization, destination selection and explicit URL framing correct at the process boundary.
@@ -2767,8 +2958,12 @@ mod ingest_tests {
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
-                let expected_output=format!("{}/library with spaces/Internet/%(title)s.%(ext)s",root.display());
-                assert_eq!(actual,vec!["-f","mp4","--no-playlist","-o",expected_output.as_str(),"--",url]);
+                assert_eq!(actual.len(),7);
+                let output=PathBuf::from(&actual[4]);
+                assert_eq!(output.file_name().unwrap(),"%(title)s.%(ext)s");
+                assert_eq!(output.parent().unwrap().parent().unwrap(),root.join("transcodes"));
+                assert!(output.parent().unwrap().file_name().unwrap().to_str().unwrap().starts_with("ingest-"));
+                assert_eq!(actual,vec!["-f","mp4","--no-playlist","-o",output.to_str().unwrap(),"--",url]);
                 assert!(!marker.exists(),"URL metacharacters executed as a shell command");
             }
             assert_eq!(std::fs::read(calls).unwrap(),b"....");
@@ -3141,7 +3336,7 @@ mod roots_scan_ingest_tests {
                     .lock()
                     .unwrap()
                     .query_row(
-                        "SELECT COUNT(*) FROM media WHERE path LIKE '%download.cbz'",
+                        "SELECT COUNT(*) FROM media WHERE path LIKE '%download.mp4'",
                         [],
                         |r| r.get::<_, i64>(0)
                     )
@@ -3157,7 +3352,7 @@ mod roots_scan_ingest_tests {
                     .lock()
                     .unwrap()
                     .query_row(
-                        "SELECT COUNT(*) FROM media WHERE path LIKE '%download.cbz'",
+                        "SELECT COUNT(*) FROM media WHERE path LIKE '%download.mp4'",
                         [],
                         |r| r.get::<_, i64>(0)
                     )
@@ -3203,15 +3398,18 @@ mod roots_scan_ingest_tests {
             "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\n\
                 touch \"$FRAYD_TEST_QUEUE_ROOT/download-ready\"\n\
                 while [ ! -e \"$FRAYD_TEST_QUEUE_ROOT/download-release\" ]; do sleep 0.01; done\nout=$5\n\
-                dest=${out%/*}\nprintf 'fixture' > \"$dest/download.cbz\"\n",
+                dest=${out%/*}\ncp \"$FRAYD_TEST_QUEUE_ROOT/valid.mp4\" \"$dest/download.mp4\"\n",
         );
         test_support::write_executable(
             &root.join("bin/ffprobe"),
-            "#!/bin/sh\ntouch \"$FRAYD_TEST_QUEUE_ROOT/probe-ready\"\n\
+            "#!/bin/sh\nfor arg do case \"$arg\" in */ingest-*/*) exec \"$FRAYD_TEST_REAL_FFPROBE\" \"$@\";; esac; done\ntouch \"$FRAYD_TEST_QUEUE_ROOT/probe-ready\"\n\
                 while [ ! -e \"$FRAYD_TEST_QUEUE_ROOT/probe-release\" ]; do sleep 0.01; done\nexit 1\n",
         );
+        assert!(Command::new("ffmpeg").args(["-v","error","-f","lavfi","-i","color=size=16x16:rate=1","-t","1","-c:v","libx264"]).arg(root.join("valid.mp4")).status().unwrap().success());
+        let ffprobe=std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|directory|directory.join("ffprobe")).find(|path|path.is_file()).unwrap();
         test_support::assert_child_passes(test_support::child("roots_scan_ingest_tests::scan_ingest_blocked_downloader_queues_original_snapshot")
-            .env("FRAYD_TEST_QUEUE_ROOT",&root).env("PATH",test_support::path_with(&root.join("bin"))));
+            .env("FRAYD_TEST_QUEUE_ROOT",&root).env("FRAYD_TEST_REAL_FFPROBE",ffprobe).env("PATH",test_support::path_with(&root.join("bin"))));
         std::fs::remove_dir_all(root).unwrap();
     }
 

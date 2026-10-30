@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import stat
@@ -56,6 +57,27 @@ def check_binary(binary, target):
         raise SystemExit('Binary format/architecture does not match native target')
 
 
+def validate_helper_identity(binary, server_identity):
+    try:
+        identity = json.loads(subprocess.check_output([binary, '--build-info'], text=True, timeout=10))
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        raise SystemExit(f'Helper binary build identity unavailable: {error}') from error
+    if not isinstance(identity, dict) or identity.get('role') != 'frayd-native':
+        raise SystemExit('Helper binary must report role frayd-native')
+    if (not isinstance(identity.get('version'), str)
+            or not isinstance(identity.get('commit'), str)
+            or not re.fullmatch('[0-9a-f]{40}', identity['commit'])
+            or 'dirty' not in identity
+            or (identity['dirty'] is not None and type(identity['dirty']) is not bool)
+            or 'commits_since_tag' not in identity
+            or (identity['commits_since_tag'] is not None
+                and (type(identity['commits_since_tag']) is not int or identity['commits_since_tag'] < 0))):
+        raise SystemExit('Helper binary build identity is malformed or unknown')
+    if any(identity[key] != server_identity.get(key)
+           for key in ('version', 'commit', 'dirty', 'commits_since_tag')):
+        raise SystemExit('Helper binary build identity must match server version, commit, dirty flag and tag distance')
+
+
 def git(*arguments):
     return subprocess.check_output(['git', '-C', str(SOURCE), *arguments], text=True)
 
@@ -87,6 +109,10 @@ def main():
         raise SystemExit('Unsupported native target')
     check_binary(server, target)
     check_binary(helper, target)
+    # Reject same-path, hardlinked and copied servers before executing either input.
+    # Role metadata detects accidental substitutions; it is not binary authentication.
+    if hashlib.sha256(Path(server).read_bytes()).digest() == hashlib.sha256(Path(helper).read_bytes()).digest():
+        raise SystemExit('Server and helper binaries must differ')
     client_paths = [Path(name) for name in git('ls-files', '--', 'client').splitlines()]
     for relative in client_paths:
         if any(part.startswith('.env') for part in relative.parts):
@@ -101,6 +127,7 @@ def main():
     version = next(line.split('"')[1] for line in (SOURCE / 'server/Cargo.toml').read_text().splitlines() if line.startswith('version = '))
     if build_info.get('version') != version:
         raise SystemExit('Server binary package version must match Cargo version')
+    validate_helper_identity(helper, build_info)
     toolchain = toolchain_metadata()
 
     output.mkdir(mode=0o700)
