@@ -1,6 +1,7 @@
 name: frayd
 services:
   app:
+    init: true
     build:
       context: .
       # Unset variables are not passed, so the Dockerfile's `unknown` defaults apply.

@@ -783,7 +783,18 @@ def main():
         proxy_name = container_id(compose, 'proxy')
         proxy_before = json.loads(docker('inspect', proxy_name).stdout)[0]
         old_ip = runtime['NetworkSettings']['Networks'][network]['IPAddress']
-        compose('stop', 'app')
+        started = time.monotonic()
+        compose('stop', '--timeout', '10', 'app')
+        stopped_in = time.monotonic() - started
+        stopped = json.loads(docker('inspect', name).stdout)[0]
+        state = stopped['State']
+        print(f"STOP: init={stopped['HostConfig'].get('Init')}, elapsed={stopped_in:.3f}s, "
+              f"status={state['Status']}, exit={state['ExitCode']}, OOMKilled={state['OOMKilled']}")
+        assert stopped['HostConfig'].get('Init') is True
+        assert stopped_in < 10, stopped_in
+        assert state['Status'] == 'exited' and state['Running'] is False
+        assert state['ExitCode'] in (0, 143) and state['OOMKilled'] is False, state
+        print('PASS: idle Compose stop exits without OOM or SIGKILL before the 10s budget')
         compose('rm', '-f', 'app')
         config['services']['reserve'] = {
             'image': args.proxy_image, 'entrypoint': ['sleep', '120'],
@@ -816,6 +827,8 @@ def main():
         login = json.loads(request('/api/auth/login', credentials))
         token = login['token']
         assert json.loads(request(f'/api/progress/{media_id}', token=token))['position'] == 0.5
+        assert json.loads(request('/api/library')) == items
+        assert request(f'/api/stream/{media_id}') == fixture
         request('/api/auth/logout', {}, token, expected=204)
         request('/api/auth/me', token=token, expected=401)
         print('PASS: recreation keeps setup and progress; login and logout work')

@@ -176,6 +176,8 @@ Publication marks completion atomically with the playback pointer. A known sourc
 
 ## Stop, resume and remove
 
+Compose enables Docker's built-in init for the app. It forwards stop signals to the server and reaps orphaned child processes, allowing prompt SIGTERM termination instead of waiting for Docker's forced kill. For a standalone `docker run`, include `--init` to retain this behavior. This does not guarantee graceful draining of active requests, scans, downloads or conversions; stop active work before maintenance when possible.
+
 Run from the same Compose directory and project used for setup:
 
 ```sh

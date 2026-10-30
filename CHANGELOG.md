@@ -39,6 +39,7 @@ Historical results apply only to their named source.
 
 ### Fixed
 
+- Enable Docker's built-in init for the Compose app so stop signals reach the server without waiting for a forced kill. Active requests and jobs are not guaranteed to drain gracefully.
 - Keep indexed media, progress and notes when a configured root is unavailable. Keep media IDs after source replacement.
 - Hold invalid older saved root settings for repair instead of stopping startup. Show the configuration error in Settings.
 - Diagnose the effective library configuration instead of unused saved roots. Preserve server errors for failed database reads.
