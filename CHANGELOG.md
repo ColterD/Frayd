@@ -77,6 +77,7 @@ Historical results apply only to their named source.
 - Check native install cancellation before owned writes, between copy chunks and before publication. Roll back only paths whose recorded identities still match.
 - Preserve paths whose install identity could not be recorded. Remove only an empty reservation whose recorded identity still matches.
 - Give the native server null input. Refuse start when an output terminal uses TOSTOP, before creating child records or starting the server.
+- Accept verified `/dev/null` output on macOS. Keep closed descriptors and unknown device errors as startup failures.
 - Handle INT, TERM, HUP and QUIT during native supervision. Stop the owned server process group before removing its child records.
 - Keep custody of an exited server while checking its owned process group on macOS. Keep uncertain child records for inspection.
 - Document source-install removal separately from native-bundle removal. Clarify fresh-clone upstream checks and canonical temporary-directory paths.

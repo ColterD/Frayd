@@ -1044,20 +1044,51 @@ mod native {
         }
     }
 
+    #[cfg(any(target_os = "macos", test))]
+    fn is_null_device_output_error(descriptor: libc::c_int, error: &io::Error) -> Result<bool> {
+        if error.raw_os_error() != Some(libc::ENODEV) {
+            return Ok(false);
+        }
+        // Darwin's memory-device ioctl returns ENODEV for /dev/null. Admit only
+        // that character device, not every descriptor with a failed terminal query.
+        let mut descriptor_stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fstat initializes valid storage and does not take fd ownership.
+        if unsafe { libc::fstat(descriptor, &mut descriptor_stat) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let mut null_stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: the path is NUL-terminated and stat initializes valid storage.
+        if unsafe { libc::stat(c"/dev/null".as_ptr(), &mut null_stat) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(descriptor_stat.st_mode & libc::S_IFMT == libc::S_IFCHR
+            && null_stat.st_mode & libc::S_IFMT == libc::S_IFCHR
+            && descriptor_stat.st_rdev == null_stat.st_rdev)
+    }
+
+    fn require_supported_output_descriptor(descriptor: libc::c_int) -> Result<()> {
+        // SAFETY: tcgetattr initializes a valid termios; ENOTTY accepts pipes/files.
+        let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(descriptor, &mut attributes) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENOTTY) {
+                return Ok(());
+            }
+            #[cfg(target_os = "macos")]
+            if is_null_device_output_error(descriptor, &error)? {
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+        if attributes.c_lflag & libc::TOSTOP != 0 {
+            return reject("output terminal has TOSTOP enabled; disable TOSTOP or redirect both stdout and stderr before start");
+        }
+        Ok(())
+    }
+
     fn require_supported_output() -> Result<()> {
         for descriptor in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
-            // SAFETY: tcgetattr initializes a valid termios; ENOTTY accepts pipes/files.
-            let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
-            if unsafe { libc::tcgetattr(descriptor, &mut attributes) } != 0 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ENOTTY) {
-                    continue;
-                }
-                return Err(error.into());
-            }
-            if attributes.c_lflag & libc::TOSTOP != 0 {
-                return reject("output terminal has TOSTOP enabled; disable TOSTOP or redirect both stdout and stderr before start");
-            }
+            require_supported_output_descriptor(descriptor)?;
         }
         Ok(())
     }
@@ -1348,6 +1379,97 @@ mod native {
     mod rollback_tests {
         use super::*;
         use std::os::unix::fs::symlink;
+
+        #[test]
+        fn output_admission_accepts_redirects_and_rejects_closed_descriptors() {
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+            let null = OpenOptions::new().write(true).open("/dev/null").unwrap();
+            require_supported_output_descriptor(null.as_raw_fd()).unwrap();
+            let file = File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+            require_supported_output_descriptor(file.as_raw_fd()).unwrap();
+            let mut pipe = [-1; 2];
+            // SAFETY: valid fd storage; OwnedFd closes each newly created fd once.
+            assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+            let _reader = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+            let writer = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+            require_supported_output_descriptor(writer.as_raw_fd()).unwrap();
+            let error = require_supported_output_descriptor(-1).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+                Some(libc::EBADF)
+            );
+        }
+
+        #[test]
+        fn output_admission_darwin_exception_requires_null_identity_and_enodev() {
+            use std::os::fd::AsRawFd;
+
+            let enodev = io::Error::from_raw_os_error(libc::ENODEV);
+            let null = File::open("/dev/null").unwrap();
+            assert!(is_null_device_output_error(null.as_raw_fd(), &enodev).unwrap());
+            let file = File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+            assert!(!is_null_device_output_error(file.as_raw_fd(), &enodev).unwrap());
+            let zero = File::open("/dev/zero").unwrap();
+            assert!(!is_null_device_output_error(zero.as_raw_fd(), &enodev).unwrap());
+            for errno in [libc::EBADF, libc::EIO, libc::EINVAL] {
+                assert!(!is_null_device_output_error(
+                    null.as_raw_fd(),
+                    &io::Error::from_raw_os_error(errno)
+                )
+                .unwrap());
+            }
+            let error = is_null_device_output_error(-1, &enodev).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+                Some(libc::EBADF)
+            );
+        }
+
+        #[test]
+        fn output_admission_preserves_real_terminal_tostop_guard() {
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+            let mut master = -1;
+            let mut slave = -1;
+            // SAFETY: valid fd outputs; null termios/winsize request system defaults.
+            assert_eq!(
+                unsafe {
+                    libc::openpty(
+                        &mut master,
+                        &mut slave,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                },
+                0
+            );
+            let _master = unsafe { OwnedFd::from_raw_fd(master) };
+            let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+            let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut attributes) },
+                0
+            );
+            attributes.c_lflag |= libc::TOSTOP;
+            assert_eq!(
+                unsafe { libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &attributes) },
+                0
+            );
+            assert!(require_supported_output_descriptor(slave.as_raw_fd())
+                .unwrap_err()
+                .to_string()
+                .contains("TOSTOP"));
+            let enodev = io::Error::from_raw_os_error(libc::ENODEV);
+            assert!(!is_null_device_output_error(slave.as_raw_fd(), &enodev).unwrap());
+            attributes.c_lflag &= !libc::TOSTOP;
+            assert_eq!(
+                unsafe { libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &attributes) },
+                0
+            );
+            require_supported_output_descriptor(slave.as_raw_fd()).unwrap();
+        }
 
         struct Fixture(PathBuf);
         impl Drop for Fixture {

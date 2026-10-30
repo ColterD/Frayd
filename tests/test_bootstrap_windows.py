@@ -188,7 +188,34 @@ def entry_environment(interpreter, directory):
 def copy_download_fixture(source):
     quoted = "'" + str(source).replace("'", "''") + "'"
     return ("function Invoke-RestMethod { [CmdletBinding()] param([Parameter(Position=0)][string]$Uri,[string]$OutFile) "
-            "Copy-Item -LiteralPath " + quoted + " -Destination $OutFile -ErrorAction Stop }; ")
+            "Copy-Item -LiteralPath " + quoted + " -Destination $OutFile -ErrorAction Stop; "
+            "[IO.File]::WriteAllText((Join-Path $env:TEMP 'entry-download-complete'), '1') }; ")
+
+
+ENTRY_MARKERS = ('entry-download-complete', 'entry-script-started', 'entry-script-complete')
+
+
+def harmless_entry_script(child_exit=0):
+    return ("param([string]$Lib)\n"
+            "[IO.File]::WriteAllText((Join-Path $env:TEMP 'entry-script-started'), '1')\n"
+            "Write-Output $Lib\n"
+            "[IO.File]::WriteAllText((Join-Path $env:TEMP 'entry-script-complete'), '1')\n"
+            f"exit {child_exit}\n")
+
+
+def run_generated_entry(arguments, *, env, directory):
+    # EOF is explicit: the CI Python launcher itself consumes a script from stdin.
+    # subprocess.run may still wait for descendant-held pipes after killing its host;
+    # this timeout diagnostic cannot make that Windows pipe drain bounded.
+    try:
+        return subprocess.run(arguments, env=env, cwd=directory, stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=30, check=False)
+    except subprocess.TimeoutExpired as error:
+        root = Path(directory)
+        markers = {name: (root / name).is_file() for name in ENTRY_MARKERS}
+        fresh_files = len(list(root.glob('frayd-install-*.ps1')))
+        raise AssertionError(f'generated entry timed out after 30s: markers={markers}; '
+                             f'fresh_download_count={fresh_files}') from error
 
 
 class QualificationMixin:
@@ -439,16 +466,17 @@ class QualificationMixin:
             with self.subTest(child_exit=child_exit), tempfile.TemporaryDirectory(prefix="Frayd entry owner's ") as directory:
                 root = Path(directory)
                 source = root / 'harmless-source.ps1'
-                source.write_text("param([string]$Lib)\nWrite-Output $Lib\nexit " + str(child_exit) + "\n", encoding='ascii')
+                source.write_text(harmless_entry_script(child_exit), encoding='ascii')
                 command = copy_download_fixture(source) + generated_windows_command(" -Lib 'Owner''s $Library with spaces'")
-                run = subprocess.run([self.interpreter, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-                    '-Command', command], env=entry_environment(self.interpreter, directory), cwd=directory,
-                    capture_output=True, text=True, timeout=30, check=False)
+                run = run_generated_entry([self.interpreter, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+                    '-Command', command], env=entry_environment(self.interpreter, directory),
+                    directory=directory)
                 self.assertEqual(run.returncode == 0, child_exit == 0, run.stderr)
                 self.assertIn("Owner's $Library with spaces", run.stdout)
                 if child_exit:
                     self.assertIn('Frayd installer failed', run.stderr)
                 self.assertEqual(list(root.glob('frayd-install-*.ps1')), [])
+                self.assertTrue(all((root / name).is_file() for name in ENTRY_MARKERS))
 
     def test_tailscale_optional_lookup_restores_terminating_errors(self):
         case = self.make_case(tailscale=True)
@@ -571,24 +599,27 @@ class WindowsPowerShell51(QualificationMixin, unittest.TestCase):
         env = entry_environment(self.interpreter, str(Path(tempfile.gettempdir())))
         policy = subprocess.run([self.interpreter, '-NoProfile', '-NonInteractive', '-Command',
             "Get-ExecutionPolicy -Scope MachinePolicy; Get-ExecutionPolicy -Scope UserPolicy"],
-            env=env, capture_output=True, text=True, timeout=30, check=False)
+            env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30, check=False)
         self.assertEqual(policy.returncode, 0, policy.stderr)
         self.assertEqual(policy.stdout.split(), ['Undefined', 'Undefined'],
                          'qualification held: Group Policy governs script execution')
         with tempfile.TemporaryDirectory(prefix="Frayd entry owner's ") as directory:
             script = Path(directory) / 'harmless-source.ps1'
-            script.write_text("param([string]$Lib)\nWrite-Output $Lib\n", encoding='ascii')
+            script.write_text(harmless_entry_script(), encoding='ascii')
             env.update(TEMP=directory, TMP=directory)
             base = [self.interpreter, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Restricted', '-Command']
             blocked = subprocess.run(base + ["& '.\\harmless-source.ps1' -Lib 'harmless fixture'"],
-                                     env=env, cwd=directory, capture_output=True, text=True, timeout=30, check=False)
+                                     env=env, cwd=directory, stdin=subprocess.DEVNULL,
+                                     capture_output=True, text=True, timeout=30, check=False)
             self.assertNotEqual(blocked.returncode, 0, 'Restricted control must refuse the file')
             self.assertNotIn('harmless fixture', blocked.stdout)
+            self.assertFalse((Path(directory) / 'entry-script-started').exists())
             command = copy_download_fixture(script) + generated_windows_command(" -Lib 'Owner''s $Library with spaces'")
-            allowed = subprocess.run(base + [command], env=env, cwd=directory, capture_output=True, text=True,
-                                     timeout=30, check=False)
+            allowed = run_generated_entry(base + [command], env=env, directory=directory)
             self.assertEqual(allowed.returncode, 0, allowed.stderr)
             self.assertEqual(allowed.stdout.strip(), "Owner's $Library with spaces")
+            self.assertTrue(all((Path(directory) / name).is_file() for name in ENTRY_MARKERS))
+            self.assertEqual(list(Path(directory).glob('frayd-install-*.ps1')), [])
 
     def check_engine(self, version, edition):
         self.assertTrue(version.startswith('5.1.') and edition == 'Desktop', f'expected Windows PowerShell 5.1, ran {version} {edition}')
