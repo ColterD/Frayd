@@ -7,7 +7,7 @@ It does not authorize deployment or qualify arbitrary media, browsers or public 
 
 ## Current source and historical visual boundary
 
-Initial pending, held and staged statuses are **as of the 2026-10-29 pre-cutover `8d87905` checkpoint**; the later source update below names its own boundary. See [PR #2](https://github.com/ColterD/Frayd/pull/2) for subsequent current-image acceptance, deployment and live TV import; those later outcomes do not rewrite this checkpoint.
+Pending, held and staged statuses in this record are as of the 2026-10-29 pre-cutover `8d87905` checkpoint. Later sections name their own boundaries.
 
 At the initial checkpoint, production source was `8d879054a16637619b7efc1e1e79ce6d38e568d2`, incorporating pinned upstream `dd8eaf42d692dee118525b6d98d883cbe76967f4` and synced fork-main base `21b2e9b6bf4cff26254f5dfcec9deecd02453718`. Its local fixture passed Node 334/334 and Chrome 47/47 with zero browser errors. These source-bound fixture results do not substitute for the current image pipeline, final patched-reader gates, actual-server workflows or hosted/platform acceptance.
 
@@ -37,7 +37,7 @@ Final tracked source `a8b1f8ed49df1bc66c12c3923269373f9c91c504` changes only the
 
 ### `76ac314` dashboard, artwork and mobile checkpoint
 
-The 2026-10-29 source `76ac31459f9025f80f9eeb92cd2036dc16994996` labels all seven dashboard shelves “Recently Added …”, defaults to newest first and offers a per-category oldest toggle. Folder order uses member date extremes while episode order and progress reads retain their own rules. TV, music, audiobook and ebook folders scroll horizontally at 768/1024/1440 CSS pixels; 320px remains one column. Local covers or representative member art appear across all seven kinds when source art exists; absent art falls back to a symbol. Node 350/350 and the current 47/47 modeled-API DOM fixture pass; the seven-kind backend artwork fixture, 110 Rust unit plus six archive tests and strict Clippy pass. Current-image Docker, HTTP, native and actual owner browser qualification were still running at this checkpoint.
+The 2026-10-29 source `76ac31459f9025f80f9eeb92cd2036dc16994996` labels all seven dashboard shelves “Recently Added …”, defaults to newest first and offers a per-category oldest toggle. Folder order uses member date extremes while episode order and progress reads retain their own rules. TV, music, audiobook and ebook folders scroll horizontally at 768/1024/1440 CSS pixels; 320px remains one column. Local covers or representative member art appear across all seven kinds when source art exists; absent art falls back to a symbol. Node 350/350 and the 47/47 modeled-API DOM fixture of that checkpoint pass; the seven-kind backend artwork fixture, 110 Rust unit plus six archive tests and strict Clippy pass. Current-image Docker, HTTP, native and actual owner browser qualification were still running at this checkpoint.
 
 [CodeRabbit finding 4415914938](https://github.com/ColterD/Frayd/pull/2#discussion_r4415914938) identified a real 320×568 reachability failure: the 168px player bar began at y=400 while the last card/title fell beneath it with only 140px clearance. The corrected mobile player bar uses document flow and 180px clearance; navigation resets scroll. The real-DOM oracle finds the last card bottom at 380.36, before the bar at 400, and checks a trusted title click and both audio controls. This is a new current finding, separate from the 129 historical dispositions. The owner's normal Vivaldi Jekyll first page loaded, but category/artwork acceptance in that browser and the separate beta blank-page cause remain unverified.
 
@@ -49,7 +49,7 @@ An isolated, source-independent EPUB first-open probe reproduced the blank in 3/
 
 ### `e7bee5f` reader, cover and review checkpoint
 
-At `f339352`, an actual first-book run in three disposable profiles restored GET 2.333 to page 2/4 with scroll 820 and one highlight, without a premature POST; TOC and resize passed. This is evidence for that image only. `e7bee5fae9f985f1341c61b4416e4c9942d047d4` additionally waits for fonts and positive frame geometry before pagination, wakes after resize, and publishes a visible “Chapter unavailable” state for 404/500/empty/missing-heading responses without a false save or stale document overwrite. A separate actual cover-cropping failure was corrected with contained, height-bounded cover layout; tall 500×862 DOM controls failed before and pass after. Node 367/367, current 47/47 DOM, Rust 118 unit plus 14 archive tests, strict Clippy and the 210-package audit pass. Actual first-open and current-image acceptance for `e7bee5f` remain pending in [PR #2](https://github.com/ColterD/Frayd/pull/2); the prior Chromium empty-frame cause remains unknown.
+At `f339352`, an actual first-book run in three disposable profiles restored GET 2.333 to page 2/4 with scroll 820 and one highlight, without a premature POST; TOC and resize passed. This is evidence for that image only. `e7bee5fae9f985f1341c61b4416e4c9942d047d4` additionally waits for fonts and positive frame geometry before pagination, wakes after resize, and publishes a visible “Chapter unavailable” state for 404/500/empty/missing-heading responses without a false save or stale document overwrite. A separate actual cover-cropping failure was corrected with contained, height-bounded cover layout; tall 500×862 DOM controls failed before and pass after. Node 367/367, 47/47 DOM at that checkpoint, Rust 118 unit plus 14 archive tests, strict Clippy and the 210-package audit pass. Actual first-open and current-image acceptance for `e7bee5f` remain pending in [PR #2](https://github.com/ColterD/Frayd/pull/2); the prior Chromium empty-frame cause remains unknown.
 
 The same source truncates unusually tall author text to one visible line while retaining its full DOM text, includes synopsis matches in the existing identity-filtered library search, and delays thumbnail decode until scroll owns the item. At 320×568, author text height fell from 278.53 to 168 CSS pixels while the title and controls remained clickable; a thumbnail 8,000px below the viewport had not decoded before scroll. These controls do not establish a performance benchmark or owner-browser acceptance. The new current review observations are listed separately from the 129 historical dispositions in the [changelog](pr-2-changelog.md#current-review-follow-ups-after-76ac314).
 
@@ -81,9 +81,9 @@ The `cdce17c` actual two-peer fixture remains a historical source-bound pass: it
 
 ## Upstream and native integration boundary
 
-That historical integration combined upstream v0.1.1 (`fe320ba`, through fork main `62dc`) with the fork corrections and experimental [native bundle](native-bundle.md). Current commands, measured counts and source hashes belong to the [PR description](https://github.com/ColterD/Frayd/pull/2), since concurrent integration changes can invalidate a working-tree receipt. The multi-root/settings, unavailable-root, queued-ingestion and administrator-deletion checks are HTTP/storage proof; they do not establish interactive browser acceptance. Client checks include six actual decoded-video controls alongside synthetic cases. Later working-tree changes require a new committed image and platform qualification; Linux results do not transfer to either Mac architecture.
+That historical integration combined upstream v0.1.1 (`fe320ba`, through fork main `62dc`) with the fork corrections and experimental [native bundle](../native-bundle.md). Working-tree receipts from that integration can be invalidated by concurrent changes, so treat its commands, counts and source hashes as historical. The multi-root/settings, unavailable-root, queued-ingestion and administrator-deletion checks are HTTP/storage proof; they do not establish interactive browser acceptance. Client checks include six actual decoded-video controls alongside synthetic cases. Later working-tree changes require a new committed image and platform qualification; Linux results do not transfer to either Mac architecture.
 
-## Post-591 native audio fixture checkpoint
+## `56a79d3` native audio resume fixture checkpoint
 
 The [browser regression](../../tests/browser-regression.cjs) uses actual decoded
 native audio and modeled party state. A focused working-tree run before the final
@@ -165,7 +165,7 @@ Historical `1ece1df` / `5d8c4f…` results remain bound to that artifact. The hi
 runtime checkpoint below uses its recorded server; no merge or live deployment
 is authorized.
 
-## Actual YouTube session checkpoint (5d63 / 767fe)
+## `5d63ac2` actual YouTube session checkpoint
 
 Checked 2026-10-28. Runtime source `5d63ac240e25878daa0ecb1df862c70610764b59`
 builds app `sha256:767fe73fa6ae69b488588e0d5d79315cf893a3d9deb19a1b94eb94d7615e7c77`,
@@ -194,7 +194,7 @@ browser is untouched. Audible output, iframe-button input, cross-machine and
 long-duration playback remain unqualified; API states/clocks are not decoded
 frame or physical-audio measurements.
 
-## Reader-ready checkpoint (6810 / 5926)
+## `6810cc2` reader-ready checkpoint
 
 Checked 2026-10-28. Tested source `6810cc2488bc1a6a0284ff2bdf140d43bd2a1fd5`
 builds app `sha256:5926bed415ff0455796396218dc1851a1139818fb40588b84561666c424fa8fe`
@@ -320,7 +320,7 @@ authorized by these checks.
 
 No sample media are added to the repository by this documentation. Embedded notices/credits remain in the test copies; public-domain statements in the retained receipts are scoped to the USA.
 
-## Earlier reviewed follow-up (858)
+## `bf3cb58` selection bounds and conversion recovery follow-up
 
 Source `bf3cb589881542cb0f6c4d47d467a9909c7b697d` builds application
 `sha256:858879bf50c7050dfb55f93723e8fa74fbde77e4a2447e00eb574d9e45bca0b5`.
@@ -330,13 +330,13 @@ boundaries, keeps raw selection text/offsets aligned, and adds conservative
 interrupted-conversion recovery. The test-wrapper extraction correction is
 included without a scanner suppression.
 
-The earlier 958-image passes below remain historical observations of that exact
+The earlier `958c9f9` image passes below remain historical observations of that exact
 artifact; they are not presented as browser qualification of this later image.
 At that checkpoint, browser acceptance was held for input recovery and
 a fresh script-payload binding. The later owner-correlated Vivaldi tab now responds;
 current-image payload binding and media rechecks remain required. At that historical checkpoint, full HTTP/storage integration and same-version stopped-volume recovery pass; these automated/storage results do not close the browser gates.
 
-## Earlier automated qualification (9fe)
+## `c4cde98` HTTP, DNS and first real-DOM qualification
 
 Runtime source `c4cde98a36b781ea0a0f5f512b0d5001a3fbd2fc` builds app
 `sha256:9fe2f139cece83cd1151a416cb45fe8fd6e80b85bce1268cc26e002b9a276a44`
@@ -349,15 +349,15 @@ build reused the qualified 51-test Rust/Clippy/release stage with identical serv
 inputs and output binary; no fresh Rust execution is claimed for that cache hit.
 Nine real-DOM cases pass separately, as described below.
 
-At that checkpoint, the retained interactive fixture ran the earlier 858 image.
+At that checkpoint, the retained interactive fixture ran the earlier `858879b` image.
 Manual media acceptance required a new image, loaded-payload binding and
 actual media actions. Browser control has now recovered as described below. Earlier
-958 observations, 858 backup recovery and these new automated results each retain
+`958c9f9` observations, `858879b` backup recovery and these new automated results each retain
 their own source/image limits.
 
-## Historical acceptance matrix (baseline / 958)
+## `407afbc` acceptance matrix, baseline and first corrected image
 
-| Scenario and exact action | Baseline observation | First corrected image (958) |
+| Scenario and exact action | Baseline observation | First corrected image (`958c9f9`) |
 |---|---|---|
 | Movie: open, confirm decoded playback, seek, Back, read saved progress, reopen | Decode/seek pass. Saved 203.002927 seconds; reopen starts at zero. A second seek/reopen also restarts. | Blocked on browser input recovery. A pre-binding restart observation is inconclusive; two bound-payload iterations and the actual progress response are still required. |
 | Music: play, seek, close, reopen | Carefree advances; saved/resumed near 106 seconds. | Blocked on post-fix browser input recovery. |
@@ -393,13 +393,13 @@ provider and guest entry responded in 0.34 seconds. The provider's “Chrome” 
 was not evidence of an installed Google Chrome browser. This correlation restores
 control on the newly identified tab; it does not explain the earlier timeouts.
 
-That control recovery used the older 858 image and did not qualify later images
+That control recovery used the older `858879b` image and did not qualify later images
 or their loaded payloads. These test resources
 remain separate from the live deployment. Browser observations do not establish
 physical audio output, full-duration playback, every codec/archive, external
 YouTube behavior, latency/soak/reconnect, public-hosting security or deployment.
 Same-version backup/restore has its separate bounded qualification in
-[Operations](../operations.md#backup-restore-and-upgrade-status).
+[Operations](../operations.md#backup-and-restore).
 
 ## Automated integration follow-up
 
@@ -479,7 +479,7 @@ analysis must confirm the alert disposition.
 
 A full review of `bf40d875` found that the first host party state can overwrite a
 locally resumed video's source and position. The correction passes a host-only
-`preserveActiveVideo` option and recognizes the exact configured stream through
+`preserveLocalPlayback` option and recognizes the exact configured stream through
 the active video attribute, Plyr source child or loaded source. The guard precedes
 both ID and drift branches, including stale same-media IDs. Guest initial and
 subsequent synchronization retains the host's position and play/pause state.
@@ -599,12 +599,12 @@ The combined disposable app uses client `074e4f53c4a5b3e6cb8c7a2b636ada68cee2dc8
 
 Actual guest actions open an EPUB with a missing ZIP chapter: HTTP 404, visible unavailable state, then Close and Music navigation produce zero progress POSTs. A separate real resume HTTP 200 is held after spine/TOC responses; Close and release produce no new chapter read or progress write. Earlier probes that held a card's lazy progress read are retained as setup failures, not reader proof. Legitimate ready-close HTTP 204 and reopen retain the owner fixture's bookmark 2.333 at page 2/4 and one highlight; TOC, next, resize and the complete SVG cover pass. Seven category headings and default-current Newest controls remain present. All playback stays muted/paused.
 
-The original 17 fixture rows remain exact. The missing-chapter test row and its 895-byte EPUB remain only in this disposable environment because supported deletion refuses its guest progress reference; no direct database mutation was used. The temporary synopsis item was removed through the supported API and its exact owned source removed. Live port3101, operator guest/session and library were untouched. Full parties, physical audio and credential-submission acceptance retain their earlier boundaries.
+The original 17 fixture rows remain exact. The missing-chapter test row and its 895-byte EPUB remain only in this disposable environment because supported deletion refuses its guest progress reference; no direct database mutation was used. The temporary synopsis item was removed through the supported API and its exact owned source removed. Live port 3101, operator guest/session and library were untouched. Full parties, physical audio and credential-submission acceptance retain their earlier boundaries.
 
 ## 6a4d202 comic and registered-auth regression
 
 The fresh normal Docker build at `6a4d2023d52d57fe3957c6da7827ea78813a0737` supplies app `9a1c5861628837a88a305f075db7ad285fbbff494af88711b9c7b40ffab822d9` and proxy `9038f4e1bd2ec70ea45154239a16d7dbcce77b5ca4a6845a2de1af95d5ed7d02`; server `70a48bc5019274178886233cf3e4f91824493d4677ba01ac8b7365d8282c9234` matches its native export. Actual CBZ and loose-manga Next/Close/reopen restore page 2 with decoded images; the owner ebook retains bookmark 2.333, its highlight and plain TOC labels. Full SVG cover, both sort directions, seven headings and guest sign-out/re-entry pass. Fourteen fresh screenshots were inspected.
 
-An additional disposable registered account completed creation/login HTTP 200, wrong-password HTTP 401, successful re-login and registered sign-out at desktop/phone widths. The sign-in form stayed centered and the app hidden; four further screenshots were inspected. No credential/token values were retained. This synthetic account remains test data because its creation response lacks an ID and the required before/after ownership baseline was not captured; no uncertain deletion was forced. All operator data and live port3101 remain outside this fixture.
+An additional disposable registered account completed creation/login HTTP 200, wrong-password HTTP 401, successful re-login and registered sign-out at desktop/phone widths. The sign-in form stayed centered and the app hidden; four further screenshots were inspected. No credential/token values were retained. This synthetic account remains test data because its creation response lacks an ID and the required before/after ownership baseline was not captured; no uncertain deletion was forced. All operator data and live port 3101 remain outside this fixture.
 
 The legacy CP437 repair has a separate real-TCP byte/order/metadata/progress oracle inside the 143-test Rust suite; these screenshots do not claim to exercise a legacy cache. Source/input equality supports the existing reader/party controls; physical audio and unsupported platforms retain their earlier limits.

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "scope": "Public, non-security QA summary for fork draft PR 2. Each result applies only to its named source and inputs. The draft PR description carries latest-head acceptance.",
+  "scope": "Public, non-security QA summary for PR 2 on the ColterD/Frayd fork. Each result applies only to its named source and inputs.",
   "source_repository": "https://github.com/ColterD/Frayd",
   "reproduce_with_tracked_sources": {
     "canonical_commands": "docs/development.md#canonical-checks",
@@ -99,7 +99,7 @@
         "cleanup": "owned browser/profile and fixture cleanup verified in local receipts; no deployment or owner Vivaldi acceptance"
       },
       "hosted_status_links": {},
-      "hosted_status_at_capture": "2aca11c has not been pushed; cdce17c hosted checks and Mac jobs are historical for this new source"
+      "hosted_status_at_capture": "no hosted job links recorded for this commit; cdce17c hosted checks and Mac jobs are historical for this source"
     }
   ],
   "limits": [

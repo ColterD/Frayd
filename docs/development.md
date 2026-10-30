@@ -1,12 +1,12 @@
 # Development and verification
 
-[Documentation index](README.md) · [Quick start](../README.md) · [Operations](operations.md) · [Historical verification ledger](verification/coderabbit-follow-up.md)
+[Documentation index](README.md) · [Quick start](../README.md) · [Operations](operations.md) · [Native bundle](native-bundle.md)
 
-Use an isolated checkout of the exact commit being qualified and disposable data. These are repeatable commands derived from the checked-in source and workflow, not a claim that a new checkout has passed. The fork draft remains separate from deployment; test success does not authorize rollout or public exposure.
+Run these commands in an isolated checkout, with disposable data. Passing them does not authorize rollout or public exposure.
 
 ## Native server
 
-Install a current Rust toolchain, Clippy and a C compiler. On Linux, the Rust tests also require `ffmpeg` and `ffprobe` on `PATH` for the real replacement-duration oracle. The Docker build stage supplies both tools before running tests. Keep `client/` beside `server/` for the source workflow. For a packaged installation, follow the [native bundle guide](verification/native-bundle.md). From `server/`:
+Install a current Rust toolchain, Clippy and a C compiler. On Linux, the Rust tests also need `ffmpeg` and `ffprobe` on `PATH` for the replacement-duration check. The Docker build stage supplies both tools before it runs the tests. Keep `client/` beside `server/`. To run a packaged install instead, follow the [native bundle guide](native-bundle.md). From `server/`:
 
 ```sh
 cargo test --locked
@@ -15,11 +15,15 @@ cargo build --locked --release
 FRAYD_BIND=127.0.0.1 FRAYD_LIBRARY=/absolute/path/to/your/media cargo run --locked
 ```
 
-Use a disposable media directory for development. Native runs have no Compose network isolation. Set `FRAYD_BIND=127.0.0.1` for loopback access. The default port is 8484; the default database is `frayd.db` under the build-time server source directory. Thumbnails and conversions default beside the database. Configure `FRAYD_DB`, `FRAYD_THUMBS` and `FRAYD_TRANSCODES` for disposable writable data, separate from any read-only source library; set `FRAYD_CLIENT_DIR` to the intended client assets. Raw `cargo run` retains its compile-time database default: moving a bare server binary does not qualify relocation. The packaged launcher supplies explicit private data/client paths and loopback binding, and verifies ownership before start/removal. `default-run = "frayd-server"` preserves `cargo run` after adding the `frayd-native` helper binary; the helper adds no Cargo dependency. See [configuration and storage](operations.md#configuration-and-storage) for environment overrides and cache caveats. Native media tools such as `ffmpeg`/`ffprobe` must be available separately; the Docker image supplies those tools.
+Use a disposable media directory. A native run has no Compose network isolation, so set `FRAYD_BIND=127.0.0.1` to keep it on loopback. The default port is 8484.
+
+The default database is `frayd.db` under the server source directory that was compiled in, and thumbnails and conversions default to the same place. Moving a bare server binary does not relocate them. Leave `FRAYD_TRUSTED_PROXY` unset for a direct native run, so login rate limits use the connection address. Set `FRAYD_DB`, `FRAYD_THUMBS` and `FRAYD_TRANSCODES` to writable disposable paths, separate from any read-only source library, and set `FRAYD_CLIENT_DIR` to the client assets you intend to serve. The packaged launcher sets all of these to private paths and binds to loopback.
+
+`default-run = "frayd-server"` keeps `cargo run` working now that the `frayd-native` helper binary exists. The helper also depends directly on `libc`, for `geteuid`. Tokio already locks the same version, so the lockfile gains no package. See [configuration and storage](operations.md#configuration-and-storage) for the environment overrides and cache limits. Install `ffmpeg` and `ffprobe` yourself for native runs. The Docker image includes them.
 
 ## Canonical checks
 
-From the repository root, with Node.js 22+, Python 3.11+, Docker Engine and Compose:
+From the repository root, with Node.js 22 or later, Python 3.11 or later, Docker Engine and Compose:
 
 ```sh
 node --check client/js/app.js
@@ -30,9 +34,9 @@ docker compose config --quiet
 git diff --check
 ```
 
-CI requires Node.js 22.23.4 on its Linux x64 runner. It reuses an exact valid toolcache entry or downloads the official archive with a pinned SHA-256 into temporary job storage, then verifies the executable version before adding it to PATH. Updating the CI version requires checking the official release and archive checksum together. Local checks support Node.js 22+ with the global WebSocket API.
+CI uses Node.js 22.23.4 on its Linux x64 runner. It reuses an exact valid toolcache entry or downloads the official archive, checks its pinned SHA-256 in temporary job storage, and verifies the executable version before adding it to `PATH`. To update the CI version, check the official release and its archive checksum together. Local checks need Node.js 22 or later with the global WebSocket API.
 
-For the Linux x86_64 hash-locked lint environment, create a temporary directory and retain its path for cleanup:
+For the Linux x86_64 hash-locked lint environment, create a temporary directory and keep its path for cleanup:
 
 ```sh
 FRAYD_LINT_DIR=$(mktemp -d)
@@ -41,9 +45,9 @@ python3 -m venv "$FRAYD_LINT_DIR/venv"
 "$FRAYD_LINT_DIR/venv/bin/ruff" check --no-cache --select E4,E7,E9,F,B905 scripts tests
 ```
 
-Remove only that created temporary directory when finished. The locked wheel targets Linux x86_64; other platforms need separately qualified tooling. No new application dependency is introduced by these checks.
+Remove only that temporary directory when you finish. The locked wheel targets Linux x86_64, so other platforms need their own lint setup.
 
-Build the neutral QA images before running the context and integration checks:
+Build the QA images before the context and integration checks:
 
 ```sh
 docker build -t frayd-qa:local .
@@ -55,201 +59,126 @@ python3 tests/test_dns_recovery.py
 python3 scripts/audit-dependencies.py
 ```
 
-The pinned Debian stages in the [Dockerfile](../Dockerfile) bound package update
-to 180 seconds and install to 360 seconds, each with a ten-second kill grace.
-APT uses 30-second HTTP/HTTPS transport timeouts, two retries and strict update
-errors. The [offline package controls](../tests/test_build_packages.py) exercise
-bounded stall and partial-index behavior during Python test discovery. These
-bounds make package acquisition fail within a known limit; they do not guarantee
-network recovery. Source-bound PR job outcomes remain in the
-[verification ledger](verification/coderabbit-follow-up.md) and PR description.
+The Debian stages in the [Dockerfile](../Dockerfile) are pinned. Each `apt-get update` has a 180-second limit and each install a 360-second limit, with a ten-second kill grace. APT uses 30-second HTTP and HTTPS timeouts, two retries and strict update errors, so package acquisition fails within a known time. The [offline package tests](../tests/test_build_packages.py) simulate a stalled download and a partial package index during Python test discovery.
 
-The [Dockerfile](../Dockerfile) runs locked Rust tests, Clippy with warnings denied and the release build. [Checks CI](../.github/workflows/checks.yml) runs client syntax/tests, real browser DOM regressions, locked Python lint, Compose validation, both image builds, context/integration and controlled DNS-failure checks, Python tests and the live dependency audit. Linux CI also exports both native binaries and actual compiler metadata from the Docker build and runs the native ownership/runtime suite with `FRAYD_NATIVE_REQUIRE_QUALIFICATION=1`; missing inputs fail instead of silently skipping. Default Python discovery in the dependency-audit job still checks packaging/static policy and explicitly skips helper or actual-server scenarios when their inputs are absent. See [native reproducible checks](verification/native-bundle.md#reproducible-checks) for the required inputs. Native Cargo commands, `git diff --check` and the standalone nginx configuration probe are additional local checks; the workflow does not invoke them separately. [CodeQL](../.github/workflows/codeql.yml) provides separate source/workflow analysis. Remote reviews, coverage and check conclusions must be read for the actual PR head; this guide does not reproduce their hosted results.
+### What CI runs
 
-The manual [macOS qualification workflow](../.github/workflows/release-mac.yml) uses standard `macos-15` ARM64 and `macos-15-intel` Intel runners, each bounded to 35 minutes. It checks actual architecture and executes each platform's native lifecycle suite. It has no tag trigger, publication or artifact upload, and introduces no new action. The proposed upload action remains rejected pending a qualified dependency check. Actual Mac execution is held until the coordinator accepts the final source and local gates; workflow configuration is not a Mac pass. Keep final source/image and architecture results in the [PR description](https://github.com/ColterD/Frayd/pull/2).
+The [Dockerfile](../Dockerfile) runs the locked Rust tests, Clippy with warnings denied and the release build. [Checks CI](../.github/workflows/checks.yml) runs:
+
+- client syntax checks and tests
+- the real browser DOM regression
+- locked Python lint
+- Compose validation
+- both image builds
+- the context, integration and controlled DNS-failure checks
+- the Python tests
+- the live dependency audit
+
+On Linux, CI also exports both native binaries and the compiler metadata from the Docker build, then runs the native ownership and runtime suite with `FRAYD_NATIVE_REQUIRE_QUALIFICATION=1`, so a missing input fails the job. The Python discovery in the dependency-audit job runs without those inputs, so it checks packaging and static policy and skips the helper and real-server scenarios. The inputs are listed under [native checks](native-bundle.md#checks).
+
+The Cargo commands in [Native server](#native-server), `git diff --check` and the standalone nginx probe are extra local checks that the workflow does not run on their own. [CodeQL](../.github/workflows/codeql.yml) analyzes the source and the workflows separately.
+
+The manual [macOS workflow](../.github/workflows/release-mac.yml) builds the native bundle on `macos-15` (ARM64) and `macos-15-intel` (x86_64), with a 35-minute limit per job. It checks the actual architecture and runs each platform's native lifecycle suite. It has no tag trigger, publishes nothing and uploads no artifact.
 
 ## Disposable QA scope
 
-The integration script defaults to `frayd-qa:local` and `frayd-proxy-qa:local`; `--app-image` and `--proxy-image` override them. It creates a unique disposable project, random loopback port and synthetic media. It checks first-owner setup, scans, comic/EPUB replacement, bounded and suffix Range bytes, unsatisfiable ranges, HEAD responses, saved progress, recreation and logout. It also checks proxy recovery after an app IP change, responsive read paths during a blocked scan, and actual codec conversion into writable storage while sources remain read-only. Source replacement checks distinguish fresh converted bytes from stale cache output while retaining IDs and progress.
+The integration script defaults to the `frayd-qa:local` and `frayd-proxy-qa:local` images. `--app-image` and `--proxy-image` override them. It starts a uniquely named disposable project on a random loopback port with synthetic media, and it checks:
 
-The context check builds with synthetic client/environment/installer sentinels to verify exclusions. The integration script removes its own containers, networks and volume, preserves the original failure if cleanup also fails, and checks for remaining project resources. It does not target the normal `frayd` project. Keep QA tags and data separate from deployment.
+- first-owner setup, scans, and comic and EPUB replacement
+- bounded and suffix Range bytes, unsatisfiable ranges and HEAD responses
+- saved progress, container recreation and logout
+- proxy recovery after the app's IP address changes
+- responsive read paths during a blocked scan
+- codec conversion into writable storage while sources stay read-only
+- that a replaced source produces fresh converted bytes, not stale cache output, and keeps its IDs and progress
 
-These are automated HTTP/storage scenarios. They do not prove browser playback, every media format, watch-party behavior, backup restoration, upgrades or public-hosting security. Client VM tests use synthetic browser/network boundaries; actual browser sandbox behavior needs browser verification. Detailed historical scenarios and immutable source/image bindings remain in the [ledger](verification/coderabbit-follow-up.md).
+The Docker call helper gives each call a 120-second deadline by default, and a call can pass its own. When it fails, the script removes its own containers, networks and volume, keeps the original failure if cleanup also fails, and checks that no project resources remain. It never targets the normal `frayd` project. Keep QA tags and data separate from your deployment.
+
+The Docker context is an exact allowlist in `.dockerignore`: the Dockerfiles, `nginx.conf`, the server sources and the client files the images use, with denials for databases, `.env` files, editor backups and OS files. `scripts/check-build-context.py` builds a scratch image from synthetic client files and plants `.env`, database, notes and editor-backup sentinels beside the normal asset. It then checks that the exported client tree holds only `client/js/app.js`, and that no sentinel or installer text reaches the image.
+
+These scenarios are automated HTTP and storage checks. They do not cover browser playback, every media format, watch-party behavior, backup restoration, upgrades or public-hosting security. Client tests that run in a VM use synthetic browser and network boundaries, so real browser sandbox behavior needs a real browser.
 
 ## Dependency audit policy
 
-The audit queries OSV for exact versions in `server/Cargo.lock`, prints findings and exits nonzero on applicable advisories. Network/API failures and incomplete pagination also fail the command.
+The audit queries OSV for the exact versions in `server/Cargo.lock`, prints findings and exits nonzero on applicable advisories. A network or API failure, or incomplete pagination, also fails it.
 
-One narrow database disagreement is handled explicitly: OSV flags `block-buffer 0.10.4` for `GHSA-qwgh-2vcv-g2f7`, while the publisher lists only `>=0.11.0,<0.12.1`. Each audit fetches the publisher advisory from the RustCrypto GitHub API and requires that exact advisory identity, package and range before classifying this finding as `not_affected`. Changed, malformed or unavailable publisher evidence keeps it fatal. All other findings remain fatal. CI tests this policy and runs the live query separately; historical clean results do not predict future advisories. See [audit implementation](../scripts/audit-dependencies.py) and [policy tests](../tests/test_audit_dependencies.py).
+One database disagreement is handled explicitly. OSV flags `block-buffer 0.10.4` for `GHSA-qwgh-2vcv-g2f7`, while the publisher lists only `>=0.11.0,<0.12.1`. Each audit fetches the publisher advisory from the RustCrypto GitHub API. It classifies the finding as `not_affected` only when the advisory identity, package and range match exactly. Changed, malformed or unavailable publisher evidence keeps the finding fatal, and so does every other finding. CI tests this policy and runs the live query separately. See the [audit implementation](../scripts/audit-dependencies.py) and its [policy tests](../tests/test_audit_dependencies.py).
 
-## Browser acceptance
+## Browser checks
 
-The automated suite does not substitute for the [manual browser acceptance matrix](verification/browser-acceptance.md). That page records its exact media, image/source identities, observed failures and corrected-image acceptance status separately from historical integration results.
+The automated suite does not replace playing your own media in a real browser.
 
 ### Real DOM regression
 
-With Node.js 22+ (the global WebSocket API is required) and an existing Chrome/Chromium executable on PATH, run:
+With Node.js 22 or later (the global WebSocket API is required) and a Chrome or Chromium executable on `PATH`, run:
 
 ```sh
 node tests/browser-regression.cjs
 ```
 
-Set `BROWSER_BIN` to an existing executable when it is not discoverable on PATH.
-The runner performs no browser download and adds no npm package. It serves a
-loopback-only fixture and creates a new temporary browser profile. It removes that
-profile only after confirming its owned process group has stopped with bounded waits.
-If shutdown fails, the runner retains the profile and reports the cleanup error.
-Runner and cleanup failures remain separate in the result. It executes the production client, generated sandboxed
-EPUB frame and vendored Plyr. Fixture APIs control annotation responses.
-Media IDs 9/10/11 use synthetic player events. Native IDs 20/21/22 use the short
-owned H.264 fixture; six controls require readyState 4, video width 160 and a
-positive decoded-frame count. That fixture does not qualify physical audio,
-other codecs or distinct-client timing. Separate real-player observations are
-recorded in the [browser acceptance checkpoints](verification/browser-acceptance.md).
-Native progress-save controls also require the current tracker, metadata and
-matching stream, including a negative check for stale local audio bookmarks.
-The fixture redirects Plyr's icon URL to the existing local sprite.
+Set `BROWSER_BIN` to the executable when it is not on `PATH`. The runner downloads no browser and adds no npm package. It serves a loopback-only fixture and uses a new temporary browser profile. It deletes that profile only after it confirms, with bounded waits, that the browser's process group has stopped. If shutdown fails, the runner keeps the profile and reports the cleanup error, separately from any test failure.
 
-The output records the actual browser version, executable hash and tested source
-hashes. CI uses its runner-provided browser and fails if no browser is available;
-this is a changing test environment, not an immutable browser qualification.
-Keep the browser supplied by your operating system or CI image updated. No new
-npm dependency is introduced, and the Cargo audit does not scan that external
-browser. These DOM checks complement the manual media matrix; they do not close
-its held interactive acceptance cases.
+The runner prints its result as JSON and also writes it to `${FRAYD_DOM_RESULT_DIR:-$TMPDIR/frayd-dom-regression}/result.json`. The result includes the browser version, the executable hash and the hashes of the tested sources. CI uses its runner's browser and fails when none exists.
 
-### Dashboard and artwork qualification
+The suite runs the production client, the generated sandboxed EPUB frame and vendored Plyr in that browser. The fixture's API handlers control annotation responses and redirect Plyr's icon URL to the local sprite. Media IDs 9, 10 and 11 use synthetic player events. Native IDs 20, 21 and 22 use a short H.264 fixture that the repository owns. Six controls on that fixture require `readyState` 4, a video width of 160 and a positive decoded-frame count. It does not cover audible audio, other codecs or timing across separate clients. Progress-save controls require the current tracker, metadata and a matching stream, including a negative check against stale local audio bookmarks.
 
-The seven dashboard shelves share `categoryShelf()` in `client/js/app.js`: newest
-first by default, one per-category oldest toggle, and folder ordering by the
-maximum/minimum actual member `created_at`. Numeric TV episode order and the
-render-scoped progress reader remain separate. `artwork()` uses the thumbnail
-API and a URL version derived from the encoded `artwork_version` field, never a
-cache path. The library/search API exposes that nullable opaque basename only
-for the same media ID's canonical UUID or retained legacy name. Missing art falls
-back to a category symbol; an artwork image does not
-establish a title/artist match.
+The browser comes from your operating system or CI image, so keep it updated. Cargo audits do not scan it.
 
-Scanner tests in `server/src/scanner.rs` exercise seven local-source kinds,
-missing-cover repair, guarded publication, replacement and conservative
-retirement. `server/src/main.rs` covers thumbnail MIME and deletion. Run
-`cargo test --locked --manifest-path server/Cargo.toml` and the strict Clippy
-command in [canonical checks](#canonical-checks); run the Node and real-DOM
-commands there for dashboard sort, representative folder art and the 320×568
-footer reachability oracle. The integration test reads the database-selected
-UUID JPEG path and asserts exact bytes, rollback preservation and 204 cleanup;
-the older `id.jpg` expectation failed before that test correction. EPUB DOM
-controls check fresh-frame publication and rejection of retired messages. These
-fixture checks do not replace current-image browser acceptance. The filename-first
-online iTunes path is **UNWIRED**:
-recover `44d1ed7` `extract_thumb`/`fetch_online_thumb`/`itunes_artwork` only
-with verified artist/album matching and explicit provider opt-in. There is no
-new artwork provider, flag or schema; no general catalog metadata lookup. The
-separate EPUB parser dependency is recorded below.
+### Dashboard and artwork
+
+The seven dashboard shelves share `categoryShelf()` in `client/js/app.js`. They show the newest items first by default, with one oldest-first toggle per category. A folder sorts by the maximum or minimum `created_at` of its members. TV episode order and the render-scoped progress reader are separate. `artwork()` uses the thumbnail API, with a URL version taken from the encoded `artwork_version` field and never a cache path. The library and search API returns that nullable opaque basename only for the same media ID's canonical UUID file or retained legacy name. Missing art falls back to a category symbol. An artwork image does not establish that the title or artist matches.
+
+Scanner tests in `server/src/scanner.rs` cover seven local-source kinds, missing-cover repair, guarded publication, replacement and conservative retirement. Tests in `server/src/main.rs` cover thumbnail MIME types and deletion. The integration test reads the UUID JPEG path selected by the database and asserts exact bytes, rollback preservation and 204 cleanup. To check dashboard sort, representative folder art and the 320×568 footer reachability, run the Rust tests and strict Clippy from [Native server](#native-server), and run the Node and real-DOM commands from [Canonical checks](#canonical-checks). The EPUB DOM controls check publication of a fresh frame and rejection of retired messages.
+
+No online artwork provider is configured. The [supported tools](operations.md#supported-tools-and-current-limits) list explains why.
 
 ### EPUB bounds and reader layout
 
-The EPUB container/OPF path uses `quick-xml` 0.42.0 with default features off
-(`server/Cargo.lock`); its MIT upstream commit is
-[`36a2c52`](https://github.com/tafia/quick-xml/tree/36a2c52a4f6c90878c3f60c3c3b5c62efaef28a9),
-checked 2026-10-29 and adopted for namespace-aware, bounded parsing. The locked
-crate checksum is `41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b`;
-it adds one registry package and reuses `memchr` 2.8.3. The local dependency
-audit covered 210 packages. This does not certify future advisory absence.
+The EPUB container and OPF path uses `quick-xml` 0.42.0 with default features off, locked in `server/Cargo.lock`. It was chosen for namespace-aware, bounded parsing.
 
-Metadata entries are capped at 2 MiB decompressed, binary entries at 32 MiB;
-the stream reads at most limit+1 bytes rather than trusting ZIP headers. XML
-has 100,000-event/128-depth bounds, ignores external DTDs and does not expand
-custom entities. URI matching decodes once and preserves literal percent names.
-Rejection stops cover fallback before FFmpeg/output publication. Cached legacy
-art uses a 12-byte sniff and 64 KiB stream chunks; these are per-entry/read
-bounds, not an archive, concurrency or RSS budget.
+The size and parser limits are listed under [supported tools](operations.md#supported-tools-and-current-limits). The reader takes at most the limit plus one byte from the stream instead of trusting ZIP headers. XML parsing ignores external DTDs and does not expand custom entities. URI matching decodes once and keeps literal percent names. A rejected entry stops the cover fallback before FFmpeg runs or output is published.
 
-The browser reader waits for fonts and a positive layout before reporting a
-page or saving resume; resize can wake an unmeasurable document. Rejected chapter
-responses publish a visible unavailable state without a false save. Closing also requires the current ready document, generation and frame identity; pending or failed chapters cannot replace a saved bookmark. Run the
-canonical Rust/Clippy/audit commands and `node --test tests/epub-message.test.cjs`
-plus the real-DOM regression. Those checks do not prove actual first-open
-behavior on a new image or explain Chromium's earlier empty-frame trigger.
+The browser reader waits for fonts and a positive layout before it reports a page or saves a resume position. A resize can wake a document that could not be measured. A chapter response that is rejected shows a visible unavailable state and saves nothing. Closing the reader also needs the current ready document, generation and frame, so a pending or failed chapter cannot replace a saved bookmark. To check this, run the Rust, Clippy and audit commands, `node --test tests/epub-message.test.cjs` and the real-DOM regression.
 
 ### Unwired UI design fragments
 
-`client/index.html` retains five named `<template id="unwired-…">` fragments
-beside their intended locations. Template children do not enter the active DOM,
-tab order or accessibility tree. The hero fragment sits outside `#hero` because
-`renderHero()` replaces that element's contents. No runtime code instantiates
-these fragments. Even a manually cloned prototype has disabled controls, explicit
-`type="button"` buttons, no control IDs and no event handlers. The working default
-continues to expose only implemented actions; these fragments are design intent,
-not supported features or a promise of activation.
+[docs/design/unwired-ui-fragments.html](design/unwired-ui-fragments.html) holds the markup for five controls that Frayd does not implement. `client/index.html` ships no `<template>`, no disabled control and no `UNWIRED` comment. Nothing serves or loads the fragments page. Each fragment is a `<template>` with disabled `type="button"` controls, no control IDs and no event handlers, and a comment naming where it belonged. They are design notes, not features.
 
-| Fragment | Removal provenance | Contract required before activation |
-| --- | --- | --- |
-| `unwired-remember` | `8d879054a16637619b7efc1e1e79ce6d38e568d2` | Define actual token/identity storage, session expiry, unchecked behavior, logout and shared-device policy; the checkbox must change that policy. |
-| `unwired-social-auth` (Google / SSO) | `8d879054a16637619b7efc1e1e79ce6d38e568d2` | Implement configured provider routes, redirect/state validation, errors and safe account linking with the local household/account model. |
-| `unwired-notifications` | `8d879054a16637619b7efc1e1e79ce6d38e568d2` | Provide an authorized event source, actual notification surface, empty/error states and read/dismiss persistence. |
-| `unwired-hero-info` | `829af7d02172fcf36610aacd044699db82d43176` | Open actual selected-media details with close/focus behavior and truthful metadata; preserve the working hero play action. |
-| `unwired-audio-navigation` (Previous / Next) | `d49b227b721b0ef20bb87c2e83f148a7e0cb108a` | Define queue order and boundaries, previous-track versus restart behavior, per-track resume/progress ownership and host/guest party authority. |
+| Fragment | Contract to define before activation |
+| --- | --- |
+| `unwired-remember` | Token and identity storage, session expiry, the unchecked behavior, logout and a shared-device policy. The checkbox must change that policy. |
+| `unwired-social-auth` (Google and SSO) | Configured provider routes, redirect and state validation, errors, and safe account linking with the local household account model. |
+| `unwired-notifications` | An authorized event source, a real notification surface, empty and error states, and read and dismiss persistence. |
+| `unwired-hero-info` | A details view for the selected media, with close and focus behavior and accurate metadata. The hero play action must keep working. |
+| `unwired-audio-navigation` (Previous and Next) | Queue order and boundaries, previous-track versus restart behavior, per-track resume and progress ownership, and host and guest authority in a party. |
 
-These are local source-history references checked on 2026-10-29; retrieve the
-pre-removal markup with `git show <commit>^:client/index.html` (the hero button
-was generated in `client/js/app.js`). SVGs and labels are retained where useful;
-removed styling remains recoverable from history. No dependency, configuration,
-environment flag or activation path is added. Before activating a fragment,
-implement its contract, accessible interaction and affected-path tests, then
-move the control into the live UI and qualify the real browser workflow.
+To activate a fragment, implement its contract and an accessible interaction, add tests for the paths it touches, move the control into the live UI, and check the workflow in a real browser. Git history holds the original markup and styling.
 
-`python3 -m unittest discover -s tests -p 'test_unwired_ui.py'` checks the source
-boundary and disabled prototype contract. Canonical Python discovery runs this
-check in CI; the real DOM suite separately checks default auth/audio controls.
+`python3 -m unittest discover -s tests -p 'test_unwired_ui.py'` asserts that `client/index.html` ships no templates, disabled controls or `UNWIRED` comments. Python discovery in CI runs it, and the real DOM suite separately checks the default auth and audio controls.
 
 ### Party protocol
 
-`POST /api/party` returns a public code and private `host_capability`. Host socket
-registration requires that proof plus the creator identity in the current
-session generation. The client offers `frayd-party` and `frayd-host.<proof>` as
-WebSocket protocols; the server selects only `frayd-party`. Do not put the proof
-in URLs, storage, public messages or logs. Ordinary guest joins carry no proof.
+`POST /api/party` returns a public code and a private `host_capability`. Host socket registration requires that proof and the creator's identity in the current session generation. The client offers `frayd-party` and `frayd-host.<proof>` as WebSocket protocols, and the server selects only `frayd-party`. Never put the proof in URLs, storage, public messages or logs. Ordinary guest joins carry no proof.
 
-Party messages show public `Host` and `Guest N` display labels and carry a
-separate `self_label` for the current client's UI. Canonical membership and
-authorization identity remains separate from those labels. Refresh open tabs
-after upgrading both client and server; mixed-version compatibility is not
-qualified by the focused label tests.
+Party messages show the public labels `Host` and `Guest N`, and carry a separate `self_label` for the current client's UI. Membership and authorization identity stay separate from those labels.
 
-Preflight and post-upgrade registration share the same role predicate before
-membership changes. Tests cover first-slot and connected-host impersonation,
-malformed/duplicate/stale offers, wrong identity and legitimate reconnects.
-Guest creation/replacement remains public for the trusted household; the proof
-authorizes existing-room host controls, not exclusive global creation rights.
-After a client/server upgrade, refresh open tabs before hosting a new party.
+The preflight check and the post-upgrade registration share one role predicate and run before any membership change. The tests cover first-slot and connected-host impersonation, malformed, duplicate and stale offers, a wrong identity, and legitimate reconnects. Any guest can still create or replace a party in a trusted household. The proof authorizes host controls in an existing room. It does not reserve party creation.
 
-A live guest key cannot be registered again until its prior outbound receiver
-closes or cleanup removes it. Both preflight and registration use this occupancy
-check; stale cleanup cannot remove a permitted successor. An immediate same-key
-rejoin can be rejected until server retirement completes. This protects active
-membership, not first-registration or inactive device-identity authentication;
-public device labels remain trusted-local identifiers. Valid creator-proof host
-replacement stays supported.
+A live guest key cannot register again until its earlier outbound receiver closes or cleanup removes it. Preflight and registration both apply this check, and stale cleanup cannot remove a permitted successor. An immediate rejoin with the same key can be refused until server retirement finishes. This protects active membership. It does not authenticate first registration or inactive device identities, so public device labels are local identifiers you trust. Host replacement with the valid creator proof is still supported.
 
-### Legacy comic page-name compatibility
+After you upgrade the client and server, refresh open tabs before you host a new party. Mixed client and server versions are untested.
 
-Persisted ZIP 0.6.6 page labels can differ from ZIP 9 even when the archive bytes are unchanged. The contextual comic reader compares the entire cached list with unique current and historical flag-aware names, preserves its order, and reads the selected physical entry. It never rewrites the cache or user progress. Ambiguous interpretations remain refused; legacy recovery also holds when ZIP reports duplicate central-directory names. Normal canonical subsets retain exact lookup, while directory, RAR and EPUB readers keep their existing paths.
+### Legacy comic page names
 
-The CP437 high-half is standard encoding data generated with Python's `cp437` codec; no dependency or second ZIP parser was added. Historical algorithm provenance: [zip 0.6.6, MIT, commit 21a20584](https://github.com/zip-rs/zip/blob/21a20584bc9e05dfa4f3c5b0bc420a1389fae2c3/src/read.rs#L1065), checked 2026-10-29; disposition: ADOPT decoding policy, not a second library. Real persisted-cache TCP and archive controls cover old names/order/progress, canonical subsets, flag handling, collisions and conservative refusal.
+Page labels persisted by ZIP 0.6.6 can differ from ZIP 9 labels even when the archive bytes are unchanged. The comic reader compares the entire cached list with the unique current names and the historical, flag-aware names. It keeps the cached order and reads the selected physical entry. It never rewrites the cache or user progress. An ambiguous match is refused, and so is a match against an archive that reports duplicate central-directory names. A canonical subset still uses exact lookup, and the directory, RAR and EPUB readers keep their existing paths.
 
-### Immutable build identity
+The decoding policy follows the zip 0.6.6 crate. The CP437 high half is standard encoding data generated with Python's `cp437` codec. The server adds no dependency and no second ZIP parser. Tests with a real persisted cache over TCP and real archives cover old names, order, progress, canonical subsets, flag handling, collisions and refusal.
 
-`Cargo.toml` owns the package version. `GET /api/build` (`Cache-Control: no-store`)
-and `frayd-server --build-info` expose the same compile-bound JSON: `version`,
-full `commit` or null, optional `commits_since_tag`, and `dirty` true/false/null.
-The CLI exits before database initialization. Sign-in, sidebar and Settings show
-`v0.1.1 · 65c232c`; the tooltip retains full provenance. Dirty source is visibly
-marked; missing source identity/state is explicitly unknown. A revision identifies
-a base commit, not the exact bytes of a dirty build.
+### Build identity
 
-Capture provenance **before** isolating source and use the same snapshot for all
-outputs. Standard local routes (no deployment implied):
+`Cargo.toml` owns the package version. `GET /api/build` (`Cache-Control: no-store`) and `frayd-server --build-info` return the same compile-time JSON: `version`, the full `commit` or null, an optional `commits_since_tag`, and `dirty` as true, false or null. The CLI exits before it opens the database. The sign-in screen, sidebar and Settings show the version and short commit, and the tooltip carries the full identity. A dirty build is marked as dirty, and a build with no source information is marked unknown. A commit identifies a base, not the exact bytes of a dirty build.
+
+Capture the identity before you isolate the source, and use the same capture for every output. The standard local routes are:
 
 ```sh
 python3 scripts/build-metadata.py -- cargo build --locked --manifest-path server/Cargo.toml --release
@@ -257,16 +186,6 @@ python3 scripts/build-metadata.py -- docker build -t frayd:local .
 python3 scripts/build-metadata.py -- docker compose build
 ```
 
-The wrapper supplies `FRAYD_BUILD_COMMIT`, `FRAYD_BUILD_COMMITS_SINCE_TAG`, and
-`FRAYD_BUILD_DIRTY`. `--env` prints only those nonsecret values for CI's environment
-file before its isolated macOS copy. Docker accepts those three build arguments;
-Compose forwards them to the builder. Bare Docker/Compose builds without capture
-report unknown provenance because `.git` stays excluded. Ordinary Cargo source
-builds discover Git locally; isolated builds must supply metadata explicitly.
-Malformed/missing fields remain unknown. Never derive identity from runtime env.
-Linux export uses the same Docker arguments as the image. Native packaging queries
-the actual server CLI and refuses unknown/mismatched base commit or package
-version. Its hashed `build-info.json` records the binary identity separately from the
-packaging checkout `source` in `manifest.json`; manifest hashes retain exact bytes. This
-check assumes a native executable on its matching host, not arbitrary cross-built
-binaries or a trusted attestation of caller-supplied build arguments.
+The wrapper supplies `FRAYD_BUILD_COMMIT`, `FRAYD_BUILD_COMMITS_SINCE_TAG` and `FRAYD_BUILD_DIRTY`. `--env` prints only those nonsecret values, which CI writes to an environment file before it copies the source for the macOS build. Docker accepts the three values as build arguments and Compose forwards them to the builder. A plain Docker or Compose build without the wrapper reports an unknown identity, because `.git` stays out of the context. A plain Cargo build in a checkout reads Git itself, while an isolated build must be given the values. Missing or malformed fields read as unknown. Never derive the identity from runtime environment variables.
+
+The Linux export uses the same Docker arguments as the image. Native packaging asks the real server binary for its identity and refuses an unknown or mismatched base commit or package version. The hashed `build-info.json` records the binary's identity, and `manifest.json` records the packaging checkout under `source`. This assumes a native binary running on the host it was built for. It does not cover cross-built binaries, and it does not attest build arguments that a caller supplied.

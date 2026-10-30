@@ -2,13 +2,10 @@
 
 | Task | Guide |
 |---|---|
-| Start the fork draft locally and add a first library | [Quick start](../README.md) |
-| Mount media, fix permissions, inspect storage or stop/remove services | [Operations](operations.md) |
-| Run natively, reproduce checks or understand disposable QA and audit policy | [Development](development.md) |
-| Install, start, qualify or remove an experimental private native bundle | [Native bundle](verification/native-bundle.md) |
-| Read the complete PR #2 base-to-head change and review coverage | [PR #2 changelog](verification/pr-2-changelog.md) |
-| Trace review findings and historical source/image qualifications | [Verification ledger](verification/coderabbit-follow-up.md) |
-| Check bounded browser/media acceptance and its limits | [Browser acceptance](verification/browser-acceptance.md) |
-| Read source-bound public QA counts, artifact IDs and hosted check links | [Acceptance checkpoints](verification/acceptance-checkpoints.json) |
+| Start locally with Docker and add a first library | [Quick start](../README.md) |
+| Mount media, fix permissions, inspect storage, back up, or stop and remove services | [Operations](operations.md) |
+| Run natively, run the checks, or read the QA and dependency-audit policy | [Development](development.md) |
+| Install, start and remove the experimental native bundle | [Native bundle](native-bundle.md) |
+| Fork only: review records for PR #2 | [Verification records](verification/) |
 
-The guides describe the checked-in fork draft. The ledger and public checkpoint preserve historical evidence for their recorded inputs; they do not qualify a new checkout or authorize deployment. Hosted acceptance for the current head belongs to the [draft PR description](https://github.com/ColterD/Frayd/pull/2). Recovery is limited to the [tested same-image named-volume scenario](operations.md#backup-restore-and-upgrade-status); upgrades and public hosting remain unqualified.
+Passing the checks in Development qualifies only the source you ran them on. It does not authorize deployment or public hosting.
