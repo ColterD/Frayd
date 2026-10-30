@@ -7,14 +7,14 @@ https://learn.microsoft.com/windows/win32/procthread/job-objects
 https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw
 """
 import ctypes
-from ctypes import wintypes
-from contextlib import contextmanager
 import json
 import os
 import shutil
 import subprocess
 import tempfile
 import time
+from contextlib import contextmanager
+from ctypes import wintypes
 
 
 class StartupInfo(ctypes.Structure):
@@ -239,9 +239,8 @@ def run_windows_job(arguments, *, env, directory):
                     os.set_handle_inheritable(handle, False)
             checked(api.AssignProcessToJobObject(job, process.hProcess))
             assigned = True
-            if time.monotonic() < deadline:
-                if api.ResumeThread(process.hThread) == 0xFFFFFFFF:
-                    raise ctypes.WinError(ctypes.get_last_error())
+            if time.monotonic() < deadline and api.ResumeThread(process.hThread) == 0xFFFFFFFF:
+                raise ctypes.WinError(ctypes.get_last_error())
 
             state = wait_for_job_exit(read_state, deadline)
             timed_out = bool(state['active'] or state['host_wait'] != 0)

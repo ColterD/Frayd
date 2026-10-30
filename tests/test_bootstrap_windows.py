@@ -683,22 +683,23 @@ class QualificationPolicy(unittest.TestCase):
             with self.subTest(pending=pending):
                 clock = [0.0]
 
-                def sleep(seconds):
+                def sleep(seconds, clock=clock):
                     clock[0] += seconds
 
                 complete = {'active': 0, 'host_wait': 0}
-                with (patch('windows_job.time.monotonic', side_effect=lambda: clock[0]),
+                with (patch('windows_job.time.monotonic', side_effect=lambda clock=clock: clock[0]),
                       patch('windows_job.time.sleep', side_effect=sleep)):
-                    def delayed_completion():
+                    def delayed_completion(pending=pending, clock=clock, complete=complete):
                         return pending if clock[0] < 0.02 else complete
 
                     state = windows_job.wait_for_job_exit(delayed_completion, 5)
                     self.assertEqual(state, complete)
                     self.assertGreaterEqual(clock[0], 0.02)
                     clock[0] = 0
-                    state = windows_job.wait_for_job_exit(lambda: pending, 5)
+                    state = windows_job.wait_for_job_exit(lambda pending=pending: pending, 5)
                     self.assertEqual(state, pending, 'a missed deadline must remain incomplete')
-                    self.assertEqual(clock[0], 5, 'all completion conditions share one budget')
+                    self.assertGreaterEqual(clock[0], 5)
+                    self.assertLessEqual(clock[0], 5 + 1e-9, 'all completion conditions share one budget')
 
     def test_fixture_cleanup_failure_preserves_the_primary_error(self):
         for primary_fails in (True, False):
@@ -708,11 +709,11 @@ class QualificationPolicy(unittest.TestCase):
                 try:
                     with patch('windows_job.shutil.rmtree', side_effect=PermissionError('injected cleanup failure')):
                         expected = AssertionError if primary_fails else PermissionError
-                        with self.assertRaises(expected) as caught:
-                            with job_fixture(prefix='Frayd cleanup failure ') as directory:
-                                (Path(directory) / 'owned').write_text('fixture')
-                                if primary_fails:
-                                    raise primary
+                        with (self.assertRaises(expected) as caught,
+                              job_fixture(prefix='Frayd cleanup failure ') as directory):
+                            (Path(directory) / 'owned').write_text('fixture')
+                            if primary_fails:
+                                raise primary
                         if primary_fails:
                             self.assertIs(caught.exception, primary)
                         self.assertTrue(any('cleanup failed (PermissionError)' in note and directory in note
