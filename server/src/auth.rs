@@ -174,6 +174,9 @@ pub fn delete_session(db: &Connection, token: &str) {
 mod tests {
     use super::*;
 
+    /// A per-run password, so no credential literal lives in the test source.
+    fn fixture_password() -> String { uuid::Uuid::new_v4().to_string() }
+
     /// IPv6 peers share one key per /64; IPv4 and IPv4-mapped IPv6 peers key by the single IPv4 address.
     #[test]
     fn client_ip_groups_ipv6_by_64_prefix_and_maps_ipv4() {
@@ -218,7 +221,7 @@ mod tests {
     fn create_account_lookup_failure_inserts_nothing() {
         let db = crate::store::open(":memory:");
         break_key_lookup(&db);
-        assert!(create_account(&db, "new@example.invalid", "fixture-secret").is_err());
+        assert!(create_account(&db, "new@example.invalid", &fixture_password()).is_err());
         let created: i64 = db.query_row("SELECT COUNT(*) FROM identities_rows WHERE key='new@example.invalid'", [], |r| r.get(0)).unwrap();
         assert_eq!(created, 0);
     }
@@ -228,6 +231,6 @@ mod tests {
     fn verify_login_lookup_failure_is_an_error() {
         let db = crate::store::open(":memory:");
         break_key_lookup(&db);
-        assert!(verify_login(&db, "new@example.invalid", "fixture-secret").is_err());
+        assert!(verify_login(&db, "new@example.invalid", &fixture_password()).is_err());
     }
 }

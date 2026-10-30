@@ -232,7 +232,7 @@ async function paginationDocument({ visible = false, pages = 4, layoutPending = 
   b.respond(async () => ({ ok: true, text: async () => '<html><head></head><body>Saved chapter</body></html>' }));
   await b.run('showChunk(2, { frac: 1 / 3 })');
   // Extract the bridge for VM execution; this is not an HTML sanitizer.
-  const script = b.nodes.get('#em-frame').srcdoc.match(/<script>([\s\S]*?)<\/script>/)[1];
+  const script = b.nodes.get('#em-frame').srcdoc.match(/<script>([\s\S]*?)<\/script>/i)[1];
   const events = new Map(), renders = [];
   let width = visible ? 760 : 0;
   const body = { appendChild() {}, getBoundingClientRect: () => ({ width, height: width ? 600 : 0 }) };

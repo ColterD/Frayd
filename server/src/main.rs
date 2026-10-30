@@ -1753,6 +1753,9 @@ mod test_support {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
+    /// A per-run password, so no credential literal lives in the test source.
+    pub fn fixture_password() -> String { uuid::Uuid::new_v4().to_string() }
+
     /// Command that re-runs exactly one test of this binary in a fresh process.
     pub(crate) fn child(test: &str) -> Command {
         let mut command = Command::new(std::env::current_exe().unwrap());
@@ -2606,7 +2609,7 @@ mod backend_regressions {
     async fn setup_count_failure_creates_no_owner() {
         let app = app_for("unused.cbz");
         break_account_count(&app);
-        let request = SetupReq { email: "owner@example.invalid".into(), password: "fixture-secret".into() };
+        let request = SetupReq { email: "owner@example.invalid".into(), password: crate::test_support::fixture_password() };
         let response = auth_setup(State(app.clone()), loopback(), axum::http::HeaderMap::new(), Json(request)).await.into_response();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let db = app.db.lock().unwrap();
@@ -2623,7 +2626,7 @@ mod backend_regressions {
             let app = app_for("unused.cbz");
             app.db.lock().unwrap().execute_batch(&format!("CREATE TRIGGER reject_write BEFORE INSERT ON {table} BEGIN
                 SELECT RAISE(ABORT,'fixture write refused'); END;")).unwrap();
-            let request = || Json(SetupReq { email: "owner@example.invalid".into(), password: "fixture-secret".into() });
+            let request = || Json(SetupReq { email: "owner@example.invalid".into(), password: crate::test_support::fixture_password() });
             let response = auth_setup(State(app.clone()), loopback(), axum::http::HeaderMap::new(), request()).await.into_response();
             assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR, "{table}");
             {
@@ -2655,12 +2658,13 @@ mod backend_regressions {
     #[tokio::test]
     async fn login_admin_lookup_failure_stores_no_session() {
         let app = app_for("unused.cbz");
+        let password = crate::test_support::fixture_password();
         {
             let db = app.db.lock().unwrap();
-            auth::create_account(&db, "member@example.invalid", "fixture-secret").unwrap();
+            auth::create_account(&db, "member@example.invalid", &password).unwrap();
             db.execute_batch("DROP TABLE user_perms").unwrap();
         }
-        let request = LoginReq { email: "member@example.invalid".into(), password: "fixture-secret".into() };
+        let request = LoginReq { email: "member@example.invalid".into(), password };
         let response = auth_login(State(app.clone()), loopback(), axum::http::HeaderMap::new(), Json(request)).await.into_response();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
