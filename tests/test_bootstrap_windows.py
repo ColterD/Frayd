@@ -22,6 +22,8 @@ import types
 import unittest
 from pathlib import Path
 
+from windows_job import JobTimeout, job_fixture, run_windows_job
+
 TESTS = Path(__file__).resolve().parent
 ROOT = TESTS.parent
 BOOTSTRAP_PS1 = ROOT / 'client/install/bootstrap.ps1'
@@ -195,27 +197,26 @@ def copy_download_fixture(source):
 ENTRY_MARKERS = ('entry-download-complete', 'entry-script-started', 'entry-script-complete')
 
 
-def harmless_entry_script(child_exit=0):
+def harmless_entry_script(child_exit=0, sleep_seconds=0):
     return ("param([string]$Lib)\n"
             "[IO.File]::WriteAllText((Join-Path $env:TEMP 'entry-script-started'), '1')\n"
+            f"Start-Sleep -Seconds {sleep_seconds}\n"
             "Write-Output $Lib\n"
             "[IO.File]::WriteAllText((Join-Path $env:TEMP 'entry-script-complete'), '1')\n"
             f"exit {child_exit}\n")
 
 
 def run_generated_entry(arguments, *, env, directory):
-    # EOF is explicit: the CI Python launcher itself consumes a script from stdin.
-    # subprocess.run may still wait for descendant-held pipes after killing its host;
-    # this timeout diagnostic cannot make that Windows pipe drain bounded.
     try:
-        return subprocess.run(arguments, env=env, cwd=directory, stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, timeout=30, check=False)
-    except subprocess.TimeoutExpired as error:
+        return run_windows_job(arguments, env=env, directory=directory)
+    except JobTimeout as error:
         root = Path(directory)
         markers = {name: (root / name).is_file() for name in ENTRY_MARKERS}
         fresh_files = len(list(root.glob('frayd-install-*.ps1')))
         raise AssertionError(f'generated entry timed out after 30s: markers={markers}; '
-                             f'fresh_download_count={fresh_files}') from error
+                             f'fresh_download_count={fresh_files}; active={error.job_active_processes}; '
+                             f'total={error.job_total_processes}; host_exited={error.host_exited}; '
+                             f'elapsed={error.elapsed:.3f}s') from error
 
 
 class QualificationMixin:
@@ -432,7 +433,7 @@ class QualificationMixin:
                     self.assertIn(f'winget install Gyan.FFmpeg failed (exit {code})', run.outcome[1], run.describe())
 
     def test_generated_download_failure_never_executes_existing_temp_script(self):
-        with tempfile.TemporaryDirectory(prefix="Frayd stale owner's ") as directory:
+        with job_fixture(prefix="Frayd stale owner's ") as directory:
             root = Path(directory)
             stale = root / 'frayd-install.ps1'
             marker = root / 'stale-ran'
@@ -447,14 +448,12 @@ class QualificationMixin:
             # error executes the real stale script in this engine, without another host.
             unsafe = ("irm 'https://example.invalid/never-contacted' -OutFile frayd-install.ps1; "
                       "& (Join-Path $env:TEMP 'frayd-install.ps1')")
-            control = subprocess.run(base + [failure + unsafe], env=env, cwd=directory,
-                                     stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30, check=False)
+            control = run_windows_job(base + [failure + unsafe], env=env, directory=directory)
             self.assertEqual(control.returncode, 0, control.stderr)
             self.assertIn('fixture download failure', control.stderr)
             self.assertTrue(marker.exists(), 'unsafe control must execute the existing harmless script')
             marker.unlink()
-            blocked = subprocess.run(base + [failure + generated_windows_command()], env=env, cwd=directory,
-                                     stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30, check=False)
+            blocked = run_generated_entry(base + [failure + generated_windows_command()], env=env, directory=directory)
             self.assertNotEqual(blocked.returncode, 0)
             self.assertIn('fixture download failure', blocked.stderr)
             self.assertFalse(marker.exists(), 'failed download must never execute the stale script')
@@ -463,7 +462,7 @@ class QualificationMixin:
 
     def test_generated_entry_cleans_its_file_after_success_and_child_failure(self):
         for child_exit in [0, 13]:
-            with self.subTest(child_exit=child_exit), tempfile.TemporaryDirectory(prefix="Frayd entry owner's ") as directory:
+            with self.subTest(child_exit=child_exit), job_fixture(prefix="Frayd entry owner's ") as directory:
                 root = Path(directory)
                 source = root / 'harmless-source.ps1'
                 source.write_text(harmless_entry_script(child_exit), encoding='ascii')
@@ -477,6 +476,29 @@ class QualificationMixin:
                     self.assertIn('Frayd installer failed', run.stderr)
                 self.assertEqual(list(root.glob('frayd-install-*.ps1')), [])
                 self.assertTrue(all((root / name).is_file() for name in ENTRY_MARKERS))
+
+    def test_generated_entry_deadline_terminates_the_owned_powershell_tree(self):
+        with job_fixture(prefix="Frayd deadline owner's ") as directory:
+            root = Path(directory)
+            source = root / 'harmless-source.ps1'
+            source.write_text(harmless_entry_script(sleep_seconds=60), encoding='ascii')
+            command = copy_download_fixture(source) + generated_windows_command(" -Lib 'deadline fixture'")
+            with self.assertRaises(JobTimeout) as caught:
+                run_windows_job([self.interpreter, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+                                 '-Command', command], env=entry_environment(self.interpreter, directory),
+                                directory=directory)
+            error = caught.exception
+            self.assertTrue((root / 'entry-download-complete').is_file())
+            self.assertTrue((root / 'entry-script-started').is_file(), 'the actual nested file child must run')
+            self.assertFalse((root / 'entry-script-complete').exists(), 'the sleeping child must be interrupted')
+            self.assertGreaterEqual(error.job_total_processes, 2, 'the job must own both PowerShell hosts')
+            self.assertEqual(error.job_active_processes, 0, 'no owned descendant may outlive the deadline')
+            self.assertTrue(error.host_exited, 'the retained host handle must confirm termination')
+            self.assertGreaterEqual(error.elapsed, 30)
+            self.assertLess(error.elapsed, 36, '30s execution budget plus at most 5s cleanup')
+            print(f'{self.interpreter_name} deadline proof: elapsed={error.elapsed:.3f}s '
+                  f'active={error.job_active_processes} total={error.job_total_processes} '
+                  f'host_exited={error.host_exited}')
 
     def test_tailscale_optional_lookup_restores_terminating_errors(self):
         case = self.make_case(tailscale=True)
@@ -603,14 +625,13 @@ class WindowsPowerShell51(QualificationMixin, unittest.TestCase):
         self.assertEqual(policy.returncode, 0, policy.stderr)
         self.assertEqual(policy.stdout.split(), ['Undefined', 'Undefined'],
                          'qualification held: Group Policy governs script execution')
-        with tempfile.TemporaryDirectory(prefix="Frayd entry owner's ") as directory:
+        with job_fixture(prefix="Frayd entry owner's ") as directory:
             script = Path(directory) / 'harmless-source.ps1'
             script.write_text(harmless_entry_script(), encoding='ascii')
             env.update(TEMP=directory, TMP=directory)
             base = [self.interpreter, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Restricted', '-Command']
-            blocked = subprocess.run(base + ["& '.\\harmless-source.ps1' -Lib 'harmless fixture'"],
-                                     env=env, cwd=directory, stdin=subprocess.DEVNULL,
-                                     capture_output=True, text=True, timeout=30, check=False)
+            blocked = run_windows_job(base + ["& '.\\harmless-source.ps1' -Lib 'harmless fixture'"],
+                                      env=env, directory=directory)
             self.assertNotEqual(blocked.returncode, 0, 'Restricted control must refuse the file')
             self.assertNotIn('harmless fixture', blocked.stdout)
             self.assertFalse((Path(directory) / 'entry-script-started').exists())
