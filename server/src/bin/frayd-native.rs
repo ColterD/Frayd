@@ -726,7 +726,12 @@ mod native {
         let signals = InstallSignals::block()?;
         signals.checkpoint()?;
         private_dir(prefix)?;
-        let reservation = fs::symlink_metadata(prefix)?;
+        let reservation = fs::symlink_metadata(prefix).map_err(|error| {
+            format!(
+                "prefix metadata failed: {error}; unqualified prefix retained at {}; inspect before recovery",
+                prefix.display()
+            )
+        })?;
         let stage = prefix
             .parent()
             .ok_or("missing parent")?
@@ -737,7 +742,17 @@ mod native {
             })?;
             return Err(error);
         }
-        let stage_identity = CreatedPath::record(stage.clone())?;
+        let stage_identity = match CreatedPath::record(stage.clone()) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return Err(retain_unqualified_stage(
+                    prefix,
+                    &reservation,
+                    &stage,
+                    error,
+                ))
+            }
+        };
         let mut created_data = None;
         let mut created_files = Vec::new();
         let mut created_dirs = Vec::new();
@@ -841,6 +856,22 @@ mod native {
         println!("Installed owned prefix; data is preserved independently.");
         Ok(())
     }
+    /// Without a stage identity, preserve it and clean only the qualified empty reservation.
+    fn retain_unqualified_stage(
+        prefix: &Path,
+        reservation: &fs::Metadata,
+        stage: &Path,
+        error: Box<dyn std::error::Error>,
+    ) -> Box<dyn std::error::Error> {
+        let mut retained = vec![stage.display().to_string()];
+        if remove_reservation(prefix, reservation).is_err() {
+            retained.push(prefix.display().to_string());
+        }
+        format!(
+            "stage metadata failed: {error}; retained paths: {retained:?}; inspect before recovery"
+        )
+        .into()
+    }
     /// Remove an empty reservation only while it still has the recorded identity.
     fn remove_reservation(prefix: &Path, reservation: &fs::Metadata) -> Result<()> {
         let current = fs::symlink_metadata(prefix)?;
@@ -923,21 +954,56 @@ mod native {
             Ok(info.si_signo == libc::SIGCHLD)
         }
     }
+    fn owned_group_lookup_authorized(
+        pid: libc::pid_t,
+        lookup: std::result::Result<libc::pid_t, i32>,
+        exited_unreaped: bool,
+    ) -> bool {
+        match lookup {
+            Ok(group) => group == pid,
+            Err(error) => error == libc::ESRCH && exited_unreaped,
+        }
+    }
     fn owned_group_signal(pid: libc::pid_t, signal: i32) -> Result<()> {
         // ECHILD rejects signalling before any numeric PID/PGID lookup or kill.
         // WNOWAIT also checks custody immediately before each nonzero signal.
         child_exited_unreaped(pid).map_err(|error| {
             format!("owned child wait custody uncertain: {error}; child receipts retained")
         })?;
-        // The Child is still unreaped. Refuse a shared or escaped process group.
-        // SAFETY: these POSIX calls do not dereference caller pointers.
-        unsafe {
-            if pid <= 1 || pid == libc::getpgrp() || libc::getpgid(pid) != pid {
-                return reject("owned child group identity uncertain; child receipts retained");
+        // Always target the spawn-owned group ID, never a lookup-supplied ID.
+        if pid <= 1 || pid == unsafe { libc::getpgrp() } {
+            return reject("owned child group identity uncertain; child receipts retained");
+        }
+        let group = unsafe { libc::getpgid(pid) };
+        let lookup = if group < 0 {
+            Err(io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO))
+        } else {
+            Ok(group)
+        };
+        // Darwin may hide an exited process from getpgid while WNOWAIT still
+        // pins that owned child's PID. Confirm the exited state afresh.
+        let exited_unreaped = if lookup == Err(libc::ESRCH) {
+            child_exited_unreaped(pid).map_err(|error| {
+                format!("owned child wait custody uncertain: {error}; child receipts retained")
+            })?
+        } else {
+            false
+        };
+        if !owned_group_lookup_authorized(pid, lookup, exited_unreaped) {
+            return reject("owned child group identity uncertain; child receipts retained");
+        }
+        if unsafe { libc::killpg(pid, signal) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error.into());
             }
-            if libc::killpg(pid, signal) != 0 {
-                return Err(io::Error::last_os_error().into());
-            }
+            // Missing eligible group members is progress, not removal authority.
+            // Keep child custody and still require reap plus the zero-only probe.
+            child_exited_unreaped(pid).map_err(|error| {
+                format!("owned child wait custody uncertain: {error}; child receipts retained")
+            })?;
         }
         Ok(())
     }
@@ -978,11 +1044,29 @@ mod native {
         }
     }
 
+    fn require_supported_output() -> Result<()> {
+        for descriptor in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+            // SAFETY: tcgetattr initializes a valid termios; ENOTTY accepts pipes/files.
+            let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
+            if unsafe { libc::tcgetattr(descriptor, &mut attributes) } != 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ENOTTY) {
+                    continue;
+                }
+                return Err(error.into());
+            }
+            if attributes.c_lflag & libc::TOSTOP != 0 {
+                return reject("output terminal has TOSTOP enabled; disable TOSTOP or redirect both stdout and stderr before start");
+            }
+        }
+        Ok(())
+    }
     /// Launch the unchanged owned server with explicit private runtime paths.
     /// Validate prefix/data and hold the lifecycle lock before spawning. Normal
     /// SIGINT/SIGTERM/SIGHUP/SIGQUIT stops the owned server process group; a crash or
     /// SIGKILL leaves its uncertainty marker to block later start/removal safely.
     fn start(prefix: &Path, port: u16) -> Result<()> {
+        require_supported_output()?;
         require_child_wait_custody()?;
         // Validate the lock file before opening it, then read the receipt under the lock.
         load_prefix(prefix, false)?;
@@ -1038,6 +1122,7 @@ mod native {
                 .env("FRAYD_CLIENT_DIR", prefix.join("client"))
                 .env("FRAYD_BIND", "127.0.0.1")
                 .env("FRAYD_PORT", port.to_string())
+                .stdin(std::process::Stdio::null())
                 .process_group(0)
                 .spawn();
             let mut child = match child {
@@ -1367,6 +1452,28 @@ mod native {
         }
 
         #[test]
+        fn missing_group_lookup_requires_confirmed_unreaped_exit() {
+            // Inject Darwin's lookup result only; no fake kernel or numeric PID signal.
+            for (lookup, exited, authorized) in [
+                (Ok(42), false, true),
+                (Ok(42), true, true),
+                (Err(libc::ESRCH), true, true),
+                (Err(libc::ESRCH), false, false),
+                (Ok(43), false, false),
+                (Ok(43), true, false),
+                (Err(libc::EPERM), true, false),
+                (Err(libc::ECHILD), true, false),
+                (Err(libc::EIO), true, false),
+            ] {
+                assert_eq!(
+                    owned_group_lookup_authorized(42, lookup, exited),
+                    authorized,
+                    "lookup={lookup:?}, exited={exited}"
+                );
+            }
+        }
+
+        #[test]
         fn reaped_child_has_no_signal_authority() {
             let _serial = CHILD_POLICY_TEST.lock().unwrap();
             let mut child = std::process::Command::new("/bin/sh")
@@ -1482,6 +1589,46 @@ mod native {
                     .to_string()
                     .contains("path changed"));
                 assert!(path.exists() && path.with_extension("original").exists());
+            }
+        }
+
+        #[test]
+        fn failed_stage_metadata_preserves_stage_and_only_cleans_matching_empty_reservation() {
+            let fixture = Fixture(Path::new("/var/tmp").join(format!(
+                "frayd-native-stage-record-{}",
+                uuid::Uuid::new_v4()
+            )));
+            private_dir(&fixture.0).unwrap();
+            for state in ["empty", "nonempty", "replaced"] {
+                let root = fixture.0.join(state);
+                private_dir(&root).unwrap();
+                let prefix = root.join("prefix");
+                private_dir(&prefix).unwrap();
+                let reservation = fs::symlink_metadata(&prefix).unwrap();
+                let stage = root.join("stage");
+                private_dir(&stage).unwrap();
+                fs::write(stage.join("unqualified"), b"preserve").unwrap();
+                if state == "nonempty" {
+                    fs::write(prefix.join("foreign"), b"preserve").unwrap();
+                } else if state == "replaced" {
+                    fs::rename(&prefix, root.join("original")).unwrap();
+                    private_dir(&prefix).unwrap();
+                }
+                let error = retain_unqualified_stage(
+                    &prefix,
+                    &reservation,
+                    &stage,
+                    io::Error::new(io::ErrorKind::PermissionDenied, "metadata fixture denied")
+                        .into(),
+                )
+                .to_string();
+                assert!(error.contains("metadata fixture denied"), "{error}");
+                assert!(error.contains(&stage.display().to_string()), "{error}");
+                assert_eq!(fs::read(stage.join("unqualified")).unwrap(), b"preserve");
+                assert_eq!(prefix.exists(), state != "empty");
+                if state != "empty" {
+                    assert!(error.contains(&prefix.display().to_string()), "{error}");
+                }
             }
         }
 

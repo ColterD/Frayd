@@ -19,6 +19,8 @@ python3 scripts/build-metadata.py -- docker compose up -d --build --wait
 
 Open **http://127.0.0.1:3100**. If port 3100 is occupied, prefix Compose commands with `FRAYD_PORT=3105` and open http://127.0.0.1:3105. The first build downloads images and Rust dependencies and runs tests, Clippy and a release build, so it can take several minutes.
 
+URL downloads are disabled in the isolated default image. To enable direct HTTP(S) MP4 video downloads and outbound routing on the same image, follow [opt-in Docker downloads](docs/operations.md#opt-in-docker-downloads).
+
 The sign-in screen and sidebar show the running server's version and commit. To inspect a custom build or check for upstream changes, see [check a build against upstream](docs/operations.md#check-a-build-against-upstream).
 
 The dashboard labels all seven media categories and starts with the newest items first. Each category can switch to oldest first. Artwork comes from local media when available, with a symbol fallback when no usable cover exists.

@@ -24,6 +24,8 @@ See the [unreleased product changelog](../../CHANGELOG.md) for current behavior 
 
 The [final inspection inventory](pr-2-changelog.md#final-inspection-changes-2026-10-30) records current changes once.
 It keeps local final inspection separate from the historical CodeRabbit findings below.
+The [post-checkpoint inventory](pr-2-changelog.md#post-checkpoint-inspection-changes-2026-10-30) covers later source changes.
+Its final combined-image and platform qualification remains separate from every historical result below.
 
 ## Workflow review follow-up (2026-10-30)
 

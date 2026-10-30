@@ -34,6 +34,34 @@ SIGKILL, blocked storage and descendants that leave the owned group remain outsi
 No complete process-tree containment, new deployment or upstream approval is claimed.
 Historical CodeRabbit output remains unknown under support ticket #39355.
 
+## Post-checkpoint inspection changes (2026-10-30)
+
+This inventory describes source changes after `3f0bda5c607a8b81283964321cb123745d9248d3`.
+That checkpoint does not identify the final working tree.
+At this inspection, final combined-image, macOS and Windows qualification remains pending.
+See the [verification appendix](https://gist.github.com/ColterD/599a8a4532de0f60e31573cccb27d179) for the latest frozen source, results and remaining limits.
+
+- **Request waits.** Move synchronous database, configuration and root-admission work to blocking workers across account, library, progress, annotation and party request paths.
+- **Optional Docker downloads.** Reuse the app image with an explicit download backend and outbound network override. Stock Docker downloads remain disabled.
+- **Download scope.** Direct mode accepts MP4 file URLs. Native mode retains yt-dlp. Settings shows the selected backend and refuses invalid configuration.
+- **Response checks.** Require a complete successful response. Reject compressed encoding, ambiguous length or transfer framing, unsupported redirects, and oversized or incomplete bodies.
+- **Publication checks.** Probe staged output for MP4 video. Keep partials outside the library and preserve existing destination files.
+- **HTTP features.** Disable automatic gzip decoding in existing Rust HTTP support. Keep TLS enabled and inspect the original encoding headers.
+- **Public assets.** Normalize root-owned public Docker asset modes so the app can read assets copied from a private checkout. Keep app writes refused.
+- **Windows setup.** Reserve a fresh installer filename and stop after download or child failure. Scope PowerShell 5.1 error handling to optional Tailscale lookup.
+- **Homebrew setup.** Request required Git and FFmpeg tools. Keep CBR optional and avoid the unavailable unrar formula.
+- **Native custody.** Handle missing process-group lookup for an exited, unreaped server without surrendering child custody. Retain conservative refusal for uncertain ownership.
+- **Explicit root overrides.** Hold an invalid explicit override with empty locked roots and a path-free configuration error. Do not select saved roots.
+- **Scan preflight.** Check aliases once for the complete scan before scan writes. Retain standalone admission guards and distinguish retryable contention from persistent repair.
+- **Native install identity.** Preserve an unqualified staging path after early identity-record failure. Remove only a matching empty reservation.
+- **Native terminal behavior.** Give the server null input. Refuse output terminals with TOSTOP before child creation. Redirect output or change terminal settings before retrying.
+
+Back up application data before persistent source-identity repair. A busy or concurrently changed scan can instead request a retry.
+Direct mode does not extract webpage video or add a Python downloader.
+Byte and redirect limits do not make platform DNS resolution interruptible.
+Native cleanup still excludes SIGKILL, blocked storage and descendants that leave the owned process group.
+Scoped source and fixture results do not replace final combined-image or platform qualification.
+
 Historical inventory against synced fork main `21b2e9b6bf4cff26254f5dfcec9deecd02453718`: 83 files at `a2473d4846df844f212358f6c27bd00562686111` (checked 2026-10-30 UTC), each listed in [Changed-file coverage](#changed-file-coverage). Later sections record fixes in commit order. The historical 129 dispositions are not 129 reproduced bugs.
 
 PR #2 is an unmerged, unreleased draft on the fork. The local deployment at `http://127.0.0.1:3101` passed the operational verification in [Verified local rollout](#verified-local-rollout).

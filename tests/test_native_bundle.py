@@ -5,7 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
-from pathlib import Path
+import pty
 import re
 import secrets
 import shlex
@@ -13,15 +13,17 @@ import shutil
 import signal
 import socket
 import stat
-import sys
 import subprocess
+import sys
 import tarfile
 import tempfile
+import termios
 import time
 import unittest
-from unittest import mock
 import urllib.request
 import zipfile
+from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = Path(os.environ.get('FRAYD_NATIVE_HELPER', ROOT / 'target/native-qualification/debug/frayd-native'))
@@ -582,6 +584,46 @@ class NativeOwnership(unittest.TestCase):
         before = self.snapshot()
         self.run_helper('uninstall', answer='n\n')
         self.assertEqual(self.snapshot(), before)
+
+    def test_server_input_is_eof_even_when_supervisor_has_input(self):
+        (self.bundle / 'frayd-server').write_text('#!/bin/sh\nif read -r value; then echo consumed-input; else echo input-eof; fi\n')
+        self.manifest()
+        self.install('--yes')
+        result = self.run_helper('start', answer='supervisor-only-input\n')
+        self.assertEqual(result.stdout.strip(), 'input-eof')
+
+    def test_tostop_output_tty_refused_before_child_receipts(self):
+        self.install('--yes')
+        for stream in ['stdout', 'stderr']:
+            with self.subTest(stream=stream):
+                master, slave = pty.openpty()
+                try:
+                    attributes = termios.tcgetattr(slave)
+                    attributes[3] |= termios.TOSTOP
+                    termios.tcsetattr(slave, termios.TCSANOW, attributes)
+                    options = {'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE, stream: slave}
+                    result = run_bounded([str(HELPER), 'start', '--prefix', str(self.prefix)],
+                                         stdin=subprocess.DEVNULL, timeout=10,
+                                         preexec_fn=lambda terminal=slave: fcntl.ioctl(terminal, termios.TIOCSCTTY, 0), **options)
+                    self.assertEqual(result.returncode, 2)
+                    os.set_blocking(master, False)
+                    diagnostic = result.stderr if stream == 'stdout' else os.read(master, 8192)
+                    self.assertIn(b'TOSTOP', diagnostic)
+                    self.assertFalse((self.prefix / '.frayd-child.json').exists())
+                    self.assertFalse((self.data / '.frayd-child.json').exists())
+                    redirected = run_bounded([str(HELPER), 'start', '--prefix', str(self.prefix)],
+                                             stdin=subprocess.DEVNULL, capture_output=True, timeout=10,
+                                             preexec_fn=lambda terminal=slave: fcntl.ioctl(terminal, termios.TIOCSCTTY, 0))
+                    self.assertEqual(redirected.returncode, 0, redirected.stderr)
+                    attributes[3] &= ~termios.TOSTOP
+                    termios.tcsetattr(slave, termios.TCSANOW, attributes)
+                    allowed = run_bounded([str(HELPER), 'start', '--prefix', str(self.prefix)],
+                                          stdin=subprocess.DEVNULL, timeout=10,
+                                          preexec_fn=lambda terminal=slave: fcntl.ioctl(terminal, termios.TIOCSCTTY, 0), **options)
+                    self.assertEqual(allowed.returncode, 0, allowed.stderr)
+                finally:
+                    os.close(slave)
+                    os.close(master)
 
     def test_install_start_remove_preserves_data_and_reinstall(self):
         self.install('--yes')

@@ -30,6 +30,21 @@ pub struct LibraryConfig { roots: Vec<PathBuf>, locked: bool }
 /// One scan with its complete root snapshot and whether it completes a pending ingest.
 pub struct ScanRequest { roots:Vec<PathBuf>, for_ingest:bool }
 
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+enum DownloadBackend {Direct,YtDlp}
+impl DownloadBackend {
+    fn name(self) -> &'static str {match self {Self::Direct=>"direct",Self::YtDlp=>"yt-dlp"}}
+}
+
+fn download_backend_from_override(value:Option<&std::ffi::OsStr>) -> Option<DownloadBackend> {
+    match value {
+        None=>Some(DownloadBackend::YtDlp),
+        Some(value) if value=="direct"=>Some(DownloadBackend::Direct),
+        Some(value) if value=="yt-dlp"=>Some(DownloadBackend::YtDlp),
+        Some(_)=>None,
+    }
+}
+
 pub struct App {
     pub db: Mutex<Connection>,
     /// Path to the SQLite file (scan and transcode workers open their own connections).
@@ -46,6 +61,9 @@ pub struct App {
     pub auth_rl: auth::RateLimiter,
     /// FRAYD_TRUSTED_PROXY=1, read once at startup: key `auth_rl` by the proxy's X-Forwarded-For instead of the TCP peer.
     pub trust_proxy: bool,
+    /// Immutable runtime download capability; absent override preserves native behavior.
+    pub downloads_enabled: bool,
+    download_backend: Option<DownloadBackend>,
     /// Active listening party (single party — household scale).
     pub party: Arc<party::Party>,
     /// yt-dlp ingest state: "downloading" | "indexing" | "done" | "failed" | None. Single ingest at a time.
@@ -55,6 +73,8 @@ pub struct App {
 impl App {
     /// Idle application state over an opened database, with no scan, party or ingest in progress.
     fn new(db: Connection, db_path: String, library: LibraryConfig) -> Self {
+        let download_backend=download_backend_from_override(std::env::var_os("FRAYD_DOWNLOAD_BACKEND").as_deref());
+        let downloads_enabled=downloads_enabled_from_override(std::env::var_os("FRAYD_DOWNLOADS_ENABLED").as_deref()) && download_backend.is_some();
         App {
             db: Mutex::new(db),
             db_path,
@@ -64,10 +84,17 @@ impl App {
             scan_error: Mutex::new(None),
             auth_rl: auth::RateLimiter::new(300, 10),
             trust_proxy: false,
+            downloads_enabled,
+            download_backend,
             party: Arc::new(party::Party::new()),
             ingest_status: Mutex::new(None),
         }
     }
+}
+
+/// Only exact `1` enables an explicitly configured capability; absent keeps native compatibility.
+fn downloads_enabled_from_override(value:Option<&std::ffi::OsStr>) -> bool {
+    match value {None=>true,Some(value)=>value=="1"}
 }
 
 /// Expose the exact path-free liveness response independently of library availability.
@@ -102,7 +129,7 @@ async fn main() {
     let default_db = concat!(env!("CARGO_MANIFEST_DIR"), "/frayd.db");
     let db_path = std::env::var("FRAYD_DB").unwrap_or_else(|_| default_db.into());
     let db = store::open(&db_path);
-    let library=effective_library_config(&db,std::env::var("FRAYD_LIBRARY").ok().as_deref()).expect("valid library configuration");
+    let library=environment_library_config(&db,std::env::var_os("FRAYD_LIBRARY").as_deref());
 
     let mut app_state = App::new(db, db_path, library.clone());
     app_state.trust_proxy = std::env::var("FRAYD_TRUSTED_PROXY").map(|v| v == "1").unwrap_or(false);
@@ -256,7 +283,12 @@ async fn auth_login(
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: axum::http::HeaderMap,
     Json(req): Json<LoginReq>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    tokio::task::spawn_blocking(move || auth_login_blocking(app,peer,headers,req).into_response()).await
+        .unwrap_or_else(|_|StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn auth_login_blocking(app:Arc<App>,peer:std::net::SocketAddr,headers:axum::http::HeaderMap,req:LoginReq) -> impl IntoResponse {
     if !app.auth_rl.check(&auth::client_ip(&headers, peer.ip(), app.trust_proxy)) {
         return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error": "too many attempts — wait 5 minutes"})));
     }
@@ -349,6 +381,11 @@ async fn auth_logout(
     State(app): State<std::sync::Arc<App>>,
     headers: axum::http::HeaderMap,
 ) -> StatusCode {
+    tokio::task::spawn_blocking(move || auth_logout_blocking(app,headers)).await
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn auth_logout_blocking(app:Arc<App>,headers:axum::http::HeaderMap) -> StatusCode {
     if let Some(token) = bearer_token(&headers) {
         let db = app.db.lock().unwrap();
         auth::delete_session(&db, &token);
@@ -368,7 +405,12 @@ async fn auth_change_password(
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: axum::http::HeaderMap,
     Json(req): Json<ChangePwReq>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    tokio::task::spawn_blocking(move || auth_change_password_blocking(app,peer,headers,req).into_response()).await
+        .unwrap_or_else(|_|StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn auth_change_password_blocking(app:Arc<App>,peer:std::net::SocketAddr,headers:axum::http::HeaderMap,req:ChangePwReq) -> impl IntoResponse {
     if !app.auth_rl.check(&format!("pw:{}", auth::client_ip(&headers, peer.ip(), app.trust_proxy))) {
         return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error": "too many attempts — wait 5 minutes"}))).into_response();
     }
@@ -398,7 +440,12 @@ async fn auth_change_password(
 }
 
 /// GET /api/setup → {needed: bool} — true while zero accounts exist.
-async fn setup_status(State(app): State<std::sync::Arc<App>>) -> impl IntoResponse {
+async fn setup_status(State(app): State<std::sync::Arc<App>>) -> axum::response::Response {
+    tokio::task::spawn_blocking(move || setup_status_blocking(app).into_response()).await
+        .unwrap_or_else(|_|StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn setup_status_blocking(app:Arc<App>) -> impl IntoResponse {
     let db = app.db.lock().unwrap();
     let Ok(have) = db.query_row("SELECT COUNT(*) FROM identities WHERE kind='account'", [], |r| r.get::<_, i64>(0)) else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -419,7 +466,12 @@ async fn auth_setup(
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: axum::http::HeaderMap,
     Json(req): Json<SetupReq>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    tokio::task::spawn_blocking(move || auth_setup_blocking(app,peer,headers,req).into_response()).await
+        .unwrap_or_else(|_|StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn auth_setup_blocking(app:Arc<App>,peer:std::net::SocketAddr,headers:axum::http::HeaderMap,req:SetupReq) -> impl IntoResponse {
     if !app.auth_rl.check(&auth::client_ip(&headers, peer.ip(), app.trust_proxy)) {
         return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error": "too many attempts — wait 5 minutes"}))).into_response();
     }
@@ -533,10 +585,9 @@ async fn thumb(
     State(app): State<std::sync::Arc<App>>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let path: Option<String> = {
-        let db = app.db.lock().unwrap();
-        db.query_row("SELECT thumb_path FROM media WHERE id = ?1", [id], |r| r.get(0))
-            .ok()
+    let path=match tokio::task::spawn_blocking(move ||thumbnail_path_blocking(app,id)).await {
+        Ok(path)=>path,
+        Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     let Some(path) = path else { return StatusCode::NO_CONTENT.into_response() };
     use tokio::io::{AsyncReadExt,AsyncSeekExt};
@@ -549,6 +600,11 @@ async fn thumb(
     let stream=tokio_util::io::ReaderStream::with_capacity(file,64*1024);
     ([(header::CONTENT_TYPE,thumbnail_mime(&signature)),(header::CACHE_CONTROL,"no-cache"),
       (header::CONTENT_LENGTH,&metadata.len().to_string())],axum::body::Body::from_stream(stream)).into_response()
+}
+
+fn thumbnail_path_blocking(app:Arc<App>,id:i64) -> Option<String> {
+    let db=app.db.lock().unwrap();
+    db.query_row("SELECT thumb_path FROM media WHERE id=?1",[id],|r|r.get(0)).ok()
 }
 
 /// GET /api/comic/:id/pages → ["p001.jpg", ...] natural-sorted.
@@ -609,6 +665,13 @@ async fn epub_spine_names(app: &Arc<App>, id: i64, path: &str) -> Option<Vec<Str
 /// and cache the result only while the row still matches the fingerprint read before listing.
 async fn cached_names(app: &Arc<App>, id: i64, path: &str, field: &'static str,
     list: fn(&StdPath) -> Option<Vec<String>>) -> Option<Vec<String>> {
+    let app=app.clone();let path=path.to_string();
+    tokio::task::spawn_blocking(move || cached_names_blocking(app,id,path,field,list)).await.ok().flatten()
+}
+
+/// Query and publish under separate DB locks, with archive listing between them on the blocking pool.
+fn cached_names_blocking(app:Arc<App>,id:i64,path:String,field:&'static str,
+    list:fn(&StdPath)->Option<Vec<String>>) -> Option<Vec<String>> {
     let version = {
         let db = app.db.lock().unwrap();
         let (meta,mtime,size): (Option<String>,Option<i64>,Option<i64>) = db.query_row(
@@ -619,10 +682,10 @@ async fn cached_names(app: &Arc<App>, id: i64, path: &str, field: &'static str,
         if let Some(names) = cached { return Some(names); }
         (mtime,size)
     };
-    let archive = PathBuf::from(path);
-    let names = tokio::task::spawn_blocking(move || list(&archive)).await.ok()??;
+    let archive = PathBuf::from(&path);
+    let names = list(&archive)?;
     let db = app.db.lock().unwrap();
-    publish_names(&db, id, path, field, version, names)
+    publish_names(&db, id, &path, field, version, names)
 }
 
 /// Merge only `meta_json.<field>`, and only for the unchanged source version. A changed row returns
@@ -728,11 +791,27 @@ fn stored_root_strings(db:&Connection) -> rusqlite::Result<Vec<String>> {
     Ok(array.iter().map(|entry|entry.as_str().map(str::to_string)).collect::<Option<Vec<_>>>().unwrap_or_default())
 }
 
+/// Read an explicit environment value without allowing malformed UTF-8 to select saved roots.
+fn environment_library_config(db:&Connection,value:Option<&std::ffi::OsStr>) -> LibraryConfig {
+    let value=match value {
+        Some(value)=>match value.to_str() {Some(value)=>Some(value),None=>return explicit_library_config(Err("Non-UTF-8 override".into()))},
+        None=>None,
+    };
+    effective_library_config(db,value).unwrap_or_else(|error|explicit_library_config(Err(error)))
+}
+
+/// An invalid explicit override remains exclusive and grants no source effects or settings unlock.
+fn explicit_library_config(roots:Result<Vec<PathBuf>,String>) -> LibraryConfig {
+    if let Ok(roots)=roots {return LibraryConfig {roots,locked:true};}
+    tracing::warn!("FRAYD_LIBRARY configuration unavailable; library held, saved roots are not used; correct the environment and restart");
+    LibraryConfig {roots:Vec::new(),locked:true}
+}
+
 /// Select one exclusive locked nonempty environment root or the unlocked persisted root array.
 /// Empty environment values enable persisted configuration and never add an implicit fallback root.
 fn effective_library_config(db: &Connection, env_override: Option<&str>) -> Result<LibraryConfig,String> {
     if let Some(path)=env_override.filter(|s| !s.is_empty()) {
-        return Ok(LibraryConfig { roots:parse_roots(&serde_json::json!([path]),true)?,locked:true });
+        return Ok(explicit_library_config(parse_roots(&serde_json::json!([path]),true)));
     }
     let roots=stored_roots(db).unwrap_or_else(|error| {
         tracing::warn!(%error,"stored library configuration held; repair through settings");
@@ -783,13 +862,10 @@ fn run_scan(state: Arc<App>, first: ScanRequest) {
         loop {
             let ScanRequest{roots,for_ingest}=request;
             *state.scan_error.lock().unwrap()=None;
-            let mut n=0;
-            for root in &roots {
-                match scanner::scan_with_roots(&db,state.db_path.clone(),root.clone(),Some(&thumbs),&roots) {
-                    Ok(count)=>n+=count,
-                    Err(error)=>{*state.scan_error.lock().unwrap()=Some(error.reason());return;}
-                }
-            }
+            let n=match scanner::scan_roots(&db,state.db_path.clone(),&roots,Some(&thumbs)) {
+                Ok(count)=>count,
+                Err(error)=>{*state.scan_error.lock().unwrap()=Some(error.reason());return;}
+            };
             if for_ingest {
                 let indexed=scanner::ingest_indexed(&db,&roots[0].join("Internet"));
                 *state.ingest_status.lock().unwrap()=Some(if indexed {"done"} else {"failed"}.into());
@@ -822,6 +898,11 @@ fn queue_ingest_scan(app: Arc<App>, roots: Vec<PathBuf>) {
 
 /// POST /api/scan → trigger library rescan. 202 if started, 409 if busy.
 async fn trigger_scan(State(app): State<std::sync::Arc<App>>) -> StatusCode {
+    tokio::task::spawn_blocking(move || trigger_scan_blocking(app)).await
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn trigger_scan_blocking(app:Arc<App>) -> StatusCode {
     use std::sync::atomic::Ordering;
     let _admission=ROOT_ADMISSION.lock().unwrap();
     let libs = library_roots(&app);
@@ -891,7 +972,7 @@ fn ingest_destination(root: &StdPath) -> std::io::Result<PathBuf> {
 
 /// Publish only one validated video from this job. Partial copies keep an unsupported extension.
 /// No preexisting library file is replaced; the caller owns staging cleanup on every exit.
-fn publish_ingest(staging: &StdPath, destination: &StdPath) -> std::io::Result<()> {
+fn publish_ingest(staging: &StdPath, destination: &StdPath, backend:DownloadBackend) -> std::io::Result<()> {
     let mut videos=Vec::new();
     for entry in std::fs::read_dir(staging)? {
         let entry=entry?;
@@ -904,6 +985,9 @@ fn publish_ingest(staging: &StdPath, destination: &StdPath) -> std::io::Result<(
         return Err(std::io::Error::other("downloaded media validation failed"));
     }
     let source=&videos[0];
+    if backend==DownloadBackend::Direct && !direct_mp4_container(source) {
+        return Err(std::io::Error::other("direct download is not MP4 video"));
+    }
     let target=destination.join(source.file_name().ok_or_else(||std::io::Error::other("missing media name"))?);
     let partial=destination.join(format!("{}.part",staging.file_name().ok_or_else(||std::io::Error::other("missing job name"))?.to_string_lossy()));
     let mut output=std::fs::OpenOptions::new().write(true).create_new(true).open(&partial)?;
@@ -914,6 +998,7 @@ fn publish_ingest(staging: &StdPath, destination: &StdPath) -> std::io::Result<(
         match std::fs::hard_link(&partial,&target) {
             Ok(())=>Ok(()),
             Err(error) if error.kind()==std::io::ErrorKind::AlreadyExists=>{
+                if backend==DownloadBackend::Direct {return Err(std::io::Error::other("direct download destination already exists"));}
                 if std::fs::symlink_metadata(&target)?.file_type().is_file() && scanner::ingest_video_valid(&target) {
                     Ok(())
                 } else {Err(std::io::Error::other("existing destination is not valid video"))}
@@ -928,15 +1013,126 @@ fn publish_ingest(staging: &StdPath, destination: &StdPath) -> std::io::Result<(
     Ok(())
 }
 
-/// POST /api/ingest { url } → download via yt-dlp into <library>/Internet/, then rescan.
-/// Admin-only. yt-dlp is a best-effort external binary (like upnpc/ffmpeg); the one HTTP(S)
-/// URL is passed after the downloader's option terminator.
+#[derive(Clone,Copy)]
+struct DirectDownloadLimits {
+    max_bytes:u64,
+    transfer_timeout:std::time::Duration,
+    connect_timeout:std::time::Duration,
+}
+const DIRECT_DOWNLOAD_LIMITS:DirectDownloadLimits=DirectDownloadLimits {
+    max_bytes:8*1024*1024*1024,
+    transfer_timeout:std::time::Duration::from_secs(3600),
+    connect_timeout:std::time::Duration::from_secs(10),
+};
+
+/// Inspect through the existing URL parser without retaining/logging the input or transport errors.
+fn direct_url(value:&str) -> Result<ureq::RequestUrl,&'static str> {
+    if value.chars().any(char::is_control) {return Err("Direct URL contains a control character");}
+    let parsed=ureq::get(value).request_url().map_err(|_|"Direct URL is invalid")?;
+    if !matches!(parsed.as_url().scheme(),"http"|"https") || parsed.as_url().host_str().is_none() {
+        return Err("Direct URL must use HTTP or HTTPS");
+    }
+    Ok(parsed)
+}
+
+/// Preserve a portable single MP4 component only; neither query nor fragment contributes a name.
+fn direct_filename(url:&ureq::RequestUrl) -> String {
+    let candidate=url.as_url().path_segments().and_then(|mut parts|parts.next_back())
+        .and_then(|name|urlencoding::decode(name).ok()).map(|name|name.into_owned());
+    if let Some(name)=candidate {
+        let stem=StdPath::new(&name).file_stem().and_then(|value|value.to_str()).unwrap_or("");
+        let upper=stem.to_ascii_uppercase();let base=upper.split('.').next().unwrap_or("");let lower=name.to_ascii_lowercase();
+        let reserved=matches!(base,"CON"|"PRN"|"AUX"|"NUL")
+            || ["COM","LPT"].iter().any(|prefix|base.strip_prefix(prefix).is_some_and(|tail|
+                tail.len()==1 && matches!(tail.as_bytes()[0],b'1'..=b'9')));
+        let safe=name.len()<=180 && !stem.is_empty() && !name.starts_with('.') && !name.ends_with(['.',' '])
+            && lower.ends_with(".mp4")
+            && !name.chars().any(|value|value.is_control() || "/\\:%?*<>|\"".contains(value))
+            && !reserved && !matches!(lower.as_str(),"audio.tmp.mp4"|"audio.mp4");
+        if safe {return format!("{}.mp4",&name[..name.len()-4]);}
+    }
+    format!("{}.mp4",uuid::Uuid::new_v4())
+}
+
+/// The shared publisher already proves a real video stream; direct mode additionally requires MP4.
+fn direct_mp4_container(path:&StdPath) -> bool {
+    let Ok(output)=Command::new("ffprobe").args(["-v","error","-show_entries","format=format_name:format_tags=major_brand","-of","json"])
+        .arg(path).output() else {return false;};
+    if !output.status.success() {return false;}
+    let Ok(value)=serde_json::from_slice::<serde_json::Value>(&output.stdout) else {return false;};
+    value["format"]["format_name"].as_str().is_some_and(|name|name.split(',').any(|part|part=="mp4"))
+        && value["format"]["tags"]["major_brand"].as_str().is_some_and(|brand|!brand.is_empty() && brand!="qt  ")
+}
+
+/// Stream one HTTP entity to owned staging, with a shared transfer deadline across bounded redirects.
+/// ureq bounds transfer I/O; its platform DNS resolution is not interruptible by this deadline.
+fn download_direct(url:&str,staging:&StdPath,limits:DirectDownloadLimits) -> Result<(),&'static str> {
+    use std::io::{Read,Write};
+    let deadline=std::time::Instant::now()+limits.transfer_timeout;
+    let mut current=url.to_string();
+    for redirects in 0..=5 {
+        let parsed=direct_url(&current)?;
+        let remaining=deadline.checked_duration_since(std::time::Instant::now()).ok_or("Direct transfer deadline exceeded")?;
+        let agent=ureq::AgentBuilder::new().redirects(0).timeout_connect(limits.connect_timeout.min(remaining)).build();
+        let response=agent.get(&current).timeout(remaining).set("Accept-Encoding","identity").set("Connection","close")
+            .call().map_err(|_|"Direct HTTP request failed")?;
+        if matches!(response.status(),301|302|303|307|308) {
+            if redirects==5 {return Err("Direct redirect limit exceeded");}
+            let location=response.header("Location").ok_or("Direct redirect missing location")?;
+            if location.chars().any(char::is_control) {return Err("Direct redirect is invalid");}
+            let next=parsed.as_url().join(location).map_err(|_|"Direct redirect is invalid")?;
+            if !matches!(next.scheme(),"http"|"https") {return Err("Direct redirect must use HTTP or HTTPS");}
+            current=next.to_string();continue;
+        }
+        if response.status()!=200 {return Err("Direct response must be a complete successful file");}
+        if response.all("Content-Encoding").len()>1 || response.header("Content-Encoding").is_some_and(|value|!value.eq_ignore_ascii_case("identity")) {
+            return Err("Direct response encoding is unsupported");
+        }
+        let lengths=response.all("Content-Length");let transfers=response.all("Transfer-Encoding");
+        if lengths.len()>1 || transfers.len()>1 || (!lengths.is_empty() && !transfers.is_empty())
+            || transfers.first().is_some_and(|value|!value.eq_ignore_ascii_case("chunked")) {
+            return Err("Direct response framing is ambiguous");
+        }
+        let expected=if let Some(length)=lengths.first() {
+            if length.is_empty() || !length.bytes().all(|value|value.is_ascii_digit()) {return Err("Direct content length is invalid");}
+            Some(length.parse::<u64>().map_err(|_|"Direct content length is invalid")?)
+        } else {None};
+        if expected.is_some_and(|length|length==0 || length>limits.max_bytes) {return Err("Direct response size is unsupported");}
+        let partial=staging.join(format!("{}.part",uuid::Uuid::new_v4()));
+        let mut output=std::fs::OpenOptions::new().write(true).create_new(true).open(&partial).map_err(|_|"Direct staging creation failed")?;
+        let mut reader=response.into_reader();let mut buffer=[0_u8;64*1024];let mut count=0_u64;
+        loop {
+            if std::time::Instant::now()>=deadline {return Err("Direct transfer deadline exceeded");}
+            let read=reader.read(&mut buffer).map_err(|_|"Direct response body failed")?;
+            if std::time::Instant::now()>=deadline {return Err("Direct transfer deadline exceeded");}
+            if read==0 {break;}
+            count=count.checked_add(read as u64).filter(|count|*count<=limits.max_bytes).ok_or("Direct response size limit exceeded")?;
+            output.write_all(&buffer[..read]).map_err(|_|"Direct staging write failed")?;
+        }
+        if count==0 || expected.is_some_and(|length|count!=length) {return Err("Direct response body was incomplete");}
+        output.sync_all().map_err(|_|"Direct staging sync failed")?;drop(output);
+        let target=staging.join(direct_filename(&parsed));
+        std::fs::hard_link(&partial,&target).map_err(|_|"Direct staged filename unavailable")?;
+        std::fs::remove_file(&partial).map_err(|_|"Direct staged partial cleanup failed")?;
+        return Ok(());
+    }
+    Err("Direct redirect limit exceeded")
+}
+
+/// POST /api/ingest { url } admits the configured native or Direct MP4 video URL backend.
+/// Both reuse owned staging, validated no-overwrite publication and queued indexing.
+/// Native yt-dlp receives its one HTTP(S) URL after the option terminator.
 async fn ingest(
     State(app): State<std::sync::Arc<App>>,
     headers: axum::http::HeaderMap,
     Query(q): Query<std::collections::HashMap<String, String>>,
     Json(body): Json<IngestReq>,
 ) -> StatusCode {
+    tokio::task::spawn_blocking(move || ingest_blocking(app,headers,q,body)).await
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn ingest_blocking(app:Arc<App>,headers:axum::http::HeaderMap,q:std::collections::HashMap<String,String>,body:IngestReq) -> StatusCode {
     // admin gate: downloading remote files into the library is an owner action
     {
         let db = app.db.lock().unwrap();
@@ -948,7 +1144,10 @@ async fn ingest(
     if !body.url.starts_with("http://") && !body.url.starts_with("https://") {
         return StatusCode::BAD_REQUEST;
     }
-    if std::process::Command::new("yt-dlp").arg("--version").output().is_err() {
+    if !app.downloads_enabled {return StatusCode::NOT_IMPLEMENTED;}
+    let Some(backend)=app.download_backend else {return StatusCode::NOT_IMPLEMENTED;};
+    if backend==DownloadBackend::Direct && direct_url(&body.url).is_err() {return StatusCode::BAD_REQUEST;}
+    if backend==DownloadBackend::YtDlp && std::process::Command::new("yt-dlp").arg("--version").output().is_err() {
         return StatusCode::NOT_IMPLEMENTED; // yt-dlp not installed
     }
     let libs;
@@ -976,17 +1175,19 @@ async fn ingest(
         let staging=cache.join(format!("ingest-{}",uuid::Uuid::new_v4()));
         if std::fs::create_dir_all(&cache).is_err() || std::fs::create_dir(&staging).is_err() { return; }
         reset.staging=Some(staging.clone());
-        let out = staging.join("%(title)s.%(ext)s");
-        let ok = std::process::Command::new("yt-dlp")
-            .args(["-f", "mp4", "--no-playlist", "-o"])
-            .arg(out)
-            .arg("--")
-            .arg(&url)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        let ok=match backend {
+            DownloadBackend::YtDlp=>{
+                let out=staging.join("%(title)s.%(ext)s");
+                std::process::Command::new("yt-dlp").args(["-f","mp4","--no-playlist","-o"])
+                    .arg(out).arg("--").arg(&url).status().map(|status|status.success()).unwrap_or(false)
+            }
+            DownloadBackend::Direct=>match download_direct(&url,&staging,DIRECT_DOWNLOAD_LIMITS) {
+                Ok(())=>true,
+                Err(reason)=>{tracing::warn!(reason,"direct download held");false}
+            },
+        };
         // A failed download stays "downloading" here, and IngestReset marks it failed.
-        let ok=ok && match ingest_destination(&libs[0]).and_then(|destination|publish_ingest(&staging,&destination)) {
+        let ok=ok && match ingest_destination(&libs[0]).and_then(|destination|publish_ingest(&staging,&destination,backend)) {
             Ok(())=>true,
             Err(error)=>{tracing::warn!(%error,path=%staging.display(),"ingest publication held");false}
         };
@@ -994,7 +1195,7 @@ async fn ingest(
             reset.handoff();
             queue_ingest_scan(state.clone(),libs);
         }
-        tracing::info!("ingest yt-dlp {url}: {}", if ok { "ok" } else { "failed" });
+        tracing::info!(outcome=if ok {"ok"} else {"failed"},"ingest download complete");
     });
     StatusCode::ACCEPTED
 }
@@ -1009,6 +1210,11 @@ struct PartyCreateReq {
 async fn party_create(
     State(app): State<Arc<App>>, headers:axum::http::HeaderMap, Json(req): Json<PartyCreateReq>,
 ) -> axum::response::Response {
+    tokio::task::spawn_blocking(move || party_create_blocking(app,headers,req).into_response()).await
+        .unwrap_or_else(|_|StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn party_create_blocking(app:Arc<App>,headers:axum::http::HeaderMap,req:PartyCreateReq) -> axum::response::Response {
     let key={
         let db=app.db.lock().unwrap();
         match party_identity_key(&db,&headers,Some(&req.identity)) {
@@ -1041,12 +1247,13 @@ async fn party_ws(
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let key={
-        let db=app.db.lock().unwrap();
-        match party_identity_key(&db,&headers,q.get("identity").map(String::as_str)) {
-            Ok(key)=>key,
-            Err(status)=>return status.into_response(),
-        }
+    let identity=q.get("identity").cloned();
+    let key=match tokio::task::spawn_blocking({
+        let app=app.clone();move ||party_request_identity_blocking(app,headers,identity)
+    }).await {
+        Ok(Ok(key))=>key,
+        Ok(Err(status))=>return status.into_response(),
+        Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     if !app.party.can_register(&admission, &key) {
         return StatusCode::FORBIDDEN.into_response();
@@ -1056,9 +1263,19 @@ async fn party_ws(
         .into_response()
 }
 
+fn party_request_identity_blocking(app:Arc<App>,headers:axum::http::HeaderMap,identity:Option<String>) -> Result<String,StatusCode> {
+    let db=app.db.lock().unwrap();
+    party_identity_key(&db,&headers,identity.as_deref())
+}
+
 /// Report scanning, configured/count metadata and ingest lifecycle from one effective configuration read.
 /// Paths remain confined to authorized settings responses.
-async fn scan_status(State(app): State<std::sync::Arc<App>>) -> Json<serde_json::Value> {
+async fn scan_status(State(app): State<std::sync::Arc<App>>) -> axum::response::Response {
+    tokio::task::spawn_blocking(move || scan_status_blocking(app).into_response()).await
+        .unwrap_or_else(|_|StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn scan_status_blocking(app:Arc<App>) -> Json<serde_json::Value> {
     let config=app.library.read().unwrap();
     Json(serde_json::json!({
         "scanning": app.scanning.load(std::sync::atomic::Ordering::SeqCst),
@@ -1167,7 +1384,12 @@ async fn epub_chunk(
 }
 
 /// Look up the indexed source path for a media ID; return None for a missing row.
-async fn media_path(app: &std::sync::Arc<App>, id: i64) -> Option<String> {
+async fn media_path(app:&Arc<App>,id:i64) -> Option<String> {
+    let app=app.clone();
+    tokio::task::spawn_blocking(move ||media_path_blocking(app,id)).await.ok().flatten()
+}
+
+fn media_path_blocking(app:Arc<App>,id:i64) -> Option<String> {
     let db = app.db.lock().unwrap();
     db.query_row("SELECT path FROM media WHERE id = ?1", [id], |r| r.get(0))
         .ok()
@@ -1321,6 +1543,11 @@ async fn library_handler(
     headers: axum::http::HeaderMap,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Response {
+    tokio::task::spawn_blocking(move || library_handler_blocking(app,headers,q).into_response()).await
+        .unwrap_or_else(|_|StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn library_handler_blocking(app:Arc<App>,headers:axum::http::HeaderMap,q:std::collections::HashMap<String,String>) -> axum::response::Response {
     let db = app.db.lock().unwrap();
     // per-identity kind visibility: NULL row/no row = see all; else only listed kinds
     let identity=match resolve_identity(&db,&headers,q.get("identity").map(String::as_str)) {
@@ -1385,17 +1612,10 @@ async fn stream(
     method: axum::http::Method,
     mut headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let path = {
-        let db = app.db.lock().unwrap();
-        match db.query_row(
-            "SELECT COALESCE(transcode_path, path) FROM media WHERE id = ?1",
-            [id],
-            |r| r.get::<_, String>(0),
-        ).optional() {
-            Ok(Some(path)) => path,
-            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        }
+    let path=match tokio::task::spawn_blocking(move ||playback_path_blocking(app,id)).await {
+        Ok(Ok(Some(path)))=>path,
+        Ok(Ok(None))=>return StatusCode::NOT_FOUND.into_response(),
+        _=>return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     let metadata = match tokio::fs::metadata(&path).await {
         Ok(metadata) => metadata,
@@ -1419,6 +1639,11 @@ async fn stream(
     }
 }
 
+
+fn playback_path_blocking(app:Arc<App>,id:i64) -> rusqlite::Result<Option<String>> {
+    let db=app.db.lock().unwrap();
+    db.query_row("SELECT COALESCE(transcode_path,path) FROM media WHERE id=?1",[id],|r|r.get(0)).optional()
+}
 
 /// Map a path suffix to the response MIME type, defaulting to application/octet-stream.
 fn mime_guess(p: &str) -> String {
@@ -1456,6 +1681,11 @@ async fn set_progress(
     headers: axum::http::HeaderMap,
     Json(p): Json<ProgressIn>,
 ) -> StatusCode {
+    tokio::task::spawn_blocking(move || set_progress_blocking(app,headers,p)).await
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn set_progress_blocking(app:Arc<App>,headers:axum::http::HeaderMap,p:ProgressIn) -> StatusCode {
     let db = app.db.lock().unwrap();
     let ident_id = match resolve_identity(&db, &headers, p.identity.as_deref()) {
         Ok(id) => id,
@@ -1480,7 +1710,12 @@ async fn get_progress(
     Path(media_id): Path<i64>,
     headers: axum::http::HeaderMap,
     Query(q): Query<std::collections::HashMap<String, String>>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    tokio::task::spawn_blocking(move || get_progress_blocking(app,media_id,headers,q).into_response()).await
+        .unwrap_or_else(|_|StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn get_progress_blocking(app:Arc<App>,media_id:i64,headers:axum::http::HeaderMap,q:std::collections::HashMap<String,String>) -> impl IntoResponse {
     let db = app.db.lock().unwrap();
     let ident_id = match resolve_identity(&db, &headers, q.get("identity").map(|s| s.as_str())) {
         Ok(id) => id,
@@ -1537,7 +1772,12 @@ async fn list_annotations(
     Path(id): Path<i64>,
     headers: axum::http::HeaderMap,
     Query(q): Query<std::collections::HashMap<String, String>>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    tokio::task::spawn_blocking(move || list_annotations_blocking(app,id,headers,q).into_response()).await
+        .unwrap_or_else(|_|StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn list_annotations_blocking(app:Arc<App>,id:i64,headers:axum::http::HeaderMap,q:std::collections::HashMap<String,String>) -> impl IntoResponse {
     let db = app.db.lock().unwrap();
     let ident_id = match resolve_identity(&db, &headers, q.get("identity").map(|s| s.as_str())) {
         Ok(v) => v,
@@ -1573,6 +1813,11 @@ async fn create_annotation(
     headers: axum::http::HeaderMap,
     Json(a): Json<AnnotationIn>,
 ) -> StatusCode {
+    tokio::task::spawn_blocking(move || create_annotation_blocking(app,headers,a)).await
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn create_annotation_blocking(app:Arc<App>,headers:axum::http::HeaderMap,a:AnnotationIn) -> StatusCode {
     let db = app.db.lock().unwrap();
     let ident_id = match resolve_identity(&db, &headers, None) {
         Ok(v) => v,
@@ -1608,6 +1853,11 @@ async fn delete_annotation(
     headers: axum::http::HeaderMap,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> StatusCode {
+    tokio::task::spawn_blocking(move || delete_annotation_blocking(app,headers,q)).await
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn delete_annotation_blocking(app:Arc<App>,headers:axum::http::HeaderMap,q:std::collections::HashMap<String,String>) -> StatusCode {
     let db = app.db.lock().unwrap();
     let ident_id = match resolve_identity(&db, &headers, q.get("identity").map(|s| s.as_str())) {
         Ok(v) => v,
@@ -1646,7 +1896,12 @@ async fn list_perms(
     State(app): State<std::sync::Arc<App>>,
     headers: axum::http::HeaderMap,
     Query(q): Query<std::collections::HashMap<String, String>>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    tokio::task::spawn_blocking(move || list_perms_blocking(app,headers,q).into_response()).await
+        .unwrap_or_else(|_|StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn list_perms_blocking(app:Arc<App>,headers:axum::http::HeaderMap,q:std::collections::HashMap<String,String>) -> impl IntoResponse {
     let db = app.db.lock().unwrap();
     if let Err(status) = require_admin(&db, &headers, q.get("identity").map(|s| s.as_str())) {
         return status.into_response();
@@ -1749,7 +2004,12 @@ async fn get_settings(
     State(app): State<std::sync::Arc<App>>,
     headers: axum::http::HeaderMap,
     Query(q): Query<std::collections::HashMap<String, String>>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    tokio::task::spawn_blocking(move || get_settings_blocking(app,headers,q).into_response()).await
+        .unwrap_or_else(|_|StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn get_settings_blocking(app:Arc<App>,headers:axum::http::HeaderMap,q:std::collections::HashMap<String,String>) -> impl IntoResponse {
     let config=app.library.read().unwrap();
     let db = app.db.lock().unwrap();
     if let Err(status) = require_admin(&db, &headers, q.get("identity").map(|s| s.as_str())) {
@@ -1767,12 +2027,17 @@ async fn get_settings(
         }
     }
     // Persisted paths and effective override are distinct authorized metadata.
-    let error=stored_roots(&db).err().map(|_| "Library configuration unavailable; repair configured roots");
+    let error=if config.locked && config.roots.is_empty() {
+        Some("FRAYD_LIBRARY configuration unavailable; correct the environment and restart")
+    } else { stored_roots(&db).err().map(|_| "Library configuration unavailable; repair configured roots") };
     let paths=stored_root_strings(&db).unwrap_or_default();
     map.remove("library_path");
     map.insert("library_paths".into(),serde_json::json!(paths));
     map.insert("library_config_error".into(),serde_json::json!(error));
     map.insert("library_locked".into(),serde_json::json!(config.locked));
+    map.insert("downloads_enabled".into(),serde_json::json!(app.downloads_enabled));
+    map.insert("download_backend".into(),serde_json::json!(app.download_backend.map(DownloadBackend::name)));
+    map.insert("download_config_error".into(),serde_json::json!(app.download_backend.is_none().then_some("Download backend configuration invalid")));
     map.insert("effective_library_paths".into(),serde_json::json!(config.roots));
     map.insert("server_version".into(),serde_json::json!(VERSION));
     Json(serde_json::Value::Object(map)).into_response()
@@ -1803,7 +2068,7 @@ fn set_setting_blocking(app:Arc<App>,headers:axum::http::HeaderMap,
     if map.keys().any(|k| {
         matches!(
             k.as_str(),
-            "library_locked" | "effective_library_paths" | "library_config_error" | "server_version"
+            "library_locked" | "effective_library_paths" | "library_config_error" | "downloads_enabled" | "download_backend" | "download_config_error" | "server_version"
         )
     }) {
         return StatusCode::BAD_REQUEST.into_response();
@@ -1870,7 +2135,12 @@ fn set_setting_blocking(app:Arc<App>,headers:axum::http::HeaderMap,
 async fn auth_me(
     State(app): State<std::sync::Arc<App>>,
     headers: axum::http::HeaderMap,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    tokio::task::spawn_blocking(move || auth_me_blocking(app,headers).into_response()).await
+        .unwrap_or_else(|_|StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn auth_me_blocking(app:Arc<App>,headers:axum::http::HeaderMap) -> impl IntoResponse {
     let db = app.db.lock().unwrap();
     let Some(token) = bearer_token(&headers) else {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -1958,6 +2228,13 @@ mod test_support {
     /// Idle application state over `db`, as `main` builds it, without starting any worker.
     pub(crate) fn app(db: rusqlite::Connection, db_path: String, roots: Vec<PathBuf>) -> std::sync::Arc<crate::App> {
         std::sync::Arc::new(crate::App::new(db, db_path, crate::LibraryConfig { roots, locked: false }))
+    }
+
+    pub(crate) async fn scan_status_body(app:std::sync::Arc<crate::App>) -> serde_json::Value {
+        use axum::response::IntoResponse;
+        let response=crate::scan_status(axum::extract::State(app)).await.into_response();
+        assert_eq!(response.status(),axum::http::StatusCode::OK);
+        serde_json::from_slice(&axum::body::to_bytes(response.into_body(),usize::MAX).await.unwrap()).unwrap()
     }
 
     /// Wait up to four seconds for the scan worker to release admission.
@@ -2608,7 +2885,7 @@ mod backend_regressions {
         run_scan(app.clone(),ScanRequest{roots:vec![PathBuf::from("/nonexistent")],for_ingest:false});
         test_support::scan_idle(&app).await;
         assert!(!app.scanning.load(std::sync::atomic::Ordering::SeqCst));
-        assert_eq!(scan_status(State(app.clone())).await.0["scan_error"],"Scan database unavailable");
+        assert_eq!(test_support::scan_status_body(app.clone()).await["scan_error"],"Scan database unavailable");
         app.scanning.store(true,std::sync::atomic::Ordering::SeqCst);
         *app.scan_error.lock().unwrap()=None;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2616,7 +2893,7 @@ mod backend_regressions {
         }));
         assert!(result.is_err());
         assert!(!app.scanning.load(std::sync::atomic::Ordering::SeqCst));
-        assert_eq!(scan_status(State(app.clone())).await.0["scan_error"],"Scan failed");
+        assert_eq!(test_support::scan_status_body(app.clone()).await["scan_error"],"Scan failed");
     }
     /// Refused scans publish a path-free error and a later admitted scan clears it.
     #[tokio::test]
@@ -2630,13 +2907,13 @@ mod backend_regressions {
         app.library.write().unwrap().roots=vec![library.clone()];
         assert_eq!(trigger_scan(State(app.clone())).await,StatusCode::ACCEPTED);
         test_support::scan_idle(&app).await;
-        let status=scan_status(State(app.clone())).await.0;
+        let status=test_support::scan_status_body(app.clone()).await;
         assert_eq!(status["scanning"],false);
         assert_eq!(status["scan_error"],"Library root unavailable");
         std::fs::create_dir_all(&library).unwrap();
         assert_eq!(trigger_scan(State(app.clone())).await,StatusCode::ACCEPTED);
         test_support::scan_idle(&app).await;
-        assert!(scan_status(State(app.clone())).await.0["scan_error"].is_null());
+        assert!(test_support::scan_status_body(app.clone()).await["scan_error"].is_null());
         std::fs::remove_dir_all(root).unwrap();
     }
     /// A cache inside the scanned root is refused and visible to status consumers.
@@ -2650,7 +2927,7 @@ mod backend_regressions {
         app.library.write().unwrap().roots=vec![library];
         assert_eq!(trigger_scan(State(app.clone())).await,StatusCode::ACCEPTED);
         test_support::scan_idle(&app).await;
-        assert_eq!(scan_status(State(app.clone())).await.0["scan_error"],"Cache boundary unavailable");
+        assert_eq!(test_support::scan_status_body(app.clone()).await["scan_error"],"Cache boundary unavailable");
         std::fs::remove_dir_all(root).unwrap();
     }
     /// A thumbnail cache that cannot be created is a reported cache-boundary failure, not a silent empty scan.
@@ -2665,7 +2942,7 @@ mod backend_regressions {
         app.library.write().unwrap().roots=vec![library];
         assert_eq!(trigger_scan(State(app.clone())).await,StatusCode::ACCEPTED);
         test_support::scan_idle(&app).await;
-        assert_eq!(scan_status(State(app.clone())).await.0["scan_error"],"Cache boundary unavailable");
+        assert_eq!(test_support::scan_status_body(app.clone()).await["scan_error"],"Cache boundary unavailable");
         assert_eq!(std::fs::read(root.join("thumbs")).unwrap(),b"not a directory");
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2870,6 +3147,53 @@ mod ingest_tests {
         ingest(State(app.clone()),axum::http::HeaderMap::new(),
             Query(std::collections::HashMap::from([("identity".to_string(),identity.to_string())])),
             Json(IngestReq { url:url.to_string() })).await
+    }
+
+    #[test]
+    fn downloads_override_is_exact_and_native_default_is_enabled() {
+        assert!(downloads_enabled_from_override(None));
+        assert!(downloads_enabled_from_override(Some(std::ffi::OsStr::new("1"))));
+        for value in ["","0","true","false","01"," 1","1 "] {
+            assert!(!downloads_enabled_from_override(Some(std::ffi::OsStr::new(value))));
+        }
+        #[cfg(unix)] {
+            use std::os::unix::ffi::OsStringExt;
+            let invalid=std::ffi::OsString::from_vec(vec![0xff]);
+            assert!(!downloads_enabled_from_override(Some(&invalid)));
+        }
+    }
+
+    /// Disabled downloads reject before the version probe, source creation or job-state publication.
+    #[tokio::test]
+    async fn downloads_disabled_preserves_auth_and_url_guards_without_tool_or_job_effects() {
+        if let Some(root)=std::env::var_os("FRAYD_TEST_DOWNLOAD_GATE_ROOT") {
+            let root=PathBuf::from(root);let app=fixture_app(&root);
+            assert_eq!(submit(&app,"fixture-reader","https://example.invalid/video").await,StatusCode::FORBIDDEN);
+            assert_eq!(submit(&app,"fixture-admin","file:///invalid").await,StatusCode::BAD_REQUEST);
+            assert_eq!(submit(&app,"fixture-admin","https://example.invalid/video").await,StatusCode::NOT_IMPLEMENTED);
+            assert!(!app.downloads_enabled);
+            let query=||Query(std::collections::HashMap::from([("identity".into(),"fixture-admin".into())]));
+            let response=get_settings(State(app.clone()),axum::http::HeaderMap::new(),query()).await.into_response();
+            assert_eq!(response.status(),StatusCode::OK);
+            let settings:serde_json::Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),usize::MAX).await.unwrap()).unwrap();
+            assert_eq!(settings["downloads_enabled"],false);
+            assert_eq!(set_setting(State(app.clone()),axum::http::HeaderMap::new(),query(),Json(serde_json::json!({"downloads_enabled":true}))).await.status(),StatusCode::BAD_REQUEST);
+            assert!(!root.join("tool-called").exists(),"disabled mode probed or invoked the downloader");
+            assert!(!root.join("library with spaces/Internet").exists());
+            assert!(app.ingest_status.lock().unwrap().is_none());assert!(app.scan_queue.lock().unwrap().is_empty());
+            assert!(!app.scanning.load(std::sync::atomic::Ordering::SeqCst));
+            return;
+        }
+        let root=std::env::temp_dir().join(format!("frayd-download-gate-{}",uuid::Uuid::new_v4()));std::fs::create_dir_all(root.join("bin")).unwrap();
+        test_support::write_executable(&root.join("bin/yt-dlp"),"#!/bin/sh\ntouch \"$FRAYD_TEST_DOWNLOAD_MARKER\"\nexit 1\n");
+        // Qualify the tool marker before using its absence as the disabled-mode oracle.
+        std::process::Command::new(root.join("bin/yt-dlp")).arg("--version")
+            .env("FRAYD_TEST_DOWNLOAD_MARKER",root.join("tool-called")).output().unwrap();
+        assert!(root.join("tool-called").exists());std::fs::remove_file(root.join("tool-called")).unwrap();
+        test_support::assert_child_passes(test_support::child("ingest_tests::downloads_disabled_preserves_auth_and_url_guards_without_tool_or_job_effects")
+            .env("FRAYD_TEST_DOWNLOAD_GATE_ROOT",&root).env("FRAYD_TEST_DOWNLOAD_MARKER",root.join("tool-called"))
+            .env("FRAYD_DOWNLOADS_ENABLED","0").env("PATH",test_support::path_with(&root.join("bin"))));
+        assert!(!root.join("tool-called").exists());std::fs::remove_dir_all(root).unwrap();
     }
 
     /// An old downloader guard must not fail a newly admitted download after indexing completes.
@@ -3209,7 +3533,7 @@ mod roots_scan_ingest_tests {
         *app.ingest_status.lock().unwrap()=Some("indexing".into());
         queue_ingest_scan(app.clone(),roots.clone());
         assert_eq!(app.scan_queue.lock().unwrap().len(),1);
-        let status=scan_status(State(app.clone())).await.0;
+        let status=test_support::scan_status_body(app.clone()).await;
         assert_eq!(status,serde_json::json!({"scanning":true,"scan_error":null,"library_configured":true,"library_count":2,"ingesting":"indexing"}));
         assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM media",[],|r|r.get::<_,i64>(0)).unwrap(),0);
         run_scan(app.clone(),ScanRequest{roots:roots.clone(),for_ingest:false});
@@ -3301,7 +3625,7 @@ mod roots_scan_ingest_tests {
             std::fs::rename(root.join("b"),root.join("b-away")).unwrap();
             std::fs::write(&release,b"release").unwrap();
             test_support::scan_idle(&app).await;
-            let status=scan_status(State(app.clone())).await.0;
+            let status=test_support::scan_status_body(app.clone()).await;
             assert_eq!(library_roots(&app),roots);
             assert!(!app.scanning.load(std::sync::atomic::Ordering::SeqCst));
             assert_eq!(status["scan_error"],"Library root unavailable","{status}");
@@ -3313,7 +3637,7 @@ mod roots_scan_ingest_tests {
             app.scanning.store(true,std::sync::atomic::Ordering::SeqCst);
             run_scan(app.clone(),ScanRequest{roots:roots.clone(),for_ingest:false});
             test_support::scan_idle(&app).await;
-            assert!(scan_status(State(app.clone())).await.0["scan_error"].is_null());
+            assert!(test_support::scan_status_body(app.clone()).await["scan_error"].is_null());
             std::fs::remove_file(&started).unwrap();std::fs::remove_file(&release).unwrap();
         }
         std::fs::remove_dir_all(root).unwrap();
@@ -3444,6 +3768,12 @@ mod roots_scan_ingest_tests {
             assert_eq!(app.ingest_status.lock().unwrap().as_deref(),Some("failed"));assert!(app.scan_queue.lock().unwrap().is_empty());
             assert_eq!(trigger_scan(State(app.clone())).await,StatusCode::ACCEPTED);
             test_support::scan_idle(&app).await;
+            // Scan completion can leave its admitted converter running; finish owned work before teardown.
+            for _ in 0..400 {
+                if !transcode::BUSY.load(std::sync::atomic::Ordering::SeqCst) {break;}
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert!(!transcode::BUSY.load(std::sync::atomic::Ordering::SeqCst),"final converter did not become idle before fixture teardown");
             std::fs::remove_dir_all(fixture_root).unwrap();return;
         }
         let root=std::env::temp_dir().join(format!("frayd-queue-{}",uuid::Uuid::new_v4()));std::fs::create_dir_all(root.join("bin")).unwrap();
@@ -3710,6 +4040,54 @@ mod integration_regressions {
             assert_eq!(status,StatusCode::NO_CONTENT);
             assert!(release.join().unwrap(),"{operation} blocked the async runtime while waiting for SQLite");
             assert_eq!(std::fs::read(root.join("library/source.cbz")).unwrap(),b"original");
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// Positively observe a blocked database writer before ordinary reads/config readers join it.
+    #[tokio::test(flavor="current_thread")]
+    async fn mixed_database_and_configuration_waits_keep_async_runtime_responsive() {
+        static WRITE_WAIT_ENTERED:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
+        fn observe_write_wait(attempt:i32) -> bool {
+            WRITE_WAIT_ENTERED.store(true,std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(1));attempt<5000
+        }
+        for operation in ["library","scan-status"] {
+            let (root,app)=fixture();seed_media(&root,&app);
+            WRITE_WAIT_ENTERED.store(false,std::sync::atomic::Ordering::SeqCst);
+            app.db.lock().unwrap().busy_handler(Some(observe_write_wait)).unwrap();
+            let writer=store::connect(&app.db_path).unwrap();writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let (armed_tx,armed_rx)=std::sync::mpsc::channel();let (progress_tx,progress_rx)=std::sync::mpsc::channel();
+            let release=std::thread::spawn(move || {
+                armed_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+                let responsive=progress_rx.recv_timeout(std::time::Duration::from_millis(300)).is_ok();
+                writer.execute_batch("COMMIT").unwrap();responsive
+            });
+            let target=app.clone();
+            let admin=tokio::spawn(async move {
+                if operation=="library" {permission(&target,serde_json::json!({"identity_id":2,"allowed_kinds":["comic"]})).await}
+                else {set_setting(State(target),axum::http::HeaderMap::new(),query(),Json(serde_json::json!({"port":8989}))).await.status()}
+            });
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(3);
+            while !WRITE_WAIT_ENTERED.load(std::sync::atomic::Ordering::SeqCst) {
+                assert!(std::time::Instant::now()<deadline,"admin never reached SQLite write admission");
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            armed_tx.send(()).unwrap();
+            let read=||async {
+                if operation=="library" {library_handler(State(app.clone()),axum::http::HeaderMap::new(),Query(std::collections::HashMap::new())).await.into_response().status()}
+                else {scan_status(State(app.clone())).await.into_response().status()}
+            };
+            let readers=async {tokio::join!(read(),read())};
+            let timer=async {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                assert_eq!(health().await.0,serde_json::json!({"status":"ok"}));
+                let _=progress_tx.send(());
+            };
+            let ((first,second),())=tokio::join!(readers,timer);
+            assert_eq!((first,second),(StatusCode::OK,StatusCode::OK));
+            assert_eq!(admin.await.unwrap(),StatusCode::NO_CONTENT);
+            assert!(release.join().unwrap(),"{operation} readers stalled the async runtime before writer release");
             std::fs::remove_dir_all(root).unwrap();
         }
     }
@@ -4546,6 +4924,45 @@ mod final_server_regressions {
     }
     fn query() -> Query<std::collections::HashMap<String,String>> { Query(std::collections::HashMap::from([("identity".into(),"admin".into())])) }
     #[tokio::test]
+    async fn explicit_environment_failures_hold_locked_without_saved_root_fallback() {
+        let (root,mut app)=fixture();
+        let state=Arc::get_mut(&mut app).unwrap();state.download_backend=Some(DownloadBackend::Direct);state.downloads_enabled=true;
+        let saved=serde_json::json!([root.join("library")]).to_string();
+        app.db.lock().unwrap().execute("INSERT INTO settings(key,value) VALUES('library_paths',?1)",[&saved]).unwrap();
+        let mut overrides=vec!["unresolved-relative-root".to_string(),root.join("db.sqlite").to_string_lossy().into_owned()];
+        #[cfg(unix)] {
+            let loop_path=root.join("loop");std::os::unix::fs::symlink(&loop_path,&loop_path).unwrap();
+            assert!(loop_path.canonicalize().is_err());
+            overrides.push(loop_path.to_string_lossy().into_owned());
+        }
+        let mut configurations:Vec<_>=overrides.iter().map(|value|environment_library_config(&app.db.lock().unwrap(),Some(std::ffi::OsStr::new(value)))).collect();
+        // Inject mount failures at the same parse-result boundary, without mounting or altering live filesystems.
+        #[cfg(target_os="linux")]
+        for errno in [5,107,116] { // EIO, ENOTCONN, ESTALE.
+            configurations.push(explicit_library_config(Err(std::io::Error::from_raw_os_error(errno).to_string())));
+        }
+        #[cfg(unix)] {
+            use std::os::unix::ffi::OsStrExt;
+            configurations.push(environment_library_config(&app.db.lock().unwrap(),Some(std::ffi::OsStr::from_bytes(b"\xff"))));
+        }
+        for config in configurations {
+            assert!(config.locked);assert!(config.roots.is_empty());*app.library.write().unwrap()=config;
+            let response=get_settings(State(app.clone()),axum::http::HeaderMap::new(),query()).await.into_response();
+            assert_eq!(response.status(),StatusCode::OK);
+            let body:serde_json::Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),usize::MAX).await.unwrap()).unwrap();
+            assert_eq!(body["library_paths"],serde_json::json!([root.join("library")]));
+            assert_eq!(body["effective_library_paths"],serde_json::json!([]));assert_eq!(body["library_locked"],true);
+            assert_eq!(body["library_config_error"],"FRAYD_LIBRARY configuration unavailable; correct the environment and restart");
+            assert_eq!(trigger_scan(State(app.clone())).await,StatusCode::NOT_IMPLEMENTED);
+            assert_eq!(ingest(State(app.clone()),axum::http::HeaderMap::new(),query(),Json(IngestReq{url:"https://example.invalid/video.mp4".into()})).await,StatusCode::NOT_IMPLEMENTED);
+            assert_eq!(set_setting(State(app.clone()),axum::http::HeaderMap::new(),query(),Json(serde_json::json!({"library_paths":[root.join("library")]}))).await.status(),StatusCode::CONFLICT);
+            assert_eq!(app.db.lock().unwrap().query_row("SELECT value FROM settings WHERE key='library_paths'",[],|row|row.get::<_,String>(0)).unwrap(),saved);
+            assert!(!app.scanning.load(std::sync::atomic::Ordering::SeqCst));assert!(app.ingest_status.lock().unwrap().is_none());
+            assert!(!root.join("library/Internet").exists());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
     async fn final_legacy_roots_remain_administrable_and_repairable() {
         let (root,app)=fixture();
         for value in [serde_json::json!("bad"),serde_json::json!([1]),serde_json::json!(["missing-relative"]),serde_json::json!(["~/Media"]),serde_json::json!([root.join("db.sqlite")]),serde_json::json!([root.join("library"),"~/Media"]),serde_json::json!([root.join("library"),1])] {
@@ -4627,4 +5044,218 @@ mod final_server_regressions {
         assert_eq!(auth_me(State(app.clone()),headers).await.into_response().status(),StatusCode::OK);
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[cfg(test)]
+mod direct_download_tests {
+    use super::*;
+    use std::io::{Read,Write};
+
+    /// Bounded raw responses expose real HTTP framing, redirects and body deadlines.
+    fn scripted_server(responses:Vec<(Vec<u8>,Option<std::time::Duration>)>) -> (String,std::thread::JoinHandle<()>) {
+        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url=format!("http://{}/owned.mp4",listener.local_addr().unwrap());
+        let worker=std::thread::spawn(move || {
+            for (response,body_delay) in responses {
+                let (mut stream,_)=listener.accept().unwrap();stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+                let mut request=Vec::new();let mut byte=[0];
+                while !request.ends_with(b"\r\n\r\n") {if stream.read(&mut byte).unwrap_or(0)==0{return;}request.push(byte[0]);assert!(request.len()<16384);}
+                if let Some(delay)=body_delay {
+                    let split=response.windows(4).position(|bytes|bytes==b"\r\n\r\n").unwrap()+4;
+                    let _=stream.write_all(&response[..split]);std::thread::sleep(delay);let _=stream.write_all(&response[split..]);
+                } else {let _=stream.write_all(&response);}
+            }
+        });
+        (url,worker)
+    }
+    fn response_server(response:Vec<u8>,body_delay:Option<std::time::Duration>) -> (String,std::thread::JoinHandle<()>) {
+        scripted_server(vec![(response,body_delay)])
+    }
+    fn response(body:&[u8],headers:&str) -> Vec<u8> {
+        let mut output=format!("HTTP/1.1 200 OK\r\n{headers}Connection: close\r\n\r\n").into_bytes();output.extend_from_slice(body);output
+    }
+
+    /// Build and independently decode a small public MP4 gzip fixture using the system test tool.
+    fn gzip_fixture(input:&[u8],decode:bool) -> Vec<u8> {
+        let mut child=Command::new("gzip").args(if decode {vec!["-d","-c"]} else {vec!["-c"]})
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+            .spawn().expect("system gzip is required to qualify the compressed response fixture");
+        let mut stdin=child.stdin.take().unwrap();let bytes=input.to_vec();
+        let writer=std::thread::spawn(move ||stdin.write_all(&bytes));
+        let output=child.wait_with_output().unwrap();writer.join().unwrap().unwrap();
+        assert!(output.status.success(),"independent gzip fixture transformation failed");output.stdout
+    }
+
+    #[tokio::test]
+    async fn direct_backend_downloads_controlled_mp4_without_a_native_tool() {
+        if std::env::var_os("FRAYD_TEST_DIRECT_ROUTE").is_none() {
+            let tools=std::env::temp_dir().join(format!("frayd-direct-tools-{}",uuid::Uuid::new_v4()));std::fs::create_dir_all(&tools).unwrap();
+            let marker=tools.join("tool-called");
+            test_support::write_executable(&tools.join("yt-dlp"),"#!/bin/sh\ntouch \"$FRAYD_TEST_DIRECT_TOOL_MARKER\"\nexit 1\n");
+            Command::new(tools.join("yt-dlp")).arg("--version").env("FRAYD_TEST_DIRECT_TOOL_MARKER",&marker).output().unwrap();
+            assert!(marker.exists());std::fs::remove_file(&marker).unwrap();
+            test_support::assert_child_passes(test_support::child("direct_download_tests::direct_backend_downloads_controlled_mp4_without_a_native_tool")
+                .env("FRAYD_TEST_DIRECT_ROUTE","1").env("FRAYD_DOWNLOAD_BACKEND","direct").env("FRAYD_DOWNLOADS_ENABLED","1")
+                .env("FRAYD_TEST_DIRECT_TOOL_MARKER",&marker).env("PATH",test_support::path_with(&tools)));
+            assert!(!marker.exists());std::fs::remove_dir_all(tools).unwrap();return;
+        }
+        let root=std::env::temp_dir().join(format!("frayd-direct-route-{}",uuid::Uuid::new_v4()));
+        let library=root.join("library");std::fs::create_dir_all(&library).unwrap();
+        let db_path=root.join("db.sqlite");let db=store::open(db_path.to_str().unwrap());
+        db.execute_batch("INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture-admin'); INSERT INTO user_perms(identity_id,is_admin) VALUES(1,1);").unwrap();
+        let app=test_support::app(db,db_path.to_string_lossy().into_owned(),vec![library.clone()]);
+        let settings=get_settings(State(app.clone()),axum::http::HeaderMap::new(),Query(std::collections::HashMap::from([("identity".into(),"fixture-admin".into())]))).await;
+        assert_eq!(settings.status(),StatusCode::OK);
+        let metadata:serde_json::Value=serde_json::from_slice(&axum::body::to_bytes(settings.into_body(),usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(metadata["download_backend"],"direct");assert_eq!(metadata["downloads_enabled"],true);assert!(metadata["download_config_error"].is_null());
+        let bytes=include_bytes!("../../tests/fixtures/native-resume.mp4");
+        let (url,server)=response_server(response(bytes,&format!("Content-Encoding: identity\r\nContent-Length: {}\r\n",bytes.len())),None);
+        let status=ingest(State(app.clone()),axum::http::HeaderMap::new(),Query(std::collections::HashMap::from([("identity".into(),"fixture-admin".into())])),Json(IngestReq{url})).await;
+        assert_eq!(status,StatusCode::ACCEPTED);
+        for _ in 0..1200 {
+            if matches!(app.ingest_status.lock().unwrap().as_deref(),Some("done"|"failed")) {break;}
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(app.ingest_status.lock().unwrap().as_deref(),Some("done"));
+        test_support::scan_idle(&app).await;server.join().unwrap();
+        assert_eq!(std::fs::read(library.join("Internet/owned.mp4")).unwrap(),bytes);
+        let published=library.join("Internet/owned.mp4");
+        let id=app.db.lock().unwrap().query_row("SELECT id FROM media WHERE path=?1",[published.to_string_lossy()],|r|r.get::<_,i64>(0)).unwrap();
+        app.db.lock().unwrap().execute("INSERT INTO progress(identity_id,media_id,position) VALUES(1,?1,0.5)",[id]).unwrap();
+        let original_mtime=std::fs::metadata(&published).unwrap().modified().unwrap();
+        let source=library.join("preserved.txt");std::fs::write(&source,b"source preserved").unwrap();
+        let cache=transcodes_dir_for(&app.db_path);std::fs::create_dir_all(&cache).unwrap();
+        let neighbor=cache.join("unowned.fixture");std::fs::write(&neighbor,b"cache preserved").unwrap();
+        let compressed=gzip_fixture(bytes,false);assert_eq!(gzip_fixture(&compressed,true),bytes,"compressed fixture must independently decode to the actual valid MP4");
+        let mut compressed_chunks=format!("{:x}\r\n",compressed.len()).into_bytes();compressed_chunks.extend_from_slice(&compressed);compressed_chunks.extend_from_slice(b"\r\n0\r\n\r\n");
+        let cases=vec![
+            ("valid gzip",response(&compressed,&format!("Content-Encoding: gzip\r\nContent-Length: {}\r\n",compressed.len()))),
+            ("valid gzip duplicate length",response(&compressed,&format!("Content-Encoding: gzip\r\nContent-Length: {}\r\nContent-Length: {}\r\n",compressed.len(),compressed.len()))),
+            ("valid gzip chunked and length",response(&compressed_chunks,&format!("Content-Encoding: gzip\r\nTransfer-Encoding: chunked\r\nContent-Length: {}\r\n",compressed.len()))),
+            ("404",b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()),
+            ("HTML",response(b"<html>not video</html>","Content-Type: text/html\r\n")),
+            ("truncated",response(b"short","Content-Length: 100\r\n")),
+            ("malformed chunk",response(b"Z\r\nx\r\n0\r\n\r\n","Transfer-Encoding: chunked\r\n")),
+            ("declared oversize",response(b"","Content-Length: 8589934593\r\n")),
+            ("no overwrite",response(bytes,&format!("Content-Length: {}\r\n",bytes.len()))),
+        ];
+        for (index,(label,wire)) in cases.into_iter().enumerate() {
+            let (mut url,server)=response_server(wire,None);
+            // A new filename prevents an old valid source collision from masking a decoded-gzip bypass.
+            if label!="no overwrite" {url=url.replace("owned.mp4",&format!("negative-{index}.mp4"));}
+            assert_eq!(ingest(State(app.clone()),axum::http::HeaderMap::new(),Query(std::collections::HashMap::from([("identity".into(),"fixture-admin".into())])),Json(IngestReq{url})).await,StatusCode::ACCEPTED);
+            for _ in 0..1200 {
+                if matches!(app.ingest_status.lock().unwrap().as_deref(),Some("done"|"failed")) {break;}
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert_eq!(app.ingest_status.lock().unwrap().as_deref(),Some("failed"),"{label}");server.join().unwrap();
+            assert_eq!(std::fs::read(&published).unwrap(),bytes);assert_eq!(std::fs::metadata(&published).unwrap().modified().unwrap(),original_mtime);
+            assert_eq!(std::fs::read(&source).unwrap(),b"source preserved");assert_eq!(std::fs::read(&neighbor).unwrap(),b"cache preserved");
+            assert_eq!(app.db.lock().unwrap().query_row("SELECT id FROM media WHERE path=?1",[published.to_string_lossy()],|r|r.get::<_,i64>(0)).unwrap(),id);
+            assert_eq!(app.db.lock().unwrap().query_row("SELECT position FROM progress WHERE media_id=?1",[id],|r|r.get::<_,f64>(0)).unwrap(),0.5);
+            assert!(std::fs::read_dir(&cache).unwrap().all(|entry|!entry.unwrap().file_name().to_string_lossy().starts_with("ingest-")));
+            assert_eq!(std::fs::read_dir(library.join("Internet")).unwrap().count(),1);
+            assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM media",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+            assert!(app.scan_queue.lock().unwrap().is_empty());
+            eprintln!("direct pipeline control passed: {label}");
+        }
+        let invalid="http://127.0.0.1/invalid\0.mp4".to_string();
+        assert_eq!(ingest(State(app.clone()),axum::http::HeaderMap::new(),Query(std::collections::HashMap::from([("identity".into(),"fixture-admin".into())])),Json(IngestReq{url:invalid})).await,StatusCode::BAD_REQUEST);
+        for _ in 0..400 {if !transcode::BUSY.load(std::sync::atomic::Ordering::SeqCst){break;}tokio::time::sleep(std::time::Duration::from_millis(5)).await;}
+        assert!(!transcode::BUSY.load(std::sync::atomic::Ordering::SeqCst));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn direct_transport_bounds_framing_deadline_and_redirects() {
+        let root=std::env::temp_dir().join(format!("frayd-direct-bounds-{}",uuid::Uuid::new_v4()));std::fs::create_dir(&root).unwrap();
+        let limits=DirectDownloadLimits{max_bytes:64,transfer_timeout:std::time::Duration::from_millis(150),connect_timeout:std::time::Duration::from_millis(100)};
+        let wires=vec![
+            response(b"short","Content-Length: 100\r\n"),
+            response(b"Z\r\nx\r\n0\r\n\r\n","Transfer-Encoding: chunked\r\n"),
+            response(&[1;65],""),
+            response(b"","Content-Length: 65\r\n"),
+            response(b"x","Content-Length: 1\r\nTransfer-Encoding: chunked\r\n"),
+            response(b"x","Content-Length: 1\r\nContent-Length: 1\r\n"),
+            response(b"x","Content-Length: bad\r\n"),
+            response(b"x","Content-Encoding: gzip\r\n"),
+            b"HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx".to_vec(),
+        ];
+        for (index,wire) in wires.into_iter().enumerate() {
+            let staging=root.join(index.to_string());std::fs::create_dir(&staging).unwrap();
+            let (url,server)=response_server(wire,None);assert!(download_direct(&url,&staging,limits).is_err(),"framing/size case {index}");server.join().unwrap();
+        }
+        let staging=root.join("deadline");std::fs::create_dir(&staging).unwrap();
+        let (url,server)=response_server(response(b"x","Content-Length: 1\r\n"),Some(std::time::Duration::from_secs(1)));
+        let deadline_limits=DirectDownloadLimits{transfer_timeout:std::time::Duration::from_millis(300),..limits};
+        let start=std::time::Instant::now();assert!(download_direct(&url,&staging,deadline_limits).is_err());
+        assert!(start.elapsed()<std::time::Duration::from_millis(800),"deadline must interrupt the read before the delayed body arrives");server.join().unwrap();
+        let redirect=b"HTTP/1.1 302 Found\r\nLocation: /redirected.mp4\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+        let bytes=include_bytes!("../../tests/fixtures/native-resume.mp4");
+        let staging=root.join("redirect");std::fs::create_dir(&staging).unwrap();
+        let (url,server)=scripted_server(vec![(redirect,None),(response(bytes,&format!("Content-Length: {}\r\n",bytes.len())),None)]);
+        download_direct(&url,&staging,DIRECT_DOWNLOAD_LIMITS).unwrap();server.join().unwrap();assert_eq!(std::fs::read(staging.join("redirected.mp4")).unwrap(),bytes);
+        let staging=root.join("chunked");std::fs::create_dir(&staging).unwrap();
+        let mut chunks=format!("{:x}\r\n",bytes.len()).into_bytes();chunks.extend_from_slice(bytes);chunks.extend_from_slice(b"\r\n0\r\n\r\n");
+        let (url,server)=response_server(response(&chunks,"Transfer-Encoding: chunked\r\nContent-Disposition: attachment; filename=ignored.mp4\r\n"),None);
+        download_direct(&url,&staging,DIRECT_DOWNLOAD_LIMITS).unwrap();server.join().unwrap();assert_eq!(std::fs::read(staging.join("owned.mp4")).unwrap(),bytes);
+        let wire=b"HTTP/1.1 302 Found\r\nLocation: file:///unsupported\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+        let (url,server)=response_server(wire,None);assert!(download_direct(&url,&root,DIRECT_DOWNLOAD_LIMITS).is_err());server.join().unwrap();
+        let loop_wire=b"HTTP/1.1 302 Found\r\nLocation: /owned.mp4\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+        let (url,server)=scripted_server((0..6).map(|_|(loop_wire.clone(),None)).collect());
+        assert_eq!(download_direct(&url,&root,DIRECT_DOWNLOAD_LIMITS),Err("Direct redirect limit exceeded"));server.join().unwrap();
+        assert!(direct_url("http://127.0.0.1/invalid\0.mp4").is_err());assert!(direct_url("file:///unsupported").is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn direct_url_names_publish_only_safe_probed_mp4_components() {
+        let root=std::env::temp_dir().join(format!("frayd-direct-names-{}",uuid::Uuid::new_v4()));std::fs::create_dir(&root).unwrap();
+        let bytes=include_bytes!("../../tests/fixtures/native-resume.mp4");
+        for (index,path) in ["owned.mp4?ignored=1#fragment","%2Fescape.mp4","%5Cescape.mp4","CON.mp4","COM1.other.mp4","audio.tmp.mp4","AUDIO.MP4","%00bad.mp4","untyped","Upper.MP4"].iter().enumerate() {
+            let staging=root.join(format!("stage-{index}"));let destination=root.join(format!("destination-{index}"));std::fs::create_dir(&staging).unwrap();std::fs::create_dir(&destination).unwrap();
+            let (base,server)=response_server(response(bytes,&format!("Content-Length: {}\r\n",bytes.len())),None);
+            let url=base.replace("owned.mp4",path);download_direct(&url,&staging,DIRECT_DOWNLOAD_LIMITS).unwrap();server.join().unwrap();
+            publish_ingest(&staging,&destination,DownloadBackend::Direct).unwrap();
+            let files:Vec<_>=std::fs::read_dir(&destination).unwrap().map(|entry|entry.unwrap().path()).collect();assert_eq!(files.len(),1);
+            if index==0 {assert_eq!(files[0].file_name().unwrap(),"owned.mp4");}
+            else if *path=="Upper.MP4" {assert_eq!(files[0].file_name().unwrap(),"Upper.mp4");}
+            else {assert!(uuid::Uuid::parse_str(files[0].file_stem().unwrap().to_str().unwrap()).is_ok());}
+            assert_eq!(std::fs::read(&files[0]).unwrap(),bytes);
+        }
+        let private=uuid::Uuid::new_v4().to_string();
+        let parsed=direct_url(&format!("http://{private}@127.0.0.1/owned.mp4?{private}#{private}")).unwrap();
+        assert_eq!(direct_filename(&parsed),"owned.mp4");
+        let video=root.join("not-mp4.mkv");
+        assert!(Command::new("ffmpeg").args(["-v","error","-i"]).arg(root.join("destination-0/owned.mp4")).args(["-c","copy"]).arg(&video).status().unwrap().success());
+        let staging=root.join("wrong-container");let destination=root.join("wrong-destination");std::fs::create_dir(&staging).unwrap();std::fs::create_dir(&destination).unwrap();
+        std::fs::copy(video,staging.join("wrong.mp4")).unwrap();assert!(scanner::ingest_video_valid(&staging.join("wrong.mp4")));assert!(publish_ingest(&staging,&destination,DownloadBackend::Direct).is_err());assert!(std::fs::read_dir(&destination).unwrap().next().is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn backend_configuration_is_fail_closed_and_metadata_is_read_only() {
+        assert_eq!(download_backend_from_override(None),Some(DownloadBackend::YtDlp));
+        assert_eq!(download_backend_from_override(Some(std::ffi::OsStr::new("direct"))),Some(DownloadBackend::Direct));
+        assert_eq!(download_backend_from_override(Some(std::ffi::OsStr::new("yt-dlp"))),Some(DownloadBackend::YtDlp));
+        for value in ["","DIRECT","unknown"," direct"] {assert_eq!(download_backend_from_override(Some(std::ffi::OsStr::new(value))),None);}
+        #[cfg(unix)] {
+            use std::os::unix::ffi::OsStringExt;
+            let invalid=std::ffi::OsString::from_vec(vec![0xff]);assert_eq!(download_backend_from_override(Some(&invalid)),None);
+        }
+        if std::env::var_os("FRAYD_TEST_INVALID_BACKEND").is_none() {
+            test_support::assert_child_passes(test_support::child("direct_download_tests::backend_configuration_is_fail_closed_and_metadata_is_read_only")
+                .env("FRAYD_TEST_INVALID_BACKEND","1").env("FRAYD_DOWNLOAD_BACKEND","unknown").env("FRAYD_DOWNLOADS_ENABLED","1"));return;
+        }
+        let db=store::open(":memory:");db.execute_batch("INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture-admin'); INSERT INTO user_perms(identity_id,is_admin) VALUES(1,1);").unwrap();
+        let app=test_support::app(db,String::new(),Vec::new());assert_eq!(app.download_backend,None);assert!(!app.downloads_enabled);
+        let query=||Query(std::collections::HashMap::from([("identity".into(),"fixture-admin".into())]));
+        let response=get_settings(State(app.clone()),axum::http::HeaderMap::new(),query()).await;
+        let value:serde_json::Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),usize::MAX).await.unwrap()).unwrap();
+        assert!(value["download_backend"].is_null());assert!(value["download_config_error"].is_string());assert_eq!(value["downloads_enabled"],false);
+        for body in [serde_json::json!({"download_backend":"direct"}),serde_json::json!({"download_config_error":null})] {
+            assert_eq!(set_setting(State(app.clone()),axum::http::HeaderMap::new(),query(),Json(body)).await.status(),StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(ingest(State(app),axum::http::HeaderMap::new(),query(),Json(IngestReq{url:"https://example.invalid/video".into()})).await,StatusCode::NOT_IMPLEMENTED);
+    }
+
 }

@@ -441,6 +441,9 @@ def upstream_contract_qualification(args):
     project = 'frayd-upstream-qa-' + secrets.token_hex(4)
     print(f'SCENARIO upstream contract: {project}')
     config = qa_config(args, project)
+    # This fake-tool scenario qualifies enabled core ingestion; the ordinary Docker default stays disabled.
+    config['services']['app']['environment']['FRAYD_DOWNLOADS_ENABLED'] = '1'
+    config['services']['app']['environment']['FRAYD_DOWNLOAD_BACKEND'] = 'yt-dlp'
     for service in config['services'].values():
         service['restart'] = 'no'
     with tempfile.TemporaryDirectory(prefix=project) as directory:
@@ -682,8 +685,15 @@ def upstream_contract_qualification(args):
                 assert not (roots / 'b').exists(), 'startup silently recreated unavailable root'
                 assert (offline / 'second.cbz').read_bytes() == source_bytes
                 before_offline_write = settings()
-                post_settings({'library_paths': ['/roots/a', '/roots/b'], 'site_name': 'must-not-commit'}, 400)
+                # Retaining the exact stored offline root permits other settings edits.
+                post_settings({'library_paths': ['/roots/a', '/roots/b']}, 204)
                 assert settings() == before_offline_write
+                # A genuinely new missing root is still strict, with atomic rejection.
+                assert not (roots / 'new-missing').exists()
+                post_settings({'library_paths': ['/roots/a', '/roots/b', '/roots/new-missing'],
+                               'site_name': 'must-not-commit'}, 400)
+                assert settings() == before_offline_write
+                assert not (roots / 'b').exists(), 'settings silently recreated unavailable root'
             finally:
                 offline.rename(roots / 'b')
             request('/api/scan', token=token, method='POST', expected=202)

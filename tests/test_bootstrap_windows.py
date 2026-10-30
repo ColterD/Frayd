@@ -171,6 +171,26 @@ class Run:
                 f'stdout={self.stdout}\nstderr={self.stderr}')
 
 
+def generated_windows_command(arguments=''):
+    page = (ROOT / 'client/install/index.html').read_text()
+    match = re.search(r'    cmd = `([^`]+)`;', page)
+    if not match:
+        raise AssertionError('generated Windows command missing')
+    return match.group(1).replace('${base}', 'https://raw.githubusercontent.com/kattiest/Frayd/main/client/install').replace('${argStr}', arguments)
+
+
+def entry_environment(interpreter, directory):
+    system = Path(os.environ['SystemRoot'])
+    return runtime_environment(PATH=os.pathsep.join([str(Path(interpreter).parent), str(system / 'System32'),
+        str(system / 'System32/WindowsPowerShell/v1.0')]), TEMP=directory, TMP=directory)
+
+
+def copy_download_fixture(source):
+    quoted = "'" + str(source).replace("'", "''") + "'"
+    return ("function Invoke-RestMethod { [CmdletBinding()] param([Parameter(Position=0)][string]$Uri,[string]$OutFile) "
+            "Copy-Item -LiteralPath " + quoted + " -Destination $OutFile -ErrorAction Stop }; ")
+
+
 class QualificationMixin:
     """The qualification cases; each concrete class binds them to one PowerShell interpreter."""
 
@@ -244,9 +264,9 @@ class QualificationMixin:
         env.update(extra)
         return env
 
-    def install(self, case, *, library=None, tunnel='', fake=None, rustup=False, setup_only=False):
+    def install(self, case, *, library=None, tunnel='', fake=None, rustup=False, setup_only=False, installer_path=BOOTSTRAP_PS1):
         arguments = [self.interpreter, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', str(FIXTURE),
-                     '-InstallerPath', str(BOOTSTRAP_PS1), '-Events', str(case.events),
+                     '-InstallerPath', str(installer_path), '-Events', str(case.events),
                      '-StartupRedirect', str(case.startup / 'frayd.bat'), '-Lib', str(library or case.library)]
         if setup_only:
             arguments += ['-SetupOnly']
@@ -384,6 +404,64 @@ class QualificationMixin:
                     self.assertEqual(run.outcome[0], 'threw', run.describe())
                     self.assertIn(f'winget install Gyan.FFmpeg failed (exit {code})', run.outcome[1], run.describe())
 
+    def test_generated_download_failure_never_executes_existing_temp_script(self):
+        with tempfile.TemporaryDirectory(prefix="Frayd stale owner's ") as directory:
+            root = Path(directory)
+            stale = root / 'frayd-install.ps1'
+            marker = root / 'stale-ran'
+            contents = "[IO.File]::WriteAllText((Join-Path $env:TEMP 'stale-ran'), 'executed')\n"
+            stale.write_text(contents, encoding='ascii')
+            env = entry_environment(self.interpreter, directory)
+            base = [self.interpreter, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command']
+            failure = ("$ErrorActionPreference = 'Continue'; function Invoke-RestMethod { [CmdletBinding()] "
+                       "param([Parameter(Position=0)][string]$Uri,[string]$OutFile) "
+                       "Write-Error 'fixture download failure' }; ")
+            # Prove the stale script can execute when a nonterminating error is ignored.
+            unsafe = ("cd $env:TEMP; irm 'https://example.invalid/never-contacted' -OutFile frayd-install.ps1; "
+                      "powershell.exe -NoProfile -ExecutionPolicy Bypass -File '.\\frayd-install.ps1'")
+            control = subprocess.run(base + [failure + unsafe], env=env, cwd=directory,
+                                     capture_output=True, text=True, timeout=30, check=False)
+            self.assertEqual(control.returncode, 0, control.stderr)
+            self.assertTrue(marker.exists(), 'unsafe control must execute the existing harmless script')
+            marker.unlink()
+            blocked = subprocess.run(base + [failure + generated_windows_command()], env=env, cwd=directory,
+                                     capture_output=True, text=True, timeout=30, check=False)
+            self.assertNotEqual(blocked.returncode, 0)
+            self.assertIn('fixture download failure', blocked.stderr)
+            self.assertFalse(marker.exists(), 'failed download must never execute the stale script')
+            self.assertEqual(stale.read_text(), contents)
+            self.assertEqual(list(root.glob('frayd-install-*.ps1')), [], 'owned fresh download must be removed')
+
+    def test_generated_entry_cleans_its_file_after_success_and_child_failure(self):
+        for child_exit in [0, 13]:
+            with self.subTest(child_exit=child_exit), tempfile.TemporaryDirectory(prefix="Frayd entry owner's ") as directory:
+                root = Path(directory)
+                source = root / 'harmless-source.ps1'
+                source.write_text("param([string]$Lib)\nWrite-Output $Lib\nexit " + str(child_exit) + "\n", encoding='ascii')
+                command = copy_download_fixture(source) + generated_windows_command(" -Lib 'Owner''s $Library with spaces'")
+                run = subprocess.run([self.interpreter, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+                    '-Command', command], env=entry_environment(self.interpreter, directory), cwd=directory,
+                    capture_output=True, text=True, timeout=30, check=False)
+                self.assertEqual(run.returncode == 0, child_exit == 0, run.stderr)
+                self.assertIn("Owner's $Library with spaces", run.stdout)
+                if child_exit:
+                    self.assertIn('Frayd installer failed', run.stderr)
+                self.assertEqual(list(root.glob('frayd-install-*.ps1')), [])
+
+    def test_tailscale_optional_lookup_restores_terminating_errors(self):
+        case = self.make_case(tailscale=True)
+        probe = case.root / 'preference-probe.ps1'
+        marker = case.root / 'must-not-continue'
+        quoted = "'" + str(marker).replace("'", "''") + "'"
+        # Append the oracle inside the production script's own preference scope.
+        probe.write_bytes(BOOTSTRAP_PS1.read_bytes() +
+            ("\nWrite-Error 'fixture postlookup failure'\n[IO.File]::WriteAllText(" + quoted + ", 'unexpected')\n").encode('ascii'))
+        run = self.install(case, tunnel='tailscale', fake={'FAKE_TAILSCALE_STDERR': '1'}, installer_path=probe)
+        self.assertEqual(run.returncode, 3, run.describe())
+        self.assertEqual(run.outcome[0], 'threw', run.describe())
+        self.assertIn('fixture postlookup failure', run.outcome[1], run.describe())
+        self.assertFalse(marker.exists(), 'later errors must still terminate after the optional lookup')
+
     def test_tailscale_address_follows_the_lookup_exit_code(self):
         rows = (
             ('address', {'tailscale': True}, {}, "[OK] Your server's Tailscale address: 100.64.0.7"),
@@ -488,8 +566,7 @@ class WindowsPowerShell51(QualificationMixin, unittest.TestCase):
     def test_generated_file_entry_overrides_only_process_restricted_policy(self):
         # No persistent policy writes. A managed policy is a held qualification,
         # rather than permission to override the administrator's policy.
-        env = runtime_environment(PATH=os.pathsep.join([str(Path(self.interpreter).parent),
-                                                      str(Path(os.environ['SystemRoot']) / 'System32')]))
+        env = entry_environment(self.interpreter, str(Path(tempfile.gettempdir())))
         policy = subprocess.run([self.interpreter, '-NoProfile', '-NonInteractive', '-Command',
             "Get-ExecutionPolicy -Scope MachinePolicy; Get-ExecutionPolicy -Scope UserPolicy"],
             env=env, capture_output=True, text=True, timeout=30, check=False)
@@ -497,17 +574,15 @@ class WindowsPowerShell51(QualificationMixin, unittest.TestCase):
         self.assertEqual(policy.stdout.split(), ['Undefined', 'Undefined'],
                          'qualification held: Group Policy governs script execution')
         with tempfile.TemporaryDirectory(prefix="Frayd entry owner's ") as directory:
-            script = Path(directory) / 'frayd-install.ps1'
+            script = Path(directory) / 'harmless-source.ps1'
             script.write_text("param([string]$Lib)\nWrite-Output $Lib\n", encoding='ascii')
             env.update(TEMP=directory, TMP=directory)
             base = [self.interpreter, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Restricted', '-Command']
-            blocked = subprocess.run(base + ["& '.\\frayd-install.ps1' -Lib 'harmless fixture'"],
+            blocked = subprocess.run(base + ["& '.\\harmless-source.ps1' -Lib 'harmless fixture'"],
                                      env=env, cwd=directory, capture_output=True, text=True, timeout=30, check=False)
             self.assertNotEqual(blocked.returncode, 0, 'Restricted control must refuse the file')
             self.assertNotIn('harmless fixture', blocked.stdout)
-            template = re.search(r"; (powershell\.exe [^\n]+)\$\{argStr\}`;", (ROOT / 'client/install/index.html').read_text())
-            self.assertIsNotNone(template, 'generated file entry must be present')
-            command = template.group(1).replace('\\\\', '\\') + " -Lib 'Owner''s $Library with spaces'"
+            command = copy_download_fixture(script) + generated_windows_command(" -Lib 'Owner''s $Library with spaces'")
             allowed = subprocess.run(base + [command], env=env, cwd=directory, capture_output=True, text=True,
                                      timeout=30, check=False)
             self.assertEqual(allowed.returncode, 0, allowed.stderr)

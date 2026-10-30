@@ -46,7 +46,9 @@ jobs:
           "$RUNNER_TEMP/frayd-python-lint/bin/python" -m pip install --disable-pip-version-check --require-hashes --no-deps --only-binary=:all: -r .github/requirements-ci.txt
           "$RUNNER_TEMP/frayd-python-lint/bin/ruff" check --no-cache --select E4,E7,E9,F,B905 scripts tests
       - name: Compose validation
-        run: docker compose config --quiet
+        run: |
+          docker compose config --quiet
+          docker compose -f compose.yaml -f compose.downloads.yaml config --quiet
       - name: Locked Rust tests, Clippy, release build and runtime images
         run: |
           python3 scripts/build-metadata.py -- docker build -t frayd-qa:local .
@@ -88,6 +90,14 @@ jobs:
           python3 scripts/check-build-context.py
           python3 scripts/integration.py
           python3 tests/test_dns_recovery.py
+      - name: Opt-in direct HTTP downloads and same-volume rollback qualification
+        env:
+          FRAYD_EXTERNAL_FIXTURE_URL: https://raw.githubusercontent.com/${{ github.event.pull_request.head.repo.full_name || github.repository }}/${{ github.event.pull_request.head.sha || github.sha }}/tests/fixtures/native-resume.mp4
+        run: |
+          node --check scripts/qualify-download-playback.cjs
+          python3 scripts/qualify-downloads.py
+          python3 scripts/qualify-downloads.py --external-tls --external-url "$FRAYD_EXTERNAL_FIXTURE_URL"
+          python3 scripts/qualify-downloads.py --private-assets
   dependency-audit:
     runs-on: ubuntu-24.04
     timeout-minutes: 5

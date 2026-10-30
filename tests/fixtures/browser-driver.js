@@ -1924,9 +1924,63 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     check(stage.textContent.includes('/env/a') && stage.textContent.includes('/env/b') && !stage.textContent.includes('/db'),
       'Effective environment roots displayed');
     check([...stage.querySelectorAll('.lib-add,.lib-remove')].every(b => b.disabled), 'All locked root controls disabled');
+    const availability = [];
+    for (const enabled of [false, true, undefined]) {
+      settingsValue = { ...baseSettings, ...(enabled === undefined ? {} : { downloads_enabled: enabled }) };
+      await openSettings();
+      const input = stage.querySelector('.s-ingest'), button = stage.querySelector('.p-ingest');
+      check(input.disabled === (enabled === false) && button.disabled === (enabled === false), 'Explicit download capability controls input and action');
+      check(stage.textContent.includes('yt-dlp') && /outbound/i.test(stage.textContent), 'Download setup requirements stay visible');
+      if (enabled === false) check(stage.textContent.includes('Downloads are disabled') && stage.textContent.includes('Configure yt-dlp'), 'Disabled legacy mode explains native installation setup');
+      const before = requests.filter(r => r.url === '/api/ingest').length;
+      responder = async (url, options) => url === '/api/ingest' ? reply(null, 500)
+        : url === '/api/scan/status' ? reply({ ingesting: 'done' }) : defaultResponder(url, options);
+      input.value = 'https://fixture.invalid/video';
+      await button.onclick();
+      equal(requests.filter(r => r.url === '/api/ingest').length - before, enabled === false ? 0 : 1,
+        'Programmatic disabled action sends no POST; true and older servers preserve admission');
+      if (enabled === false) {
+        const label = button.textContent;
+        pollSettings(settingsGeneration, 'ingest', button);
+        await until(() => settingsMonitors.ingest === null, 'Disabled control survives terminal monitoring');
+        check(button.disabled && input.disabled && button.textContent === label, 'Completion never re-enables capability-disabled controls');
+      } else check(button.textContent === 'Download failed' && !button.disabled, 'Enabled and older server failure recovery stays available');
+      availability.push({ metadata: enabled === undefined ? 'absent' : enabled, inputDisabled: input.disabled,
+        buttonDisabled: button.disabled, blockedProgrammaticPost: enabled === false });
+    }
+    const downloadModes = [];
+    for (const mode of [
+      { backend: 'direct', enabled: true }, { backend: 'direct', enabled: false },
+      { backend: 'yt-dlp', enabled: true },
+      { backend: null, enabled: false, error: 'Invalid <img src=x onerror=alert(1)> download backend' },
+    ]) {
+      settingsValue = { ...baseSettings, download_backend: mode.backend, downloads_enabled: mode.enabled,
+        download_config_error: mode.error || null };
+      await openSettings();
+      const input = stage.querySelector('.s-ingest'), button = stage.querySelector('.p-ingest');
+      const row = input.closest('.perm-row');
+      if (mode.backend === 'direct') {
+        equal(input.placeholder, 'Direct MP4 video URL', 'Direct mode names the MP4 publisher contract');
+        check(row.textContent.includes('Direct MP4 video URL only') && !/yt-dlp|YouTube|webpage/i.test(row.textContent),
+          'Direct mode makes no webpage extraction claim');
+        if (!mode.enabled) check(row.textContent.includes('optional Docker downloads setup'), 'Direct disabled setup explains opt-in');
+      } else if (mode.backend === 'yt-dlp') check(/yt-dlp.*outbound.*additional setup/i.test(row.textContent), 'Native mode explains tool and site requirements');
+      else {
+        check(input.disabled && button.disabled && row.textContent.includes('configuration is corrected'), 'Invalid backend fails closed with repair guidance');
+        check(stage.textContent.includes(mode.error) && !stage.querySelector('img'), 'Configuration error is rendered as text, not markup');
+      }
+      const before = requests.filter(r => r.url === '/api/ingest').length;
+      responder = async (url, options) => url === '/api/ingest' ? reply(null, 501) : defaultResponder(url, options);
+      input.value = 'https://fixture.invalid/video.mp4';
+      await button.onclick();
+      equal(requests.filter(r => r.url === '/api/ingest').length - before, mode.enabled ? 1 : 0, 'Mode copy preserves capability admission guard');
+      if (mode.backend === 'direct' && mode.enabled) check(document.getElementById('toast-host').lastElementChild.textContent.includes('enable direct downloads'), 'Direct unavailable response does not require yt-dlp');
+      downloadModes.push({ backend: mode.backend, enabled: mode.enabled, placeholder: input.placeholder,
+        configErrorTextOnly: !!mode.error });
+    }
     settingsValue = baseSettings;
     document.getElementById('settings-close').click();
-    return { payloads: bodies };
+    return { payloads: bodies, downloadAvailability: availability, downloadModes };
   });
   await run('actual settings scan and save controls report bounded modeled failures', async () => {
     const observations = [];

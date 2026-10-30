@@ -1,0 +1,11 @@
+# Explicit opt-in: docker compose -f compose.yaml -f compose.downloads.yaml ...
+services:
+  app:
+    environment:
+      FRAYD_DOWNLOADS_ENABLED: "1"
+      FRAYD_DOWNLOAD_BACKEND: direct
+    networks:
+      - isolated
+      - downloads-egress
+networks:
+  downloads-egress:

@@ -2,7 +2,7 @@
 # Args: [-Lib LIBRARY_PATH] [-Tunnel tailscale|cloudflared]
 param([string]$Lib = "", [string]$Tunnel = "")
 $ErrorActionPreference = "Stop"
-# Stop does not apply to native commands; check their exit codes explicitly.
+# Native exit codes need explicit checks; optional PS5.1 stderr handling is scoped below.
 function Assert-NativeSuccess([string]$Step) { if ($LASTEXITCODE -ne 0) { throw "$Step failed (exit $LASTEXITCODE)" } }
 # winget exits nonzero when the package is already installed (0x8A150061) or has no newer version (0x8A15002B).
 function Assert-WingetSuccess([string]$Step) { if ($LASTEXITCODE -notin 0, -1978335135, -1978335189) { throw "$Step failed (exit $LASTEXITCODE)" } }
@@ -65,8 +65,21 @@ if ($Tunnel -eq "tailscale") {
   }
   Write-Host "[*] Launching Tailscale - log in in the window that opens."
   Start-Process "tailscale" "up" -ErrorAction SilentlyContinue
-  $address = if (Get-Command tailscale -ErrorAction SilentlyContinue) { tailscale ip -4 2>$null }
-  if ($LASTEXITCODE -eq 0 -and $address) { Write-Host "[OK] Your server's Tailscale address: $address  (or run: tailscale ip -4)" }
+  $address = $null
+  $addressExitCode = 1
+  if (Get-Command tailscale -ErrorAction SilentlyContinue) {
+    # Windows PowerShell 5.1 turns redirected native stderr into error records.
+    # This optional lookup may report "not logged in"; keep Stop for later steps.
+    $previousErrorAction = $ErrorActionPreference
+    try {
+      $ErrorActionPreference = 'Continue'
+      $address = tailscale ip -4 2>$null
+      $addressExitCode = $LASTEXITCODE
+    } finally {
+      $ErrorActionPreference = $previousErrorAction
+    }
+  }
+  if ($addressExitCode -eq 0 -and $address) { Write-Host "[OK] Your server's Tailscale address: $address  (or run: tailscale ip -4)" }
   else { Write-Host "[!] No Tailscale address yet - log in, then run: tailscale ip -4" }
   Write-Host "     Install Tailscale on your phone/laptop, same account, then open that address:8484"
 } elseif ($Tunnel -eq "cloudflared") {

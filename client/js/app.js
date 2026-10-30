@@ -197,7 +197,8 @@ function pollSettings(generation, mode, button) {
   const monitor = settingsMonitors[mode] = {};
   const ownsAccount = accountGuard();
   const current = () => settingsMonitors[mode] === monitor && ownsAccount();
-  const panelCurrent = () => generation === settingsGeneration;
+  const panelCurrent = () => generation === settingsGeneration
+    && (mode !== 'ingest' || button.dataset?.downloadsEnabled !== 'false');
   let pending = false;
   let failures = 0;
   monitor.timer = setInterval(async () => {
@@ -355,6 +356,22 @@ async function openSettings() {
     if (!current()) return;
     const libs = settingsRoots(settings);
     const locked = !!settings.library_locked;
+    const downloadBackend = settings.download_backend === undefined ? 'yt-dlp' : settings.download_backend;
+    const downloadConfigError = typeof settings.download_config_error === 'string' && settings.download_config_error.trim()
+      ? settings.download_config_error : null;
+    const downloadConfigured = ['direct', 'yt-dlp'].includes(downloadBackend) && !downloadConfigError;
+    const downloadsEnabled = settings.downloads_enabled !== false && downloadConfigured;
+    const directDownloads = downloadBackend === 'direct';
+    const downloadPlaceholder = !downloadConfigured ? 'Download URL (configuration required)'
+      : directDownloads ? 'Direct MP4 video URL' : 'video URL (yt-dlp supported)';
+    let downloadHint;
+    if (!downloadConfigured) downloadHint = 'Downloads are unavailable until the download backend configuration is corrected.';
+    else if (directDownloads) downloadHint = downloadsEnabled
+      ? 'Direct MP4 video URL only. Requires outbound network access.'
+      : 'Downloads are disabled. Enable the optional Docker downloads setup with outbound network access. Direct MP4 video URL only.';
+    else downloadHint = downloadsEnabled
+      ? 'Requires yt-dlp and outbound network access; some sites need additional setup.'
+      : 'Downloads are disabled. Configure yt-dlp and enable downloads for this installation. Outbound network access is required; some sites need additional setup.';
     const kindBoxes = (p) => KINDS.map(k => `
       <label class="p-kind"><input type="checkbox" value="${k}" ${!p.allowed_kinds || p.allowed_kinds.includes(k) ? 'checked' : ''}>${k}</label>`).join('');
     stage.innerHTML = '<div class="party-sec">Users — untick kinds to hide that section from them</div>'
@@ -367,7 +384,9 @@ async function openSettings() {
         <button class="p-remove" data-name="${esc(p.key)}" title="Remove user, their progress and highlights">Remove</button>
       </div>`).join('') : '<div class="party-sec">No accounts yet</div>')
       + `<div class="party-sec">Media folders${locked ? ' — locked by FRAYD_LIBRARY' : ''}</div>`
-      + (settings.library_config_error ? `<div class="party-error">${esc(settings.library_config_error)}. Add a valid folder to replace the held configuration.</div>` : '')
+      + (settings.library_config_error ? `<div class="party-error">${esc(settings.library_config_error)}. ${libs.length
+        ? 'Remove invalid listed entries, then add a valid folder.'
+        : 'Add a valid folder to replace the held configuration.'}</div>` : '')
       + (libs.length ? libs.map(l => `
       <div class="perm-row"><span class="k">${esc(l)}</span>`
         + `<button class="lib-remove" ${locked ? 'disabled' : ''} data-path="${esc(l)}">Remove</button></div>`).join('')
@@ -387,7 +406,8 @@ async function openSettings() {
       + `<div class="perm-row"><span class="k">Domain</span><input class="s-domain" value="${esc(settings.domain ?? '')}" placeholder="media.example.com" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px;flex:1"><span class="s">A record → your IP; use a real cert (e.g. Let's Encrypt) for this</span></div>`
       + `<div class="party-sec">Library</div>`
       + `<div class="perm-row"><button class="p-scan">Scan all folders</button></div>`
-      + `<div class="perm-row"><span class="k">Add from URL</span><input class="s-ingest" placeholder="video URL (yt-dlp supported)" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px;flex:1"><button class="p-ingest">Download</button><span class="s">needs yt-dlp installed</span></div>`
+      + (downloadConfigError ? `<div class="party-error">${esc(downloadConfigError)}</div>` : '')
+      + `<div class="perm-row"><span class="k">Add from URL</span><input class="s-ingest" ${downloadsEnabled ? '' : 'disabled'} placeholder="${esc(downloadPlaceholder)}" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px;flex:1"><button class="p-ingest" ${downloadsEnabled ? '' : 'disabled'}>Download</button><span class="s">${downloadHint}</span></div>`
       + `<div class="perm-row" style="border:none"><span class="s">Suggested layout (any subset):</span></div>`
       + `<div class="perm-row" style="border:none"><pre class="s" style="color:#8A8F9E;font-size:12px;margin:0;line-height:1.5">Media/\n  Movies/    *.mp4 *.mkv\n  Shows/     S01E01 files\n  Music/     *.mp3 *.flac\n  Audiobooks/ *.m4b *.mp3\n  Ebooks/    *.epub\n  Comics/    *.cbz *.cbr\n  Manga/     folder of images under a *manga* dir</pre></div>`
       + `<button id="s-net-save" style="margin-top:10px;width:100%;background:#5B46F6;color:#fff;border:none;border-radius:8px;padding:10px;cursor:pointer">Save network settings</button>`
@@ -480,8 +500,12 @@ async function openSettings() {
       } catch { if (current()) toast('Remove failed — server unreachable', true); }
     });
     const ingestBtn = stage.querySelector('.p-ingest');
+    const ingestInput = stage.querySelector('.s-ingest');
+    ingestBtn.dataset.downloadsEnabled = String(downloadsEnabled);
+    ingestBtn.disabled = ingestInput.disabled = !downloadsEnabled;
     ingestBtn.onclick = async () => {
-      const url = stage.querySelector('.s-ingest').value.trim();
+      if (!current() || !downloadsEnabled) return;
+      const url = ingestInput.value.trim();
       if (!/^https?:\/\//.test(url)) { ingestBtn.textContent = 'Invalid URL'; return; }
       ingestBtn.disabled = true;
       const ownsAccount = accountGuard();
@@ -491,7 +515,8 @@ async function openSettings() {
         });
         if (!ownsAccount()) return;
         if (response.status !== 202) throw new Error(response.status === 409 ? 'Download already active'
-          : response.status === 501 ? 'Download unavailable: configure a folder and yt-dlp' : `Download failed (${response.status})`);
+          : response.status === 501 ? (directDownloads ? 'Download unavailable: configure a folder and enable direct downloads'
+            : 'Download unavailable: configure a folder and yt-dlp') : `Download failed (${response.status})`);
         if (current()) ingestBtn.textContent = 'Downloading…';
         pollSettings(generation, 'ingest', ingestBtn);
       } catch (error) {

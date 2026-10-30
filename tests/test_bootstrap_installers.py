@@ -119,6 +119,12 @@ class BootstrapShell(unittest.TestCase):
         self.assertIn(f'FRAYD_LIBRARY={self.library}\n', self.env_file(run))
         self.assertTrue(self.library.is_dir())
 
+    def test_brew_requests_only_required_available_tools(self):
+        run = self.run_bootstrap(str(self.library), managers=('brew',), tools=('cargo', 'launchctl'))
+        self.assert_installed(run, self.library)
+        self.assertIn('brew install -q git ffmpeg', run.calls)
+        self.assertFalse(any('unrar' in call or 'unar' in call for call in run.calls))
+
     def test_brew_failure_stops_before_clone_build_and_autostart(self):
         run = self.run_bootstrap(str(self.library), managers=('brew',), tools=('cargo', 'launchctl'),
                                  environment={'SHIM_BREW_EXIT': '1'})

@@ -282,8 +282,16 @@ pub enum ScanError {
     RootUnavailable,
     /// A cache directory overlaps a root, cannot be resolved, or cannot be created.
     CacheBoundaryUnavailable,
-    /// Legacy paths are ambiguous, changed concurrently, or have active artifact ownership.
+    /// Persisted source paths collide or an ambiguous lexical path cannot be resolved.
     IdentityConflict,
+    /// A converter currently holds identity admission.
+    IdentityBusy,
+    /// Source identity changed after the filesystem snapshot.
+    IdentityChanged,
+    /// An alias still has unfinished artifact ownership.
+    IdentityPending,
+    /// Identity preflight could not read or commit the database.
+    DatabaseUnavailable,
 }
 
 impl ScanError {
@@ -293,8 +301,28 @@ impl ScanError {
             ScanError::RootUnavailable => "Library root unavailable",
             ScanError::CacheBoundaryUnavailable => "Cache boundary unavailable",
             ScanError::IdentityConflict => "Library source identity requires repair",
+            ScanError::IdentityBusy => "Library source identity busy; retry scan",
+            ScanError::IdentityChanged => "Library source identity changed; retry scan",
+            ScanError::IdentityPending => "Library source artifacts unfinished; recovery or repair required",
+            ScanError::DatabaseUnavailable => "Scan database unavailable",
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ALIAS_SNAPSHOT_HOOK: std::cell::Cell<Option<fn(&Connection)>> = const {std::cell::Cell::new(None)};
+    static ALIAS_PREFLIGHT_COUNTS: std::cell::Cell<(usize,usize)> = const {std::cell::Cell::new((0,0))};
+}
+
+/// Scan the complete request while retaining standalone callers' admission checks.
+pub fn scan_roots(db:&Connection,db_path:String,roots:&[std::path::PathBuf],thumbs_dir:Option<&Path>) -> Result<usize,ScanError> {
+    if roots.is_empty() {return Ok(0);}
+    if let [root]=roots {return scan_with_roots(db,db_path,root.clone(),thumbs_dir,roots);}
+    preflight_scan(db,&db_path,thumbs_dir,roots,&roots[0])?;
+    let mut count=0;
+    for root in roots {count+=scan_preflighted_root(db,db_path.clone(),root.clone(),thumbs_dir,roots)?;}
+    Ok(count)
 }
 
 /// Resolve each persisted source once before recovery can mutate ownership or historical rows.
@@ -303,10 +331,12 @@ fn migrate_source_aliases(db:&Connection,roots:&[std::path::PathBuf]) -> Result<
     let read=|db:&Connection| -> rusqlite::Result<Vec<(i64,String)>> {
         db.prepare("SELECT id,path FROM media ORDER BY id")?.query_map([],|r|Ok((r.get(0)?,r.get(1)?)))?.collect()
     };
-    let rows=read(db).map_err(|_|ScanError::IdentityConflict)?;
+    #[cfg(test)] ALIAS_PREFLIGHT_COUNTS.with(|counts| {let (passes,rows)=counts.get();counts.set((passes+1,rows));});
+    let rows=read(db).map_err(|_|ScanError::DatabaseUnavailable)?;
     let mut equivalents=std::collections::HashMap::new();
     let mut changes=Vec::new();
     for (id,raw) in &rows {
+        #[cfg(test)] ALIAS_PREFLIGHT_COUNTS.with(|counts| {let (passes,rows)=counts.get();counts.set((passes,rows+1));});
         let path=Path::new(raw);
         let canonical=match path.canonicalize() {
             Ok(path)=>path,
@@ -321,25 +351,27 @@ fn migrate_source_aliases(db:&Connection,roots:&[std::path::PathBuf]) -> Result<
     if changes.is_empty() {return Ok(());}
     // Share converter admission while changing registry identity; no active worker may retain the old path.
     if crate::transcode::BUSY.compare_exchange(false,true,std::sync::atomic::Ordering::SeqCst,std::sync::atomic::Ordering::SeqCst).is_err() {
-        return Err(ScanError::IdentityConflict);
+        return Err(ScanError::IdentityBusy);
     }
     struct Admission;
     impl Drop for Admission {fn drop(&mut self){crate::transcode::BUSY.store(false,std::sync::atomic::Ordering::SeqCst);}}
     let _admission=Admission;
+    #[cfg(test)] ALIAS_SNAPSHOT_HOOK.with(|hook| {if let Some(action)=hook.take() {action(db);}});
+    let mut hold=ScanError::DatabaseUnavailable;
     immediate(db,|tx| {
-        if read(tx)?!=rows {return Err(rusqlite::Error::InvalidQuery);}
+        if read(tx)?!=rows {hold=ScanError::IdentityChanged;return Err(rusqlite::Error::InvalidQuery);}
         for (id,old,new) in &changes {
             let unfinished:i64=tx.query_row("SELECT COUNT(*) FROM transcode_artifacts WHERE owner_media_id=?1
                 AND lifecycle IN ('pending','retiring')",[id],|r|r.get(0))?;
-            if unfinished!=0 {return Err(rusqlite::Error::InvalidQuery);}
+            if unfinished!=0 {hold=ScanError::IdentityPending;return Err(rusqlite::Error::InvalidQuery);}
             if tx.execute("UPDATE media SET path=?1 WHERE id=?2 AND path=?3",rusqlite::params![new,id,old])?!=1 {
-                return Err(rusqlite::Error::InvalidQuery);
+                hold=ScanError::IdentityChanged;return Err(rusqlite::Error::InvalidQuery);
             }
             tx.execute("UPDATE transcode_artifacts SET owner_source_path=?1 WHERE owner_media_id=?2 AND owner_source_path=?3",
                 rusqlite::params![new,id,old])?;
         }
         Ok(())
-    }).map_err(|_|ScanError::IdentityConflict)
+    }).map_err(|_|hold)
 }
 
 /// Incrementally scan one root against the complete admitted root snapshot; returns new/updated items.
@@ -348,24 +380,42 @@ fn migrate_source_aliases(db:&Connection,roots:&[std::path::PathBuf]) -> Result<
 /// authority to delete it.
 pub fn scan_with_roots(db: &Connection, db_path: String, root: std::path::PathBuf, thumbs_dir: Option<&Path>,
     roots: &[std::path::PathBuf]) -> Result<usize, ScanError> {
+    preflight_scan(db,&db_path,thumbs_dir,roots,&root)?;
+    scan_preflighted_root(db,db_path,root,thumbs_dir,roots)
+}
+
+/// Validate all boundaries and resolve legacy identities before the first recovery or indexing write.
+fn preflight_scan(db:&Connection,db_path:&str,thumbs_dir:Option<&Path>,roots:&[std::path::PathBuf],source_root:&Path) -> Result<(),ScanError> {
+    validate_scan_boundaries(db_path,thumbs_dir,roots,source_root)?;
+    migrate_source_aliases(db,roots)
+}
+
+/// Recheck mutable filesystem boundaries at each root without repeating media identity resolution.
+fn validate_scan_boundaries(db_path:&str,thumbs_dir:Option<&Path>,roots:&[std::path::PathBuf],source_root:&Path) -> Result<(),ScanError> {
     if let Some(root)=roots.iter().find(|r| !r.is_dir()) {
         tracing::warn!(operation="walk",path=%root.display(),"library scan traversal failed: configured root unavailable");
         return Err(ScanError::RootUnavailable);
     }
-    let cache=crate::transcodes_dir_for(&db_path);
+    let cache=crate::transcodes_dir_for(db_path);
     if crate::transcode::validate_cache(&cache,roots).is_none() {
-        tracing::warn!(operation="validate_cache",cache_kind="transcode",path=%cache.display(),source_root=%root.display(),
+        tracing::warn!(operation="validate_cache",cache_kind="transcode",path=%cache.display(),source_root=%source_root.display(),
             reason="unresolvable cache/root or overlap with configured roots","library scan held");
         return Err(ScanError::CacheBoundaryUnavailable);
     }
     if let Some(t)=thumbs_dir {
         if crate::transcode::validate_cache(t,roots).is_none() {
-            tracing::warn!(operation="validate_cache",cache_kind="thumbnail",path=%t.display(),source_root=%root.display(),
+            tracing::warn!(operation="validate_cache",cache_kind="thumbnail",path=%t.display(),source_root=%source_root.display(),
                 reason="unresolvable cache/root or overlap with configured roots","library scan held");
             return Err(ScanError::CacheBoundaryUnavailable);
         }
     }
-    migrate_source_aliases(db,roots)?;
+    Ok(())
+}
+
+/// Only complete-request and standalone entry points may call this after preflight succeeds.
+fn scan_preflighted_root(db:&Connection,db_path:String,root:std::path::PathBuf,thumbs_dir:Option<&Path>,
+    roots:&[std::path::PathBuf]) -> Result<usize,ScanError> {
+    validate_scan_boundaries(&db_path,thumbs_dir,roots,&root)?;
     if let Some(t)=thumbs_dir {
         if let Err(error)=std::fs::create_dir_all(t) {
             tracing::warn!(operation="create_dir_all",cache_kind="thumbnail",path=%t.display(),source_root=%root.display(),
@@ -2514,6 +2564,35 @@ exit "$probe_status"
 mod final_alias_regressions {
     use super::*;
     #[test]
+    fn complete_request_preflights_identity_once_before_any_root_write() {
+        let root=std::env::temp_dir().join(format!("frayd-preflight-{}",uuid::Uuid::new_v4()));
+        let roots=vec![root.join("a"),root.join("b"),root.join("c")];
+        for path in &roots {std::fs::create_dir_all(path).unwrap();}
+        let db_path=root.join("db.sqlite");let db=crate::store::open(db_path.to_str().unwrap());
+        for id in 1..=4 {db.execute("INSERT INTO media(id,kind,path,title) VALUES(?1,'music',?2,'missing')",
+            rusqlite::params![id,root.join(format!("missing-{id}.mp3")).to_string_lossy()]).unwrap();}
+        ALIAS_PREFLIGHT_COUNTS.with(|counts|counts.set((0,0)));
+        assert_eq!(scan_roots(&db,db_path.to_string_lossy().into_owned(),&roots,None),Ok(0));
+        assert_eq!(ALIAS_PREFLIGHT_COUNTS.with(|counts|counts.get()),(1,4),"one complete request must resolve each stored row once, independent of root count");
+        std::fs::write(roots[0].join("new.mp3"),b"new").unwrap();
+        db.execute("INSERT INTO media(id,kind,path,title) VALUES(9,'music','unresolved/../alias.mp3','held')",[]).unwrap();
+        let before:i64=db.query_row("SELECT total_changes()",[],|row|row.get(0)).unwrap();
+        assert_eq!(scan_roots(&db,db_path.to_string_lossy().into_owned(),&roots,None),Err(ScanError::IdentityConflict));
+        assert_eq!(db.query_row("SELECT total_changes()",[],|row|row.get::<_,i64>(0)).unwrap(),before);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM media",[],|row|row.get::<_,i64>(0)).unwrap(),5);
+        db.execute("DELETE FROM media WHERE id=9",[]).unwrap();
+        let source=roots[1].join("song.mp3");let alias=roots[2].join("alias.mp3");
+        std::fs::write(&source,b"kept").unwrap();std::os::unix::fs::symlink(&source,&alias).unwrap();
+        for (id,path) in [(10,&source),(11,&alias)] {db.execute("INSERT INTO media(id,kind,path,title) VALUES(?1,'music',?2,'collision')",rusqlite::params![id,path.to_string_lossy()]).unwrap();}
+        db.execute_batch("INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture'); INSERT INTO progress(identity_id,media_id,position) VALUES(1,10,42),(1,11,17);").unwrap();
+        let before:i64=db.query_row("SELECT total_changes()",[],|row|row.get(0)).unwrap();
+        assert_eq!(scan_roots(&db,db_path.to_string_lossy().into_owned(),&roots,None),Err(ScanError::IdentityConflict));
+        assert_eq!(db.query_row("SELECT total_changes()",[],|row|row.get::<_,i64>(0)).unwrap(),before,"collision in later roots must hold even indexing the first root");
+        for (id,position) in [(10,42.0),(11,17.0)] {assert_eq!(db.query_row("SELECT position FROM progress WHERE media_id=?1",[id],|row|row.get::<_,f64>(0)).unwrap(),position);}
+        assert_eq!(std::fs::read(&source).unwrap(),b"kept");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn final_thumbnail_changed_reference_snapshot_holds_cleanup() {
         let root=std::env::temp_dir().join(format!("frayd-retire-snapshot-{}",uuid::Uuid::new_v4()));
         let thumbs=root.join("thumbs");let library=root.join("library");std::fs::create_dir_all(&thumbs).unwrap();std::fs::create_dir(&library).unwrap();
@@ -2544,12 +2623,20 @@ mod final_alias_regressions {
         let artifact=root.join("artifact.mp4");std::fs::write(&artifact,b"artifact").unwrap();
         db.execute("INSERT INTO transcode_artifacts(path,owner_media_id,owner_source_path,role,provenance,lifecycle)
             VALUES(?1,41,?2,'final','generated','pending')",rusqlite::params![artifact.to_string_lossy(),alias.to_string_lossy()]).unwrap();
-        assert_eq!(scan_with_roots(&db,db_path.to_string_lossy().into_owned(),library.clone(),None,std::slice::from_ref(&library)),Err(ScanError::IdentityConflict));
+        assert_eq!(scan_with_roots(&db,db_path.to_string_lossy().into_owned(),library.clone(),None,std::slice::from_ref(&library)),Err(ScanError::IdentityPending));
         assert_eq!(db.query_row("SELECT path FROM media WHERE id=41",[],|r|r.get::<_,String>(0)).unwrap(),alias.to_string_lossy());
         db.execute("UPDATE transcode_artifacts SET lifecycle='completed'",[]).unwrap();
         crate::transcode::BUSY.store(true,std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(scan_with_roots(&db,db_path.to_string_lossy().into_owned(),library.clone(),None,std::slice::from_ref(&library)),Err(ScanError::IdentityConflict));
+        assert_eq!(scan_with_roots(&db,db_path.to_string_lossy().into_owned(),library.clone(),None,std::slice::from_ref(&library)),Err(ScanError::IdentityBusy));
         crate::transcode::BUSY.store(false,std::sync::atomic::Ordering::SeqCst);
+        ALIAS_SNAPSHOT_HOOK.with(|hook|hook.set(Some(|db| {db.execute("INSERT INTO media(id,kind,path,title) VALUES(99,'music','/historical-missing-snapshot.mp3','changed')",[]).unwrap();})));
+        assert_eq!(scan_with_roots(&db,db_path.to_string_lossy().into_owned(),library.clone(),None,std::slice::from_ref(&library)),Err(ScanError::IdentityChanged));
+        assert_eq!(db.query_row("SELECT path FROM media WHERE id=41",[],|r|r.get::<_,String>(0)).unwrap(),alias.to_string_lossy());
+        assert_eq!(db.query_row("SELECT position FROM progress WHERE media_id=41",[],|r|r.get::<_,f64>(0)).unwrap(),42.0);
+        assert_eq!(db.query_row("SELECT owner_source_path FROM transcode_artifacts WHERE owner_media_id=41",[],|r|r.get::<_,String>(0)).unwrap(),alias.to_string_lossy());
+        db.execute("DELETE FROM media WHERE id=99",[]).unwrap();
+        assert_ne!(ScanError::IdentityBusy.reason(),ScanError::IdentityConflict.reason());
+        assert_ne!(ScanError::IdentityChanged.reason(),ScanError::IdentityConflict.reason());
         for _ in 0..2 { assert!(scan_with_roots(&db,db_path.to_string_lossy().into_owned(),library.clone(),None,std::slice::from_ref(&library)).is_ok()); }
         assert_eq!(db.query_row("SELECT owner_source_path FROM transcode_artifacts WHERE owner_media_id=41",[],|r|r.get::<_,String>(0)).unwrap(),canonical.to_string_lossy());
         assert_eq!(db.query_row("SELECT title,author,json_extract(meta_json,'$.custom') FROM media WHERE id=41",[],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).unwrap(),("kept".into(),"kept-author".into(),"kept".into()));

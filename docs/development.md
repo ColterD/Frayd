@@ -98,6 +98,22 @@ The Docker context is an exact allowlist in `.dockerignore`: the Dockerfiles, `n
 
 These scenarios are automated HTTP and storage checks. They do not cover browser playback, every media format, watch-party behavior, backup restoration, upgrades or public-hosting security. Client tests that run in a VM use synthetic browser and network boundaries, so real browser sandbox behavior needs a real browser.
 
+### Docker download checks
+
+CI is configured to require three separate modes after building the QA images above. Use an existing Chrome or Chromium browser; set `BROWSER_BIN` when it is not on `PATH`. Set `FRAYD_EXTERNAL_FIXTURE_URL` to the public raw GitHub URL of `tests/fixtures/native-resume.mp4` at a full commit matching the checkout. CI derives the URL from the event's head repository and revision and passes it as a quoted environment argument.
+
+```sh
+python3 scripts/qualify-downloads.py
+python3 scripts/qualify-downloads.py --external-tls --external-url "$FRAYD_EXTERNAL_FIXTURE_URL"
+python3 scripts/qualify-downloads.py --private-assets
+```
+
+- The controlled mode uses an owned nginx HTTP origin for actual MP4 download, indexing, streaming, FFmpeg decode and muted browser playback. It covers authentication and read-only settings, invalid/HTML/non-MP4/audio-only responses, failed requests, collisions, and rollback on the same image and volume. Disabled, missing-native-tool and unknown-backend controls check refusal without job or library effects. A healthy egress-only fixture is reachable from the proxy and refused by the default app.
+- The external mode submits one Rust HTTPS ingestion request, waits for indexing and byte-compares its stream with the checkout's exact Git fixture. It bounds the local blob to 1 MiB and the stream read to the expected size plus one byte. It supplies no external credentials and never retries the ingestion POST. Success qualifies that endpoint, not general site compatibility.
+- The private-assets mode builds only a tiny layer from the prebuilt app image, with public source directories at 0700 and files at 0600. It reuses the production normalization step and checks all eight HTTP responses against source bytes, root ownership, runtime directories at 0755 and files at 0644. It rebuilds no Rust code and removes its owned image aliases afterward.
+
+Keep each mode's exit status, image/source identities, platform and cleanup result. Configured CI checks are not passing receipts, and passing one mode does not satisfy the others. The qualifiers use disposable projects; rollback keeps the volume, while final fixture cleanup removes only those projects' resources. These checks do not authorize deployment. See [opt-in operation and rollback](operations.md#opt-in-docker-downloads) for the operator commands.
+
 ## Dependency audit policy
 
 The audit queries OSV for the exact versions in `server/Cargo.lock`, prints findings and exits nonzero on applicable advisories. A network or API failure, or incomplete pagination, also fails it.

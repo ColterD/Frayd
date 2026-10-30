@@ -30,11 +30,13 @@ RUN timeout --kill-after=10s 180s apt-get $APT_TRANSPORT -o APT::Update::Error-M
     && mkdir -p /data/library /data/thumbs /data/transcodes && chown -R frayd:frayd /data
 COPY --from=build /app/server/target/release/frayd-server /usr/local/bin/frayd-server
 COPY client/ /app/client/
-# ServeDir embeds /app/server/../client at compile time; the intermediate directory must exist.
-RUN mkdir -p /app/server
+# ServeDir needs the intermediate directory. Public root-owned assets must also work from a private checkout.
+RUN mkdir -p /app/server \
+    && find /app/client -type d -exec chmod 0755 {} + \
+    && find /app/client -type f -exec chmod 0644 {} +
 USER 10001:10001
 WORKDIR /data
-ENV FRAYD_DB=/data/frayd.sqlite FRAYD_LIBRARY=/data/library FRAYD_THUMBS=/data/thumbs FRAYD_TRANSCODES=/data/transcodes FRAYD_PORT=8484 FRAYD_UPNP=0
+ENV FRAYD_DB=/data/frayd.sqlite FRAYD_LIBRARY=/data/library FRAYD_THUMBS=/data/thumbs FRAYD_TRANSCODES=/data/transcodes FRAYD_PORT=8484 FRAYD_UPNP=0 FRAYD_DOWNLOADS_ENABLED=0 FRAYD_DOWNLOAD_BACKEND=direct
 EXPOSE 8484
 HEALTHCHECK --interval=15s --timeout=5s --start-period=15s --retries=3 CMD curl --fail --silent http://127.0.0.1:8484/ > /dev/null && curl --fail --silent http://127.0.0.1:8484/api/health > /dev/null || exit 1
 ENTRYPOINT ["frayd-server"]

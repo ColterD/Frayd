@@ -93,13 +93,15 @@ test('new retry aborts prior request and ignores its later response',async()=>{
   assert.equal(b.requests.length,3);assert.equal(b.nodes.get('#s-stat').textContent,text);assert.equal(b.timers.size,0);
 });
 
+const expectedWindowsCommand=(base,args='')=>`& { $ErrorActionPreference = 'Stop'; $fraydInstall = Join-Path $env:TEMP ('frayd-install-' + [guid]::NewGuid().ToString() + '.ps1'); ([IO.File]::Open($fraydInstall, [IO.FileMode]::CreateNew)).Dispose(); try { irm "${base}/bootstrap.ps1" -OutFile $fraydInstall -ErrorAction Stop; powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$fraydInstall"${args}; if ($LASTEXITCODE -ne 0) { throw 'Frayd installer failed' } } finally { Remove-Item -LiteralPath $fraydInstall -Force -ErrorAction Stop } }`;
+
 test('download command links remain available for Linux, macOS and Windows',()=>{
   const b=installer();
   const shellCommand = 'curl -fsSL "https://raw.githubusercontent.com/kattiest/Frayd/main/client/install/bootstrap.sh" -o frayd-install.sh && bash frayd-install.sh';
   const commands = {
     linux: shellCommand,
     mac: shellCommand,
-    win: `cd $env:TEMP; irm "https://raw.githubusercontent.com/kattiest/Frayd/main/client/install/bootstrap.ps1" -OutFile frayd-install.ps1; powershell.exe -NoProfile -ExecutionPolicy Bypass -File '.\\frayd-install.ps1'`,
+    win: expectedWindowsCommand('https://raw.githubusercontent.com/kattiest/Frayd/main/client/install'),
   };
   for(const os of ['linux','mac','win']){
     b.run(`os=${JSON.stringify(os)};gen()`);
@@ -123,7 +125,7 @@ test('configured commands pass quoted library and tunnel arguments for each plat
     for(const os of ['linux','mac','win']){
       b.run(`os=${JSON.stringify(os)};gen()`);
       const expected=os==='win'
-        ? `cd $env:TEMP; irm "${base}/bootstrap.ps1" -OutFile frayd-install.ps1; powershell.exe -NoProfile -ExecutionPolicy Bypass -File '.\\frayd-install.ps1' -Lib ${fixture.windowsLib} -Tunnel ${fixture.windowsTunnel}`
+        ? expectedWindowsCommand(base, ` -Lib ${fixture.windowsLib} -Tunnel ${fixture.windowsTunnel}`)
         : `curl -fsSL "${base}/bootstrap.sh" -o frayd-install.sh && bash frayd-install.sh --tunnel ${fixture.posixTunnel} -- ${fixture.posixLib}`;
       assert.equal(b.nodes.get('#cmd').textContent,expected);
     }

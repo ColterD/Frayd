@@ -159,7 +159,7 @@ test('admin delete survives card markup and stops click and key bubbling', async
 test('settings render locks root controls, sends scoped permissions and cancels user deletion', async () => {
   const b=browser();
   const controls=new Map();
-  const control=selector=>{if(!controls.has(selector)) controls.set(selector,{value:'',textContent:'',addEventListener(){}});return controls.get(selector);};
+  const control=selector=>{if(!controls.has(selector)) controls.set(selector,{value:'',textContent:'',dataset:{},addEventListener(){}});return controls.get(selector);};
   let permissionRow;
   const save={closest:()=>permissionRow};
   const remove={dataset:{name:'User'},closest:()=>({dataset:{id:'3'}})};
@@ -817,11 +817,167 @@ for (const selector of ['#s-site-save', '#s-net-save']) {
   });
 }
 
-test('held library configuration renders escaped repair guidance without preventing settings', async () => {
-  const b = browser();
-  const { stage } = passwordPanel(b);
-  b.respond(async url => reply(url.endsWith('/perms') ? [] : {library_paths:[],library_config_error:'Invalid <legacy> configuration'}));
-  await b.run('openSettings()');
-  assert.match(stage.innerHTML, /Invalid &lt;legacy&gt; configuration/);
-  assert.match(stage.innerHTML, /Add a valid folder/);
-});
+for (const listed of [false, true]) {
+  test(`held library configuration repair guidance handles ${listed ? 'listed invalid entries' : 'empty normalized roots'} and escapes markup`, async () => {
+    const b = browser();
+    const { stage } = passwordPanel(b);
+    b.respond(async url => reply(url.endsWith('/perms') ? [] : {
+      library_paths: listed ? ['~/invalid<folder>'] : [],
+      library_config_error: 'Invalid <img src=x onerror=alert(1)> configuration',
+    }));
+    await b.run('openSettings()');
+    assert.match(stage.innerHTML, /Invalid &lt;img src=x onerror=alert\(1\)&gt; configuration/);
+    assert.doesNotMatch(stage.innerHTML, /<img|<folder>/);
+    if (listed) {
+      assert.match(stage.innerHTML, /Remove invalid listed entries, then add a valid folder/);
+      assert.match(stage.innerHTML, /class="lib-remove"/);
+      assert.match(stage.innerHTML, /~\/invalid&lt;folder&gt;/);
+      assert.doesNotMatch(stage.innerHTML, /Add a valid folder to replace the held configuration/);
+    } else {
+      assert.match(stage.innerHTML, /Add a valid folder to replace the held configuration/);
+      assert.doesNotMatch(stage.innerHTML, /Remove invalid listed entries/);
+    }
+    assert.match(stage.innerHTML, /class="lib-add" >Add \+ scan/);
+    assert.equal(b.requests.some(request => request.options?.method === 'POST'), false);
+  });
+}
+
+
+for (const enabled of [false, true, undefined]) {
+  test(`URL download availability ${String(enabled)} controls input action and admission`, async () => {
+    const b = browser();
+    const { stage, control } = passwordPanel(b);
+    b.respond(async url => reply(url.startsWith('/api/library') || url.endsWith('/perms') ? [] : {
+      library_paths:[], ...(enabled === undefined ? {} : {downloads_enabled:enabled}),
+    }));
+    await b.run('openSettings()');
+    const input = control('.s-ingest');
+    const button = control('.p-ingest');
+    assert.equal(!!input.disabled, enabled === false);
+    assert.equal(!!button.disabled, enabled === false);
+    assert.match(stage.innerHTML, /yt-dlp/i);
+    if (enabled === false) assert.match(stage.innerHTML, /Downloads are disabled.*yt-dlp.*outbound/i);
+    input.value = 'https://fixture.invalid/video';
+    b.respond(async url => url === '/api/ingest' ? {status:202} : reply(url === '/api/scan/status' ? {ingesting:'done'} : []));
+    await button.onclick();
+    assert.equal(b.requests.filter(request=>request.url==='/api/ingest').length, enabled === false ? 0 : 1);
+    assert.equal(b.intervals.size, enabled === false ? 0 : 1);
+    if (enabled !== false) {
+      await [...b.intervals.values()][0]();
+      assert.equal(button.disabled, false);
+      assert.equal(button.textContent, 'Download complete');
+    }
+  });
+}
+
+for (const phase of ['downloading', 'indexing', 'done', 'failed', 'network']) {
+  test(`capability-disabled download control stays disabled after monitor ${phase}`, async () => {
+    const b = browser();
+    const { control } = passwordPanel(b);
+    b.respond(async url => reply(url.startsWith('/api/library') || url.endsWith('/perms') ? [] : {library_paths:[],downloads_enabled:false}));
+    await b.run('openSettings()');
+    const button = control('.p-ingest');
+    const label = button.textContent;
+    b.context.downloadButton = button;
+    b.run('pollSettings(settingsGeneration,"ingest",downloadButton)');
+    b.respond(async url => {
+      if (phase === 'network') throw Error('offline');
+      return reply(url === '/api/scan/status' ? {ingesting:phase} : []);
+    });
+    await [...b.intervals.values()][0]();
+    assert.equal(button.disabled, true);
+    assert.equal(button.textContent, label);
+    assert.equal(control('.s-ingest').disabled, true);
+  });
+}
+
+for (const phase of ['admission', 'monitor']) {
+  for (const retire of ['panel', 'account']) {
+    test(`retired enabled download ${phase} cannot alter successor disabled controls after ${retire} change`, async () => {
+      const b = browser();
+      let { control } = passwordPanel(b);
+      b.respond(async url => reply(url.startsWith('/api/library') || url.endsWith('/perms') ? [] : {library_paths:[],downloads_enabled:true}));
+      await b.run('openSettings()');
+      control('.s-ingest').value = 'https://fixture.invalid/video';
+      let release;
+      b.respond(url => phase === 'admission' && url === '/api/ingest'
+        ? new Promise(resolve=>{release=resolve;}) : Promise.resolve({status:202}));
+      let pending = control('.p-ingest').onclick();
+      if (phase === 'monitor') {
+        await pending;
+        b.respond(()=>new Promise(resolve=>{release=resolve;}));
+        pending = [...b.intervals.values()][0]();
+      }
+      if (retire === 'account') {
+        b.respond(async()=>reply([]));
+        b.run('IDENTITY="replacement";account={name:"Replacement",isAdmin:true};enterApp()');
+      }
+      ({ control } = passwordPanel(b));
+      b.respond(async url => reply(url.startsWith('/api/library') || url.endsWith('/perms') ? [] : {library_paths:[],downloads_enabled:false}));
+      await b.run('openSettings()');
+      const button = control('.p-ingest');
+      const label = button.textContent;
+      release(phase === 'admission' ? {status:500} : reply({ingesting:'done'}));
+      await pending;
+      assert.equal(button.disabled, true);
+      assert.equal(button.textContent, label);
+      assert.equal(control('.s-ingest').disabled, true);
+      await button.onclick();
+      assert.equal(b.requests.filter(request=>request.url==='/api/ingest').length, 1);
+      await settle();
+    });
+  }
+}
+
+
+for (const scenario of [
+  {name:'direct enabled',backend:'direct',enabled:true,direct:true},
+  {name:'direct disabled',backend:'direct',enabled:false,direct:true,blocked:true},
+  {name:'native enabled',backend:'yt-dlp',enabled:true},
+  {name:'native disabled',backend:'yt-dlp',enabled:false,blocked:true},
+  {name:'legacy metadata absent'},
+  {name:'invalid backend',backend:null,enabled:false,error:'Invalid <img src=x onerror=alert(1)> download backend',blocked:true,invalid:true},
+  {name:'unknown backend fails closed',backend:'unexpected',enabled:true,blocked:true,invalid:true},
+  {name:'configuration error fails closed',backend:'direct',enabled:true,error:'Invalid download configuration',blocked:true,invalid:true},
+]) {
+  test(`download mode copy ${scenario.name} has truthful requirements and guarded admission`, async () => {
+    const b=browser();
+    const {stage,control}=passwordPanel(b);
+    b.respond(async url=>reply(url.startsWith('/api/library')||url.endsWith('/perms')?[]:{
+      library_paths:[],
+      ...(scenario.backend===undefined?{}:{download_backend:scenario.backend}),
+      ...(scenario.enabled===undefined?{}:{downloads_enabled:scenario.enabled}),
+      download_config_error:scenario.error||null,
+    }));
+    await b.run('openSettings()');
+    const row=stage.innerHTML.match(/<div class="perm-row"><span class="k">Add from URL<\/span>[\s\S]*?<\/div>/)?.[0];
+    assert.ok(row);
+    if(scenario.invalid){
+      assert.match(row,/configuration.*corrected/i);
+      if(scenario.error) assert.match(stage.innerHTML,/Invalid.*download/i);
+    }else if(scenario.direct){
+      assert.match(row,/placeholder="Direct MP4 video URL"/);
+      assert.match(row,/Direct MP4 video URL only/);
+      assert.match(row,/outbound/i);
+      assert.doesNotMatch(row,/yt-dlp|YouTube|webpage/i);
+      if(scenario.blocked) assert.match(row,/optional Docker downloads setup/);
+    }else{
+      assert.match(row,/placeholder="video URL \(yt-dlp supported\)"/);
+      assert.match(row,/yt-dlp.*outbound/i);
+      if(!scenario.blocked) assert.match(row,/additional setup/);
+    }
+    assert.doesNotMatch(stage.innerHTML,/<img/);
+    if(scenario.error?.includes('<img')) assert.match(stage.innerHTML,/&lt;img src=x onerror=alert\(1\)&gt;/);
+    const button=control('.p-ingest');
+    assert.equal(button.disabled,!!scenario.blocked);
+    assert.equal(control('.s-ingest').disabled,!!scenario.blocked);
+    control('.s-ingest').value='https://fixture.invalid/video.mp4';
+    b.respond(async()=>({status:501}));
+    await button.onclick();
+    assert.equal(b.requests.filter(r=>r.url==='/api/ingest').length,scenario.blocked?0:1);
+    if(scenario.direct&&!scenario.blocked){
+      assert.match(b.notices(),/configure a folder and enable direct downloads/);
+      assert.doesNotMatch(b.notices(),/yt-dlp/);
+    }
+  });
+}

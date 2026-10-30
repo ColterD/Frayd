@@ -108,7 +108,7 @@ function gen() {
     if (l) args.push(`-Lib ${quotePowerShellArgument(l)}`);
     if (tunnel()) args.push(`-Tunnel ${quotePowerShellArgument(tunnel())}`);
     const argStr = args.length ? ' ' + args.join(' ') : '';
-    cmd = `cd $env:TEMP; irm "${base}/bootstrap.ps1" -OutFile frayd-install.ps1; powershell.exe -NoProfile -ExecutionPolicy Bypass -File '.\\frayd-install.ps1'${argStr}`;
+    cmd = `& { $ErrorActionPreference = 'Stop'; $fraydInstall = Join-Path $env:TEMP ('frayd-install-' + [guid]::NewGuid().ToString() + '.ps1'); ([IO.File]::Open($fraydInstall, [IO.FileMode]::CreateNew)).Dispose(); try { irm "${base}/bootstrap.ps1" -OutFile $fraydInstall -ErrorAction Stop; powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$fraydInstall"${argStr}; if ($LASTEXITCODE -ne 0) { throw 'Frayd installer failed' } } finally { Remove-Item -LiteralPath $fraydInstall -Force -ErrorAction Stop } }`;
   } else {
     const args = [];
     if (tunnel()) args.push(`--tunnel ${quotePosixArgument(tunnel())}`);
