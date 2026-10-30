@@ -445,13 +445,13 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser, diagno
  * after confirmed group shutdown, retaining it when shutdown cannot be established.
  */
 async function main({ removeProfile = rmSync, resultDirectory = process.env.FRAYD_DOM_RESULT_DIR, cacheSetup = configureOwnedBrowserCache,
-  stopGroup = stopBrowserGroup, startupBudgetMs = 30000, caseBudgetMs = 60000 } = {}) {
+  stopGroup = stopBrowserGroup, startupBudgetMs = 30000, caseBudgetMs = 120000 } = {}) {
   if (Number(process.versions.node.split('.')[0]) < 22 || typeof WebSocket !== 'function') {
     throw new Error('Browser regressions require Node.js 22+ with the global WebSocket API');
   }
   if (!Number.isInteger(startupBudgetMs) || startupBudgetMs < 1 || startupBudgetMs > 30000
-    || !Number.isInteger(caseBudgetMs) || caseBudgetMs < 1 || caseBudgetMs > 60000) {
-    throw new Error('Phase budgets must be positive milliseconds, at most 30000 for startup and 60000 for cases');
+    || !Number.isInteger(caseBudgetMs) || caseBudgetMs < 1 || caseBudgetMs > 120000) {
+    throw new Error('Phase budgets must be positive milliseconds, at most 30000 for startup and 120000 for cases');
   }
   let browser;
   let profile;

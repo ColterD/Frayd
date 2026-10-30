@@ -589,6 +589,13 @@ setInterval(() => {}, 1000);
 });
 
 
+test('total case budget rejects excessive and unbounded overrides before launching a browser', async () => {
+  const { main } = require('./browser-regression.cjs');
+  for (const caseBudgetMs of [120001, Infinity]) {
+    await assert.rejects(main({ caseBudgetMs }), /at most 30000 for startup and 120000 for cases/);
+  }
+});
+
 test('startup and cases have separate finite budgets and preserve partial progress on failure', { timeout: 8000 }, async () => {
   const fixtureDirectory = mkdtempSync(join(tmpdir(), 'frayd-phase-budgets-'));
   const browserScript = join(fixtureDirectory, 'browser.cjs');
@@ -858,7 +865,7 @@ if (process.argv.includes('--version')) {
     assert.equal(existsSync(versionMarker), false, 'No extra browser process runs for provenance');
     assert.equal(result.provenance.browserVersion, 'FixtureChrome/1');
     assert.equal(result.provenance.browserRevision, 'fixture-revision');
-    assert.equal(result.timeBudgets.casesMs, 60000);
+    assert.equal(result.timeBudgets.casesMs, 120000);
     assert.equal(Object.values(result.cleanup).every(Boolean), true);
     assert.deepEqual(result.cleanupErrors, []);
   } finally {

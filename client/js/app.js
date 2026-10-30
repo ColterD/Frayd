@@ -633,9 +633,9 @@ $('#add-media').onclick = async () => {
 };
 
 // ---------- nav ----------
-document.querySelectorAll('.nav-item').forEach(btn => {
+document.querySelectorAll('.nav-item[data-kind]').forEach(btn => {
   btn.onclick = () => {
-    document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.nav-item[data-kind]').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     filtering = btn.dataset.kind !== 'all';
     // Navigation opens shelves at their top level, including the dashboard's grouped shelves.
@@ -679,7 +679,7 @@ async function serverSearch(q) {
  * @returns {string}
  */
 function currentKind() {
-  const active = document.querySelector('.nav-item.active');
+  const active = document.querySelector('.nav-item[data-kind].active');
   return active ? active.dataset.kind : 'all';
 }
 

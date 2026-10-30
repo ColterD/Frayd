@@ -296,6 +296,26 @@ async function isolatedResponsiveCase(width) {
       const nav = [...document.querySelectorAll('#sidebar .nav-item')];
       nav.forEach(node => { check(node.textContent.trim().length > 0, 'Navigation label retained'); reachable(node); });
       nav.find(node => node.dataset.kind === 'movie').click(); equal(activeKind, 'movie', 'Visible movie navigation works');
+      const accountButton = document.getElementById('account-btn');
+      reachable(accountButton);
+      const selectedShelf = document.querySelector('#sidebar .nav-item[data-kind].active');
+      const retainedView = document.getElementById('main').firstElementChild;
+      const retainedState = JSON.stringify({ activeKind, activeQuery, filtering, showsDrill, authorDrill });
+      const accountRequestCount = fixture.requests.length;
+      accountButton.click();
+      check(document.getElementById('settings-modal').classList.contains('on')
+        && document.getElementById('settings-title').textContent === 'Account'
+        && document.getElementById('account-pw-old') && document.getElementById('account-pw-new'),
+      'Visible Account opens its own password controls');
+      equal(JSON.stringify({ activeKind, activeQuery, filtering, showsDrill, authorDrill }), retainedState,
+        'Account preserves the current shelf, search and drills');
+      check(document.getElementById('main').firstElementChild === retainedView, 'Account preserves the rendered library DOM');
+      check(selectedShelf.classList.contains('active') && !accountButton.classList.contains('active')
+        && currentKind() === 'movie', 'Account preserves the selected Movies navigation');
+      equal(fixture.requests.length, accountRequestCount, 'Account opens without shelf or admin requests');
+      measured.accountNavigation = { kindBefore: 'movie', kindAfter: activeKind, selectedShelf: selectedShelf.dataset.kind,
+        passwordPanel: true, retainedDOM: true, retainedDrills: true, requests: fixture.requests.length - accountRequestCount };
+      document.getElementById('settings-close').click();
       reachable(document.getElementById('settings-btn')); document.getElementById('settings-btn').click();
       await until(() => !!document.querySelector('.p-scan'), 'Visible Settings opens usable controls');
       const settingsPanel = document.querySelector('#settings-modal .modal-panel');

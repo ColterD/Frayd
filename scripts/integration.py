@@ -452,12 +452,18 @@ def upstream_contract_qualification(args):
         (data / 'frayd.sqlite').touch(mode=0o660)
         (data / 'frayd.sqlite').chmod(0o660)
         source_bytes = comic_archive()
-        for path in (roots / 'a/first.cbz', roots / 'b/second.cbz', tools / 'comic.cbz'):
+        for path in (roots / 'a/first.cbz', roots / 'b/second.cbz'):
             path.write_bytes(source_bytes)
+        download_bytes = (ROOT / 'tests/fixtures/native-resume.mp4').read_bytes()
+        (tools / 'download.mp4').write_bytes(download_bytes)
         (tools / 'yt-dlp').write_text('#!/bin/sh\nif [ "$1" = --version ]; then echo owned-fixture; exit 0; fi\n'
-                                    'cp /qa/comic.cbz /roots/a/Internet/queued.cbz\n')
-        (tools / 'ffprobe').write_text('#!/bin/sh\nif [ -e /data/hold-probe ]; then touch /data/probe-entered; '
-                                     'while [ -e /data/hold-probe ]; do sleep 0.05; done; fi\n'
+                                    'set -eu\noutput=\nwhile [ "$#" -gt 0 ]; do\n'
+                                    'case "$1" in -o) output="$2"; shift 2;; *) shift;; esac\ndone\n'
+                                    '[ -n "$output" ] || exit 2\n'
+                                    'cp /qa/download.mp4 "${output%/*}/queued.mp4"\n')
+        (tools / 'ffprobe').write_text('#!/bin/sh\ncase "$*" in */roots/b/block.mp4*) '
+                                     'if [ -e /data/hold-probe ]; then touch /data/probe-entered; '
+                                     'while [ -e /data/hold-probe ]; do sleep 0.05; done; fi;; esac\n'
                                      'case "$*" in *stream=codec_name*) if [ -e /data/hold-conversion ]; then '
                                      'touch /data/conversion-entered; while [ -e /data/hold-conversion ]; do sleep 0.05; done; '
                                      'fi;; esac\nexec /usr/bin/ffprobe "$@"\n')
@@ -586,7 +592,7 @@ def upstream_contract_qualification(args):
             (data / 'hold-conversion').unlink()
             status = wait_until(lambda: ingest_status('done', 'failed'), 'ingest did not finish', 30)
             assert status['ingesting'] == 'done', status
-            queued_id = sql("SELECT id FROM media WHERE path='/roots/a/Internet/queued.cbz'")[0][0]
+            queued_id = sql("SELECT id FROM media WHERE path='/roots/a/Internet/queued.mp4'")[0][0]
             assert queued_id in {item['id'] for item in library()}
             wait_for_scan_idle()
             print('PASS: ingest queues behind a running scan and is indexed before done; busy requests get 409')
@@ -669,7 +675,7 @@ def upstream_contract_qualification(args):
                 assert offline_id in {item['id'] for item in library()}
                 assert json.loads(request(f'/api/progress/{offline_id}', token=token))['position'] == 0.75
                 assert len(json.loads(request(f'/api/annotations/{offline_id}', token=token))) == 1
-                assert request(f'/api/stream/{queued_id}') == source_bytes
+                assert request(f'/api/stream/{queued_id}') == download_bytes
                 assert not (roots / 'b').exists(), 'startup silently recreated unavailable root'
                 assert (offline / 'second.cbz').read_bytes() == source_bytes
                 before_offline_write = settings()
