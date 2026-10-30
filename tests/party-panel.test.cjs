@@ -27,6 +27,8 @@ function panel(fetch) {
       get innerHTML() { return html; },
       set innerHTML(value) { html = value; requests.length = 0; parse(value); },
       insertAdjacentHTML(position, value) { html = value + html; },
+      focus() { context.document.activeElement = this; },
+      setSelectionRange(start, end, direction) { this.selectionStart = start; this.selectionEnd = end; this.selectionDirection = direction; },
       addEventListener() {},
     };
   }
@@ -395,3 +397,41 @@ for (const retire of ['Leave', 'remote close', 'ended', 'replacement']) {
     assert.equal(html.includes(p.context.localStorage.frayd_identity), false);
   });
 }
+
+
+test('host library to external to same library loads the returning queue item once', () => {
+  const p = panel();
+  const calls = [];
+  p.context.partyFollow = (...args) => calls.push(['native', args[0]]);
+  p.context.partyFollowExternal = (...args) => calls.push(['external', args[0]]);
+  const socket = p.joinParty('ABCD', true);
+  const snapshot = state => socket.onmessage({data:JSON.stringify({type:'state',state})});
+  snapshot({external_url:'abcdefghijk',title:'External',queue:[],position:0,playing:true});
+  snapshot({media_id:8,title:'Song',queue:[],position:0,playing:true});
+  snapshot({media_id:8,title:'Song',queue:[],position:2,playing:true});
+  assert.deepEqual(calls, [['native',8],['external','abcdefghijk'],['native',8]]);
+});
+
+
+test('host state and member echoes preserve unfinished YouTube draft, focus and caret; session replacement retires it', () => {
+  const p = panel();
+  const old = p.joinParty('ABCD', true);
+  let input = p.nodes.get('#pt-yt');
+  input.value = 'https://youtu.be/unfinished';
+  input.focus();
+  input.setSelectionRange(8, 13, 'backward');
+  old.onmessage({data:JSON.stringify({type:'state',state:{title:'Song',media_id:8,position:4,queue:[]}})});
+  input = p.nodes.get('#pt-yt');
+  assert.equal(input.value, 'https://youtu.be/unfinished');
+  assert.equal(p.context.document.activeElement, input);
+  assert.equal(input.selectionStart, 8);
+  assert.equal(input.selectionEnd, 13);
+  assert.equal(input.selectionDirection, 'backward');
+  old.onmessage({data:JSON.stringify({type:'members',members:['Host (host)']})});
+  assert.equal(p.nodes.get('#pt-yt').value, input.value);
+  p.run('PartyUI.close()');
+  // This fixture map retains detached IDs; the browser removes the old host input on close.
+  p.nodes.delete('#pt-yt');
+  p.joinParty('EFGH', true);
+  assert.equal(p.nodes.get('#pt-yt').value, '');
+});

@@ -127,21 +127,14 @@ pub fn client_ip(headers: &axum::http::HeaderMap, peer: std::net::IpAddr, trust_
 }
 
 /// Resolve an Authorization: Bearer token to identity_id, sliding-expiry refresh.
-pub fn identity_from_token(db: &Connection, token: &str) -> Option<i64> {
-    let id: i64 = db
-        .query_row(
-            "SELECT identity_id FROM sessions WHERE token = ?1 AND expires_at > unixepoch()",
-            [token],
-            |r| r.get(0),
-        )
-        .ok()?;
-    if let Err(e) = db.execute(
-        "UPDATE sessions SET expires_at = unixepoch() + ?2 WHERE token = ?1",
-        rusqlite::params![token, session_ttl_secs()],
-    ) {
-        tracing::warn!("session expiry refresh failed: {e}");
+pub fn identity_from_token(db: &Connection, token: &str) -> rusqlite::Result<Option<i64>> {
+    let id:Option<i64>=db.query_row(
+        "SELECT identity_id FROM sessions WHERE token=?1 AND expires_at>unixepoch()",[token],|r|r.get(0)).optional()?;
+    if id.is_some() {
+        db.execute("UPDATE sessions SET expires_at=unixepoch()+?2 WHERE token=?1",
+            rusqlite::params![token,session_ttl_secs()])?;
     }
-    Some(id)
+    Ok(id)
 }
 
 /// Change password: verify old, write new argon2id hash. Returns Err on bad old pw.

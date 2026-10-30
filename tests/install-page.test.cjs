@@ -37,7 +37,7 @@ test('installer requires typed health and setup JSON and keeps setup inside the 
     const b=installer(async url=>json(url.endsWith('/health')?{status:'ok'}:{needed}));
     await flush();
     assert.match(b.nodes.get('#stat').textContent,/verified/i);
-    assert.match(b.nodes.get('#s-stat').textContent,needed?/create.*owner.*in.*Frayd/i:/sign in.*Frayd/i);
+    assert.match(b.nodes.get('#s-stat').textContent,needed?/Sign in.*first login.*creates the owner account/i:/sign in.*Frayd/i);
     assert.match(page,/<a[^>]+href="http:\/\/127\.0\.0\.1:8484\/"[^>]*>Open Frayd/i);
     assert.equal(b.requests.length,2);
     assert.equal(b.requests.every(({url,options})=>url.startsWith('http://127.0.0.1:8484/') && !options.method && options.credentials==='omit'),true);
@@ -99,7 +99,7 @@ test('download command links remain available for Linux, macOS and Windows',()=>
   const commands = {
     linux: shellCommand,
     mac: shellCommand,
-    win: 'cd $env:TEMP; irm "https://raw.githubusercontent.com/kattiest/Frayd/main/client/install/bootstrap.ps1" -OutFile frayd-install.ps1; & .\\frayd-install.ps1',
+    win: `cd $env:TEMP; irm "https://raw.githubusercontent.com/kattiest/Frayd/main/client/install/bootstrap.ps1" -OutFile frayd-install.ps1; powershell.exe -NoProfile -ExecutionPolicy Bypass -File '.\\frayd-install.ps1'`,
   };
   for(const os of ['linux','mac','win']){
     b.run(`os=${JSON.stringify(os)};gen()`);
@@ -123,7 +123,7 @@ test('configured commands pass quoted library and tunnel arguments for each plat
     for(const os of ['linux','mac','win']){
       b.run(`os=${JSON.stringify(os)};gen()`);
       const expected=os==='win'
-        ? `cd $env:TEMP; irm "${base}/bootstrap.ps1" -OutFile frayd-install.ps1; & .\\frayd-install.ps1 -Lib ${fixture.windowsLib} -Tunnel ${fixture.windowsTunnel}`
+        ? `cd $env:TEMP; irm "${base}/bootstrap.ps1" -OutFile frayd-install.ps1; powershell.exe -NoProfile -ExecutionPolicy Bypass -File '.\\frayd-install.ps1' -Lib ${fixture.windowsLib} -Tunnel ${fixture.windowsTunnel}`
         : `curl -fsSL "${base}/bootstrap.sh" -o frayd-install.sh && bash frayd-install.sh --tunnel ${fixture.posixTunnel} -- ${fixture.posixLib}`;
       assert.equal(b.nodes.get('#cmd').textContent,expected);
     }

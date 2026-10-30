@@ -66,14 +66,14 @@
 
   <p><a href="http://127.0.0.1:8484/" id="open-frayd">Open Frayd →</a></p>
   <button class="btn" id="retry">Retry server check</button>
-  <div class="status" id="s-stat">Open Frayd manually to create your owner account inside the app, or sign in.</div>
+  <div class="status" id="s-stat">Open Frayd and use Sign in. On a new server, the first login creates the owner account.</div>
 
   <ol class="steps">
     <li>Pick your OS, enter your media folder path</li>
     <li>Copy the command, paste it in a terminal (PowerShell on Windows)</li>
     <li>It installs everything, builds, and starts on boot — a few minutes</li>
     <li>Use Open Frayd to open your local app; this page can check its server protocol if your browser permits it</li>
-    <li>Create the owner account inside Frayd when prompted, or sign in</li>
+    <li>Use Sign in inside Frayd; on a new server, the first login creates the owner account</li>
   </ol>
   <p class="sub" style="margin-top:14px">Opening this to the public internet? Add <code>FRAYD_SESSION_DAYS=7</code> to <code>server/.env</code> for shorter sessions. Login attempts are rate-limited automatically.</p>
 </div>
@@ -108,7 +108,7 @@ function gen() {
     if (l) args.push(`-Lib ${quotePowerShellArgument(l)}`);
     if (tunnel()) args.push(`-Tunnel ${quotePowerShellArgument(tunnel())}`);
     const argStr = args.length ? ' ' + args.join(' ') : '';
-    cmd = `cd $env:TEMP; irm "${base}/bootstrap.ps1" -OutFile frayd-install.ps1; & .\\frayd-install.ps1${argStr}`;
+    cmd = `cd $env:TEMP; irm "${base}/bootstrap.ps1" -OutFile frayd-install.ps1; powershell.exe -NoProfile -ExecutionPolicy Bypass -File '.\\frayd-install.ps1'${argStr}`;
   } else {
     const args = [];
     if (tunnel()) args.push(`--tunnel ${quotePosixArgument(tunnel())}`);
@@ -169,7 +169,7 @@ async function checkServer(generation, attempt) {
     if (typeof setup.needed !== 'boolean') throw new Error('Unknown setup response');
     $('#stat').textContent = 'Server protocol verified at ' + appBase + '. Open Frayd manually.';
     $('#s-stat').textContent = setup.needed
-      ? 'Create your owner account inside Frayd using Open Frayd.'
+      ? 'Use Open Frayd, then Sign in; the first login on a new server creates the owner account.'
       : 'Sign in inside Frayd using Open Frayd.';
   } catch {
     if (generation !== checkGeneration) return;
@@ -189,7 +189,7 @@ async function checkServer(generation, attempt) {
 function retryChecks() {
   retireChecks();
   $('#stat').textContent = 'Checking local server protocol…';
-  $('#s-stat').textContent = 'Open Frayd manually to create your owner account inside the app, or sign in.';
+  $('#s-stat').textContent = 'Open Frayd and use Sign in. On a new server, the first login creates the owner account.';
   return checkServer(checkGeneration, 1);
 }
 $('#retry').onclick = retryChecks;

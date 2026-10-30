@@ -1879,7 +1879,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     check(LIBRARY.length === 1 && !document.getElementById('video-modal').classList.contains('on'), 'Cancel retains row without player');
     await key('Enter', true);
     await delay(20);
-    check(LIBRARY.length === 1 && document.getElementById('toast-host').textContent.includes('referenced'), '409 retains item and explains refusal');
+    check(LIBRARY.length === 1 && document.getElementById('toast-host').textContent.includes('protected reading/watching progress') && document.getElementById('toast-host').textContent.includes('source file are preserved'), '409 retains item and explains refusal');
     deleteStatus = 204;
     await key(' ', true);
     await until(() => LIBRARY.length === 0, '204 removes modeled row');
@@ -2451,7 +2451,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     }
     equal(outsiderOrigins, ['null', location.origin], 'Both opaque and same-origin negative controls actually delivered');
     const targets = [document.querySelector('#search input'), document.getElementById('em-search')];
-    for (const tag of ['textarea', 'select', 'div', 'button']) {
+    for (const tag of ['textarea', 'select', 'div']) {
       const target = document.createElement(tag);
       if (tag === 'div') target.contentEditable = 'true';
       document.getElementById('ebook-modal').appendChild(target);
@@ -2460,8 +2460,8 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     for (const target of targets) {
       target.focus();
       for (const press of ['ArrowRight', ' ', 't']) await key(press);
-      equal(ebook.chunk, 0, 'Editable/button target cannot flip chapter');
-      equal(ebook.document.generation, initialGeneration, 'Editable/button target cannot replace reader document');
+      equal(ebook.chunk, 0, 'Editable target cannot flip chapter');
+      equal(ebook.document.generation, initialGeneration, 'Editable target cannot replace reader document');
     }
     document.getElementById('settings-modal').classList.add('on');
     document.body.tabIndex = -1; document.body.focus();
@@ -2473,6 +2473,12 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
     document.body.focus(); await key('ArrowRight');
     await until(() => ebook.chunk === 1 && ebook.document?.ready, 'active body flips once');
     equal(ebook.chunk, 1, 'Positive key flips exactly once');
+    const readerNext = document.getElementById('em-next');
+    readerNext.click(); readerNext.focus();
+    await key('ArrowLeft');
+    await until(() => ebook.chunk === 0 && ebook.document?.ready, 'focused reader button pages left');
+    readerNext.focus(); await key('ArrowRight');
+    await until(() => ebook.chunk === 1 && ebook.document?.ready, 'focused reader button pages right');
     check((await probe()).opaqueOrigin === 'null', 'Current opaque WindowProxy remains functional');
     document.getElementById('em-close').click();
     targets.slice(2).forEach(target => target.remove());
@@ -2547,7 +2553,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
           check(fixture.requests.every(r => r.method === 'GET' && r.credentials === 'omit' && r.cache === 'no-store'),
             'All modeled requests are credential-free fixed GETs');
           equal(fixture.storage, [], 'Installer never accesses storage'); equal(fixture.errors, [], 'Installer has no uncaught errors');
-          if (mode === 'valid') check(d.getElementById('s-stat').textContent.includes('Create your owner'), 'Typed true gives manual owner instruction');
+          if (mode === 'valid') check(/Sign in.*first login.*creates the owner account/i.test(d.getElementById('s-stat').textContent), 'Typed true explains the first Sign in creates the owner');
           if (mode === 'signed-in') check(d.getElementById('s-stat').textContent.includes('Sign in'), 'Typed false gives manual sign-in instruction');
           d.querySelector('[data-os=linux]').click(); d.getElementById('gen').click();
           check(d.getElementById('cmd').textContent.includes('/bootstrap.sh'), 'Linux source command remains available');
@@ -2579,7 +2585,7 @@ async function freshResponsiveDocument(width, toolbarRetryMode = null) {
         const w = node.contentWindow, d = node.contentDocument, fixture = w.__installerFixture;
         await until(() => fixture.held.length === 1, 'Old request held');
         fixture.mode = 'signed-in'; d.getElementById('retry').click();
-        await until(() => d.getElementById('s-stat').textContent.includes('Sign in'), 'New retry wins');
+        await until(() => d.getElementById('stat').textContent.includes('verified at') && d.getElementById('s-stat').textContent === 'Sign in inside Frayd using Open Frayd.', 'New retry wins');
         const current = d.getElementById('stat').textContent;
         fixture.release(); await delay(30);
         equal(d.getElementById('stat').textContent, current, 'Late old request cannot publish');

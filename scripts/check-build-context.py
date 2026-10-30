@@ -7,6 +7,9 @@ from pathlib import Path
 
 from integration import cleanup_project, docker
 
+if not __debug__:
+    raise SystemExit('unsupported optimized Python execution: qualification requires assertions; remove -O and PYTHONOPTIMIZE')
+
 ROOT = Path(__file__).resolve().parents[1]
 SERVER_SOURCES = ('Cargo.toml', 'Cargo.lock', 'build.rs', 'schema.sql', 'src/main.rs', 'tests/archive_readers.rs')
 STATE_SENTINELS = ('.env', '.env.local', '.env.production', '.env.production.local',

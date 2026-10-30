@@ -98,6 +98,7 @@ async function tryResume() {
 
 /** Enter the dashboard for the current account generation and start loading the library. */
 function enterApp() {
+  if (typeof PartyUI !== 'undefined') PartyUI.close();
   delete localStorage.frayd_logout;
   ++accountGeneration;
   stopSettingsMonitor();
@@ -366,6 +367,7 @@ async function openSettings() {
         <button class="p-remove" data-name="${esc(p.key)}" title="Remove user, their progress and highlights">Remove</button>
       </div>`).join('') : '<div class="party-sec">No accounts yet</div>')
       + `<div class="party-sec">Media folders${locked ? ' — locked by FRAYD_LIBRARY' : ''}</div>`
+      + (settings.library_config_error ? `<div class="party-error">${esc(settings.library_config_error)}. Add a valid folder to replace the held configuration.</div>` : '')
       + (libs.length ? libs.map(l => `
       <div class="perm-row"><span class="k">${esc(l)}</span>`
         + `<button class="lib-remove" ${locked ? 'disabled' : ''} data-path="${esc(l)}">Remove</button></div>`).join('')
@@ -409,13 +411,20 @@ async function openSettings() {
       } catch { if (current()) toast('Permission save failed — server unreachable', true); }
     });
     $('#s-site-save').onclick = async (e) => {
+      const button = e.target;
+      button.textContent = 'Saving…';
+      button.disabled = true;
       try {
         if (await saveSettings({site_name: stage.querySelector('.s-site').value}, generation)) e.target.textContent = 'Saved';
-      } catch (error) { if (current()) toast(error.message || 'Save failed — server unreachable', true); }
+      } catch (error) { if (current()) { button.textContent = 'Save failed'; toast(error.message || 'Save failed — server unreachable', true); } }
+      finally { if (current()) button.disabled = false; }
     };
     $('#s-net-save').onclick = async (e) => {
       const port = +stage.querySelector('.s-port').value;
       if (!Number.isInteger(port) || port < 1024 || port > 65535) { e.target.textContent = 'Bad port'; return; }
+      const button = e.target;
+      button.textContent = 'Saving…';
+      button.disabled = true;
       const body = {
         port,
         upnp: stage.querySelector('.s-upnp').checked,
@@ -425,7 +434,8 @@ async function openSettings() {
       };
       try {
         if (await saveSettings(body, generation)) e.target.textContent = 'Saved — restart to apply port/TLS';
-      } catch (error) { if (current()) toast(error.message || 'Save failed — server unreachable', true); }
+      } catch (error) { if (current()) { button.textContent = 'Save failed'; toast(error.message || 'Save failed — server unreachable', true); } }
+      finally { if (current()) button.disabled = false; }
     };
     bindPassword(stage, generation);
     const scanBtn = stage.querySelector('.p-scan');
@@ -521,10 +531,16 @@ async function doLogin(ev) {
       body: JSON.stringify({ email, password: pw })
     });
     if (!current()) return;
+    if (r.status === 429) {
+      const body = await r.json().catch(() => null);
+      if (!current()) return;
+      throw new Error(typeof body?.error === 'string' && body.error.trim()
+        ? body.error : 'Too many sign-in attempts. Wait 5 minutes and try again.');
+    }
     if (!r.ok) throw new Error(r.status === 401 ? 'Invalid email or password' : `Server error (${r.status})`);
     const data = await r.json();
     if (!current()) return;
-    account = { name: data.name || email.split('@')[0], token: data.token, isAdmin: !!data.is_admin };
+    account = { name: data.name || email.split('@')[0], isAdmin: !!data.is_admin };
     localStorage.frayd_token = data.token;
     IDENTITY = localStorage.frayd_identity ||= location.hostname + ':' + crypto.randomUUID();
     enterApp();
@@ -749,7 +765,7 @@ async function deleteMedia(it) {
   try {
     const response = await fetch(`/api/media/${it.id}?identity=${encodeURIComponent(IDENTITY)}`, {method:'DELETE', headers:authHeaders()});
     if (!response.ok) {
-      toast(response.status === 409 ? 'Cannot remove: media is referenced or a job is active'
+      toast(response.status === 409 ? 'Cannot remove: protected reading/watching progress, highlights, conversion history, or an active job references this item. The library entry and source file are preserved'
         : response.status === 403 ? 'Admin access required' : `Remove failed (${response.status})`, true);
       return;
     }
@@ -1581,7 +1597,6 @@ window.addEventListener('message', async (e) => {
     syncProgress(ebook.it.id, ebook.chunk + ebook.lastFrac);
   } else if (e.data?.type === 'search-results') {
     if (!Number.isSafeInteger(e.data.count) || e.data.count < 0) return;
-    ebook.searchHits = e.data.count;
     $('#em-searchinfo').textContent = e.data.count
       ? `${e.data.count} hits — Enter for next` : 'No hits';
   } else if (e.data?.type === 'search-hit') {
@@ -1627,7 +1642,8 @@ function ebookShortcutAllowed(event) {
   const target = event.target;
   return !!ebook && $('#ebook-modal').classList.contains('on')
     && !$('#settings-modal').classList.contains('on')
-    && !['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON'].includes(target?.tagName)
+    && !['INPUT', 'TEXTAREA', 'SELECT'].includes(target?.tagName)
+    && (target?.tagName !== 'BUTTON' || ['ArrowRight', 'ArrowLeft'].includes(event.key))
     && !target?.isContentEditable;
 }
 // reader shortcuts: ←/→/space flip, s search, t toc, f fullscreen, Esc closes overlays
@@ -2032,7 +2048,12 @@ window.partyControlPlayback = async (type, state) => {
     return;
   }
   if (state?.media_id == null) throw new Error('Choose a track first');
-  const media = isVideoId(state.media_id) ? plyr : pbAudio;
+  const kind = isVideoId(state.media_id) ? 'video' : 'audio';
+  const native = kind === 'video' ? plyr.media : pbAudio;
+  const visible = $(kind === 'video' ? '#video-modal' : '#playerbar').classList.contains('on');
+  if (partyPlaybackKind !== kind || !hasNativeStream(native, state.media_id) || (playing && !visible))
+    throw new Error('Reopen this item from the library before using party controls.');
+  const media = kind === 'video' ? plyr : pbAudio;
   if (media.paused === !playing) {
     window.partySend?.({ type, position: media.currentTime });
   } else if (playing) await media.play();

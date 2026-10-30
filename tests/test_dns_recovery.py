@@ -14,6 +14,9 @@ import time
 import urllib.request
 from pathlib import Path
 
+if not __debug__:
+    raise SystemExit('unsupported optimized Python execution: qualification requires assertions; remove -O and PYTHONOPTIMIZE')
+
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON_IMAGE = 'python@sha256:1b668429b3511ab407d8e00648891631b0b1a4d7e15e3ca70f38ab5b91ad4ab4'
 CLEANUP_TIMEOUT = 5

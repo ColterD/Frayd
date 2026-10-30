@@ -22,6 +22,9 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
+if not __debug__:
+    raise SystemExit('unsupported optimized Python execution: qualification requires assertions; remove -O and PYTHONOPTIMIZE')
+
 ROOT = Path(__file__).resolve().parents[1]
 base = ''
 

@@ -379,8 +379,10 @@ async fn auth_change_password(
     let Some(tok) = bearer_token(&headers) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    let Some(iid) = auth::identity_from_token(&db, &tok) else {
-        return StatusCode::UNAUTHORIZED.into_response();
+    let iid = match auth::identity_from_token(&db, &tok) {
+        Ok(Some(id)) => id,
+        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     let Ok(key) = db.query_row(
         "SELECT key FROM identities WHERE id = ?1 AND kind='account'",
@@ -479,7 +481,7 @@ fn resolve_identity(
     query_identity: Option<&str>,
 ) -> Result<i64, StatusCode> {
     if let Some(token) = bearer_token(headers) {
-        if let Some(id) = auth::identity_from_token(db, &token) {
+        if let Some(id) = auth::identity_from_token(db, &token).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
             return Ok(id);
         }
     }
@@ -712,13 +714,31 @@ fn stored_roots(db: &Connection) -> Result<Vec<PathBuf>,String> {
     }
 }
 
+/// Return only an editable string array; malformed legacy values stay in the DB until a valid save.
+fn stored_root_strings(db:&Connection) -> rusqlite::Result<Vec<String>> {
+    let raw:Option<String>=db.query_row("SELECT value FROM settings WHERE key='library_paths'",[],|r|r.get(0)).optional()?;
+    let value=if let Some(raw)=raw { serde_json::from_str::<serde_json::Value>(&raw).ok() } else {
+        let legacy:Option<String>=db.query_row("SELECT value FROM settings WHERE key='library_path'",[],|r|r.get(0)).optional()?;
+        legacy.and_then(|raw|serde_json::from_str::<serde_json::Value>(&raw).ok()).map(|v| {
+            if v.is_null() || v=="" {serde_json::json!([])} else {serde_json::json!([v])}
+        })
+    };
+    let value=value.unwrap_or_else(||serde_json::json!([]));
+    let Some(array)=value.as_array() else {return Ok(Vec::new());};
+    Ok(array.iter().map(|entry|entry.as_str().map(str::to_string)).collect::<Option<Vec<_>>>().unwrap_or_default())
+}
+
 /// Select one exclusive locked nonempty environment root or the unlocked persisted root array.
 /// Empty environment values enable persisted configuration and never add an implicit fallback root.
 fn effective_library_config(db: &Connection, env_override: Option<&str>) -> Result<LibraryConfig,String> {
     if let Some(path)=env_override.filter(|s| !s.is_empty()) {
         return Ok(LibraryConfig { roots:parse_roots(&serde_json::json!([path]),true)?,locked:true });
     }
-    Ok(LibraryConfig { roots:stored_roots(db)?,locked:false })
+    let roots=stored_roots(db).unwrap_or_else(|error| {
+        tracing::warn!(%error,"stored library configuration held; repair through settings");
+        Vec::new()
+    });
+    Ok(LibraryConfig { roots,locked:false })
 }
 
 /// Web client directory. Resolution order:
@@ -1158,6 +1178,13 @@ async fn remove_user(
     State(app): State<Arc<App>>, headers: axum::http::HeaderMap,
     Query(q): Query<std::collections::HashMap<String,String>>, Path(id): Path<i64>,
 ) -> StatusCode {
+    tokio::task::spawn_blocking(move ||remove_user_blocking(app,headers,q,id)).await
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Keep database locking, authorization and the complete transaction on the blocking pool.
+fn remove_user_blocking(app:Arc<App>,headers:axum::http::HeaderMap,
+    q:std::collections::HashMap<String,String>,id:i64) -> StatusCode {
     let mut db=app.db.lock().unwrap();
     let result=(|| -> Result<(),StatusCode> {
         let tx=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -1205,12 +1232,13 @@ async fn remove_user(
 fn cleanup_owned_thumbnail(db: &mut Connection, thumbs: &StdPath, roots: &[PathBuf], id:i64,
     source:&str, thumbnail:Option<&str>) -> Result<(),String> {
     let Some(thumbnail)=thumbnail else {return Ok(());};
-    let tx=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|error|error.to_string())?;
     // The deleted row is no longer in the reference query, so retain its original source explicitly.
     if StdPath::new(source).canonicalize().ok().is_some_and(|source| StdPath::new(thumbnail).canonicalize().ok().as_ref()==Some(&source)) {
         return Err("thumbnail is the original source".into());
     }
-    scanner::retire_thumbnail(&tx,id,thumbnail,thumbs,roots)?;
+    let prepared=scanner::prepare_thumbnail_retirement(db,id,thumbnail,thumbs,roots)?;
+    let tx=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|error|error.to_string())?;
+    scanner::finish_thumbnail_retirement(&tx,prepared)?;
     tx.commit().map_err(|error|error.to_string())
 }
 
@@ -1292,17 +1320,20 @@ async fn library_handler(
     State(app): State<std::sync::Arc<App>>,
     headers: axum::http::HeaderMap,
     Query(q): Query<std::collections::HashMap<String, String>>,
-) -> Json<Vec<LibraryItem>> {
+) -> axum::response::Response {
     let db = app.db.lock().unwrap();
     // per-identity kind visibility: NULL row/no row = see all; else only listed kinds
-    let allowed: Option<Vec<String>> = resolve_identity(&db, &headers, q.get("identity").map(|s| s.as_str()))
-        .ok()
-        .and_then(|iid| {
-            db.query_row("SELECT allowed_kinds FROM user_perms WHERE identity_id = ?1", [iid], |r| r.get::<_, Option<String>>(0))
-                .ok()
-                .flatten()
-                .and_then(|s| serde_json::from_str(&s).ok())
-        });
+    let identity=match resolve_identity(&db,&headers,q.get("identity").map(String::as_str)) {
+        Ok(id)=>Some(id),
+        Err(StatusCode::UNAUTHORIZED)=>None,
+        Err(status)=>return status.into_response(),
+    };
+    let allowed:Option<Vec<String>>=if let Some(id)=identity {
+        match db.query_row("SELECT allowed_kinds FROM user_perms WHERE identity_id=?1",[id],|r|r.get::<_,Option<String>>(0)).optional() {
+            Ok(value)=>value.flatten().and_then(|value|serde_json::from_str(&value).ok()),
+            Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    } else {None};
     let kinds_clause = allowed.as_ref().map(|ks| {
         format!(
             " AND kind IN ({})",
@@ -1320,7 +1351,7 @@ async fn library_handler(
         kinds_clause.as_deref().unwrap_or("")
     );
     let mut stmt = db.prepare(&sql).unwrap();
-    let items = stmt
+    let items:Vec<LibraryItem> = stmt
         .query_map(rusqlite::params![filter], |r| {
             Ok(LibraryItem {
                 id: r.get(0)?,
@@ -1337,7 +1368,7 @@ async fn library_handler(
         .unwrap()
         .filter_map(Result::ok)
         .collect();
-    Json(items)
+    Json(items).into_response()
 }
 
 /// Expose persisted artwork availability as an opaque version, never an operator filesystem path.
@@ -1649,6 +1680,13 @@ async fn set_perm(
     State(app): State<Arc<App>>, headers: axum::http::HeaderMap,
     Query(q): Query<std::collections::HashMap<String,String>>, Json(body): Json<serde_json::Value>,
 ) -> StatusCode {
+    tokio::task::spawn_blocking(move ||set_perm_blocking(app,headers,q,body)).await
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Keep database locking, authorization and the complete transaction on the blocking pool.
+fn set_perm_blocking(app:Arc<App>,headers:axum::http::HeaderMap,
+    q:std::collections::HashMap<String,String>,body:serde_json::Value) -> StatusCode {
     let mut db=app.db.lock().unwrap();
     let result=(|| -> Result<(),StatusCode> {
         let tx=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -1729,12 +1767,11 @@ async fn get_settings(
         }
     }
     // Persisted paths and effective override are distinct authorized metadata.
-    let normalized=stored_roots(&db).unwrap_or_else(|error| {
-        tracing::warn!(%error,"stored library paths unreadable; reporting effective roots");
-        config.roots.clone()
-    });
+    let error=stored_roots(&db).err().map(|_| "Library configuration unavailable; repair configured roots");
+    let paths=stored_root_strings(&db).unwrap_or_default();
     map.remove("library_path");
-    map.insert("library_paths".into(),serde_json::json!(normalized));
+    map.insert("library_paths".into(),serde_json::json!(paths));
+    map.insert("library_config_error".into(),serde_json::json!(error));
     map.insert("library_locked".into(),serde_json::json!(config.locked));
     map.insert("effective_library_paths".into(),serde_json::json!(config.roots));
     map.insert("server_version".into(),serde_json::json!(VERSION));
@@ -1766,7 +1803,7 @@ fn set_setting_blocking(app:Arc<App>,headers:axum::http::HeaderMap,
     if map.keys().any(|k| {
         matches!(
             k.as_str(),
-            "library_locked" | "effective_library_paths" | "server_version"
+            "library_locked" | "effective_library_paths" | "library_config_error" | "server_version"
         )
     }) {
         return StatusCode::BAD_REQUEST.into_response();
@@ -1775,10 +1812,23 @@ fn set_setting_blocking(app:Arc<App>,headers:axum::http::HeaderMap,
         let value=if let Some(value)=map.remove("library_path") {
             if value.is_null() || value=="" { serde_json::json!([]) } else { serde_json::json!([value]) }
         } else { map.remove("library_paths").unwrap() };
-        let Ok(roots)=normalize_roots(&value) else { return StatusCode::BAD_REQUEST.into_response(); };
-        if !roots.is_empty() && (transcode::validate_cache(&transcodes_dir_for(&app.db_path),&roots).is_none()
-            || transcode::validate_cache(&thumbs_dir_for(&app.db_path),&roots).is_none()) { return StatusCode::BAD_REQUEST.into_response(); }
-        map.insert("library_paths".into(),serde_json::json!(roots));
+        let Some(list)=value.as_array() else { return StatusCode::BAD_REQUEST.into_response(); };
+        let retained=match stored_root_strings(&db) { Ok(paths)=>paths.into_iter().collect::<std::collections::HashSet<_>>(), Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response() };
+        let mut saved=Vec::new();let mut seen=std::collections::HashSet::new();
+        for entry in list {
+            let Some(text)=entry.as_str() else { return StatusCode::BAD_REQUEST.into_response(); };
+            let path=if retained.contains(text) { text.to_string() } else {
+                let Ok(roots)=normalize_roots(&serde_json::json!([text])) else { return StatusCode::BAD_REQUEST.into_response(); };
+                roots[0].to_string_lossy().into_owned()
+            };
+            if seen.insert(path.clone()) { saved.push(path); }
+        }
+        let roots=parse_roots(&serde_json::json!(saved),true).unwrap_or_default();
+        // Unavailable retained roots grant no effects, but cannot prevent editing another root.
+        let available:Vec<_>=saved.iter().filter_map(|path|normalize_roots(&serde_json::json!([path])).ok()).flatten().collect();
+        if !available.is_empty() && (transcode::validate_cache(&transcodes_dir_for(&app.db_path),&available).is_none()
+            || transcode::validate_cache(&thumbs_dir_for(&app.db_path),&available).is_none()) { return StatusCode::BAD_REQUEST.into_response(); }
+        map.insert("library_paths".into(),serde_json::json!(saved));
         Some(roots)
     } else { None };
     for (key,value) in &map {
@@ -1795,8 +1845,12 @@ fn set_setting_blocking(app:Arc<App>,headers:axum::http::HeaderMap,
         || matches!(app.ingest_status.lock().unwrap().as_deref(),Some("downloading"|"indexing"))) {
         return StatusCode::CONFLICT.into_response();
     }
+    let tx=match db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
+        Ok(tx)=>tx,
+        Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if let Err(status)=require_admin(&tx,&headers,q.get("identity").map(String::as_str)) {return status.into_response();}
     let result=(|| -> rusqlite::Result<()> {
-        let tx=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         for (key,value) in map {
             tx.execute(
                 "INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=?2",
@@ -1821,17 +1875,17 @@ async fn auth_me(
     let Some(token) = bearer_token(&headers) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    let Ok(iid) = resolve_identity(&db, &headers, None) else {
-        return StatusCode::UNAUTHORIZED.into_response();
+    let iid = match resolve_identity(&db, &headers, None) {
+        Ok(id)=>id,
+        Err(status)=>return status.into_response(),
     };
     // token validity is implied by resolve_identity; get key + admin flag
-    let key: String = db
-        .query_row(
-            "SELECT i.key FROM identities i JOIN sessions s ON s.identity_id = i.id WHERE s.token = ?1",
-            [token],
-            |r| r.get(0),
-        )
-        .unwrap_or_else(|_| "user".into());
+    let key: String = match db.query_row(
+        "SELECT i.key FROM identities i JOIN sessions s ON s.identity_id = i.id WHERE s.token = ?1",
+        [token], |r|r.get(0)) {
+        Ok(key)=>key,
+        Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
     let Ok(admin) = db
         .query_row("SELECT is_admin FROM user_perms WHERE identity_id = ?1", [iid], |r| r.get::<_, i64>(0))
         .optional()
@@ -3631,7 +3685,7 @@ mod integration_regressions {
     /// A held SQLite writer must not stop a current-thread Tokio timer while an admin operation waits.
     #[tokio::test(flavor="current_thread")]
     async fn admin_database_wait_keeps_async_runtime_responsive() {
-        for operation in ["settings","media"] {
+        for operation in ["settings","media","permission","user"] {
             let (root,app)=fixture();seed_media(&root,&app);
             let writer=store::connect(&app.db_path).unwrap();writer.execute_batch("BEGIN IMMEDIATE").unwrap();
             let (progress_tx,progress_rx)=std::sync::mpsc::channel();
@@ -3640,7 +3694,11 @@ mod integration_regressions {
                 writer.execute_batch("COMMIT").unwrap();responsive
             });
             let request=async {
-                if operation=="media" {media(&app,1).await} else {
+                if operation=="media" {media(&app,1).await} else if operation=="user" {
+                    user(&app,2).await
+                } else if operation=="permission" {
+                    permission(&app,serde_json::json!({"identity_id":2,"allowed_kinds":["comic"]})).await
+                } else {
                     set_setting(State(app.clone()),axum::http::HeaderMap::new(),query(),Json(serde_json::json!({"port":8989}))).await.status()
                 }
             };
@@ -3974,9 +4032,9 @@ mod integration_regressions {
     async fn admin_user_cleanup_targets_only_one_account() {
         let (root,app)=fixture();seed_media(&root,&app);seed_user_children(&app);
         let session=auth::create_session(&app.db.lock().unwrap(),2).unwrap();
-        assert_eq!(auth::identity_from_token(&app.db.lock().unwrap(),&session),Some(2));
+        assert_eq!(auth::identity_from_token(&app.db.lock().unwrap(),&session).unwrap(),Some(2));
         assert_eq!(user(&app,2).await,StatusCode::NO_CONTENT);
-        assert_eq!(auth::identity_from_token(&app.db.lock().unwrap(),&session),None);
+        assert_eq!(auth::identity_from_token(&app.db.lock().unwrap(),&session).unwrap(),None);
         {
         let db=app.db.lock().unwrap();
         for table in ["sessions","user_perms","progress","annotations","playlists"] {
@@ -4040,7 +4098,9 @@ mod integration_regressions {
                     .unwrap(),
                 kinds.to_string()
             );
-            let listed=library_handler(State(app.clone()),bearer(&app,2),Query(std::collections::HashMap::new())).await.0;
+            let response=library_handler(State(app.clone()),bearer(&app,2),Query(std::collections::HashMap::new())).await;
+            assert_eq!(response.status(),StatusCode::OK);
+            let listed:Vec<serde_json::Value>=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),usize::MAX).await.unwrap()).unwrap();
             assert_eq!(listed.len(),if kinds.as_array().unwrap().is_empty() {0}else{1});
         }
         let before = app
@@ -4094,8 +4154,17 @@ mod integration_regressions {
     #[test]
     /// Revoke admin while each real handler waits behind a write lock; no cached pre-transaction authority may survive.
     fn admin_rechecks_authority_after_database_write_admission() {
-        for operation in ["media","user","permission"] {
+        static WRITE_WAIT_ENTERED:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
+        fn observe_write_wait(attempt:i32) -> bool {
+            WRITE_WAIT_ENTERED.store(true,std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            attempt<3000
+        }
+        for operation in ["media","user","permission","settings","settings-db-error"] {
             let (root,app)=fixture();seed_media(&root,&app);
+            let original_roots=library_roots(&app);
+            WRITE_WAIT_ENTERED.store(false,std::sync::atomic::Ordering::SeqCst);
+            app.db.lock().unwrap().busy_handler(Some(observe_write_wait)).unwrap();
             let other=store::connect(&app.db_path).unwrap();other.execute_batch("BEGIN IMMEDIATE").unwrap();
             let target=app.clone();let (ready_tx,ready_rx)=std::sync::mpsc::channel();let (done_tx,done_rx)=std::sync::mpsc::channel();
             let worker=std::thread::spawn(move || {
@@ -4104,6 +4173,7 @@ mod integration_regressions {
                     match operation {
                         "media" => media(&target, 1).await,
                         "user" => user(&target, 2).await,
+                        "settings" | "settings-db-error" => set_setting(State(target.clone()),axum::http::HeaderMap::new(),query(),Json(serde_json::json!({"library_paths":[],"port":8989}))).await.status(),
                         _ => {
                             permission(
                                 &target,
@@ -4115,9 +4185,19 @@ mod integration_regressions {
                 });
                 done_tx.send(result).unwrap();
             });
-            ready_rx.recv().unwrap();std::thread::sleep(std::time::Duration::from_millis(30));assert!(done_rx.try_recv().is_err());
-            other.execute_batch("UPDATE user_perms SET is_admin=0 WHERE identity_id=1;COMMIT").unwrap();
-            assert_eq!(done_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap(),StatusCode::FORBIDDEN);worker.join().unwrap();
+            ready_rx.recv().unwrap();
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(3);
+            while !WRITE_WAIT_ENTERED.load(std::sync::atomic::Ordering::SeqCst) {
+                assert!(done_rx.try_recv().is_err(),"{operation} completed before write admission");
+                assert!(std::time::Instant::now()<deadline,"{operation} never reached SQLite write admission");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if operation=="settings-db-error" {other.execute_batch("DROP TABLE user_perms;COMMIT").unwrap();}
+            else {other.execute_batch("UPDATE user_perms SET is_admin=0 WHERE identity_id=1;COMMIT").unwrap();}
+            let expected=if operation=="settings-db-error" {StatusCode::INTERNAL_SERVER_ERROR} else {StatusCode::FORBIDDEN};
+            assert_eq!(done_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap(),expected,"{operation}");worker.join().unwrap();
+            assert_eq!(library_roots(&app),original_roots,"{operation} published configuration without authority");
+            assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM settings WHERE key='port'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
             assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM identities WHERE id=2",[],|r|r.get::<_,i64>(0)).unwrap(),1);
             assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM media WHERE id=1",[],|r|r.get::<_,i64>(0)).unwrap(),1);
             assert_eq!(std::fs::read(owned_thumb(&root)).unwrap(),b"thumbnail");
@@ -4449,6 +4529,102 @@ mod stream_range_tests {
             assert!(!response.headers().contains_key(header::CONTENT_RANGE));
             assert!(axum::body::to_bytes(response.into_body(),4096).await.unwrap().is_empty());
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod final_server_regressions {
+    use super::*;
+    fn fixture() -> (PathBuf,Arc<App>) {
+        let root=std::env::temp_dir().join(format!("frayd-final-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("library")).unwrap();
+        let db=store::open(root.join("db.sqlite").to_str().unwrap());
+        db.execute_batch("INSERT INTO identities(id,kind,key) VALUES(1,'device','admin'); INSERT INTO user_perms(identity_id,is_admin) VALUES(1,1);").unwrap();
+        let app=test_support::app(db,root.join("db.sqlite").to_string_lossy().into_owned(),vec![]);
+        (root,app)
+    }
+    fn query() -> Query<std::collections::HashMap<String,String>> { Query(std::collections::HashMap::from([("identity".into(),"admin".into())])) }
+    #[tokio::test]
+    async fn final_legacy_roots_remain_administrable_and_repairable() {
+        let (root,app)=fixture();
+        for value in [serde_json::json!("bad"),serde_json::json!([1]),serde_json::json!(["missing-relative"]),serde_json::json!(["~/Media"]),serde_json::json!([root.join("db.sqlite")]),serde_json::json!([root.join("library"),"~/Media"]),serde_json::json!([root.join("library"),1])] {
+            let raw=value.to_string();
+            app.db.lock().unwrap().execute("INSERT OR REPLACE INTO settings(key,value) VALUES('library_paths',?1)",[&raw]).unwrap();
+            let config=effective_library_config(&app.db.lock().unwrap(),None).expect("legacy settings must not prevent startup");
+            assert!(config.roots.is_empty());
+            *app.library.write().unwrap()=config;
+            let response=get_settings(State(app.clone()),axum::http::HeaderMap::new(),query()).await.into_response();
+            assert_eq!(response.status(),StatusCode::OK);
+            let bytes=axum::body::to_bytes(response.into_body(),usize::MAX).await.unwrap();
+            let body:serde_json::Value=serde_json::from_slice(&bytes).unwrap();
+            assert!(body["library_paths"].as_array().unwrap().iter().all(serde_json::Value::is_string));
+            assert!(body["library_config_error"].is_string());
+            if !value.is_array() || value.as_array().unwrap().iter().any(|v|!v.is_string()) {assert_eq!(body["library_paths"],serde_json::json!([]));}
+            else {assert_eq!(body["library_paths"],value);}
+            assert_eq!(trigger_scan(State(app.clone())).await,StatusCode::NOT_IMPLEMENTED);
+            assert_eq!(app.db.lock().unwrap().query_row("SELECT value FROM settings WHERE key='library_paths'",[],|r|r.get::<_,String>(0)).unwrap(),raw);
+        }
+        let response=set_setting(State(app.clone()),axum::http::HeaderMap::new(),query(),Json(serde_json::json!({"library_paths":[root.join("library")]}))).await;
+        assert_eq!(response.status(),StatusCode::NO_CONTENT);
+        assert_eq!(library_roots(&app),vec![root.join("library")]);
+        assert_eq!(set_setting(State(app.clone()),axum::http::HeaderMap::new(),query(),Json(serde_json::json!({"library_config_error":null}))).await.status(),StatusCode::BAD_REQUEST);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn final_retained_offline_root_does_not_block_other_edits() {
+        let (root,app)=fixture();let offline=root.join("offline");
+        app.db.lock().unwrap().execute("INSERT INTO settings(key,value) VALUES('library_paths',?1)",[serde_json::json!([offline]).to_string()]).unwrap();
+        *app.library.write().unwrap()=effective_library_config(&app.db.lock().unwrap(),None).unwrap();
+        let edit=serde_json::json!({"library_paths":[offline,root.join("library")]});
+        assert_eq!(set_setting(State(app.clone()),axum::http::HeaderMap::new(),query(),Json(edit)).await.status(),StatusCode::NO_CONTENT);
+        assert!(!offline.exists());
+        assert_eq!(set_setting(State(app.clone()),axum::http::HeaderMap::new(),query(),Json(serde_json::json!({"library_paths":[offline,root.join("new-missing")]}))).await.status(),StatusCode::BAD_REQUEST);
+        assert!(!root.join("new-missing").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn final_thumbnail_resolution_precedes_write_transaction() {
+        let (root,app)=fixture();let thumbs=root.join("thumbs");std::fs::create_dir(&thumbs).unwrap();
+        let thumbnail=thumbs.join(format!("41-{}.jpg",uuid::Uuid::new_v4()));std::fs::write(&thumbnail,b"owned").unwrap();
+        let source=root.join("library/source.mp3");std::fs::write(&source,b"source").unwrap();
+        let mut db=app.db.lock().unwrap();
+        db.execute("INSERT INTO media(id,kind,path,title) VALUES(42,'music',?1,'reference')",[source.to_string_lossy()]).unwrap();
+        scanner::RETIREMENT_WRITE_PROBES.with(|count|count.set(0));
+        cleanup_owned_thumbnail(&mut db,&thumbs,&[root.join("library")],41,source.to_str().unwrap(),thumbnail.to_str()).unwrap();
+        assert!(!thumbnail.exists());assert!(source.exists());
+        scanner::RETIREMENT_WRITE_PROBES.with(|count|assert_eq!(count.get(),0,"filesystem resolution held the SQLite write transaction"));
+        drop(db);std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn final_session_database_error_never_falls_back_to_device_or_guest() {
+        let (root,app)=fixture();let token=uuid::Uuid::new_v4().to_string();
+        let mut headers=axum::http::HeaderMap::new();headers.insert(header::AUTHORIZATION,format!("Bearer {token}").parse().unwrap());
+        {
+            let db=app.db.lock().unwrap();
+            assert_eq!(resolve_identity(&db,&headers,None),Err(StatusCode::UNAUTHORIZED));
+            db.execute("INSERT INTO sessions(token,identity_id,expires_at) VALUES(?1,1,unixepoch()-1)",[&token]).unwrap();
+            assert_eq!(resolve_identity(&db,&headers,None),Err(StatusCode::UNAUTHORIZED));
+            db.execute("UPDATE sessions SET expires_at=unixepoch()+3600",[]).unwrap();
+            assert_eq!(resolve_identity(&db,&headers,Some("unused-device")),Ok(1));
+            db.execute_batch("CREATE TRIGGER deny_refresh BEFORE UPDATE ON sessions BEGIN SELECT RAISE(ABORT,'fixture'); END").unwrap();
+            assert_eq!(resolve_identity(&db,&headers,Some("new-device")),Err(StatusCode::INTERNAL_SERVER_ERROR));
+            db.execute_batch("DROP TRIGGER deny_refresh; ALTER TABLE sessions RENAME TO unavailable_sessions").unwrap();
+        }
+        assert_eq!(resolve_identity(&app.db.lock().unwrap(),&headers,Some("new-device")),Err(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(app.db.lock().unwrap().query_row("SELECT COUNT(*) FROM identities WHERE key='new-device'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        assert_eq!(auth_me(State(app.clone()),headers.clone()).await.into_response().status(),StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(library_handler(State(app.clone()),headers.clone(),Query(std::collections::HashMap::new())).await.status(),StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(list_perms(State(app.clone()),headers.clone(),query()).await.into_response().status(),StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(get_progress(State(app.clone()),Path(41),headers.clone(),query()).await.into_response().status(),StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(list_annotations(State(app.clone()),Path(41),headers.clone(),query()).await.into_response().status(),StatusCode::INTERNAL_SERVER_ERROR);
+        let password=ChangePwReq {old:uuid::Uuid::new_v4().to_string(),new:uuid::Uuid::new_v4().to_string()};
+        assert_eq!(auth_change_password(State(app.clone()),ConnectInfo("127.0.0.1:1".parse().unwrap()),headers.clone(),Json(password)).await.into_response().status(),StatusCode::INTERNAL_SERVER_ERROR);
+        let (code,proof)=app.party.create("admin");
+        assert_eq!(party_create(State(app.clone()),headers.clone(),Json(PartyCreateReq {identity:"new-device".into()})).await.into_response().status(),StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(app.party.can_register(&app.party.authorize(&code,Some(proof)).unwrap(),"admin"));
+        app.db.lock().unwrap().execute_batch("ALTER TABLE unavailable_sessions RENAME TO sessions").unwrap();
+        assert_eq!(auth_me(State(app.clone()),headers).await.into_response().status(),StatusCode::OK);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

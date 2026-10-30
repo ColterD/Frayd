@@ -410,7 +410,7 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser, diagno
     phase('ready');
     // Only fixed keyboard commands are exposed to the loopback fixture, never arbitrary RPC.
     async function key(key, accept = false) {
-      const codes = { Tab: 9, Enter: 13, ' ': 32, ArrowRight: 39, t: 84 };
+      const codes = { Tab: 9, Enter: 13, ' ': 32, ArrowLeft: 37, ArrowRight: 39, t: 84 };
       if (!(key in codes)) throw new Error('Unknown fixture keyboard key');
       acceptDialog = accept;
       const before = dialogs.length;

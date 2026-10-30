@@ -3141,3 +3141,81 @@ test('a failed progress save is logged without interrupting playback', async () 
   assert.deepEqual(warnings.at(-1), ['progress save failed', 500]);
   assert.equal(b.notices(), '');
 });
+
+for (const kind of ['music', 'movie']) {
+  test(`closed ${kind} party player cannot resume invisibly or control stale media`, async () => {
+    const { b, socket, state, media } = await hostParty(kind);
+    media.currentTime = 41;
+    b.nodes.get(kind === 'music' ? '#pb-close' : '#vm-back').onclick();
+    await settle();
+    socket.sent.length = 0;
+    await assert.rejects(b.run(`partyControlPlayback("play", ${JSON.stringify(state)})`), /Reopen this item/);
+    assert.equal(media.paused, true);
+    assert.equal(media.currentTime, 41);
+    assert.deepEqual(socket.sent, []);
+  });
+}
+
+test('reader arrow shortcuts work after button focus but respect editable controls and button Space', () => {
+  const b = browser();
+  b.run('ebook={}; document.querySelector("#ebook-modal").classList.add("on")');
+  for (const key of ['ArrowRight', 'ArrowLeft']) {
+    assert.equal(b.run(`ebookShortcutAllowed({key:"${key}",target:{tagName:"BUTTON"}})`), true);
+    for (const tagName of ['INPUT', 'TEXTAREA', 'SELECT'])
+      assert.equal(b.run(`ebookShortcutAllowed({key:"${key}",target:{tagName:"${tagName}"}})`), false);
+    assert.equal(b.run(`ebookShortcutAllowed({key:"${key}",target:{isContentEditable:true}})`), false);
+  }
+  assert.equal(b.run('ebookShortcutAllowed({key:" ",target:{tagName:"BUTTON"}})'), false);
+});
+
+for (const kind of ['music', 'movie']) {
+  test(`${kind} party pause remains available for a hidden owned stream; stale source is rejected`, async () => {
+    const { b, socket, state, media } = await hostParty(kind);
+    b.nodes.get(kind === 'music' ? '#playerbar' : '#video-modal').classList.remove('on');
+    media.currentTime = 29;
+    await b.run(`partyControlPlayback("pause", ${JSON.stringify(state)})`);
+    await settle();
+    assert.equal(media.paused, true);
+    assert.deepEqual(socket.sent, [{type:'pause',position:29}]);
+    media.src = '/api/stream/99';
+    await assert.rejects(b.run(`partyControlPlayback("play", ${JSON.stringify(state)})`), /Reopen this item/);
+    await assert.rejects(b.run(`partyControlPlayback("pause", ${JSON.stringify(state)})`), /Reopen this item/);
+    assert.equal(media.paused, true);
+  });
+}
+
+
+test('account entry retires party ownership before replacement dashboard mounts', async () => {
+  const { b, socket } = await hostParty();
+  b.respond(async url => reply(url.startsWith('/api/library') ? [] : null));
+  b.run('account={name:"Replacement",isAdmin:false};IDENTITY="replacement";enterApp()');
+  await settle();
+  assert.equal(socket.readyState, 3);
+  assert.equal(b.context.partySend, null);
+  assert.equal(b.nodes.get('#party-modal').classList.contains('on'), false);
+});
+
+
+for (const scenario of [
+  { name: '429 server retry guidance', status: 429, body: {error:'too many attempts — wait 5 minutes'}, expected:'too many attempts — wait 5 minutes' },
+  { name: '429 empty body fallback', status: 429, invalidJSON: true, expected:'Too many sign-in attempts. Wait 5 minutes and try again.' },
+  { name: '429 nonstring error fallback', status: 429, body: {error:42}, expected:'Too many sign-in attempts. Wait 5 minutes and try again.' },
+  { name: '429 markup remains text', status: 429, body: {error:'<img src=x onerror=alert(1)> wait 5 minutes'}, expected:'<img src=x onerror=alert(1)> wait 5 minutes' },
+  { name: '401 keeps credential message', status: 401, body: {error:'private internal detail'}, expected:'Invalid email or password' },
+  { name: '500 hides server detail', status: 500, body: {error:'private internal detail'}, expected:'Server error (500)' },
+]) {
+  test(`login ${scenario.name}`, async () => {
+    const b = browser();
+    b.nodes.get('#email').value = 'fixture@example.invalid';
+    b.nodes.get('#password').value = 'owned-fixture-password';
+    b.respond(async () => ({ok:false,status:scenario.status,json:async()=>{
+      if (scenario.invalidJSON) throw new SyntaxError('empty body');
+      return scenario.body;
+    }}));
+    await b.run('doLogin({preventDefault(){}})');
+    assert.equal(b.nodes.get('#auth-error').textContent, scenario.expected);
+    assert.equal(b.nodes.get('#auth-error').style.display, 'block');
+    assert.equal(b.requests.filter(r=>r.url==='/api/auth/login').length, 1);
+    assert.equal(b.context.localStorage.frayd_token, undefined);
+  });
+}

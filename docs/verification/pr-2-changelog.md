@@ -2,13 +2,45 @@
 
 [Verification records](README.md) · [Review dispositions](coderabbit-follow-up.md) · [Canonical checks](../development.md#canonical-checks) · [Draft PR #2](https://github.com/ColterD/Frayd/pull/2)
 
-Net inventory against synced fork main `21b2e9b6bf4cff26254f5dfcec9deecd02453718`: 83 files at `a2473d4846df844f212358f6c27bd00562686111` (checked 2026-10-30 UTC), each listed in [Changed-file coverage](#changed-file-coverage). Later sections record fixes in commit order. The historical 129 dispositions are not 129 reproduced bugs.
+## Current qualification status
+
+The [verification appendix](https://gist.github.com/ColterD/599a8a4532de0f60e31573cccb27d179) links current source identities, test status and remaining limits.
+The appendix records the current source, results and remaining limits.
+Historical entries below keep their original source IDs, counts, failures and platform results.
+Their passing checks do not qualify later changes.
+See the [unreleased product changelog](../../CHANGELOG.md) for current behavior changes.
+
+## Final inspection changes (2026-10-30)
+
+This inventory describes the current source. It does not report new runtime passes.
+See the [verification appendix](https://gist.github.com/ColterD/599a8a4532de0f60e31573cccb27d179) for source identity and test results.
+
+- **Library continuity.** Hold invalid older root settings for repair. Preserve media IDs across unique path aliases and refuse ambiguous or active-conversion conflicts.
+- **Root edits and cache cleanup.** Retain an offline saved root while editing another. Resolve thumbnail paths before the write transaction and recheck references before removal.
+- **Account errors and waits.** Report session database errors separately from invalid sessions. Move account deletion and permission updates to blocking workers with their complete transactions.
+- **Settings feedback.** Show a failed save instead of an earlier Saved label. Show held library configuration in Settings.
+- **Settings authority.** Recheck administrator rights after write admission. Refuse revoked rights or database errors before changing stored or active configuration.
+- **Sign-in feedback.** Show rate-limit retry guidance as text. Use a five-minute fallback for missing guidance and retain existing invalid-password and server-error messages.
+- **Reader and party controls.** Preserve arrow keys after button focus and typed party URLs during state updates. Refuse hidden-player party Play with a recovery message.
+- **Party handoff.** Reload local media after external playback. Retire the party panel on an account change and remove unused client state.
+- **Install commands.** Make the generated Windows command select its child execution policy. Report Homebrew prerequisite errors and explain first-login owner creation.
+- **Native cancellation.** Check supported cancellation signals during staging. Roll back only unchanged attempt-owned paths. A completed publication remains installed.
+- **Native shutdown.** Stop the owned server process group for INT, TERM, HUP and QUIT. Remove child records only after group cleanup succeeds.
+- **Removal and documentation.** Explain protected media deletion and source-install removal. Clarify fresh-clone upstream checks and canonical temporary-directory paths.
+- **Test simplification.** Remove the helper-only encoding test. Keep explicit UTF-8 reads and three functional UI-fragment checks.
+- **Qualification commands.** Refuse optimized Python before build-context, integration or DNS qualification creates resources. Keep the required assertions active.
+
+SIGKILL, blocked storage and descendants that leave the owned group remain outside the native cleanup guarantee.
+No complete process-tree containment, new deployment or upstream approval is claimed.
+Historical CodeRabbit output remains unknown under support ticket #39355.
+
+Historical inventory against synced fork main `21b2e9b6bf4cff26254f5dfcec9deecd02453718`: 83 files at `a2473d4846df844f212358f6c27bd00562686111` (checked 2026-10-30 UTC), each listed in [Changed-file coverage](#changed-file-coverage). Later sections record fixes in commit order. The historical 129 dispositions are not 129 reproduced bugs.
 
 PR #2 is an unmerged, unreleased draft on the fork. The local deployment at `http://127.0.0.1:3101` passed the operational verification in [Verified local rollout](#verified-local-rollout).
 
 ## Workflow follow-up checkpoint (2026-10-30)
 
-Current committed source: `1581f7efbf7d0bbfa5c8c73a87b55ad6e547600c`. This revision contains the Account navigation fix, the finite 120-second browser case cap and the corrected integration fixture. Its `client/js/app.js` SHA-256 is `1e3de038d025b5f7a8835b616ff4ca23772a0e0377192c36d9e248f7e325195c`. Results below keep that committed checkpoint separate from the clean `99e146a` workflow runtime and earlier `cd92f30` observations. The later CRLF finding concerns test-source extraction only; its status is recorded separately. PR #2 remains a draft; no new deployment or upstream publication is claimed.
+Historical committed checkpoint: `1581f7efbf7d0bbfa5c8c73a87b55ad6e547600c`. This revision contains the Account navigation fix, the finite 120-second browser case cap and the corrected integration fixture. Its `client/js/app.js` SHA-256 is `1e3de038d025b5f7a8835b616ff4ca23772a0e0377192c36d9e248f7e325195c`. Results below keep that committed checkpoint separate from the clean `99e146a` workflow runtime and earlier `cd92f30` observations. The later CRLF finding concerns test-source extraction only; its status is recorded separately. PR #2 remains a draft; no new deployment or upstream publication is claimed.
 
 ### Fixed
 

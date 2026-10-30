@@ -98,6 +98,7 @@ if defined FAKE_WINGET_EXIT exit /b %FAKE_WINGET_EXIT%
 exit /b 0
 ''',
     'tailscale': '''>>"%FAKE_LOG%" echo tailscale %*
+if defined FAKE_TAILSCALE_STDERR echo fixture diagnostic 1>&2
 if defined FAKE_TAILSCALE_EXIT exit /b %FAKE_TAILSCALE_EXIT%
 if /i "%~1"=="ip" echo 100.64.0.7
 exit /b 0
@@ -387,6 +388,8 @@ class QualificationMixin:
         rows = (
             ('address', {'tailscale': True}, {}, "[OK] Your server's Tailscale address: 100.64.0.7"),
             ('lookup fails', {'tailscale': True}, {'FAKE_TAILSCALE_EXIT': '1'}, '[!] No Tailscale address yet'),
+            ('stderr with address', {'tailscale': True}, {'FAKE_TAILSCALE_STDERR': '1'}, "[OK] Your server's Tailscale address: 100.64.0.7"),
+            ('stderr without address', {'tailscale': True}, {'FAKE_TAILSCALE_STDERR': '1', 'FAKE_TAILSCALE_EXIT': '1'}, '[!] No Tailscale address yet'),
             ('not on PATH after install', {'tailscale': False}, {}, '[!] No Tailscale address yet'),
         )
         for label, options, fake, expected in rows:
@@ -481,6 +484,34 @@ class QualificationMixin:
 
 class WindowsPowerShell51(QualificationMixin, unittest.TestCase):
     interpreter_name = 'powershell'
+
+    def test_generated_file_entry_overrides_only_process_restricted_policy(self):
+        # No persistent policy writes. A managed policy is a held qualification,
+        # rather than permission to override the administrator's policy.
+        env = runtime_environment(PATH=os.pathsep.join([str(Path(self.interpreter).parent),
+                                                      str(Path(os.environ['SystemRoot']) / 'System32')]))
+        policy = subprocess.run([self.interpreter, '-NoProfile', '-NonInteractive', '-Command',
+            "Get-ExecutionPolicy -Scope MachinePolicy; Get-ExecutionPolicy -Scope UserPolicy"],
+            env=env, capture_output=True, text=True, timeout=30, check=False)
+        self.assertEqual(policy.returncode, 0, policy.stderr)
+        self.assertEqual(policy.stdout.split(), ['Undefined', 'Undefined'],
+                         'qualification held: Group Policy governs script execution')
+        with tempfile.TemporaryDirectory(prefix="Frayd entry owner's ") as directory:
+            script = Path(directory) / 'frayd-install.ps1'
+            script.write_text("param([string]$Lib)\nWrite-Output $Lib\n", encoding='ascii')
+            env.update(TEMP=directory, TMP=directory)
+            base = [self.interpreter, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Restricted', '-Command']
+            blocked = subprocess.run(base + ["& '.\\frayd-install.ps1' -Lib 'harmless fixture'"],
+                                     env=env, cwd=directory, capture_output=True, text=True, timeout=30, check=False)
+            self.assertNotEqual(blocked.returncode, 0, 'Restricted control must refuse the file')
+            self.assertNotIn('harmless fixture', blocked.stdout)
+            template = re.search(r"; (powershell\.exe [^\n]+)\$\{argStr\}`;", (ROOT / 'client/install/index.html').read_text())
+            self.assertIsNotNone(template, 'generated file entry must be present')
+            command = template.group(1).replace('\\\\', '\\') + " -Lib 'Owner''s $Library with spaces'"
+            allowed = subprocess.run(base + [command], env=env, cwd=directory, capture_output=True, text=True,
+                                     timeout=30, check=False)
+            self.assertEqual(allowed.returncode, 0, allowed.stderr)
+            self.assertEqual(allowed.stdout.strip(), "Owner's $Library with spaces")
 
     def check_engine(self, version, edition):
         self.assertTrue(version.startswith('5.1.') and edition == 'Desktop', f'expected Windows PowerShell 5.1, ran {version} {edition}')

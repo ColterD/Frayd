@@ -45,7 +45,7 @@ test('legitimate opaque reader persists highlights and fractional progress, upda
   assert.equal(JSON.parse(b.requests[1].options.body).position, 1.5);
   assert.equal(b.nodes.get('#em-pageinfo').textContent, '2 · p3/5');
   b.send({ type: 'search-results', count: 2 });
-  assert.equal(b.run('ebook.searchHits'), 2);
+  assert.equal(b.nodes.get('#em-searchinfo').textContent, '2 hits — Enter for next');
   b.send({ type: 'search-hit', idx: 1, total: 2 });
   assert.equal(b.nodes.get('#em-searchinfo').textContent, '1/2 in ch.');
   b.nodes.get('#em-close').onclick();

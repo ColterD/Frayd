@@ -279,21 +279,89 @@ These shell checks are safeguards around the steps above. They are not an automa
 - **TV Shows** groups recognized episodes by series and season. Supported video filenames use a complete `S01E02`, `1x02` or whitespace-separated `Season 1 Episode 2` token (case insensitive, at most two season digits and three episode digits); dimensions such as `1920x1080` remain movies. Series metadata takes precedence, then the filename prefix, then up to two parents inside an admitted library root, skipping a numbered Season folder. Rescanning can reclassify an unchanged movie and fill only a NULL episode series without probing or converting media; existing non-NULL values, including an empty string, are preserved. Renaming filenames or changing this metadata is not an episode editor.
 - Music, audiobooks and ebooks group by author and named album or series; loose items remain visible beside series folders. Folder tiles do not make media-progress requests.
 - Sign-in offers a local email and password, and guest entry. Remember me, Google and SSO sign-in, notifications, and audio Previous and Next buttons are not implemented. Their design fragments are in [docs/design](design/unwired-ui-fragments.html).
-- The [native bundle](native-bundle.md) is experimental, with explicit ownership and removal checks. The browser and bootstrap installers are separate and also experimental. On Windows, `tests/test_bootstrap_windows.py` runs `bootstrap.ps1` under Windows PowerShell 5.1 and PowerShell 7 with stub commands and runs the generated startup launcher. It does not install real Git, Rust, FFmpeg or tunnel software. The [Docker quick start](../README.md#run-with-docker) is the startup route this guide documents.
+- The [native bundle](native-bundle.md) is experimental, with explicit ownership and removal checks. The browser and bootstrap installers are separate and also experimental. On Windows, `tests/test_bootstrap_windows.py` runs `bootstrap.ps1` under Windows PowerShell 5.1 and PowerShell 7 with stub commands and runs the generated startup launcher. It does not install real Git, Rust, FFmpeg or tunnel software. The generated Windows command supplies an explicit process-only execution policy for its quoted script file; it does not change persistent policy and cannot override Group Policy. Windows qualification includes a harmless file under a Restricted parent process and holds if Group Policy governs execution. The [Docker quick start](../README.md#run-with-docker) is the startup route this guide documents.
 - ZIP readers support stored and deflate archives. Container isolation does not establish that arbitrary media is safe.
 - No license file is currently present in the repository. Do not assume redistribution terms from the public repository alone.
+
+### Remove a source-bootstrap autostart
+
+The browser source installer creates autostart separately from the experimental native bundle. A checkout's `scripts/uninstall.sh` deliberately refuses bundle removal without its adjacent helper; it does not remove a source-install service. Use the following operator procedure for a source install. Keep the checkout, `.env`, databases, thumbnails, transcodes and media; keep shared Rust, Tailscale, FFmpeg and other dependencies. Do not disable user lingering: other services may need it.
+
+On Linux, first inspect `systemctl --user show frayd.service -p FragmentPath -p DropInPaths -p ExecStart -p WorkingDirectory -p EnvironmentFiles`. The fragment must be exactly `$HOME/.config/systemd/user/frayd.service`, with no drop-ins, `WorkingDirectory` equal to `$HOME/Frayd/server`, `EnvironmentFile` equal to that directory's `.env`, and `ExecStart` equal to that directory's `target/release/frayd-server`. Compare the unit with the template in `client/install/bootstrap.sh`; preserve and investigate modified, redirected or uncertain units instead of stopping them by name. After verifying that this is the source install you intend to stop:
+
+```sh
+(
+frayd_source_unit="$HOME/.config/systemd/user/frayd.service"
+frayd_source_backup="$frayd_source_unit.frayd-source-backup"
+[ -f "$frayd_source_unit" ] && [ ! -L "$frayd_source_unit" ] &&
+[ ! -e "$frayd_source_backup" ] && [ ! -L "$frayd_source_backup" ] || exit 2
+systemctl --user disable --now frayd.service || exit 2
+mv -n "$frayd_source_unit" "$frayd_source_backup" || exit 2
+[ ! -e "$frayd_source_unit" ] && [ ! -L "$frayd_source_unit" ] || exit 2
+systemctl --user daemon-reload || exit 2
+systemctl --user is-enabled frayd.service
+systemctl --user is-active frayd.service
+)
+```
+
+The last two checks should report disabled/not-found and inactive (nonzero exits are expected). Verify the inspected server process has stopped. If any step fails, retain the unit and checkout and investigate before continuing. An existing backup, including a dangling symlink, refuses the procedure before any service command. `mv -n` never overwrites; its source-absence check also catches implementations that return success when declining an overwrite.
+
+To restore, inspect the preserved unit first. Refuse an existing or redirected destination and a redirected backup:
+
+```sh
+(
+frayd_source_unit="$HOME/.config/systemd/user/frayd.service"
+frayd_source_backup="$frayd_source_unit.frayd-source-backup"
+[ ! -e "$frayd_source_unit" ] && [ ! -L "$frayd_source_unit" ] &&
+[ -f "$frayd_source_backup" ] && [ ! -L "$frayd_source_backup" ] || exit 2
+mv -n "$frayd_source_backup" "$frayd_source_unit" || exit 2
+[ ! -e "$frayd_source_backup" ] && [ ! -L "$frayd_source_backup" ] || exit 2
+systemctl --user daemon-reload && systemctl --user enable --now frayd.service
+)
+```
+
+On macOS, inspect `$HOME/Library/LaunchAgents/io.github.kattiest.frayd.plist` with `plutil -p` and compare it with the source bootstrap's template: label `io.github.kattiest.frayd`, working directory `$HOME/Frayd/server`, sole program argument `$HOME/Frayd/server/target/release/frayd-server`, and the intended `FRAYD_LIBRARY`. Inspect `launchctl print "gui/$(id -u)/io.github.kattiest.frayd"` for the same path/program. Preserve and investigate modified, redirected or uncertain files or jobs. After verifying ownership, unload the exact plist before moving it:
+
+```sh
+(
+frayd_source_unit="$HOME/Library/LaunchAgents/io.github.kattiest.frayd.plist"
+frayd_source_backup="$frayd_source_unit.frayd-source-backup"
+[ -f "$frayd_source_unit" ] && [ ! -L "$frayd_source_unit" ] &&
+[ ! -e "$frayd_source_backup" ] && [ ! -L "$frayd_source_backup" ] || exit 2
+launchctl bootout "gui/$(id -u)" "$frayd_source_unit" || exit 2
+mv -n "$frayd_source_unit" "$frayd_source_backup" || exit 2
+[ ! -e "$frayd_source_unit" ] && [ ! -L "$frayd_source_unit" ] || exit 2
+launchctl print "gui/$(id -u)/io.github.kattiest.frayd"
+)
+```
+
+The final check should report the service absent; verify the inspected process has stopped. The same backup and no-overwrite guards apply. To restore, inspect the preserved plist first, then run:
+
+```sh
+(
+frayd_source_unit="$HOME/Library/LaunchAgents/io.github.kattiest.frayd.plist"
+frayd_source_backup="$frayd_source_unit.frayd-source-backup"
+[ ! -e "$frayd_source_unit" ] && [ ! -L "$frayd_source_unit" ] &&
+[ -f "$frayd_source_backup" ] && [ ! -L "$frayd_source_backup" ] || exit 2
+mv -n "$frayd_source_backup" "$frayd_source_unit" || exit 2
+[ ! -e "$frayd_source_backup" ] && [ ! -L "$frayd_source_backup" ] || exit 2
+launchctl bootstrap "gui/$(id -u)" "$frayd_source_unit"
+)
+```
+
+These are operator steps, not an automated ownership receipt or a claim that service removal was exercised on your machine.
 
 ### Check a build against upstream
 
 The app makes no upstream requests. Settings links to the upstream GitHub page (sign-in may be required). To check a build, run an explicit operator command from a checkout that already has authenticated Git access:
 
 ```sh
-python3 scripts/check-upstream.py --build-url http://127.0.0.1:3100
+python3 scripts/check-upstream.py --remote origin --build-url http://127.0.0.1:3100
 # Alternatively compare a selected source ref, not the running app:
-python3 scripts/check-upstream.py --ref HEAD
+python3 scripts/check-upstream.py --remote origin --ref HEAD
 ```
 
-The default remote is the checkout's `upstream` remote, branch `main`. `--remote` selects another existing remote. The command prints JSON with the selected SHA, the upstream SHA and commit time, and the UTC time of the check. With `--build-url` it reads `/api/build` from the running app, and it always fetches into disposable storage. Git operations have 45-second limits within a 90-second total. HTTP uses a 10-second timeout per operation and for reading the body. Prompts and redirects are disabled, and raw errors and remote URLs are not printed. No token is copied or printed, and existing Git credential helpers may be used as normal.
+The examples use `origin`, which a fresh clone creates; verify it names the intended upstream repository first with `git remote`. Fork checkouts should select their authenticated upstream remote explicitly. The CLI default remains the checkout's `upstream` remote, branch `main`; if that remote is absent it returns `unknown` without updating anything. `--remote` selects another existing remote. The command prints JSON with the selected SHA, the upstream SHA and commit time, and the UTC time of the check. With `--build-url` it reads `/api/build` from the running app, and it always fetches into disposable storage. Git operations have 45-second limits within a 90-second total. HTTP uses a 10-second timeout per operation and for reading the body. Prompts and redirects are disabled, and raw errors and remote URLs are not printed. No token is copied or printed, and existing Git credential helpers may be used as normal.
 
 The command changes nothing: no branch, index, working tree, local fetch ref, setting, credential or installed binary is updated. It needs Git and full history, and it runs on the host, outside the app's isolated Docker network.
 

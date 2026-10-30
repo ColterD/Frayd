@@ -794,3 +794,34 @@ for (const lineEnding of ['\n', '\r\n']) {
     assert.equal(shelves.filter(node => node.classList.contains('active')).length, 1);
   });
 }
+
+for (const selector of ['#s-site-save', '#s-net-save']) {
+  test(`${selector} replaces earlier success with pending then failure on 204 followed by 500`, async () => {
+    const b = browser();
+    const { control } = passwordPanel(b);
+    b.respond(async url => reply(url.endsWith('/perms') ? [] : {library_paths:[]}));
+    await b.run('openSettings()');
+    control('.s-port').value = '8484';
+    const button = b.nodes.get(selector);
+    b.respond(async () => ({ok:true,status:204}));
+    await button.onclick({target:button});
+    assert.match(button.textContent, /Saved/);
+    let release;
+    b.respond(() => new Promise(resolve => {release=resolve;}));
+    const pending = button.onclick({target:button});
+    assert.equal(button.textContent, 'Saving…');
+    release({ok:false,status:500});
+    await pending;
+    assert.equal(button.textContent, 'Save failed');
+    assert.match(b.notices(), /500/);
+  });
+}
+
+test('held library configuration renders escaped repair guidance without preventing settings', async () => {
+  const b = browser();
+  const { stage } = passwordPanel(b);
+  b.respond(async url => reply(url.endsWith('/perms') ? [] : {library_paths:[],library_config_error:'Invalid <legacy> configuration'}));
+  await b.run('openSettings()');
+  assert.match(stage.innerHTML, /Invalid &lt;legacy&gt; configuration/);
+  assert.match(stage.innerHTML, /Add a valid folder/);
+});

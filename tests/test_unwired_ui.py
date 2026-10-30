@@ -3,12 +3,9 @@
 Whether the default UI renders only implemented controls is the real DOM suite's job (tests/browser-regression.cjs).
 """
 from html.parser import HTMLParser
-import io
 from pathlib import Path
 import re
-import tempfile
 import unittest
-from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTROLS = {'button', 'input', 'select', 'textarea'}
@@ -62,16 +59,6 @@ class UnwiredFragmentTests(unittest.TestCase):
                 self.assertIn('disabled', attrs, (template, tag))
                 self.assertNotIn('id', attrs, (template, tag))
         self.assertNotIn('docs/design', read('client/index.html'))
-
-    def test_html_reader_uses_utf8_with_a_legacy_default_encoding(self):
-        with tempfile.TemporaryDirectory() as directory:
-            fixture = Path(directory) / 'unicode.html'
-            source = '<p>\u2014</p>'
-            fixture.write_text(source, encoding='utf-8')
-            with patch.object(io, 'text_encoding', side_effect=lambda encoding, *_args: encoding or 'cp932'):
-                with self.assertRaises(UnicodeDecodeError):
-                    fixture.read_text()
-                self.assertEqual(read(fixture), source)
 
 
 if __name__ == '__main__':

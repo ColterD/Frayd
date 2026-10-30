@@ -30,7 +30,7 @@ elif have dnf; then
 elif have pacman; then
   sudo pacman -S --noconfirm --needed git curl base-devel sqlite unzip unrar ffmpeg >/dev/null
 elif have brew; then
-  brew install -q git sqlite unzip unrar ffmpeg >/dev/null 2>&1 || true
+  brew install -q git sqlite unzip unrar ffmpeg >/dev/null
 fi
 
 if ! have cargo; then

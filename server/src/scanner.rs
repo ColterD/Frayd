@@ -75,35 +75,62 @@ pub(crate) fn generated_thumbnail_name(id: i64, path: &Path) -> bool {
         .is_some_and(|token| uuid::Uuid::parse_str(token).is_ok_and(|parsed| parsed.to_string() == token))
 }
 
-/// Retire one exact generated file only when no source, playback, or thumbnail still references it.
-pub(crate) fn retire_thumbnail(db: &Connection, id: i64, saved: &str, thumbs: &Path, roots: &[std::path::PathBuf]) -> Result<(), String> {
-    let path = Path::new(saved);
-    if !generated_thumbnail_name(id, path) { return Ok(()); }
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.to_string()),
-    };
-    if !metadata.is_file() || metadata.file_type().is_symlink() { return Err("thumbnail is not a regular owned file".into()); }
-    let cache = thumbs.canonicalize().map_err(|error| error.to_string())?;
-    let owned = path.canonicalize().map_err(|error| error.to_string())?;
-    if owned.parent() != Some(cache.as_path()) { return Err("thumbnail outside configured cache".into()); }
-    for root in roots {
-        if owned.starts_with(root.canonicalize().map_err(|error| error.to_string())?) { return Err("thumbnail overlaps source root".into()); }
-    }
-    let mut statement = db
-        .prepare("SELECT path FROM media UNION ALL SELECT thumb_path FROM media WHERE thumb_path IS NOT NULL
+#[cfg(test)]
+thread_local! {pub(crate) static RETIREMENT_WRITE_PROBES:std::cell::Cell<usize>=const {std::cell::Cell::new(0)};}
+
+/// Keep filesystem resolution observable in critical-section regression tests.
+fn retirement_canonicalize(_db:&Connection,path:&Path) -> std::io::Result<std::path::PathBuf> {
+    #[cfg(test)]
+    if !_db.is_autocommit() {RETIREMENT_WRITE_PROBES.with(|count|count.set(count.get()+1));}
+    path.canonicalize()
+}
+
+/// Raw references are rechecked under the write lock; all path resolution precedes that lock.
+pub(crate) struct ThumbnailRetirement { owned:std::path::PathBuf, references:Vec<String> }
+fn thumbnail_references(db:&Connection) -> Result<Vec<String>,String> {
+    db.prepare("SELECT path FROM media UNION ALL SELECT thumb_path FROM media WHERE thumb_path IS NOT NULL
         UNION ALL SELECT transcode_path FROM media WHERE transcode_path IS NOT NULL
-        UNION ALL SELECT path FROM transcode_artifacts UNION ALL SELECT owner_source_path FROM transcode_artifacts")
-        .map_err(|error| error.to_string())?;
-    for reference in statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|error| error.to_string())?
-    {
-        let reference = reference.map_err(|error| error.to_string())?;
-        if Path::new(&reference).canonicalize().ok().as_ref() == Some(&owned) { return Err("thumbnail retains a database reference".into()); }
+        UNION ALL SELECT path FROM transcode_artifacts UNION ALL SELECT owner_source_path FROM transcode_artifacts
+        ORDER BY 1").map_err(|error|error.to_string())?
+        .query_map([],|row|row.get(0)).map_err(|error|error.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>().map_err(|error|error.to_string())
+}
+
+/// Prepare only exact generated files, preserving every source/cache/reference refusal.
+pub(crate) fn prepare_thumbnail_retirement(db:&Connection,id:i64,saved:&str,thumbs:&Path,
+    roots:&[std::path::PathBuf]) -> Result<Option<ThumbnailRetirement>,String> {
+    let path=Path::new(saved);
+    if !generated_thumbnail_name(id,path) {return Ok(None);}
+    let metadata=match std::fs::symlink_metadata(path) {
+        Ok(metadata)=>metadata,
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(None),
+        Err(error)=>return Err(error.to_string()),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {return Err("thumbnail is not a regular owned file".into());}
+    let cache=retirement_canonicalize(db,thumbs).map_err(|error|error.to_string())?;
+    let owned=retirement_canonicalize(db,path).map_err(|error|error.to_string())?;
+    if owned.parent()!=Some(cache.as_path()) {return Err("thumbnail outside configured cache".into());}
+    for root in roots {
+        if owned.starts_with(retirement_canonicalize(db,root).map_err(|error|error.to_string())?) {return Err("thumbnail overlaps source root".into());}
     }
-    std::fs::remove_file(&owned).map_err(|error| error.to_string())
+    let references=thumbnail_references(db)?;
+    for reference in &references {
+        if retirement_canonicalize(db,Path::new(reference)).ok().as_ref()==Some(&owned) {return Err("thumbnail retains a database reference".into());}
+    }
+    Ok(Some(ThumbnailRetirement {owned,references}))
+}
+
+/// A changed reference snapshot holds optional cleanup; the transaction performs no path resolution.
+pub(crate) fn finish_thumbnail_retirement(db:&Connection,prepared:Option<ThumbnailRetirement>) -> Result<(),String> {
+    let Some(prepared)=prepared else {return Ok(());};
+    if thumbnail_references(db)?!=prepared.references {return Err("thumbnail references changed during cleanup".into());}
+    std::fs::remove_file(&prepared.owned).map_err(|error|error.to_string())
+}
+
+#[cfg(test)]
+/// Direct ownership-negative test entry point; production callers prepare before their write transaction.
+pub(crate) fn retire_thumbnail(db:&Connection,id:i64,saved:&str,thumbs:&Path,roots:&[std::path::PathBuf]) -> Result<(),String> {
+    finish_thumbnail_retirement(db,prepare_thumbnail_retirement(db,id,saved,thumbs,roots)?)
 }
 
 /// Whole-second source modification time, the unit stored in `media.mtime_secs`.
@@ -255,6 +282,8 @@ pub enum ScanError {
     RootUnavailable,
     /// A cache directory overlaps a root, cannot be resolved, or cannot be created.
     CacheBoundaryUnavailable,
+    /// Legacy paths are ambiguous, changed concurrently, or have active artifact ownership.
+    IdentityConflict,
 }
 
 impl ScanError {
@@ -263,8 +292,54 @@ impl ScanError {
         match self {
             ScanError::RootUnavailable => "Library root unavailable",
             ScanError::CacheBoundaryUnavailable => "Cache boundary unavailable",
+            ScanError::IdentityConflict => "Library source identity requires repair",
         }
     }
+}
+
+/// Resolve each persisted source once before recovery can mutate ownership or historical rows.
+/// Collisions hold the complete scan; a unique alias changes only its identity-bearing path fields.
+fn migrate_source_aliases(db:&Connection,roots:&[std::path::PathBuf]) -> Result<(),ScanError> {
+    let read=|db:&Connection| -> rusqlite::Result<Vec<(i64,String)>> {
+        db.prepare("SELECT id,path FROM media ORDER BY id")?.query_map([],|r|Ok((r.get(0)?,r.get(1)?)))?.collect()
+    };
+    let rows=read(db).map_err(|_|ScanError::IdentityConflict)?;
+    let mut equivalents=std::collections::HashMap::new();
+    let mut changes=Vec::new();
+    for (id,raw) in &rows {
+        let path=Path::new(raw);
+        let canonical=match path.canonicalize() {
+            Ok(path)=>path,
+            Err(_) if path.is_absolute() && !path.components().any(|c|matches!(c,std::path::Component::ParentDir|std::path::Component::CurDir))=>continue,
+            Err(_)=>return Err(ScanError::IdentityConflict),
+        };
+        if equivalents.insert(canonical.clone(),*id).is_some() {return Err(ScanError::IdentityConflict);}
+        if canonical!=path && roots.iter().any(|root|canonical.starts_with(root)) {
+            changes.push((*id,raw.clone(),canonical.to_string_lossy().into_owned()));
+        }
+    }
+    if changes.is_empty() {return Ok(());}
+    // Share converter admission while changing registry identity; no active worker may retain the old path.
+    if crate::transcode::BUSY.compare_exchange(false,true,std::sync::atomic::Ordering::SeqCst,std::sync::atomic::Ordering::SeqCst).is_err() {
+        return Err(ScanError::IdentityConflict);
+    }
+    struct Admission;
+    impl Drop for Admission {fn drop(&mut self){crate::transcode::BUSY.store(false,std::sync::atomic::Ordering::SeqCst);}}
+    let _admission=Admission;
+    immediate(db,|tx| {
+        if read(tx)?!=rows {return Err(rusqlite::Error::InvalidQuery);}
+        for (id,old,new) in &changes {
+            let unfinished:i64=tx.query_row("SELECT COUNT(*) FROM transcode_artifacts WHERE owner_media_id=?1
+                AND lifecycle IN ('pending','retiring')",[id],|r|r.get(0))?;
+            if unfinished!=0 {return Err(rusqlite::Error::InvalidQuery);}
+            if tx.execute("UPDATE media SET path=?1 WHERE id=?2 AND path=?3",rusqlite::params![new,id,old])?!=1 {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            tx.execute("UPDATE transcode_artifacts SET owner_source_path=?1 WHERE owner_media_id=?2 AND owner_source_path=?3",
+                rusqlite::params![new,id,old])?;
+        }
+        Ok(())
+    }).map_err(|_|ScanError::IdentityConflict)
 }
 
 /// Incrementally scan one root against the complete admitted root snapshot; returns new/updated items.
@@ -289,6 +364,9 @@ pub fn scan_with_roots(db: &Connection, db_path: String, root: std::path::PathBu
                 reason="unresolvable cache/root or overlap with configured roots","library scan held");
             return Err(ScanError::CacheBoundaryUnavailable);
         }
+    }
+    migrate_source_aliases(db,roots)?;
+    if let Some(t)=thumbs_dir {
         if let Err(error)=std::fs::create_dir_all(t) {
             tracing::warn!(operation="create_dir_all",cache_kind="thumbnail",path=%t.display(),source_root=%root.display(),
                 reason="thumbnail directory creation failed",%error,"library scan held");
@@ -509,8 +587,10 @@ fn upsert_item_with_roots(
     if let Some(thumbs) = thumbs_dir {
         if let Some((id,previous)) = prior_thumb {
             // Invalidation already committed. A cleanup failure retains the optional cache file.
-            let retired = immediate(db, |tx| Ok(retire_thumbnail(tx,id,&previous,thumbs,roots)))
-                .map_err(|error| error.to_string()).and_then(|retired| retired);
+            let retired = prepare_thumbnail_retirement(db,id,&previous,thumbs,roots).and_then(|prepared| {
+                immediate(db, |tx| Ok(finish_thumbnail_retirement(tx,prepared)))
+                    .map_err(|error|error.to_string()).and_then(|retired|retired)
+            });
             if let Err(error) = retired { tracing::warn!(id,%error,"obsolete thumbnail cleanup held"); }
         }
         if !classification_only {
@@ -2428,4 +2508,73 @@ exit "$probe_status"
         }
     }
 
+}
+
+#[cfg(all(test,unix))]
+mod final_alias_regressions {
+    use super::*;
+    #[test]
+    fn final_thumbnail_changed_reference_snapshot_holds_cleanup() {
+        let root=std::env::temp_dir().join(format!("frayd-retire-snapshot-{}",uuid::Uuid::new_v4()));
+        let thumbs=root.join("thumbs");let library=root.join("library");std::fs::create_dir_all(&thumbs).unwrap();std::fs::create_dir(&library).unwrap();
+        let thumbnail=thumbs.join(format!("41-{}.jpg",uuid::Uuid::new_v4()));std::fs::write(&thumbnail,b"kept").unwrap();
+        let db=crate::store::open(root.join("db.sqlite").to_str().unwrap());
+        let prepared=prepare_thumbnail_retirement(&db,41,thumbnail.to_str().unwrap(),&thumbs,std::slice::from_ref(&library)).unwrap();
+        db.execute("INSERT INTO media(id,kind,path,title) VALUES(42,'music',?1,'reference')",[thumbnail.to_string_lossy()]).unwrap();
+        let result=immediate(&db,|tx|Ok(finish_thumbnail_retirement(tx,prepared))).unwrap();
+        assert!(result.is_err());assert_eq!(std::fs::read(&thumbnail).unwrap(),b"kept");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn final_alias_scan_preserves_identity_and_holds_collisions() {
+        if std::env::var_os("FRAYD_TEST_FINAL_ALIAS").is_none() {
+            crate::test_support::assert_child_passes(crate::test_support::child("scanner::final_alias_regressions::final_alias_scan_preserves_identity_and_holds_collisions").env("FRAYD_TEST_FINAL_ALIAS","1"));return;
+        }
+        let root=std::env::temp_dir().join(format!("frayd-alias-{}",uuid::Uuid::new_v4()));
+        let library=root.join("real");std::fs::create_dir_all(&library).unwrap();
+        std::fs::write(library.join("song.mp3"),b"fixture").unwrap();
+        std::os::unix::fs::symlink(&library,root.join("alias")).unwrap();
+        let db_path=root.join("db.sqlite");let db=crate::store::open(db_path.to_str().unwrap());
+        let alias=root.join("alias/song.mp3");let canonical=library.join("song.mp3");
+        db.execute("INSERT INTO media(id,kind,path,title,author,meta_json) VALUES(41,'music',?1,'kept','kept-author','{\"custom\":\"kept\"}')",[alias.to_string_lossy()]).unwrap();
+        db.execute_batch("INSERT INTO identities(id,kind,key) VALUES(1,'device','fixture'); INSERT INTO progress(identity_id,media_id,position) VALUES(1,41,42);").unwrap();
+        db.execute_batch("INSERT INTO annotations(identity_id,media_id,kind,spine_idx,cfi,note) VALUES(1,41,'bookmark',0,'fixture','kept');
+            INSERT INTO tracks(media_id,track_no) VALUES(41,3); INSERT INTO playlists(id,identity_id,title) VALUES(1,1,'kept');
+            INSERT INTO playlist_items(playlist_id,media_id,pos) VALUES(1,41,0);").unwrap();
+        let artifact=root.join("artifact.mp4");std::fs::write(&artifact,b"artifact").unwrap();
+        db.execute("INSERT INTO transcode_artifacts(path,owner_media_id,owner_source_path,role,provenance,lifecycle)
+            VALUES(?1,41,?2,'final','generated','pending')",rusqlite::params![artifact.to_string_lossy(),alias.to_string_lossy()]).unwrap();
+        assert_eq!(scan_with_roots(&db,db_path.to_string_lossy().into_owned(),library.clone(),None,std::slice::from_ref(&library)),Err(ScanError::IdentityConflict));
+        assert_eq!(db.query_row("SELECT path FROM media WHERE id=41",[],|r|r.get::<_,String>(0)).unwrap(),alias.to_string_lossy());
+        db.execute("UPDATE transcode_artifacts SET lifecycle='completed'",[]).unwrap();
+        crate::transcode::BUSY.store(true,std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(scan_with_roots(&db,db_path.to_string_lossy().into_owned(),library.clone(),None,std::slice::from_ref(&library)),Err(ScanError::IdentityConflict));
+        crate::transcode::BUSY.store(false,std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..2 { assert!(scan_with_roots(&db,db_path.to_string_lossy().into_owned(),library.clone(),None,std::slice::from_ref(&library)).is_ok()); }
+        assert_eq!(db.query_row("SELECT owner_source_path FROM transcode_artifacts WHERE owner_media_id=41",[],|r|r.get::<_,String>(0)).unwrap(),canonical.to_string_lossy());
+        assert_eq!(db.query_row("SELECT title,author,json_extract(meta_json,'$.custom') FROM media WHERE id=41",[],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).unwrap(),("kept".into(),"kept-author".into(),"kept".into()));
+        for table in ["annotations","tracks","playlist_items"] {assert_eq!(db.query_row(&format!("SELECT COUNT(*) FROM {table} WHERE media_id=41"),[],|r|r.get::<_,i64>(0)).unwrap(),1);}
+        // A different lexical spelling migrates to the same stable identity.
+        db.execute("UPDATE media SET path=?1 WHERE id=41",[library.join("../real/song.mp3").to_string_lossy()]).unwrap();
+        db.execute("UPDATE transcode_artifacts SET owner_source_path=?1 WHERE owner_media_id=41",[library.join("../real/song.mp3").to_string_lossy()]).unwrap();
+        assert!(scan_with_roots(&db,db_path.to_string_lossy().into_owned(),library.clone(),None,std::slice::from_ref(&library)).is_ok());
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM media",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(db.query_row("SELECT path FROM media WHERE id=41",[],|r|r.get::<_,String>(0)).unwrap(),canonical.to_string_lossy());
+        assert_eq!(db.query_row("SELECT position FROM progress WHERE media_id=41",[],|r|r.get::<_,f64>(0)).unwrap(),42.0);
+        // Unavailable ordinary absolute sources have no provable equivalence; keep history and allow additions.
+        db.execute("INSERT INTO media(id,kind,path,title) VALUES(50,'music',?1,'missing')",[root.join("historical-missing.mp3").to_string_lossy()]).unwrap();
+        db.execute_batch("INSERT INTO progress(identity_id,media_id,position) VALUES(1,50,19);").unwrap();
+        std::fs::write(library.join("new.mp3"),b"new").unwrap();
+        assert!(scan_with_roots(&db,db_path.to_string_lossy().into_owned(),library.clone(),None,std::slice::from_ref(&library)).is_ok());
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM media",[],|r|r.get::<_,i64>(0)).unwrap(),3);
+        assert_eq!(db.query_row("SELECT position FROM progress WHERE media_id=50",[],|r|r.get::<_,f64>(0)).unwrap(),19.0);
+        db.execute("INSERT INTO media(id,kind,path,title) VALUES(42,'music',?1,'collision')",[alias.to_string_lossy()]).unwrap();
+        db.execute_batch("INSERT INTO progress(identity_id,media_id,position) VALUES(1,42,17);").unwrap();
+        let before:i64=db.query_row("SELECT total_changes()",[],|r|r.get(0)).unwrap();
+        assert_eq!(scan_with_roots(&db,db_path.to_string_lossy().into_owned(),library.clone(),None,std::slice::from_ref(&library)),Err(ScanError::IdentityConflict));
+        assert_eq!(db.query_row("SELECT total_changes()",[],|r|r.get::<_,i64>(0)).unwrap(),before,"collision must precede every reconciliation write");
+        assert_eq!(db.query_row("SELECT position FROM progress WHERE media_id=42",[],|r|r.get::<_,f64>(0)).unwrap(),17.0);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM media",[],|r|r.get::<_,i64>(0)).unwrap(),4);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

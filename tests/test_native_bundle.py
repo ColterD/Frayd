@@ -56,14 +56,14 @@ def run_bounded(arguments, *, timeout=60, check=False, input=None, capture_outpu
     return result
 
 
-def wait_for(probe, what, timeout=10):
+def wait_for(probe, what, timeout=10, interval=0.02):
     """Poll probe() until it returns something truthy, which is returned; fail the test after timeout seconds."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         value = probe()
         if value:
             return value
-        time.sleep(0.02)
+        time.sleep(interval)
     raise AssertionError(f'timed out after {timeout}s waiting for {what}')
 
 
@@ -376,7 +376,8 @@ class NativeOwnership(unittest.TestCase):
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='frayd native ', dir=TEMP_ROOT)
-        self.addCleanup(self.temp.cleanup)
+        self.preserve_fixture = False
+        self.addCleanup(self.cleanup_fixture)
         self.base = Path(self.temp.name)
         self.bundle = self.base / 'extracted bundle'
         self.bundle.mkdir(mode=0o700)
@@ -395,6 +396,12 @@ class NativeOwnership(unittest.TestCase):
             (self.base / name).mkdir(parents=True)
         for name in ['.cargo/sentinel', '.rustup/sentinel', 'media library/sentinel', 'original checkout/.env', 'original checkout/config.json']:
             (self.base / name).write_bytes(b'NONSECRET protected fixture sentinel')
+
+    def cleanup_fixture(self):
+        if self.preserve_fixture:
+            self.temp._finalizer.detach()
+            raise AssertionError(f'uncertain native fixture retained at {self.base}')
+        self.temp.cleanup()
 
     def manifest(self):
         entries = []
@@ -431,12 +438,15 @@ class NativeOwnership(unittest.TestCase):
         os.set_blocking(process.stderr.fileno(), True)
         return process, bytes(prompt)
 
-    @staticmethod
-    def stop_helper(process):
-        """Kill the helper's own session only while it is unreaped, so its pid cannot name another process."""
+    def stop_helper(self, process):
+        """Ask the unreaped supervisor to stop its own group; never guess a child PGID."""
         if process.poll() is None:
-            os.killpg(process.pid, signal.SIGKILL)
-        process.communicate(timeout=10)
+            process.send_signal(signal.SIGTERM)
+        try:
+            process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.preserve_fixture = True
+            raise AssertionError(f'cleanup uncertain; native fixture retained at {self.base}') from None
 
     def test_package_complete_manifest_and_architecture(self):
         output = self.base / 'package output'
@@ -834,11 +844,201 @@ class NativeOwnership(unittest.TestCase):
         self.assertFalse(self.prefix.exists())
         self.assertTrue((self.data / '.frayd-data.json').exists())
 
+    def test_install_cancellation_rolls_back_only_owned_staging_paths(self):
+        # A large sparse payload gives an observable copying window without a production test hook.
+        payload = self.bundle / 'client/slow-copy.bin'
+        with payload.open('wb') as file:
+            file.truncate(64 * 1024 * 1024)
+        self.manifest()
+        for cancellation in [signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT]:
+            for unknown in [False, True]:
+                with self.subTest(cancellation=cancellation, unknown=unknown):
+                    process = subprocess.Popen([str(HELPER), 'install', '--bundle', str(self.bundle),
+                        '--prefix', str(self.prefix), '--data-dir', str(self.data), '--yes'],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
+                    try:
+                        def copying():
+                            for stage in self.base.glob('.frayd-stage-*'):
+                                try:
+                                    copied = (stage / 'client/slow-copy.bin').stat().st_size
+                                except FileNotFoundError:
+                                    continue
+                                if 0 < copied < payload.stat().st_size:
+                                    return stage
+                            return None
+                        stage = wait_for(copying, 'partially copied install payload (fixture handshake)', timeout=30, interval=0.0005)
+                        os.kill(process.pid, signal.SIGSTOP)
+                        os.waitpid(process.pid, os.WUNTRACED)
+                        self.assertIsNone(process.poll(), 'fixture setup: installer must still be copying')
+                        copied = (stage / 'client/slow-copy.bin').stat().st_size
+                        self.assertTrue(0 < copied < payload.stat().st_size, 'fixture setup: pause missed the partial-copy window')
+                        sentinel = stage / 'unknown-preserve'
+                        if unknown:
+                            sentinel.write_bytes(b'preserve unowned staging entry')
+                        os.kill(process.pid, cancellation)
+                        os.kill(process.pid, signal.SIGCONT)
+                        _, stderr = process.communicate(timeout=30)
+                        self.assertEqual(process.returncode, 2, stderr)
+                        self.assertIn(b'installation cancelled', stderr)
+                        self.assertFalse(self.prefix.exists(), 'owned empty reservation must be removed')
+                        if unknown:
+                            self.assertEqual(sentinel.read_bytes(), b'preserve unowned staging entry')
+                            self.assertIn(str(stage).encode(), stderr)
+                            sentinel.unlink()
+                            stage.rmdir()
+                        else:
+                            self.assertFalse(stage.exists())
+                    finally:
+                        if process.poll() is None:
+                            os.killpg(process.pid, signal.SIGKILL)
+                            process.wait(timeout=10)
+                        process.stderr.close()
+
+    def test_inherited_ignored_sigchld_refuses_before_child_records_or_spawn(self):
+        started = self.base / 'must-not-start'
+        (self.bundle / 'frayd-server').write_text('#!/bin/sh\ntouch ' + shlex.quote(str(started)) + '\n')
+        self.manifest()
+        self.install('--yes')
+        before = self.snapshot()
+        process = subprocess.Popen([str(HELPER), 'start', '--prefix', str(self.prefix)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True,
+            preexec_fn=lambda: signal.signal(signal.SIGCHLD, signal.SIG_IGN))
+        _, stderr = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 2, stderr)
+        self.assertIn(b'unsupported SIGCHLD disposition', stderr)
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse(started.exists())
+        for root in [self.prefix, self.data]:
+            self.assertFalse((root / '.frayd-child.json').exists())
+
+    def test_changed_child_group_retains_receipts_without_signalling_shared_group(self):
+        stop = self.base / 'escaped-stop'
+        ready = self.base / 'escaped-ready'
+        done = self.base / 'escaped-done'
+        server = self.bundle / 'frayd-server'
+        server.write_text('#!' + sys.executable + '\nimport os,pathlib,time\n'
+            'os.setpgid(0, os.getppid())\npathlib.Path(' + repr(str(ready)) + ').touch()\n'
+            'stop=pathlib.Path(' + repr(str(stop)) + ')\n'
+            'for _ in range(1000):\n if stop.exists(): break\n time.sleep(.02)\n'
+            'pathlib.Path(' + repr(str(done)) + ').touch()\n')
+        self.manifest()
+        self.install('--yes')
+        process = subprocess.Popen([str(HELPER), 'start', '--prefix', str(self.prefix)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
+        try:
+            child = wait_for(lambda: shared_running_child_pid(self.prefix, self.data), 'child receipts')
+            wait_for(ready.exists, 'fixture child group change')
+            self.assertEqual(os.getpgid(child), process.pid)
+            process.send_signal(signal.SIGTERM)
+            self.assertEqual(process.wait(timeout=10), 2)
+            for root in [self.prefix, self.data]:
+                self.assertTrue((root / '.frayd-child.json').exists(), 'uncertain cleanup must retain both receipts')
+            self.run_helper('start', code=2)
+            self.run_helper('uninstall', '--yes', code=2)
+            self.assertFalse(done.exists(), 'refusal must not signal the shared group')
+        finally:
+            # This deliberately escaped fixture has a bounded self-exit oracle.
+            # Never signal its old PID or process group after helper exit.
+            stop.touch()
+            wait_for(done.exists, 'escaped fixture self-exit', timeout=25)
+            if process.poll() is None:
+                process.send_signal(signal.SIGTERM)
+                process.wait(timeout=10)
+            _, stderr = process.communicate(timeout=10)
+            self.assertIn(b'owned child group identity uncertain', stderr)
+            process.stderr.close()
+
+    def test_owned_server_group_stops_descendants_and_preserves_foreign_group(self):
+        foreign = subprocess.Popen(['sleep', '600'], start_new_session=True)
+        self.addCleanup(foreign.wait, 10)
+        self.addCleanup(foreign.kill)
+        for stop_mode in ['normal', 'helper-term', 'helper-hup', 'group-term', 'group-hup', 'helper-term-ignore']:
+            with self.subTest(stop_mode=stop_mode):
+                stop = self.base / 'worker-stop'
+                pidfile = self.base / 'worker-pid'
+                worker = self.base / 'worker.py'
+                release = self.base / 'server-release'
+                done = self.base / 'worker-done'
+                ready = self.base / 'worker-ready'
+                lease = self.base / 'worker-lease'
+                worker.write_text('import fcntl,pathlib,signal,time\n'
+                    + ('signal.signal(signal.SIGTERM, signal.SIG_IGN)\n' if stop_mode.endswith('ignore') else '')
+                    + 'f=open(' + repr(str(lease)) + ', \'w\');fcntl.flock(f, fcntl.LOCK_EX)\n'
+                    + 'pathlib.Path(' + repr(str(ready)) + ').touch()\n'
+                    + 'p=pathlib.Path(' + repr(str(stop)) + ')\nfor _ in range(1000):\n if p.exists(): break\n time.sleep(.02)\npathlib.Path(' + repr(str(done)) + ').touch()\n')
+
+                def lease_held():
+                    with lease.open('a') as handle:
+                        try:
+                            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            return True
+                        fcntl.flock(handle, fcntl.LOCK_UN)
+                        return False
+                (self.bundle / 'frayd-server').write_text(
+                    '#!/bin/sh\n' + shlex.quote(sys.executable) + ' ' + shlex.quote(str(worker)) + ' &\n'
+                    'echo $! > ' + shlex.quote(str(pidfile)) + '\n'
+                    + ('while [ ! -e ' + shlex.quote(str(release)) + ' ]; do sleep .02; done\nexit 0\n' if stop_mode == 'normal' else 'wait\n'))
+                self.manifest()
+                self.install('--yes')
+                process = subprocess.Popen([str(HELPER), 'start', '--prefix', str(self.prefix)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
+                try:
+                    child = wait_for(lambda: shared_running_child_pid(self.prefix, self.data), 'owned group receipts')
+                    self.assertEqual(os.getpgid(child), child, 'server must lead a dedicated group')
+                    self.assertNotEqual(child, os.getpgid(process.pid))
+                    wait_for(lambda: pidfile.exists() and pidfile.read_text().strip() and ready.exists() and lease_held(), 'descendant readiness and owned lease')
+                    worker_pid = int(pidfile.read_text())
+                    self.assertEqual(os.getpgid(worker_pid), child)
+                    if stop_mode == 'normal':
+                        release.touch()
+                    else:
+                        cancellation = signal.SIGHUP if stop_mode.endswith('hup') else signal.SIGTERM
+                        if stop_mode.startswith('group'):
+                            os.killpg(process.pid, cancellation)
+                        else:
+                            os.kill(process.pid, cancellation)
+                    self.assertEqual(process.wait(timeout=15), 0)
+                    # Assert before receipt checks or ANY cooperative cleanup stop.
+                    self.assertFalse(lease_held(), 'owned descendant lease must be released before receipt cleanup')
+                    with self.assertRaises(ProcessLookupError, msg='owned descendant must be absent before cleanup stop'):
+                        os.kill(worker_pid, 0)
+                    self.assertFalse((self.prefix / '.frayd-child.json').exists())
+                    self.assertFalse((self.data / '.frayd-child.json').exists())
+                    self.assertIsNone(foreign.poll(), 'foreign group must remain alive')
+                    self.run_helper('uninstall', '--yes')
+                finally:
+                    # The worker has its own fixture stop oracle, so failure cleanup
+                    # never guesses ownership of a possibly reaped server PID/PGID.
+                    stop.touch()
+                    release.touch()
+                    if process.poll() is None:
+                        process.send_signal(signal.SIGTERM)
+                    process.wait(timeout=15)
+                    process.stderr.close()
+                    if pidfile.exists() and pidfile.read_text().strip():
+                        worker_pid = int(pidfile.read_text())
+                        def worker_exited():
+                            if done.exists():
+                                return True
+                            try:
+                                os.kill(worker_pid, 0)
+                            except ProcessLookupError:
+                                return True
+                            return False
+                        wait_for(worker_exited, 'fixture worker stop without PID signals', timeout=25)
+                    pidfile.unlink(missing_ok=True)
+                    stop.unlink(missing_ok=True)
+                    release.unlink(missing_ok=True)
+                    done.unlink(missing_ok=True)
+                    ready.unlink(missing_ok=True)
+                    lease.unlink(missing_ok=True)
+
     def test_foreground_interrupt_cleans_child_and_allows_removal(self):
-        (self.bundle / 'frayd-server').write_text('#!/bin/sh\nexec sleep 60\n')
+        (self.bundle / 'frayd-server').write_text('#!/bin/sh\nulimit -c 0\nexec sleep 60\n')
         self.manifest()
         for target in ['group', 'helper', 'child', 'both-ready']:
-            for interrupt in [signal.SIGINT, signal.SIGTERM]:
+            for interrupt in [signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT]:
                 with self.subTest(target=target, interrupt=interrupt):
                     self.install('--yes')
                     process = subprocess.Popen([str(HELPER), 'start', '--prefix', str(self.prefix)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, start_new_session=True)
@@ -872,8 +1072,7 @@ class NativeOwnership(unittest.TestCase):
                         self.assertNotIn('server exited with', stderr)
                     finally:
                         if process.poll() is None:
-                            os.killpg(process.pid, signal.SIGKILL)
-                            process.wait(timeout=10)
+                            self.stop_helper(process)
                         process.stderr.close()
 
     def test_unexpected_child_exit_remains_an_error(self):
@@ -907,8 +1106,7 @@ class NativeOwnership(unittest.TestCase):
             self.assertEqual(self.snapshot(), before)
         finally:
             if process.poll() is None:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=10)
+                self.stop_helper(process)
 
     def test_invalid_targets_and_flags_zero_effects(self):
         before = self.snapshot()
@@ -994,9 +1192,10 @@ class NativeOwnership(unittest.TestCase):
 )
 class NativeRuntime(unittest.TestCase):
     def setUp(self):
-        temp = tempfile.TemporaryDirectory(prefix='frayd runtime ', dir=TEMP_ROOT)
-        self.addCleanup(temp.cleanup)
-        self.base = Path(temp.name)
+        self.temp = tempfile.TemporaryDirectory(prefix='frayd runtime ', dir=TEMP_ROOT)
+        self.preserve_fixture = False
+        self.addCleanup(self.cleanup_fixture)
+        self.base = Path(self.temp.name)
         archive = Path(os.environ['FRAYD_NATIVE_ARCHIVE'])
         checksum = archive.with_suffix(archive.suffix + '.sha256').read_text().split()[0]
         self.assertEqual(hashlib.sha256(archive.read_bytes()).hexdigest(), checksum)
@@ -1029,11 +1228,19 @@ class NativeRuntime(unittest.TestCase):
         self.process = None
         self.addCleanup(self.kill_server)
 
+    cleanup_fixture = NativeOwnership.cleanup_fixture
+
     def kill_server(self):
         if self.process is not None and self.process.poll() is None:
-            # This process group was created by this fixture only.
-            os.killpg(self.process.pid, signal.SIGKILL)
-            self.process.wait(timeout=10)
+            self.process.send_signal(signal.SIGTERM)
+            try:
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.preserve_fixture = True
+                raise AssertionError(f'cleanup uncertain; runtime fixture retained at {self.base}') from None
+        if self.process is not None and any((root / '.frayd-child.json').exists() for root in [self.prefix, self.data]):
+            self.preserve_fixture = True
+            raise AssertionError(f'child receipts remain; runtime fixture retained at {self.base}')
 
     def request(self, path, payload=None, token=None, expected=200):
         headers = {'Content-Type': 'application/json'}

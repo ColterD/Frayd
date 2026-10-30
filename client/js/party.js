@@ -182,11 +182,15 @@ const PartyUI = (() => {
   function followMediaChangeOnly() {
     // external (YouTube) load → mirror into YT player, host events handled separately
     const ext = state?.external_url;
-    if (ext && ext !== hostLoadedExt) {
-      hostLoadedExt = ext;
-      window.partyFollowExternal(ext, state.title, 0, state.playing, state.updated_at);
+    if (ext) {
+      hostLoadedMedia = null;
+      if (ext !== hostLoadedExt) {
+        hostLoadedExt = ext;
+        window.partyFollowExternal(ext, state.title, 0, state.playing, state.updated_at);
+      }
       return;
     }
+    hostLoadedExt = null;
     const id = state?.media_id;
     if (id != null && id !== hostLoadedMedia) {
       hostLoadedMedia = id;
@@ -306,6 +310,9 @@ const PartyUI = (() => {
       return;
     }
     if (!state) return renderConnecting(partyCode);
+    const priorInput = isHost ? $('#pt-yt') : null;
+    const draft = priorInput ? { value: priorInput.value, start: priorInput.selectionStart,
+      end: priorInput.selectionEnd, direction: priorInput.selectionDirection, focused: document.activeElement === priorInput } : null;
     stage.innerHTML = `
       <div class="party-code">Code: <b>${esc(partyCode)}</b> <span class="s">${isHost ? '(you are host)' : '(guest)'}</span></div>
       ${nowPlaying()}
@@ -321,8 +328,6 @@ const PartyUI = (() => {
     bind('#pt-play', () => control('play'));
     bind('#pt-pause', () => control('pause'));
     bind('#pt-skip', () => send({ type: 'skip' }));
-    bind('#pt-host', host);
-    bind('#pt-join', join);
     document.querySelectorAll('.pt-approve').forEach(b => {
       b.onclick = () => {
         const r = pending.splice(+b.dataset.req, 1)[0];
@@ -340,6 +345,14 @@ const PartyUI = (() => {
       send({ type: 'load', external_url: id, title: 'YouTube · ' + id, position: 0 });
       window.partyFollowExternal(id, 'YouTube · ' + id, 0, true, Math.floor(Date.now() / 1000));
     });
+    const input = $('#pt-yt');
+    if (input && draft) {
+      input.value = draft.value;
+      if (draft.focused) {
+        input.focus();
+        input.setSelectionRange(draft.start, draft.end, draft.direction);
+      }
+    }
     $('#pt-yt')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#pt-yt-go').click(); });
   }
 

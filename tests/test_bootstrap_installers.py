@@ -92,6 +92,8 @@ class BootstrapShell(unittest.TestCase):
             (shims / name).symlink_to(shutil.which(name))
         for name in RECORDERS:
             body = LOG + ('[ "$*" = "ip -4" ] && echo 100.64.0.1\nexit 0\n' if name == 'tailscale' else '')
+            if name == 'brew':
+                body += 'exit "${SHIM_BREW_EXIT:-0}"\n'
             if name == 'cargo':
                 self.shim(self.root / 'stash', name, body)
             if name in managers or name in tools:
@@ -116,6 +118,16 @@ class BootstrapShell(unittest.TestCase):
         self.assertIn(f'Media folder: {expected_library}', run.stdout)
         self.assertIn(f'FRAYD_LIBRARY={self.library}\n', self.env_file(run))
         self.assertTrue(self.library.is_dir())
+
+    def test_brew_failure_stops_before_clone_build_and_autostart(self):
+        run = self.run_bootstrap(str(self.library), managers=('brew',), tools=('cargo', 'launchctl'),
+                                 environment={'SHIM_BREW_EXIT': '1'})
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertTrue(run.called('brew install'))
+        for step in ('git clone', 'cargo build', 'launchctl load'):
+            self.assertFalse(run.called(step), step)
+        self.assertFalse((run.home / 'Frayd').exists())
+        self.assertNotIn('[OK]', run.stdout)
 
     def test_library_then_tunnel(self):
         run = self.run_bootstrap(str(self.library), '--tunnel', 'tailscale')

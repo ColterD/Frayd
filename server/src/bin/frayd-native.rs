@@ -16,7 +16,7 @@ mod native {
     use std::fs::{self, DirBuilder, File, OpenOptions};
     use std::io::{self, Read, Seek, Write};
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-    use std::os::unix::process::ExitStatusExt;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::path::{Component, Path, PathBuf};
     use std::process::ExitCode;
     use walkdir::WalkDir;
@@ -26,6 +26,125 @@ mod native {
     const DATA_RECEIPT: &str = ".frayd-data.json";
     const LOCK: &str = ".frayd-lock";
     const CHILD: &str = ".frayd-child.json";
+
+    const INSTALL_SIGNALS: [i32; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
+
+    /// Install is single-threaded. Block cancellation before creating owned paths,
+    /// inspect pending signals at bounded checkpoints, and keep the mask through rollback.
+    struct InstallSignals {
+        previous: libc::sigset_t,
+    }
+    impl InstallSignals {
+        fn block() -> Result<Self> {
+            // SAFETY: initialized sets and valid pointers are passed to POSIX APIs.
+            unsafe {
+                let mut blocked = std::mem::zeroed();
+                let mut previous = std::mem::zeroed();
+                libc::sigemptyset(&mut blocked);
+                for signal in INSTALL_SIGNALS {
+                    libc::sigaddset(&mut blocked, signal);
+                }
+                let error = libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut previous);
+                if error != 0 {
+                    return Err(io::Error::from_raw_os_error(error).into());
+                }
+                Ok(Self { previous })
+            }
+        }
+        fn checkpoint(&self) -> Result<()> {
+            // SAFETY: sigpending initializes the valid set passed to sigismember.
+            unsafe {
+                let mut pending = std::mem::zeroed();
+                if libc::sigpending(&mut pending) != 0 {
+                    return Err(io::Error::last_os_error().into());
+                }
+                if INSTALL_SIGNALS
+                    .iter()
+                    .any(|signal| libc::sigismember(&pending, *signal) == 1)
+                {
+                    return reject("installation cancelled; rolling back attempt-owned paths");
+                }
+            }
+            Ok(())
+        }
+    }
+    impl Drop for InstallSignals {
+        fn drop(&mut self) {
+            // Cleanup/commit has finished. Consume each currently pending blocked
+            // cancellation with sigwait, then restore the caller's original mask.
+            // A later signal follows the original disposition; no rollback follows commit.
+            // SAFETY: only this installation thread consumes these blocked signals.
+            unsafe {
+                for signal in INSTALL_SIGNALS {
+                    let mut pending = std::mem::zeroed();
+                    if libc::sigpending(&mut pending) == 0
+                        && libc::sigismember(&pending, signal) == 1
+                    {
+                        let mut one = std::mem::zeroed();
+                        libc::sigemptyset(&mut one);
+                        libc::sigaddset(&mut one, signal);
+                        let mut consumed = 0;
+                        libc::sigwait(&one, &mut consumed);
+                    }
+                }
+                let error =
+                    libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut());
+                if error != 0 {
+                    eprintln!(
+                        "could not restore installation signal mask: {}",
+                        io::Error::from_raw_os_error(error)
+                    );
+                }
+            }
+        }
+    }
+    /// The path must still name this attempt's inode before rollback may remove it.
+    struct CreatedPath {
+        path: PathBuf,
+        identity: fs::Metadata,
+    }
+    impl CreatedPath {
+        fn record(path: PathBuf) -> Result<Self> {
+            let identity = fs::symlink_metadata(&path)?;
+            Ok(Self { path, identity })
+        }
+        fn remove(&self) -> Result<()> {
+            let current = fs::symlink_metadata(&self.path)?;
+            if current.dev() != self.identity.dev()
+                || current.ino() != self.identity.ino()
+                || current.file_type() != self.identity.file_type()
+            {
+                return reject("attempt-owned path changed; retained for inspection");
+            }
+            if current.is_dir() {
+                fs::remove_dir(&self.path)?;
+            } else {
+                fs::remove_file(&self.path)?;
+            }
+            Ok(())
+        }
+    }
+    fn copy_install_file(
+        source: &mut File,
+        destination: &mut File,
+        signals: &InstallSignals,
+    ) -> Result<()> {
+        let mut buffer = vec![0; 1024 * 1024];
+        loop {
+            signals.checkpoint()?;
+            let count = source.read(&mut buffer)?;
+            if count == 0 {
+                return Ok(());
+            }
+            signals.checkpoint()?;
+            destination.write_all(&buffer[..count])?;
+        }
+    }
+    fn publish_install(stage: &Path, prefix: &Path, signals: &InstallSignals) -> Result<()> {
+        signals.checkpoint()?;
+        fs::rename(stage, prefix)?;
+        Ok(())
+    }
 
     /// Payload entry type, serialized as "file" or "dir".
     #[derive(Deserialize, Serialize, PartialEq, Eq)]
@@ -604,6 +723,8 @@ mod native {
         }
         // Reserve only a NEW prefix, then atomically rename a complete sibling stage over
         // our own empty reservation. A nonempty replacement causes rename to fail.
+        let signals = InstallSignals::block()?;
+        signals.checkpoint()?;
         private_dir(prefix)?;
         let reservation = fs::symlink_metadata(prefix)?;
         let stage = prefix
@@ -616,10 +737,12 @@ mod native {
             })?;
             return Err(error);
         }
-        let mut created_data = false;
+        let stage_identity = CreatedPath::record(stage.clone())?;
+        let mut created_data = None;
         let mut created_files = Vec::new();
         let mut created_dirs = Vec::new();
         let result = (|| -> Result<()> {
+            signals.checkpoint()?;
             let mut dirs: Vec<_> = manifest
                 .entries
                 .iter()
@@ -627,8 +750,9 @@ mod native {
                 .collect();
             dirs.sort_by_key(|e| e.path.matches('/').count());
             for item in dirs {
+                signals.checkpoint()?;
                 private_dir(&stage.join(&item.path))?;
-                created_dirs.push(stage.join(&item.path));
+                created_dirs.push(CreatedPath::record(stage.join(&item.path))?);
             }
             for item in manifest
                 .entries
@@ -636,13 +760,14 @@ mod native {
                 .filter(|e| e.kind == Kind::File)
                 .chain(std::iter::once(&manifest_file))
             {
+                signals.checkpoint()?;
                 let mut source = File::open(bundle.join(&item.path))?;
                 let mut dest = OpenOptions::new()
                     .write(true)
                     .create_new(true)
                     .open(stage.join(&item.path))?;
-                created_files.push(stage.join(&item.path));
-                io::copy(&mut source, &mut dest)?;
+                created_files.push(CreatedPath::record(stage.join(&item.path))?);
+                copy_install_file(&mut source, &mut dest, &signals)?;
                 fs::set_permissions(
                     stage.join(&item.path),
                     fs::Permissions::from_mode(item.mode),
@@ -650,16 +775,19 @@ mod native {
             }
             // Directory modes are restored only after all private staging writes finish.
             for item in manifest.entries.iter().filter(|e| e.kind == Kind::Dir) {
+                signals.checkpoint()?;
                 fs::set_permissions(
                     stage.join(&item.path),
                     fs::Permissions::from_mode(item.mode),
                 )?;
             }
+            signals.checkpoint()?;
             verify_tree(&stage, &manifest, &["manifest.json"], false)?;
+            signals.checkpoint()?;
             verify_entry(&stage, &manifest_file, false)?;
             if !reuse_data {
                 private_dir(data)?;
-                created_data = true;
+                created_data = Some(fs::symlink_metadata(data)?);
                 private_file(
                     &data.join(DATA_RECEIPT),
                     &serde_json::to_vec_pretty(&data_record)?,
@@ -670,7 +798,7 @@ mod native {
                 return reject("data ownership changed during installation");
             }
             private_file(&stage.join(LOCK), b"")?;
-            created_files.push(stage.join(LOCK));
+            created_files.push(CreatedPath::record(stage.join(LOCK))?);
             let receipt = Receipt {
                 schema: 1,
                 prefix: prefix.into(),
@@ -680,7 +808,7 @@ mod native {
                 manifest_file,
             };
             private_file(&stage.join(RECEIPT), &serde_json::to_vec_pretty(&receipt)?)?;
-            created_files.push(stage.join(RECEIPT));
+            created_files.push(CreatedPath::record(stage.join(RECEIPT))?);
             let current = fs::symlink_metadata(prefix)?;
             if !current.is_dir()
                 || current.dev() != reservation.dev()
@@ -689,18 +817,19 @@ mod native {
             {
                 return reject("prefix reservation changed; refusing publication");
             }
-            fs::rename(&stage, prefix)?;
+            publish_install(&stage, prefix, &signals)?;
             Ok(())
         })();
         if let Err(error) = result {
+            let error = signals.checkpoint().err().unwrap_or(error);
             // Roll back only paths created in this attempt; never recurse through an
             // unexpected tree. Failure retains exact paths and reports the original error.
             let retained = rollback_install(
                 prefix,
                 data,
-                &stage,
+                &stage_identity,
                 &reservation,
-                created_data,
+                created_data.as_ref(),
                 &created_files,
                 &created_dirs,
             );
@@ -728,43 +857,133 @@ mod native {
     fn rollback_install(
         prefix: &Path,
         data: &Path,
-        stage: &Path,
+        stage: &CreatedPath,
         reservation: &fs::Metadata,
-        created_data: bool,
-        created_files: &[PathBuf],
-        created_dirs: &[PathBuf],
+        created_data: Option<&fs::Metadata>,
+        created_files: &[CreatedPath],
+        created_dirs: &[CreatedPath],
     ) -> Vec<String> {
         let mut retained = Vec::new();
-        if created_data {
+        if let Some(identity) = created_data {
             match data.join(DATA_RECEIPT).try_exists() {
                 // Preserve marked or uncertain data and report its exact path.
-                Ok(false) if fs::remove_dir(data).is_ok() => (),
+                Ok(false) if remove_reservation(data, identity).is_ok() => (),
                 _ => retained.push(data.display().to_string()),
             }
         }
         for file in created_files.iter().rev() {
-            if fs::remove_file(file).is_err() {
-                retained.push(file.display().to_string());
+            if file.remove().is_err() {
+                retained.push(file.path.display().to_string());
             }
         }
         for directory in created_dirs.iter().rev() {
-            if fs::remove_dir(directory).is_err() {
-                retained.push(directory.display().to_string());
+            if directory.remove().is_err() {
+                retained.push(directory.path.display().to_string());
             }
         }
-        if fs::remove_dir(stage).is_err() {
-            retained.push(stage.display().to_string());
+        if stage.remove().is_err() {
+            retained.push(stage.path.display().to_string());
         }
         if remove_reservation(prefix, reservation).is_err() {
             retained.push(prefix.display().to_string());
         }
         retained
     }
+    fn require_child_wait_custody() -> Result<()> {
+        // Do not normalize inherited process-global policy. Ignored SIGCHLD,
+        // SA_NOCLDWAIT or an unknown handler could reap/release the leader PID.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut action) != 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            if action.sa_sigaction != libc::SIG_DFL || action.sa_flags & libc::SA_NOCLDWAIT != 0 {
+                return reject("unsupported SIGCHLD disposition; start requires default child wait custody; no child spawned");
+            }
+        }
+        Ok(())
+    }
+
+    /// Observe exit without reaping: the leader PID reserves its process-group ID
+    /// until all nonzero group signals have completed. Never call try_wait here.
+    fn child_exited_unreaped(pid: libc::pid_t) -> Result<bool> {
+        // SAFETY: valid zero-initialized siginfo and a direct, unreaped child PID.
+        unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            if libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            ) != 0
+            {
+                let error = io::Error::last_os_error();
+                return Err(error.into());
+            }
+            Ok(info.si_signo == libc::SIGCHLD)
+        }
+    }
+    fn owned_group_signal(pid: libc::pid_t, signal: i32) -> Result<()> {
+        // ECHILD rejects signalling before any numeric PID/PGID lookup or kill.
+        // WNOWAIT also checks custody immediately before each nonzero signal.
+        child_exited_unreaped(pid).map_err(|error| {
+            format!("owned child wait custody uncertain: {error}; child receipts retained")
+        })?;
+        // The Child is still unreaped. Refuse a shared or escaped process group.
+        // SAFETY: these POSIX calls do not dereference caller pointers.
+        unsafe {
+            if pid <= 1 || pid == libc::getpgrp() || libc::getpgid(pid) != pid {
+                return reject("owned child group identity uncertain; child receipts retained");
+            }
+            if libc::killpg(pid, signal) != 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+        }
+        Ok(())
+    }
+    async fn stop_owned_group(child: &mut std::process::Child) -> Result<std::process::ExitStatus> {
+        let pid = libc::pid_t::try_from(child.id())?;
+        owned_group_signal(pid, libc::SIGTERM)?;
+        // Keep the leader unreaped through both signals, including when TERM
+        // already exited it. Descendants may ignore TERM or outlive that leader.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        owned_group_signal(pid, libc::SIGKILL)?;
+        let reap_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !child_exited_unreaped(pid)? {
+            if tokio::time::Instant::now() >= reap_deadline {
+                return reject("owned child did not exit after cleanup; child receipts retained");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let status = child.wait()?;
+        // No further nonzero signal may use this now-reusable ID. A surviving,
+        // permission-denied or reused group conservatively retains both receipts.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            // SAFETY: signal zero only probes existence and cannot terminate a process.
+            if unsafe { libc::killpg(pid, 0) } != 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    return Ok(status);
+                }
+                return Err(format!(
+                    "child group cleanup uncertain: {error}; child receipts retained"
+                )
+                .into());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return reject("child group still exists after cleanup; child receipts retained");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
     /// Launch the unchanged owned server with explicit private runtime paths.
     /// Validate prefix/data and hold the lifecycle lock before spawning. Normal
-    /// SIGINT/SIGTERM terminates and reaps only the owned Child handle; a crash or
+    /// SIGINT/SIGTERM/SIGHUP/SIGQUIT stops the owned server process group; a crash or
     /// SIGKILL leaves its uncertainty marker to block later start/removal safely.
     fn start(prefix: &Path, port: u16) -> Result<()> {
+        require_child_wait_custody()?;
         // Validate the lock file before opening it, then read the receipt under the lock.
         load_prefix(prefix, false)?;
         let _lock = locked(prefix)?;
@@ -790,12 +1009,15 @@ mod native {
             .enable_all()
             .build()?;
         runtime.block_on(async {
-            // Register before child creation. Normal terminal INT/TERM reaps only this
-            // Child handle. SIGKILL/crash still leaves the fail-closed orphan marker.
+            // Register before child creation. The server leads its own group; the
+            // helper remains outside it. A crash still leaves fail-closed receipts.
             let mut interrupt =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
             let mut terminate =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            let mut hangup =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+            let mut quit = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::quit())?;
             let mut child_record =
                 private_file(&prefix.join(CHILD), b"{\"state\":\"spawning-or-unknown\"}")?;
             let mut data_child_record = match private_file(
@@ -808,7 +1030,7 @@ mod native {
                     return Err(error);
                 }
             };
-            let child = tokio::process::Command::new(prefix.join("frayd-server"))
+            let child = std::process::Command::new(prefix.join("frayd-server"))
                 .current_dir(&receipt.data)
                 .env("FRAYD_DB", receipt.data.join("frayd.db"))
                 .env("FRAYD_THUMBS", receipt.data.join("thumbs"))
@@ -816,6 +1038,7 @@ mod native {
                 .env("FRAYD_CLIENT_DIR", prefix.join("client"))
                 .env("FRAYD_BIND", "127.0.0.1")
                 .env("FRAYD_PORT", port.to_string())
+                .process_group(0)
                 .spawn();
             let mut child = match child {
                 Ok(child) => child,
@@ -825,21 +1048,25 @@ mod native {
                     return Err(error.into());
                 }
             };
-            record_child(&mut child_record, child.id())?;
-            record_child(&mut data_child_record, child.id())?;
-            let (status, interrupted) = tokio::select! {
-                // Foreground signals can make both the signal and child wait ready.
-                // Prefer the explicit interruption; a child-only INT/TERM is also
-                // normal interruption, even if its wait completes first.
-                biased;
-                _ = interrupt.recv() => { child.start_kill()?; (child.wait().await?, true) },
-                _ = terminate.recv() => { child.start_kill()?; (child.wait().await?, true) },
-                result = child.wait() => {
-                    let status = result?;
-                    let interrupted = matches!(status.signal(), Some(2) | Some(15));
-                    (status, interrupted)
-                },
+            record_child(&mut child_record, Some(child.id()))?;
+            record_child(&mut data_child_record, Some(child.id()))?;
+            let pid = libc::pid_t::try_from(child.id())?;
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(20));
+            let interrupted = loop {
+                tokio::select! {
+                    biased;
+                    _ = interrupt.recv() => break true,
+                    _ = terminate.recv() => break true,
+                    _ = hangup.recv() => break true,
+                    _ = quit.recv() => break true,
+                    _ = tick.tick() => {
+                        if child_exited_unreaped(pid)? { break false; }
+                    },
+                }
             };
+            let status = stop_owned_group(&mut child).await?;
+            let interrupted =
+                interrupted || matches!(status.signal(), Some(1) | Some(2) | Some(3) | Some(15));
             remove_private_file(&receipt.data.join(CHILD), &data_child_record)?;
             remove_private_file(&prefix.join(CHILD), &child_record)?;
             if !status.success() && !interrupted {
@@ -1074,11 +1301,11 @@ mod native {
             let retained = rollback_install(
                 &prefix,
                 &data,
-                &stage,
+                &CreatedPath::record(stage.clone()).unwrap(),
                 &reservation,
-                true,
-                &[file],
-                &[directory],
+                Some(&fs::symlink_metadata(&data).unwrap()),
+                &[CreatedPath::record(file).unwrap()],
+                &[CreatedPath::record(directory).unwrap()],
             );
             assert!(!stage.exists(), "stage cleanup skipped");
             assert!(!prefix.exists(), "empty reservation cleanup skipped");
@@ -1104,6 +1331,157 @@ mod native {
             }
             if missing_prefix {
                 assert!(retained.contains(&prefix.display().to_string()));
+            }
+        }
+
+        static CHILD_POLICY_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        struct SavedChildPolicy(libc::sigaction);
+        impl Drop for SavedChildPolicy {
+            fn drop(&mut self) {
+                assert_eq!(
+                    unsafe { libc::sigaction(libc::SIGCHLD, &self.0, std::ptr::null_mut()) },
+                    0
+                );
+            }
+        }
+
+        #[test]
+        fn start_rejects_ignored_and_no_child_wait_policy_before_paths_or_spawn() {
+            let _serial = CHILD_POLICY_TEST.lock().unwrap();
+            for (handler, flags) in [(libc::SIG_IGN, 0), (libc::SIG_DFL, libc::SA_NOCLDWAIT)] {
+                unsafe {
+                    let mut previous = std::mem::zeroed();
+                    let mut action: libc::sigaction = std::mem::zeroed();
+                    action.sa_sigaction = handler;
+                    action.sa_flags = flags;
+                    libc::sigemptyset(&mut action.sa_mask);
+                    assert_eq!(libc::sigaction(libc::SIGCHLD, &action, &mut previous), 0);
+                    let _restore = SavedChildPolicy(previous);
+                    let missing = Path::new("/var/tmp")
+                        .join(format!("frayd-never-created-{}", uuid::Uuid::new_v4()));
+                    let error = start(&missing, 18484).unwrap_err().to_string();
+                    assert!(error.contains("unsupported SIGCHLD disposition"), "{error}");
+                    assert!(!missing.exists());
+                }
+            }
+        }
+
+        #[test]
+        fn reaped_child_has_no_signal_authority() {
+            let _serial = CHILD_POLICY_TEST.lock().unwrap();
+            let mut child = std::process::Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let pid = libc::pid_t::try_from(child.id()).unwrap();
+            assert!(child.wait().unwrap().success());
+            // This only proves ECHILD rejection, never forces or signals PID reuse.
+            let error = owned_group_signal(pid, libc::SIGTERM)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("wait custody uncertain"), "{error}");
+        }
+
+        #[test]
+        fn cancellation_before_publication_preserves_both_directories_and_restores_mask() {
+            for cancellation in INSTALL_SIGNALS {
+                let fixture = Fixture(
+                    Path::new("/var/tmp")
+                        .join(format!("frayd-native-cancel-{}", uuid::Uuid::new_v4())),
+                );
+                private_dir(&fixture.0).unwrap();
+                let stage = fixture.0.join("stage");
+                let prefix = fixture.0.join("prefix");
+                private_dir(&stage).unwrap();
+                private_dir(&prefix).unwrap();
+                let previous = unsafe {
+                    let mut mask = std::mem::zeroed();
+                    assert_eq!(
+                        libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut mask),
+                        0
+                    );
+                    mask
+                };
+                {
+                    let signals = InstallSignals::block().unwrap();
+                    // Thread-targeted signals cannot interrupt another parallel Rust test.
+                    assert_eq!(
+                        unsafe { libc::pthread_kill(libc::pthread_self(), cancellation) },
+                        0
+                    );
+                    let error = publish_install(&stage, &prefix, &signals)
+                        .unwrap_err()
+                        .to_string();
+                    assert!(error.contains("installation cancelled"), "{error}");
+                    assert!(stage.is_dir() && prefix.is_dir());
+                }
+                unsafe {
+                    let mut mask = std::mem::zeroed();
+                    assert_eq!(
+                        libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut mask),
+                        0
+                    );
+                    for signal in INSTALL_SIGNALS {
+                        assert_eq!(
+                            libc::sigismember(&mask, signal),
+                            libc::sigismember(&previous, signal)
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn cancellation_after_publication_keeps_the_committed_tree() {
+            let fixture = Fixture(
+                Path::new("/var/tmp").join(format!("frayd-native-commit-{}", uuid::Uuid::new_v4())),
+            );
+            private_dir(&fixture.0).unwrap();
+            let stage = fixture.0.join("stage");
+            let prefix = fixture.0.join("prefix");
+            private_dir(&stage).unwrap();
+            private_dir(&prefix).unwrap();
+            fs::write(stage.join("published"), b"committed").unwrap();
+            {
+                let signals = InstallSignals::block().unwrap();
+                publish_install(&stage, &prefix, &signals).unwrap();
+                assert_eq!(
+                    unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGQUIT) },
+                    0
+                );
+            }
+            assert!(!stage.exists());
+            assert_eq!(fs::read(prefix.join("published")).unwrap(), b"committed");
+        }
+
+        #[test]
+        fn rollback_refuses_replaced_file_and_directory_identities() {
+            let fixture = Fixture(
+                Path::new("/var/tmp")
+                    .join(format!("frayd-native-replaced-{}", uuid::Uuid::new_v4())),
+            );
+            private_dir(&fixture.0).unwrap();
+            for directory in [false, true] {
+                let path = fixture.0.join(if directory { "directory" } else { "file" });
+                if directory {
+                    private_dir(&path).unwrap();
+                } else {
+                    fs::write(&path, b"owned").unwrap();
+                }
+                let owned = CreatedPath::record(path.clone()).unwrap();
+                fs::rename(&path, path.with_extension("original")).unwrap();
+                if directory {
+                    private_dir(&path).unwrap();
+                } else {
+                    fs::write(&path, b"preserve replacement").unwrap();
+                }
+                assert!(owned
+                    .remove()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("path changed"));
+                assert!(path.exists() && path.with_extension("original").exists());
             }
         }
 
