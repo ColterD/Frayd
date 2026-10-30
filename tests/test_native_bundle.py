@@ -1,9 +1,11 @@
 """Native bundle contract. Helper scenarios need FRAYD_NATIVE_HELPER; the real-server scenario also needs FRAYD_NATIVE_ARCHIVE and FRAYD_NATIVE_BUILD_SOURCE."""
 import base64
+import errno
 import fcntl
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import pty
 import re
@@ -18,6 +20,7 @@ import sys
 import tarfile
 import tempfile
 import termios
+import threading
 import time
 import unittest
 import urllib.request
@@ -34,25 +37,122 @@ ARCHITECTURE = 'aarch64' if os.uname().machine in ['arm64', 'aarch64'] else 'x86
 TARGET = ARCHITECTURE + ('-apple-darwin' if os.uname().sysname == 'Darwin' else '-unknown-linux-gnu')
 
 
-def run_bounded(arguments, *, timeout=60, check=False, input=None, capture_output=False, **options):
-    """Run a finite fixture command in a private session and kill the whole process group on timeout or interruption.
+class RunBoundedCleanupUncertain(RuntimeError):
+    """The caller must retain its fixture when owned cleanup cannot be confirmed."""
 
-    subprocess.run(timeout=...) kills only the direct child, which would leave a hung helper's server running.
+
+def run_bounded(arguments, *, timeout=60, check=False, input=None, capture_output=False, terminal_master=None, **options):
+    """Bound communication and cleanup of one spawn-owned session.
+
+    Popen/preexec admission precedes the communication budget and is not bounded
+    by it. terminal_master is borrowed; its real output is returned separately.
     """
+    if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError('run_bounded timeout must be positive and finite before spawning')
+    # This single-owner fixture permits no custom SIGCHLD handler or other
+    # waiter. Fresh WNOWAIT below must still confirm custody before signalling.
+    if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
+        raise RuntimeError('run_bounded requires default SIGCHLD custody before spawning')
+    if not callable(getattr(os, 'waitid', None)) or not all(hasattr(os, name) for name in ['WNOWAIT', 'WEXITED', 'WNOHANG', 'P_PID']):
+        raise RuntimeError('run_bounded requires WNOWAIT child custody before spawning')
     if capture_output:
         options['stdout'] = options['stderr'] = subprocess.PIPE
     if input is not None:
         options['stdin'] = subprocess.PIPE
-    with subprocess.Popen(arguments, start_new_session=True, **options) as process:
+    process = subprocess.Popen(arguments, start_new_session=True, **options)
+    operation_deadline = time.monotonic() + timeout
+    terminal_output = bytearray()
+    terminal_errors = []
+    terminal_stop = threading.Event()
+    terminal_deadline = [operation_deadline + 5]
+    terminal_reader = None
+
+    def drain_terminal():
+        while time.monotonic() < terminal_deadline[0]:
+            try:
+                chunk = os.read(terminal_master, 65536)
+            except BlockingIOError:
+                if terminal_stop.is_set():
+                    return
+                terminal_stop.wait(0.01)
+                continue
+            except OSError as error:
+                # PTY master hangup can report EIO. Reaping is still required.
+                if error.errno != errno.EIO:
+                    terminal_errors.append(error)
+                return
+            if not chunk:
+                return
+            remaining = 1024 * 1024 - len(terminal_output)
+            terminal_output.extend(chunk[:remaining])
+            if len(chunk) > remaining and not terminal_errors:
+                terminal_errors.append(RuntimeError('terminal output exceeded the 1 MiB capture limit'))
+            # On overflow keep draining through cleanup, but never accept the run.
+        terminal_errors.append(RuntimeError('terminal reader exceeded its operation/cleanup deadline'))
+
+    operation_error = None
+    stdout = stderr = None
+    try:
+        if terminal_master is not None:
+            os.set_blocking(terminal_master, False)
+            reader = threading.Thread(target=drain_terminal, name="frayd-pty-reader", daemon=True)
+            reader.start()
+            terminal_reader = reader
+        stdout, stderr = process.communicate(input, timeout=max(0, operation_deadline - time.monotonic()))
+    except BaseException as error:  # noqa: BLE001 - Cancellation needs cleanup; preserve the original error.
+        operation_error = error
+
+    cleanup_deadline = time.monotonic() + 5
+    terminal_deadline[0] = min(terminal_deadline[0], cleanup_deadline)
+    cleanup_errors = []
+    if operation_error is not None and process.returncode is None:
+        # No poll/try_wait here: keep the spawn-owned leader unreaped while
+        # signalling its original session group. Never signal after a known reap.
         try:
-            stdout, stderr = process.communicate(input, timeout=timeout)
-        except BaseException:
+            info = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+            if info is not None and info.si_pid != process.pid:
+                raise RuntimeError('owned child wait identity changed; no group signal sent')
+        except (OSError, RuntimeError) as error:
+            cleanup_errors.append(error)
+        else:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            raise
+            except OSError as error:
+                cleanup_errors.append(error)
+    if process.returncode is None:
+        try:
+            process.wait(timeout=max(0, cleanup_deadline - time.monotonic()))
+        except BaseException as error:  # noqa: BLE001 - Preserve cleanup cancellation beside the original error.
+            cleanup_errors.append(error)
+    # Keep consuming the PTY until the owned process has reaped or cleanup held.
+    terminal_stop.set()
+    if terminal_reader is not None:
+        terminal_reader.join(timeout=max(0, cleanup_deadline - time.monotonic()))
+        if terminal_reader.is_alive():
+            cleanup_errors.append(RuntimeError('terminal reader did not stop within the cleanup budget'))
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError as error:
+                cleanup_errors.append(error)
+    if cleanup_errors:
+        kinds = ', '.join(type(error).__name__ for error in cleanup_errors)
+        error = RunBoundedCleanupUncertain(f'owned process cleanup uncertain ({kinds}); retain the fixture and receipts')
+        error.process = process
+        error.cleanup_errors = tuple(cleanup_errors)
+        error.terminal_output = bytes(terminal_output)
+        raise error from (operation_error or cleanup_errors[0])
+    if operation_error is not None:
+        operation_error.terminal_output = bytes(terminal_output)
+        raise operation_error
+    if terminal_errors:
+        terminal_errors[0].terminal_output = bytes(terminal_output)
+        raise terminal_errors[0]
     result = subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
+    result.terminal_output = bytes(terminal_output)
     if check:
         result.check_returncode()
     return result
@@ -154,6 +254,110 @@ class RunBounded(unittest.TestCase):
             return False
         wait_for(gone, 'the killed process group to exit', timeout=5)
         self.assertFalse(self.lease_held(), 'a descendant still holds the lease')
+
+    def test_terminal_pressure_is_drained_and_preserved(self):
+        master, slave = pty.openpty()
+        try:
+            attributes = termios.tcgetattr(slave)
+            attributes[3] &= ~termios.TOSTOP
+            termios.tcsetattr(slave, termios.TCSANOW, attributes)
+            command = [sys.executable, '-c', "import sys; sys.stdout.buffer.write(b'x'*262144); sys.stdout.flush(); sys.stderr.write('done\\n')"]
+            result = run_bounded(command, timeout=3, stdout=slave, stderr=subprocess.PIPE,
+                                 terminal_master=master,
+                                 preexec_fn=lambda: fcntl.ioctl(slave, termios.TIOCSCTTY, 0))
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.terminal_output, b'x' * 262144)
+            self.assertEqual(result.stderr, b'done\n')
+        finally:
+            os.close(slave)
+            os.close(master)
+
+    def test_terminal_capture_overflow_is_an_error_after_reaping(self):
+        master, slave = pty.openpty()
+        try:
+            with self.assertRaisesRegex(RuntimeError, '1 MiB capture limit') as failure:
+                run_bounded([sys.executable, '-c', "import sys; sys.stdout.buffer.write(b'x'*2097152)"],
+                            timeout=3, stdout=slave, stderr=subprocess.PIPE, terminal_master=master)
+            self.assertEqual(failure.exception.terminal_output, b'x' * 1048576)
+            self.assertFalse(any(thread.name == 'frayd-pty-reader' for thread in threading.enumerate()))
+        finally:
+            os.close(slave)
+            os.close(master)
+
+    def test_known_reap_never_signals_and_never_implicitly_waits(self):
+        process = mock.Mock(returncode=0, stdin=None, stdout=None, stderr=None)
+        process.communicate.side_effect = subprocess.TimeoutExpired('reaped fixture', 1)
+        with (
+            mock.patch.object(subprocess, 'Popen', return_value=process),
+            mock.patch.object(os, 'killpg') as kill,
+            self.assertRaises(subprocess.TimeoutExpired),
+        ):
+            run_bounded(['reaped fixture'], timeout=1)
+        kill.assert_not_called()
+        process.wait.assert_not_called()
+        self.assertNotIn('__exit__', [call[0] for call in process.mock_calls])
+
+    def test_unknown_wait_custody_retains_cleanup_without_signalling(self):
+        process = mock.Mock(returncode=None, stdin=None, stdout=None, stderr=None)
+        process.communicate.side_effect = subprocess.TimeoutExpired('unknown fixture', 1)
+        with (
+            mock.patch.object(subprocess, 'Popen', return_value=process),
+            mock.patch.object(os, 'waitid', side_effect=ChildProcessError('custody lost')),
+            mock.patch.object(os, 'killpg') as kill,
+            self.assertRaises(RunBoundedCleanupUncertain) as failure,
+        ):
+            run_bounded(['unknown fixture'], timeout=1)
+        kill.assert_not_called()
+        self.assertIsInstance(failure.exception.cleanup_errors[0], ChildProcessError)
+        self.assertIs(failure.exception.process, process)
+        self.assertEqual(process.wait.call_count, 1)
+        self.assertLessEqual(process.wait.call_args.kwargs['timeout'], 5)
+
+    def test_nondefault_child_policy_refuses_before_spawn(self):
+        with (
+            mock.patch.object(signal, 'getsignal', return_value=signal.SIG_IGN),
+            mock.patch.object(subprocess, 'Popen') as spawn,
+            self.assertRaisesRegex(RuntimeError, 'default SIGCHLD custody'),
+        ):
+            run_bounded(['must not spawn'])
+        spawn.assert_not_called()
+        with (
+            mock.patch.object(os, 'waitid', None),
+            mock.patch.object(subprocess, 'Popen') as spawn,
+            self.assertRaisesRegex(RuntimeError, 'WNOWAIT child custody'),
+        ):
+            run_bounded(['must not spawn'])
+        spawn.assert_not_called()
+        for timeout in [None, 0, float('inf')]:
+            with (
+                mock.patch.object(subprocess, 'Popen') as spawn,
+                self.assertRaisesRegex(ValueError, 'positive and finite'),
+            ):
+                run_bounded(['must not spawn'], timeout=timeout)
+            spawn.assert_not_called()
+
+    def test_cleanup_deadline_failure_keeps_the_owned_process_handle(self):
+        children = []
+        popen = subprocess.Popen
+
+        def spawn(*args, **options):
+            process = popen(*args, **options)
+            children.append(process)
+            return process
+
+        try:
+            with (
+                mock.patch.object(subprocess, 'Popen', side_effect=spawn),
+                mock.patch.object(popen, 'wait', side_effect=subprocess.TimeoutExpired('cleanup fixture', 5)),
+                self.assertRaises(RunBoundedCleanupUncertain) as failure,
+            ):
+                run_bounded([sys.executable, '-c', 'import time; time.sleep(60)'],
+                            timeout=0.05, capture_output=True)
+            self.assertIs(failure.exception.process, children[0])
+            self.assertIsInstance(failure.exception.__cause__, subprocess.TimeoutExpired)
+        finally:
+            for process in children:
+                process.wait(timeout=5)
 
     def test_timeout_kills_descendants_even_after_a_slow_start(self):
         for startup_delay in (0, 3.2):
@@ -414,7 +618,11 @@ class NativeOwnership(unittest.TestCase):
         (self.bundle / 'manifest.json').write_text(json.dumps({'schema': 1, 'version': '0.1.1', 'source': 'a' * 40, 'target': 'fixture', 'toolchain': 'fixture', 'entries': entries}))
 
     def run_helper(self, command, *args, code=0, answer='', environment=None, timeout=60):
-        result = run_bounded([str(HELPER), command, '--prefix', str(self.prefix), *args], input=answer, text=True, capture_output=True, env=environment, timeout=timeout)
+        try:
+            result = run_bounded([str(HELPER), command, '--prefix', str(self.prefix), *args], input=answer, text=True, capture_output=True, env=environment, timeout=timeout)
+        except RunBoundedCleanupUncertain:
+            self.preserve_fixture = True
+            raise
         self.assertEqual(result.returncode, code, result.stderr)
         return result
 
@@ -610,21 +818,29 @@ class NativeOwnership(unittest.TestCase):
                         options = {'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE}
                         if control != 'redirected':
                             options[stream] = slave
-                        result = run_bounded([str(HELPER), 'start', '--prefix', str(self.prefix)],
-                                             stdin=subprocess.DEVNULL, timeout=10,
-                                             preexec_fn=lambda terminal=slave: fcntl.ioctl(terminal, termios.TIOCSCTTY, 0), **options)
+                        try:
+                            result = run_bounded([str(HELPER), 'start', '--prefix', str(self.prefix)],
+                                                 stdin=subprocess.DEVNULL, timeout=10, terminal_master=master,
+                                                 preexec_fn=lambda terminal=slave: fcntl.ioctl(terminal, termios.TIOCSCTTY, 0), **options)
+                        except RunBoundedCleanupUncertain:
+                            self.preserve_fixture = True
+                            raise
                         if control == 'blocked':
                             self.assertEqual(result.returncode, 2)
-                            os.set_blocking(master, False)
-                            diagnostic = result.stderr if stream == 'stdout' else os.read(master, 8192)
+                            diagnostic = result.stderr if stream == 'stdout' else result.terminal_output
                             self.assertIn(b'TOSTOP', diagnostic)
                             self.assertFalse((self.prefix / '.frayd-child.json').exists())
                             self.assertFalse((self.data / '.frayd-child.json').exists())
                         else:
                             self.assertEqual(result.returncode, 0, result.stderr)
+                            if control == 'allowed' and stream == 'stdout':
+                                self.assertEqual(result.terminal_output.splitlines(),
+                                                 [b'127.0.0.1', str(self.data / 'frayd.db').encode(), str(self.prefix / 'client').encode()])
                     finally:
                         os.close(slave)
                         os.close(master)
+                if self.preserve_fixture:
+                    return
 
     def test_install_start_remove_preserves_data_and_reinstall(self):
         self.install('--yes')

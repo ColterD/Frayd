@@ -72,6 +72,11 @@ jobs:
           printf 'FRAYD_NATIVE_ARCHIVE=%s\n' "$RUNNER_TEMP"/frayd-packages/*.tar.gz >> "$GITHUB_ENV"
           printf 'FRAYD_NATIVE_BUILD_SOURCE=%s\n' "$RUNNER_TEMP/frayd-build-source/server" >> "$GITHUB_ENV"
 
+      - name: Confirm old terminal timeout and bounded output consumer
+        shell: bash
+        run: |
+          python3 tests/native-pty-probe.py --test-source tests/test_native_bundle.py --expect-old-timeout
+
       - name: Actual helper and server lifecycle, HTTP reader and persistence
         shell: bash
         run: |
