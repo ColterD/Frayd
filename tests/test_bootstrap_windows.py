@@ -201,16 +201,20 @@ ENTRY_MARKERS = ('entry-download-complete', 'entry-script-started', 'entry-scrip
 
 def harmless_entry_script(child_exit=0, sleep_seconds=0):
     return ("param([string]$Lib)\n"
-            "[IO.File]::WriteAllText((Join-Path $env:TEMP 'entry-script-started'), '1')\n"
-            f"Start-Sleep -Seconds {sleep_seconds}\n"
-            "Write-Output $Lib\n"
-            "[IO.File]::WriteAllText((Join-Path $env:TEMP 'entry-script-complete'), '1')\n"
+            "[IO.File]::WriteAllText([IO.Path]::Combine($env:TEMP, 'entry-script-started'), '1')\n"
+            f"[Threading.Thread]::Sleep({sleep_seconds * 1000})\n"
+            "[Console]::Out.WriteLine($Lib)\n"
+            "[IO.File]::WriteAllText([IO.Path]::Combine($env:TEMP, 'entry-script-complete'), '1')\n"
             f"exit {child_exit}\n")
 
 
 def run_generated_entry(arguments, *, env, directory):
     try:
-        return run_windows_job(arguments, env=env, directory=directory)
+        result = run_windows_job(arguments, env=env, directory=directory)
+        print(f'generated entry completed: elapsed={result.elapsed:.3f}s status={result.returncode} '
+              f'active={result.job_active_processes} total={result.job_total_processes} '
+              f'host_exited={result.host_exited}', flush=True)
+        return result
     except JobTimeout as error:
         root = Path(directory)
         markers = {name: (root / name).is_file() for name in ENTRY_MARKERS}

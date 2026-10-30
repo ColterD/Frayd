@@ -22,10 +22,31 @@ jobs:
           $PSVersionTable
           powershell.exe -NoProfile -NonInteractive -Command '$PSVersionTable'
           Write-Output "Runner image: $env:ImageOS / $env:ImageVersion"
-      - name: Diagnose parent and nested-file startup under original deadline
+      - name: Qualify owned-tree deadline and generated-entry failures
         shell: pwsh
         run: |
           if (-not (Test-Path -LiteralPath tests/test_bootstrap_windows.py -PathType Leaf)) {
             throw 'Required Windows qualification suite is missing'
           }
-          python tests/diagnose_windows_entry.py --tests-dir tests --profile-control
+          @'
+          import sys, unittest
+          sys.path.insert(0, 'tests')
+          from test_bootstrap_windows import PowerShellCore, WindowsPowerShell51, QualificationPolicy
+          methods = [
+              'test_generated_entry_deadline_terminates_the_owned_powershell_tree',
+              'test_generated_entry_cleans_its_file_after_success_and_child_failure',
+              'test_job_output_preserves_explicit_utf8_bytes',
+              'test_generated_download_failure_never_executes_existing_temp_script',
+          ]
+          suite = unittest.TestSuite()
+          for engine in (PowerShellCore, WindowsPowerShell51):
+              for method in methods:
+                  suite.addTest(engine(method))
+          suite.addTest(WindowsPowerShell51('test_generated_file_entry_overrides_only_process_restricted_policy'))
+          suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(QualificationPolicy))
+          if suite.countTestCases() != 14:
+              raise SystemExit('Focused Windows qualification must contain 14 tests')
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          if not result.wasSuccessful() or result.skipped:
+              raise SystemExit(1)
+          '@ | python
