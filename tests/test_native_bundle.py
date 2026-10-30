@@ -1244,11 +1244,25 @@ class NativeRuntime(unittest.TestCase):
         extracted = self.base / 'relocated extracted bundle'
         extracted.mkdir(mode=0o700)
         with tarfile.open(archive) as tar:
-            for member in tar.getmembers():
+            members = tar.getmembers()
+            names = [member.name for member in members]
+            self.assertEqual(len(names), len(set(names)), 'duplicate archive member')
+            for member in members:
                 self.assertTrue(member.isfile() or member.isdir())
                 self.assertFalse(Path(member.name).is_absolute())
                 self.assertNotIn('..', Path(member.name).parts)
-            tar.extractall(extracted, filter='data')
+            bundle_name = archive.name.removesuffix('.tar.gz')
+            manifest_name = bundle_name + '/manifest.json'
+            manifest_member = tar.getmember(manifest_name)
+            self.assertTrue(manifest_member.isfile())
+            with tar.extractfile(manifest_member) as manifest_file:
+                manifest = json.load(manifest_file)
+            allowed = {bundle_name, manifest_name}
+            allowed.update(bundle_name + '/' + entry['path'] for entry in manifest['entries'])
+            self.assertEqual(set(names), allowed, 'archive members must match the manifest exactly')
+        # Match the documented user workflow: preserve manifest modes even under umask 077.
+        run_bounded(['tar', '-xpzf', str(archive), '-C', str(extracted)],
+                    umask=0o077, check=True, capture_output=True)
         bundles = list(extracted.iterdir())
         self.assertEqual(len(bundles), 1)
         self.bundle = bundles[0]
