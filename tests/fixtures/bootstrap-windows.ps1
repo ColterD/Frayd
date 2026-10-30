@@ -8,14 +8,22 @@ param(
   [Parameter(Mandatory = $true)][string]$StartupRedirect,
   [Parameter(Mandatory = $true)][string]$Lib,
   [string]$Tunnel = '',
-  [string]$RustupStub = ''
+  [string]$RustupStub = '',
+  [switch]$SetupOnly
 )
 $ErrorActionPreference = 'Stop'
 
 $global:FrayFixtureEvents = $Events
 $global:FrayFixtureRustupStub = $RustupStub
 $global:FrayFixtureStartupRedirect = $StartupRedirect
-$global:FrayFixtureStartupBat = Join-Path ([Environment]::GetFolderPath('Startup')) 'frayd.bat'
+# Resolve the real API before any installer action, but accept only this case's created directory.
+$fixtureStartup = [Environment]::GetFolderPath('Startup')
+$expectedStartup = Join-Path $env:USERPROFILE 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup'
+if ([string]::IsNullOrWhiteSpace($fixtureStartup) -or $fixtureStartup -ne $expectedStartup -or
+    -not (Test-Path -LiteralPath $fixtureStartup -PathType Container)) {
+  throw 'Fixture Startup must resolve to the created directory inside the case profile'
+}
+$global:FrayFixtureStartupBat = Join-Path $fixtureStartup 'frayd.bat'
 $global:FrayFixtureUtf8 = New-Object System.Text.UTF8Encoding($false)
 
 function global:Write-FixtureEvent([string]$Text) {
@@ -69,6 +77,11 @@ function global:Out-File {
 }
 
 Write-FixtureEvent ('engine|{0}|{1}' -f $PSVersionTable.PSVersion, $PSVersionTable.PSEdition)
+Write-FixtureEvent ('startup|{0}' -f $fixtureStartup)
+if ($SetupOnly) {
+  Write-FixtureEvent 'result|setup-only|0'
+  exit 0
+}
 $installerArguments = @{ Lib = $Lib }
 if ($Tunnel) { $installerArguments['Tunnel'] = $Tunnel }
 try {

@@ -187,6 +187,18 @@ class QualificationMixin:
             unavailable(f'{cls.interpreter_name} is not on PATH')
         cls.interpreter = found
         cls.stub_exe = stub_executable()
+        # Fail once per engine before installer scenarios if the synthetic profile is not a known-folder profile.
+        probe = cls()
+        try:
+            case = probe.make_case()
+            run = probe.install(case, setup_only=True)
+            probe.assertEqual(run.returncode, 0, run.describe())
+            probe.assertEqual(run.outcome, ('setup-only', '0'), run.describe())
+            probe.assertEqual(run.calls, [], run.describe())
+            probe.assertFalse((case.startup / 'frayd.bat').exists(), run.describe())
+            probe.assertFalse((case.profile / 'Frayd').exists(), run.describe())
+        finally:
+            probe.doCleanups()
 
     def check_engine(self, version, edition):
         raise NotImplementedError
@@ -198,7 +210,9 @@ class QualificationMixin:
         root = Path(directory.name).resolve()
         case = types.SimpleNamespace(root=root, profile=root / profile, library=root / library, bin=root / 'bin',
                                      startup=root / 'startup', events=root / 'events.log', log=root / 'calls.log')
-        for folder in (case.profile, case.bin, case.startup, root / 'work', root / 'tmp', root / 'appdata',
+        case.appdata = case.profile / 'AppData/Roaming'
+        case.known_startup = case.appdata / 'Microsoft/Windows/Start Menu/Programs/Startup'
+        for folder in (case.known_startup, case.bin, case.startup, root / 'work', root / 'tmp',
                        root / 'localappdata', root / 'elsewhere'):
             folder.mkdir(parents=True)
         if existing:
@@ -222,17 +236,19 @@ class QualificationMixin:
         """Build each case's environment from scratch: no parent variable is copied unless it is named here."""
         system = Path(os.environ['SystemRoot'])
         env = runtime_environment(
-            USERPROFILE=str(case.profile), APPDATA=str(case.root / 'appdata'),
+            USERPROFILE=str(case.profile), APPDATA=str(case.appdata),
             LOCALAPPDATA=str(case.root / 'localappdata'), TEMP=str(case.root / 'tmp'), TMP=str(case.root / 'tmp'),
             PATH=os.pathsep.join([str(case.bin), str(system / 'System32'), str(system), str(system / 'System32/Wbem')]),
             FAKE_LOG=str(case.log), POWERSHELL_TELEMETRY_OPTOUT='1', POWERSHELL_UPDATECHECK='Off')
         env.update(extra)
         return env
 
-    def install(self, case, *, library=None, tunnel='', fake=None, rustup=False):
+    def install(self, case, *, library=None, tunnel='', fake=None, rustup=False, setup_only=False):
         arguments = [self.interpreter, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', str(FIXTURE),
                      '-InstallerPath', str(BOOTSTRAP_PS1), '-Events', str(case.events),
                      '-StartupRedirect', str(case.startup / 'frayd.bat'), '-Lib', str(library or case.library)]
+        if setup_only:
+            arguments += ['-SetupOnly']
         if tunnel:
             arguments += ['-Tunnel', tunnel]
         if rustup:
@@ -243,6 +259,7 @@ class QualificationMixin:
         engine = run.of('engine')
         self.assertEqual(len(engine), 1, run.describe())
         self.check_engine(engine[0][1], engine[0][2])
+        self.assertEqual(run.of('startup'), [['startup', str(case.known_startup)]], run.describe())
         self.assertIsNotNone(run.outcome, run.describe())
         return run
 
