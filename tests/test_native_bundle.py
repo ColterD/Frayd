@@ -10,6 +10,7 @@ import os
 import pty
 import re
 import secrets
+import select
 import shlex
 import shutil
 import signal
@@ -45,7 +46,10 @@ def run_bounded(arguments, *, timeout=60, check=False, input=None, capture_outpu
     """Bound communication and cleanup of one spawn-owned session.
 
     Popen/preexec admission precedes the communication budget and is not bounded
-    by it. terminal_master is borrowed; its real output is returned separately.
+    by it. terminal_master is borrowed exclusively during the call. Its owned
+    duplicate temporarily shares nonblocking flags; the reader restores the old
+    mode and closes its copy on exit, including after an uncertain join. The
+    borrowed mode can remain nonblocking until that outstanding reader exits.
     """
     if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
         raise ValueError('run_bounded timeout must be positive and finite before spawning')
@@ -66,38 +70,81 @@ def run_bounded(arguments, *, timeout=60, check=False, input=None, capture_outpu
     terminal_stop = threading.Event()
     terminal_deadline = [operation_deadline + 5]
     terminal_reader = None
+    terminal_ready = threading.Event()
+    terminal_admission = threading.Lock()
+    terminal_cancelled = False
+    terminal_copy = None
+    terminal_blocking = None
+    terminal_cleanup_errors = []
+
+    def close_terminal_copy():
+        if terminal_copy is None:
+            return
+        if terminal_blocking is not None:
+            try:
+                os.set_blocking(terminal_copy, terminal_blocking)
+            except OSError as error:
+                terminal_cleanup_errors.append(error)
+        try:
+            os.close(terminal_copy)
+        except OSError as error:
+            terminal_cleanup_errors.append(error)
 
     def drain_terminal():
-        while time.monotonic() < terminal_deadline[0]:
-            try:
-                chunk = os.read(terminal_master, 65536)
-            except BlockingIOError:
-                if terminal_stop.is_set():
+        # Only the reader and admission resolver use this nonblocking lock.
+        if not terminal_admission.acquire(blocking=False):
+            terminal_errors.append(RuntimeError('terminal reader admission was being resolved'))
+            return
+        try:
+            if terminal_cancelled:
+                return
+            terminal_ready.set()
+        finally:
+            terminal_admission.release()
+        # A cancelled late target returns before this descriptor-owning finally.
+        try:
+            while time.monotonic() < terminal_deadline[0]:
+                try:
+                    chunk = os.read(terminal_copy, 65536)
+                except BlockingIOError:
+                    # Wait for readiness, not a fixed delay per small PTY turn.
+                    remaining = max(0, terminal_deadline[0] - time.monotonic())
+                    delay = 0 if terminal_stop.is_set() else min(0.01, remaining)
+                    try:
+                        ready, _, _ = select.select([terminal_copy], [], [], delay)
+                    except (OSError, ValueError) as error:
+                        # FD >= FD_SETSIZE fails closed; there is no selector fallback.
+                        terminal_errors.append(error)
+                        return
+                    if not ready and terminal_stop.is_set():
+                        return
+                    continue
+                except OSError as error:
+                    # PTY master hangup can report EIO. Reaping is still required.
+                    if error.errno != errno.EIO:
+                        terminal_errors.append(error)
                     return
-                terminal_stop.wait(0.01)
-                continue
-            except OSError as error:
-                # PTY master hangup can report EIO. Reaping is still required.
-                if error.errno != errno.EIO:
-                    terminal_errors.append(error)
-                return
-            if not chunk:
-                return
-            remaining = 1024 * 1024 - len(terminal_output)
-            terminal_output.extend(chunk[:remaining])
-            if len(chunk) > remaining and not terminal_errors:
-                terminal_errors.append(RuntimeError('terminal output exceeded the 1 MiB capture limit'))
-            # On overflow keep draining through cleanup, but never accept the run.
-        terminal_errors.append(RuntimeError('terminal reader exceeded its operation/cleanup deadline'))
+                if not chunk:
+                    return
+                remaining = 1024 * 1024 - len(terminal_output)
+                terminal_output.extend(chunk[:remaining])
+                if len(chunk) > remaining and not terminal_errors:
+                    terminal_errors.append(RuntimeError('terminal output exceeded the 1 MiB capture limit'))
+                # On overflow keep draining through cleanup, but never accept the run.
+            terminal_errors.append(RuntimeError('terminal reader exceeded its operation/cleanup deadline'))
+        finally:
+            # Only this reader touches its descriptor once ownership transfers.
+            close_terminal_copy()
 
     operation_error = None
     stdout = stderr = None
     try:
         if terminal_master is not None:
-            os.set_blocking(terminal_master, False)
-            reader = threading.Thread(target=drain_terminal, name="frayd-pty-reader", daemon=True)
-            reader.start()
-            terminal_reader = reader
+            terminal_copy = os.dup(terminal_master)
+            terminal_blocking = os.get_blocking(terminal_copy)
+            os.set_blocking(terminal_copy, False)
+            terminal_reader = threading.Thread(target=drain_terminal, name="frayd-pty-reader", daemon=True)
+            terminal_reader.start()
         stdout, stderr = process.communicate(input, timeout=max(0, operation_deadline - time.monotonic()))
     except BaseException as error:  # noqa: BLE001 - Cancellation needs cleanup; preserve the original error.
         operation_error = error
@@ -128,10 +175,31 @@ def run_bounded(arguments, *, timeout=60, check=False, input=None, capture_outpu
             cleanup_errors.append(error)
     # Keep consuming the PTY until the owned process has reaped or cleanup held.
     terminal_stop.set()
-    if terminal_reader is not None:
-        terminal_reader.join(timeout=max(0, cleanup_deadline - time.monotonic()))
-        if terminal_reader.is_alive():
-            cleanup_errors.append(RuntimeError('terminal reader did not stop within the cleanup budget'))
+    if terminal_reader is None:
+        close_terminal_copy()
+    else:
+        acknowledged = terminal_ready.wait(timeout=max(0, cleanup_deadline - time.monotonic()))
+        if not acknowledged:
+            reclaimed = False
+            if terminal_admission.acquire(blocking=False):
+                try:
+                    if not terminal_ready.is_set():
+                        terminal_cancelled = True
+                        reclaimed = True
+                finally:
+                    terminal_admission.release()
+                if reclaimed:
+                    close_terminal_copy()
+                    if operation_error is None:
+                        terminal_errors.append(RuntimeError('terminal reader was cancelled before admission'))
+            else:
+                cleanup_errors.append(RuntimeError('terminal reader ownership could not be resolved within the cleanup budget'))
+        if terminal_ready.is_set():
+            terminal_reader.join(timeout=max(0, cleanup_deadline - time.monotonic()))
+            if terminal_reader.is_alive():
+                cleanup_errors.append(RuntimeError('terminal reader did not stop within the cleanup budget'))
+    # An uncertain join leaves the owned copy with the reader, never the caller.
+    cleanup_errors.extend(terminal_cleanup_errors)
     for stream in (process.stdin, process.stdout, process.stderr):
         if stream is not None:
             try:
@@ -142,6 +210,7 @@ def run_bounded(arguments, *, timeout=60, check=False, input=None, capture_outpu
         kinds = ', '.join(type(error).__name__ for error in cleanup_errors)
         error = RunBoundedCleanupUncertain(f'owned process cleanup uncertain ({kinds}); retain the fixture and receipts')
         error.process = process
+        error.terminal_reader = terminal_reader
         error.cleanup_errors = tuple(cleanup_errors)
         error.terminal_output = bytes(terminal_output)
         raise error from (operation_error or cleanup_errors[0])
@@ -268,6 +337,7 @@ class RunBounded(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
             self.assertEqual(result.terminal_output, b'x' * 262144)
             self.assertEqual(result.stderr, b'done\n')
+            self.assertTrue(os.get_blocking(master))
         finally:
             os.close(slave)
             os.close(master)
@@ -283,6 +353,188 @@ class RunBounded(unittest.TestCase):
         finally:
             os.close(slave)
             os.close(master)
+
+    def test_small_terminal_turns_use_readiness_without_poll_delay(self):
+        master, slave = pty.openpty()
+        read = os.read
+        pending_yield = False
+        self.terminal_read_counts = {'data_turns': 0, 'would_block_turns': 0, 'bytes_read': 0}
+
+        def small_read(descriptor, size):
+            nonlocal pending_yield
+            if threading.current_thread().name != 'frayd-pty-reader':
+                return read(descriptor, size)
+            if pending_yield:
+                pending_yield = False
+                self.terminal_read_counts['would_block_turns'] += 1
+                raise BlockingIOError(errno.EAGAIN, 'controlled PTY scheduling boundary')
+            chunk = read(descriptor, min(size, 1024))
+            if chunk:
+                pending_yield = True
+                self.terminal_read_counts['data_turns'] += 1
+                self.terminal_read_counts['bytes_read'] += len(chunk)
+            return chunk
+
+        try:
+            with (
+                mock.patch.object(os, 'read', side_effect=small_read),
+                self.assertRaisesRegex(RuntimeError, '1 MiB capture limit') as failure,
+            ):
+                run_bounded([sys.executable, '-c', "import sys; sys.stdout.buffer.write(b'x'*2097152)"],
+                            timeout=3, stdout=slave, stderr=subprocess.PIPE, terminal_master=master)
+            self.assertEqual(failure.exception.terminal_output, b'x' * 1048576)
+            self.assertEqual(self.terminal_read_counts['bytes_read'], 2097152)
+            self.assertGreaterEqual(self.terminal_read_counts['data_turns'], 2048)
+            self.assertGreaterEqual(self.terminal_read_counts['would_block_turns'],
+                                    self.terminal_read_counts['data_turns'] - 1)
+        finally:
+            os.close(slave)
+            os.close(master)
+
+    def test_terminal_timeout_restores_each_borrowed_mode(self):
+        for blocking in [True, False]:
+            master, slave = pty.openpty()
+            try:
+                os.set_blocking(master, blocking)
+                with self.subTest(blocking=blocking), self.assertRaises(subprocess.TimeoutExpired):
+                    run_bounded([sys.executable, '-c', 'import time; time.sleep(60)'], timeout=0.05,
+                                stdout=slave, stderr=subprocess.PIPE, terminal_master=master)
+                self.assertEqual(os.get_blocking(master), blocking)
+            finally:
+                os.close(slave)
+                os.close(master)
+
+    def test_uncertain_join_cannot_read_a_reused_borrowed_descriptor(self):
+        master, slave = pty.openpty()
+        master_open = True
+        entered = threading.Event()
+        release = threading.Event()
+        read = os.read
+        join = threading.Thread.join
+        descriptors = []
+        reader = None
+
+        def paused_read(descriptor, size):
+            if threading.current_thread().name == 'frayd-pty-reader':
+                descriptors.append(descriptor)
+                entered.set()
+                if not release.wait(timeout=2):
+                    raise RuntimeError('controlled reader was not released')
+            return read(descriptor, size)
+
+        def skip_reader_join(thread, timeout=None):
+            if thread.name != 'frayd-pty-reader':
+                return join(thread, timeout=timeout)
+            self.assertTrue(entered.wait(timeout=1))
+            return None
+
+        try:
+            with (
+                mock.patch.object(os, 'read', side_effect=paused_read),
+                mock.patch.object(threading.Thread, 'join', new=skip_reader_join),
+                self.assertRaises(RunBoundedCleanupUncertain),
+            ):
+                run_bounded([sys.executable, '-c', 'pass'], timeout=3,
+                            stdout=slave, stderr=subprocess.PIPE, terminal_master=master)
+            reader = next(thread for thread in threading.enumerate() if thread.name == 'frayd-pty-reader')
+            os.close(master)
+            master_open = False
+            with tempfile.TemporaryDirectory(prefix='frayd-fd-reuse-', dir=TEMP_ROOT) as directory:
+                sentinel = Path(directory) / 'unrelated'
+                sentinel.write_bytes(b'unrelated descriptor must not be read')
+                replacement = os.open(sentinel, os.O_RDONLY)
+                if replacement != master:
+                    os.dup2(replacement, master)
+                    os.close(replacement)
+                master_open = True
+                os.set_blocking(master, False)
+                release.set()
+                join(reader, timeout=2)
+                self.assertFalse(reader.is_alive())
+                self.assertNotEqual(descriptors[0], master)
+                self.assertEqual(os.lseek(master, 0, os.SEEK_CUR), 0)
+                self.assertFalse(os.get_blocking(master))
+                with self.assertRaises(OSError) as closed:
+                    os.fstat(descriptors[0])
+                self.assertEqual(closed.exception.errno, errno.EBADF)
+        finally:
+            release.set()
+            if reader is not None:
+                join(reader, timeout=2)
+            os.close(slave)
+            if master_open:
+                os.close(master)
+
+    def test_cancelled_reader_admission_reclaims_copy_before_late_target(self):
+        for enter_late in [False, True]:
+            master, slave = pty.openpty()
+            copies = []
+            targets = []
+            duplicate = os.dup
+            reader = mock.Mock()
+            reader.start.side_effect = KeyboardInterrupt('controlled reader admission cancellation')
+
+            def track_duplicate(descriptor, duplicate=duplicate, copies=copies):
+                copy = duplicate(descriptor)
+                copies.append(copy)
+                return copy
+
+            def deferred_reader(*, targets=targets, reader=reader, **options):
+                targets.append(options['target'])
+                return reader
+
+            try:
+                with (
+                    self.subTest(enter_late=enter_late),
+                    mock.patch.object(os, 'dup', side_effect=track_duplicate),
+                    mock.patch.object(threading, 'Thread', side_effect=deferred_reader),
+                    self.assertRaises(KeyboardInterrupt),
+                ):
+                    run_bounded([sys.executable, '-c', 'import time; time.sleep(60)'], timeout=3,
+                                stdout=slave, stderr=subprocess.PIPE, terminal_master=master)
+                self.assertEqual(len(copies), 1)
+                self.assertTrue(os.get_blocking(master))
+                with self.assertRaises(OSError) as closed:
+                    os.fstat(copies[0])
+                self.assertEqual(closed.exception.errno, errno.EBADF)
+                reader.is_alive.assert_not_called()
+                reader.join.assert_not_called()
+                if enter_late:
+                    with tempfile.TemporaryDirectory(prefix='frayd-late-reader-', dir=TEMP_ROOT) as directory:
+                        sentinel = Path(directory) / 'unrelated'
+                        sentinel.write_bytes(b'late target must not access this descriptor')
+                        replacement = os.open(sentinel, os.O_RDONLY)
+                        if replacement != copies[0]:
+                            os.dup2(replacement, copies[0])
+                            os.close(replacement)
+                        os.set_blocking(copies[0], False)
+                        try:
+                            with (
+                                mock.patch.object(os, 'read', wraps=os.read) as read,
+                                mock.patch.object(os, 'close', wraps=os.close) as close,
+                                mock.patch.object(os, 'set_blocking', wraps=os.set_blocking) as mode,
+                            ):
+                                targets[0]()
+                            read.assert_not_called()
+                            close.assert_not_called()
+                            mode.assert_not_called()
+                            os.fstat(copies[0])
+                            self.assertEqual(os.lseek(copies[0], 0, os.SEEK_CUR), 0)
+                            self.assertFalse(os.get_blocking(copies[0]))
+                        finally:
+                            os.close(copies[0])
+            finally:
+                # A failing pre-fix control has no actual OS reader thread.
+                for descriptor in copies:
+                    try:
+                        os.set_blocking(descriptor, True)
+                    except OSError as error:
+                        if error.errno != errno.EBADF:
+                            raise
+                    else:
+                        os.close(descriptor)
+                os.close(slave)
+                os.close(master)
 
     def test_known_reap_never_signals_and_never_implicitly_waits(self):
         process = mock.Mock(returncode=0, stdin=None, stdout=None, stderr=None)
