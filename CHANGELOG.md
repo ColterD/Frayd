@@ -9,6 +9,7 @@ Historical results apply only to their named source.
 
 ### Added
 
+- Add a real locked Windows source-build and disposable HTTP startup CI gate, separate from bootstrap fixtures and Unix native bundle qualification.
 - Show build details on the sign-in screen, sidebar and Settings. Provide a command to compare a build with upstream.
 - Add Recently Added shelves with date sorting and versioned local cover art.
 - Add an Account entry so signed-in users can change their own password. Administrators can also use the form in Settings.
@@ -27,6 +28,8 @@ Historical results apply only to their named source.
 - Limit the files Docker can copy into an image. Limit package download waits. Let nginx resolve the app address after replacement.
 - Run macOS qualification by manual request with read-only access. Check separate ARM64 and Intel archives. Publish nothing from that workflow.
 - Reject optimized Python for build-context, HTTP integration and DNS qualification. Keep required assertions active before those commands create test resources.
+- Bound Windows entry-point qualification with an owned process-tree deadline. Use a disposable harmless child to check script cleanup and process-only execution-policy behavior.
+- Give each native terminal test a separate terminal. Read its output and bound timeout cleanup while preserving child ownership.
 
 ### Removed
 
@@ -79,7 +82,7 @@ Historical results apply only to their named source.
 - Give the native server null input. Refuse start when an output terminal uses TOSTOP, before creating child records or starting the server.
 - Accept verified `/dev/null` output on macOS. Keep closed descriptors and unknown device errors as startup failures.
 - Handle INT, TERM, HUP and QUIT during native supervision. Stop the owned server process group before removing its child records.
-- Keep custody of an exited server while checking its owned process group on macOS. Keep uncertain child records for inspection.
+- Allow macOS group-signal EPERM progress only after a fresh wait confirms the owned server exited without reaping. Keep child records until final group absence.
 - Document source-install removal separately from native-bundle removal. Clarify fresh-clone upstream checks and canonical temporary-directory paths.
 
 ### Security

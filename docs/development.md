@@ -78,6 +78,15 @@ On Linux, CI also exports both native binaries and the compiler metadata from th
 
 The Cargo commands in [Native server](#native-server), `git diff --check` and the standalone nginx probe are extra local checks that the workflow does not run on their own. [CodeQL](../.github/workflows/codeql.yml) analyzes the source and the workflows separately.
 
+The separate `windows-native-build` job uses `windows-2025`, official Rust 1.99.1 and two Cargo build jobs. It checks:
+
+- A locked release build of `frayd-server.exe` and `frayd-native.exe` through the source-metadata wrapper.
+- The server's exact clean source commit and package version, and the helper's unsupported-platform refusal with exit code 2.
+- Loopback health, matching HTTP build identity and all eight public asset bytes, using an empty synthetic library and a fresh private database. Downloads and UPnP stay disabled.
+- Cleanup of the child through its retained process handle. After child exit, a bounded startup-log check requires zero errors and panics, and reports warnings separately.
+
+This covers basic source builds and startup. The separate `windows-bootstrap` job uses fixtures and stubbed Cargo. Neither job qualifies a full Windows installation, browser playback, media tools or production deployment. The native bundle helper supports Linux and macOS only. A configured job is not proof of a pass; Windows qualification requires a passing run at the exact source revision.
+
 The manual [macOS workflow](../.github/workflows/release-mac.yml) builds the native bundle on `macos-15` (ARM64) and `macos-15-intel` (x86_64), with a 35-minute limit per job. It checks the actual architecture and runs each platform's native lifecycle suite. It has no tag trigger, publishes nothing and uploads no artifact.
 
 ## Disposable QA scope
