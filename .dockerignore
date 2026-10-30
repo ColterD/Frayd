@@ -1,22 +1,28 @@
-# Only application sources and proxy configuration belong in the build context.
+# Allowlist only the files the images build from; everything else stays out of the context.
 *
 !Dockerfile
 !Dockerfile.proxy
 !nginx.conf
-!server/
 !server/Cargo.toml
 !server/Cargo.lock
 !server/build.rs
 !server/*.sql
-!server/src/
 !server/src/**
-!server/tests/
 !server/tests/**
-!client/
-!client/**
-client/install/
-server/target/
+!client/index.html
+!client/css/**
+!client/js/**
+!client/vendor/**
 
-# Environment files must remain excluded after the client allowlist.
+# Local state, secrets and editor leftovers inside allowlisted directories.
 **/.env
 **/.env.*
+**/*.db
+**/*.db-*
+**/*.sqlite
+**/*.sqlite-*
+**/.DS_Store
+**/*~
+**/*.swp
+**/*.orig
+**/*.rej
