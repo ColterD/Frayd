@@ -1,6 +1,8 @@
 name: Windows real build QA
 on:
   workflow_dispatch:
+  push:
+    branches: [qa/windows-native-build-20261030]
 permissions:
   contents: read
 jobs:
