@@ -964,6 +964,37 @@ mod native {
             Err(error) => error == libc::ESRCH && exited_unreaped,
         }
     }
+    #[cfg(any(target_os = "macos", test))]
+    fn macos_exited_group_signal_progress(
+        error: io::Error,
+        exited_unreaped: Result<bool>,
+    ) -> Result<()> {
+        if error.raw_os_error() != Some(libc::EPERM) {
+            return Err(error.into());
+        }
+        // Darwin may report EPERM with only exited group members remaining.
+        // Fresh wait custody permits progress, never a claim of group absence.
+        // The caller still reaps and requires the final zero probe's ESRCH.
+        let exited = exited_unreaped.map_err(|error| {
+            format!("owned child wait custody uncertain: {error}; child receipts retained")
+        })?;
+        if !exited {
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    fn group_probe_absent(probe: io::Result<()>) -> Result<bool> {
+        match probe {
+            Ok(()) => Ok(false),
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(true),
+            Err(error) => Err(format!(
+                "child group cleanup uncertain: {error}; child receipts retained"
+            )
+            .into()),
+        }
+    }
+
     fn owned_group_signal(pid: libc::pid_t, signal: i32) -> Result<()> {
         // ECHILD rejects signalling before any numeric PID/PGID lookup or kill.
         // WNOWAIT also checks custody immediately before each nonzero signal.
@@ -997,6 +1028,10 @@ mod native {
         if unsafe { libc::killpg(pid, signal) } != 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::ESRCH) {
+                #[cfg(target_os = "macos")]
+                if error.raw_os_error() == Some(libc::EPERM) {
+                    return macos_exited_group_signal_progress(error, child_exited_unreaped(pid));
+                }
                 return Err(error.into());
             }
             // Missing eligible group members is progress, not removal authority.
@@ -1027,15 +1062,13 @@ mod native {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             // SAFETY: signal zero only probes existence and cannot terminate a process.
-            if unsafe { libc::killpg(pid, 0) } != 0 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ESRCH) {
-                    return Ok(status);
-                }
-                return Err(format!(
-                    "child group cleanup uncertain: {error}; child receipts retained"
-                )
-                .into());
+            let probe = if unsafe { libc::killpg(pid, 0) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            };
+            if group_probe_absent(probe)? {
+                return Ok(status);
             }
             if tokio::time::Instant::now() >= deadline {
                 return reject("child group still exists after cleanup; child receipts retained");
@@ -1592,6 +1625,50 @@ mod native {
                     authorized,
                     "lookup={lookup:?}, exited={exited}"
                 );
+            }
+        }
+
+        #[test]
+        fn macos_group_eperm_progress_requires_fresh_confirmed_exit() {
+            let permission_error = || io::Error::from_raw_os_error(libc::EPERM);
+            macos_exited_group_signal_progress(permission_error(), Ok(true)).unwrap();
+            let error =
+                macos_exited_group_signal_progress(permission_error(), Ok(false)).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+                Some(libc::EPERM)
+            );
+            for errno in [libc::ECHILD, libc::EIO] {
+                let error = macos_exited_group_signal_progress(
+                    permission_error(),
+                    Err(io::Error::from_raw_os_error(errno).into()),
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(error.contains("wait custody uncertain"), "{error}");
+                assert!(error.contains("child receipts retained"), "{error}");
+            }
+            let error = macos_exited_group_signal_progress(
+                io::Error::from_raw_os_error(libc::EIO),
+                Ok(true),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+                Some(libc::EIO)
+            );
+        }
+
+        #[test]
+        fn group_probe_never_clears_live_or_permission_denied_groups() {
+            assert!(!group_probe_absent(Ok(())).unwrap());
+            assert!(group_probe_absent(Err(io::Error::from_raw_os_error(libc::ESRCH))).unwrap());
+            for errno in [libc::EPERM, libc::EIO, libc::EINVAL] {
+                let error = group_probe_absent(Err(io::Error::from_raw_os_error(errno)))
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("child group cleanup uncertain"), "{error}");
+                assert!(error.contains("child receipts retained"), "{error}");
             }
         }
 
