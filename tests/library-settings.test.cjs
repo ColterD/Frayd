@@ -722,11 +722,11 @@ for (const retirement of ['panel close', 'account switch', 'same-mode replacemen
   });
 }
 
-function sidebarNavigation(b) {
+function sidebarNavigation(b, lineEnding) {
   // The fixture does not parse shelf buttons. Rebind the actual production nav block
   // against these DOM boundary nodes so both Account's listener and shelf onclick run.
   const source = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'client/js/app.js'), 'utf8');
-  const navigation = source.match(/\/\/ ---------- nav ----------\n([\s\S]*?)\nlet searchTimer;/);
+  const navigation = source.replace(/\r?\n/g, lineEnding).match(/\/\/ ---------- nav ----------\r?\n([\s\S]*?)\r?\nlet searchTimer;/);
   assert.ok(navigation, 'production navigation block is available');
   const shelves = ['all', 'movie', 'show', 'ebook'].map(kind => {
     const node = b.context.document.createElement('button');
@@ -746,48 +746,51 @@ function sidebarNavigation(b) {
   return shelves;
 }
 
-for (const kind of ['all', 'movie', 'show', 'ebook']) {
-  test(`opening Account preserves ${kind} shelf, active navigation and drill state`, async () => {
+for (const lineEnding of ['\n', '\r\n']) {
+  const ending = lineEnding === '\n' ? 'LF' : 'CRLF';
+  for (const kind of ['all', 'movie', 'show', 'ebook']) {
+    test(`opening Account preserves ${kind} shelf, active navigation and drill state (${ending})`, async () => {
+      const b = browser();
+      await settle();
+      passwordPanel(b);
+      const shelves = sidebarNavigation(b, lineEnding);
+      const active = shelves.find(node => node.dataset.kind === kind);
+      active.classList.add('active');
+      b.context.shelf = kind;
+      b.run('account={name:"Member",isAdmin:false};activeKind=libraryKind(shelf);activeQuery="retained search";filtering=true;showsDrill="Retained series";authorDrill.ebook={author:"Retained author",series:"Retained books"}');
+      const state = b.run('JSON.stringify({activeKind,activeQuery,filtering,showsDrill,authorDrill})');
+      const main = b.nodes.get('#main');
+      main.innerHTML = '<div>Retained current view</div>';
+      main.scrollTop = 321;
+      b.requests.length = 0;
+      b.nodes.get('#account-btn').emit('click');
+      await settle();
+      assert.equal(b.nodes.get('#settings-modal').classList.contains('on'), true);
+      assert.equal(b.nodes.get('#settings-title').textContent, 'Account');
+      assert.equal(b.run('JSON.stringify({activeKind,activeQuery,filtering,showsDrill,authorDrill})'), state);
+      assert.equal(b.run('currentKind()'), kind);
+      assert.equal(active.classList.contains('active'), true);
+      assert.equal(b.nodes.get('#account-btn').classList.contains('active'), false);
+      assert.equal(main.innerHTML, '<div>Retained current view</div>');
+      assert.equal(main.scrollTop, 321);
+      assert.equal(b.requests.length, 0);
+    });
+  }
+
+  test(`Dashboard remains shelf navigation and clears retained drill state (${ending})`, async () => {
     const b = browser();
     await settle();
-    passwordPanel(b);
-    const shelves = sidebarNavigation(b);
-    const active = shelves.find(node => node.dataset.kind === kind);
-    active.classList.add('active');
-    b.context.shelf = kind;
-    b.run('account={name:"Member",isAdmin:false};activeKind=libraryKind(shelf);activeQuery="retained search";filtering=true;showsDrill="Retained series";authorDrill.ebook={author:"Retained author",series:"Retained books"}');
-    const state = b.run('JSON.stringify({activeKind,activeQuery,filtering,showsDrill,authorDrill})');
-    const main = b.nodes.get('#main');
-    main.innerHTML = '<div>Retained current view</div>';
-    main.scrollTop = 321;
-    b.requests.length = 0;
-    b.nodes.get('#account-btn').emit('click');
+    const shelves = sidebarNavigation(b, lineEnding);
+    const dashboard = shelves.find(node => node.dataset.kind === 'all');
+    shelves.find(node => node.dataset.kind === 'ebook').classList.add('active');
+    b.run('activeKind="ebook";showsDrill="Retained show";authorDrill.ebook={author:"Retained author"}');
+    dashboard.emit('click');
     await settle();
-    assert.equal(b.nodes.get('#settings-modal').classList.contains('on'), true);
-    assert.equal(b.nodes.get('#settings-title').textContent, 'Account');
-    assert.equal(b.run('JSON.stringify({activeKind,activeQuery,filtering,showsDrill,authorDrill})'), state);
-    assert.equal(b.run('currentKind()'), kind);
-    assert.equal(active.classList.contains('active'), true);
-    assert.equal(b.nodes.get('#account-btn').classList.contains('active'), false);
-    assert.equal(main.innerHTML, '<div>Retained current view</div>');
-    assert.equal(main.scrollTop, 321);
-    assert.equal(b.requests.length, 0);
+    assert.equal(b.run('activeKind'), 'all');
+    assert.equal(b.run('currentKind()'), 'all');
+    assert.equal(b.run('showsDrill'), null);
+    assert.equal(b.run('Object.values(authorDrill).every(value=>value===null)'), true);
+    assert.equal(dashboard.classList.contains('active'), true);
+    assert.equal(shelves.filter(node => node.classList.contains('active')).length, 1);
   });
 }
-
-test('Dashboard remains shelf navigation and clears retained drill state', async () => {
-  const b = browser();
-  await settle();
-  const shelves = sidebarNavigation(b);
-  const dashboard = shelves.find(node => node.dataset.kind === 'all');
-  shelves.find(node => node.dataset.kind === 'ebook').classList.add('active');
-  b.run('activeKind="ebook";showsDrill="Retained show";authorDrill.ebook={author:"Retained author"}');
-  dashboard.emit('click');
-  await settle();
-  assert.equal(b.run('activeKind'), 'all');
-  assert.equal(b.run('currentKind()'), 'all');
-  assert.equal(b.run('showsDrill'), null);
-  assert.equal(b.run('Object.values(authorDrill).every(value=>value===null)'), true);
-  assert.equal(dashboard.classList.contains('active'), true);
-  assert.equal(shelves.filter(node => node.classList.contains('active')).length, 1);
-});
