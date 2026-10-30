@@ -403,6 +403,7 @@ dependencies = [
  "axum-server",
  "futures",
  "hex",
+ "libc",
  "quick-xml",
  "rand",
  "rusqlite",

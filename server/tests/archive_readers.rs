@@ -42,9 +42,9 @@ fn invalid_archives_return_none() {
     assert_eq!(epub::read_zip_entry(&path, "one.xhtml"), None);
 }
 
-/// Characterize the alleged encoding regression against exact legacy UTF-8 cached names.
+/// Names stored as UTF-8 bytes without the UTF-8 flag are listed and read by their UTF-8 spelling.
 #[test]
-fn legacy_unflagged_utf8_name_lookup_characterizes_zip9_fallback() {
+fn unflagged_utf8_names_list_and_read_by_their_utf8_spelling() {
     let path = fixture("legacy-utf8.cbz");
     let pages = comic::comic_pages(&path).unwrap();
     assert_eq!(pages.len(), 2);
@@ -77,7 +77,9 @@ fn boundary_archive(entries: &[(&str,&str,u64)]) -> PathBuf {
 fn epub_boundary_rejects_oversized_metadata_declared_root_first_image_and_assets() {
     let container="<container><rootfile full-path=\"book.opf\"/></container>";
     let opf="<package><manifest><item id=\"c\" href=\"declared.png\" properties=\"cover-image\"/></manifest></package>";
-    for route in ["container","opf","declared","root","first","asset","toc"] {
+    let deep=format!("<package>{}{}</package>","<level>".repeat(128),"</level>".repeat(128));
+    let many=format!("<package>{}</package>","<item/>".repeat(100_000));
+    for route in ["container","opf","declared","root","first","asset","toc","depth","events"] {
         let mut entries=vec![("META-INF/container.xml",container,0),("book.opf",opf,0)];
         match route {
             "container"=>{entries[0].2=2*1024*1024+1-container.len() as u64;entries.push(("cover.png","small fallback must not mask rejection",0));},
@@ -86,11 +88,28 @@ fn epub_boundary_rejects_oversized_metadata_declared_root_first_image_and_assets
             "root"=>{entries.push(("cover.png","x",32*1024*1024));entries.push(("zz.png","small fallback",0));},
             "first"=>{entries.push(("first.png","x",32*1024*1024));entries.push(("zz.png","small fallback",0));},
             "asset"=>entries.push(("chapter.xhtml","x",32*1024*1024)),
-            "toc"=>{entries[1].1="<package><manifest><item id=\"chapter\" href=\"chapter.xhtml\"/><item id=\"toc\" href=\"toc.ncx\" media-type=\"application/x-dtbncx+xml\"/></manifest><spine><itemref idref=\"chapter\"/></spine></package>";entries.push(("toc.ncx","<ncx><navPoint><navLabel><text>Title</text></navLabel><content src=\"chapter.xhtml\"/></navPoint></ncx>",2*1024*1024));},
-            _=>unreachable!(),
+            "depth"|"events"=>{entries[1].1=if route=="depth" {&deep} else {&many};entries.push(("cover.png","small fallback",0));},
+            "toc" => {
+                entries[1].1 = "<package><manifest><item id=\"chapter\" href=\"chapter.xhtml\"/><item \
+                    id=\"toc\" href=\"toc.ncx\" media-type=\"application/x-dtbncx+xml\"/></manifest><spine>\
+                    <itemref idref=\"chapter\"/></spine></package>";
+                entries.push((
+                    "toc.ncx",
+                    "<ncx><navPoint><navLabel><text>Title</text></navLabel><content src=\"chapter.xhtml\"/></navPoint></ncx>",
+                    2 * 1024 * 1024,
+                ));
+            }
+            _ => unreachable!(),
         }
         let path=boundary_archive(&entries);
-        match route {"asset"=>assert!(epub::read_zip_entry(&path,"chapter.xhtml").is_none()),"toc"=>assert!(epub::epub_toc(&path).is_none()),_=>assert!(epub::epub_cover(&path).is_none(),"{route} oversize must not become fallback artwork")}
+        match route {
+            "asset" => assert!(epub::read_zip_entry(&path, "chapter.xhtml").is_none()),
+            "toc" => assert!(epub::epub_toc(&path).is_none()),
+            _ => assert!(
+                epub::epub_cover(&path).is_none(),
+                "{route} oversize must not become fallback artwork"
+            ),
+        }
         std::fs::remove_file(path).unwrap();
     }
 }
@@ -99,26 +118,92 @@ fn epub_boundary_rejects_oversized_metadata_declared_root_first_image_and_assets
 fn epub_boundary_real_xml_and_uri_compatibility_preserves_epub2_epub3_and_fallback() {
     let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();listener.set_nonblocking(true).unwrap();
     for version in [2,3] {
-        let container="<?xml version='1.0'?><c:container xmlns:c='urn:oasis:names:tc:opendocument:xmlns:container'><c:rootfiles><c:rootfile\n full-path = 'OPS/book.opf'/></c:rootfiles></c:container>";
-        let opf=format!("<?xml version='1.0'?><!DOCTYPE package SYSTEM 'http://{}/never.dtd'><p:package xmlns:p='http://www.idpf.org/2007/opf'><p:metadata>{}</p:metadata><p:manifest><p:item\n\t id = 'cover' href = 'images/a&amp;b%20%23+%C3%A9%2520.png#fragment' {}/><p:item\n id='chapter' href='chap%20one.xhtml'/><p:item id='toc' href='toc.ncx' media-type='application/x-dtbncx+xml'/></p:manifest><p:spine><p:itemref\n idref = 'chapter'/></p:spine></p:package>",listener.local_addr().unwrap(),if version==2 {"<p:meta\n name = 'cover' content = 'cover'/>"}else{""},if version==3 {"properties = 'other cover-image'"}else{""});
-        let path=boundary_archive(&[("META-INF/container.xml",container,0),("OPS/book.opf",&opf,0),("000-decoy.png","wrong fallback",0),("OPS/images/a&b #+é%20.png","declared cover",0),("OPS/chap one.xhtml","<p>small chapter</p>",0),("OPS/toc.ncx","<!DOCTYPE ncx SYSTEM 'http://127.0.0.1:9/never.dtd'><ncx><navPoint><navLabel><text>Chapter</text></navLabel><content src=\"chap%20one.xhtml#section\"/></navPoint></ncx>",0)]);
+        let container = "<?xml version='1.0'?><c:container \
+            xmlns:c='urn:oasis:names:tc:opendocument:xmlns:container'><c:rootfiles><c:rootfile\n full-path = \
+            'OPS/book.opf'/></c:rootfiles></c:container>";
+        let opf = format!(
+            "<?xml version='1.0'?><!DOCTYPE package SYSTEM 'http://{}/never.dtd'><p:package \
+                xmlns:p='http://www.idpf.org/2007/opf'><p:metadata>{}</p:metadata><p:manifest><p:item\n\t id \
+                = 'cover' href = 'images/a&amp;b%20%23+%C3%A9%2520.png#fragment' {}/><p:item\n id='chapter' \
+                href='chap%20one.xhtml'/><p:item id='toc' href='toc.ncx' \
+                media-type='application/x-dtbncx+xml'/></p:manifest><p:spine><p:itemref\n idref = 'chapter'/>\
+                </p:spine></p:package>",
+            listener.local_addr().unwrap(),
+            if version == 2 {
+                "<p:meta\n name = 'cover' content = 'cover'/>"
+            } else {
+                ""
+            },
+            if version == 3 {
+                "properties = 'other cover-image'"
+            } else {
+                ""
+            }
+        );
+        let path = boundary_archive(&[
+            ("META-INF/container.xml", container, 0),
+            ("OPS/book.opf", &opf, 0),
+            ("000-decoy.png", "wrong fallback", 0),
+            ("OPS/images/a&b #+é%20.png", "declared cover", 0),
+            ("OPS/chap one.xhtml", "<p>small chapter</p>", 0),
+            (
+                "OPS/toc.ncx",
+                "<!DOCTYPE ncx SYSTEM 'http://127.0.0.1:9/never.dtd'><ncx><navPoint><navLabel><text>Chapter\
+                    </text></navLabel><content src=\"chap%20one.xhtml#section\"/></navPoint></ncx>",
+                0,
+            ),
+        ]);
         assert_eq!(epub::epub_cover(&path).unwrap(),b"declared cover");
         assert_eq!(epub::epub_spine(&path).unwrap(),vec!["OPS/chap one.xhtml"]);
         assert_eq!(epub::epub_toc(&path).unwrap(),vec![("Chapter".into(),0)]);
         assert_eq!(epub::read_zip_entry(&path,"OPS/chap one.xhtml").unwrap(),b"<p>small chapter</p>");
         std::fs::remove_file(path).unwrap();
     }
-    assert!(matches!(listener.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock),"DOCTYPE resolution must make no network connection");
-    for name in ["cover.png","images/first.png"] {let path=boundary_archive(&[(name,"small image-only fallback",0)]);assert_eq!(epub::epub_cover(&path).unwrap(),b"small image-only fallback");std::fs::remove_file(path).unwrap();}
+    assert!(
+        matches!(listener.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock),
+        "DOCTYPE resolution must make no network connection"
+    );
+    for name in ["cover.png", "images/first.png"] {
+        let path = boundary_archive(&[(name, "small image-only fallback", 0)]);
+        assert_eq!(
+            epub::epub_cover(&path).unwrap(),
+            b"small image-only fallback"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
 }
 
 #[test]
 fn epub_boundary_manifest_context_ignores_decoys_and_toc_entities_match_spine() {
-    let container="<container><metadata><rootfile full-path=\"wrong.opf\"/></metadata><rootfiles><rootfile full-path=\"OPS/book.opf\"/></rootfiles></container>";
+    let container = "<container><metadata><rootfile full-path=\"wrong.opf\"/></metadata><rootfiles><rootfile \
+        full-path=\"OPS/book.opf\"/></rootfiles></container>";
     for format in ["ncx","nav"] {
-        let opf=format!("<package><metadata><item id=\"decoy\" href=\"decoy.png\" properties=\"cover-image\"/><meta name=\"cover\" content=\"real\"/></metadata><manifest><item id=\"real\" href=\"real.png\" properties=\"cover-image\"/><item id=\"chapter\" href=\"chapter&amp;one.xhtml\"/><item id=\"toc\" href=\"toc.{format}\" {}/></manifest><spine><itemref idref=\"chapter\"/></spine><itemref idref=\"decoy\"/></package>",if format=="ncx" {"media-type=\"application/x-dtbncx+xml\""}else{"properties=\"nav\""});
-        let toc=if format=="ncx" {"<ncx><navPoint><navLabel><text>Chapter</text></navLabel><content src=\"chapter&amp;one.xhtml#part\"/></navPoint></ncx>"}else{"<html><nav><a href=\"chapter&amp;one.xhtml#part\">Chapter</a></nav></html>"};
-        let toc_path=format!("OPS/toc.{format}");let path=boundary_archive(&[("META-INF/container.xml",container,0),("OPS/book.opf",&opf,0),("OPS/decoy.png","wrong image",0),("OPS/real.png","real declared cover",0),(&toc_path,toc,0),("OPS/chapter&one.xhtml","chapter bytes",0)]);
+        let opf = format!(
+            "<package><metadata><item id=\"decoy\" href=\"decoy.png\" properties=\"cover-image\"/><meta \
+                name=\"cover\" content=\"real\"/></metadata><manifest><item id=\"real\" href=\"real.png\" \
+                properties=\"cover-image\"/><item id=\"chapter\" href=\"chapter&amp;one.xhtml\"/><item \
+                id=\"toc\" href=\"toc.{format}\" {}/></manifest><spine><itemref idref=\"chapter\"/></spine>\
+                <itemref idref=\"decoy\"/></package>",
+            if format == "ncx" {
+                "media-type=\"application/x-dtbncx+xml\""
+            } else {
+                "properties=\"nav\""
+            }
+        );
+        let toc = if format == "ncx" {
+            "<ncx><navPoint><navLabel><text>Chapter</text></navLabel><content src=\"chapter&amp;one.xhtml#part\"/></navPoint></ncx>"
+        } else {
+            "<html><nav><a href=\"chapter&amp;one.xhtml#part\">Chapter</a></nav></html>"
+        };
+        let toc_path = format!("OPS/toc.{format}");
+        let path = boundary_archive(&[
+            ("META-INF/container.xml", container, 0),
+            ("OPS/book.opf", &opf, 0),
+            ("OPS/decoy.png", "wrong image", 0),
+            ("OPS/real.png", "real declared cover", 0),
+            (&toc_path, toc, 0),
+            ("OPS/chapter&one.xhtml", "chapter bytes", 0),
+        ]);
         assert_eq!(epub::epub_cover(&path).unwrap(),b"real declared cover");
         assert_eq!(epub::epub_spine(&path).unwrap(),vec!["OPS/chapter&one.xhtml"]);
         assert_eq!(epub::epub_toc(&path).unwrap(),vec![("Chapter".into(),0)]);
@@ -129,8 +214,8 @@ fn epub_boundary_manifest_context_ignores_decoys_and_toc_entities_match_spine() 
 #[test]
 fn epub_boundary_exact_cached_names_keep_literal_percent_without_double_decoding() {
     let path=boundary_archive(&[("chapter one.xhtml","space chapter",0),("literal%20name.xhtml","literal percent chapter",0)]);
-    // Historical cached raw URI for the space entry never matched the old exact ZIP lookup.
-    assert!(epub::read_zip_entry(&path,"chapter%20one.xhtml").is_none());
+    // A percent-encoded cached name is not decoded again, so it does not find the space entry.
+    assert_eq!(epub::read_zip_entry(&path,"chapter%20one.xhtml"),None);
     assert_eq!(epub::read_zip_entry(&path,"chapter one.xhtml").unwrap(),b"space chapter");
     // A working literal-percent cached entry must retain its exact identity and order.
     assert_eq!(epub::read_zip_entry(&path,"literal%20name.xhtml").unwrap(),b"literal percent chapter");
@@ -144,13 +229,19 @@ fn epub_toc_labels_decode_entities_and_collect_only_xml_text() {
         for (label, expected) in [
             ("Q&amp;A", Some("Q&A")),
             ("<span>One</span>", Some("One")),
-            (" <span title=\"1 > 0\">One</span><!-- ignored --><em> &amp; 二</em> <![CDATA[<b>&amp;</b>]]> &#x1F4D6; &lt;safe&gt; ", Some("One & 二 <b>&amp;</b> 📖 <safe>")),
+            (
+                " <span title=\"1 > 0\">One</span><!-- ignored --><em> &amp; 二</em> <![CDATA[<b>&amp;</b>]]> &#x1F4D6; &lt;safe&gt; ",
+                Some("One & 二 <b>&amp;</b> 📖 <safe>"),
+            ),
             ("left <span>middle</span>  right", Some("left middle  right")),
             ("&unknown;", None),
             ("<span>unclosed", None),
         ] {
             let properties = if format == "ncx" { "media-type=\"application/x-dtbncx+xml\"" } else { "properties=\"nav\"" };
-            let opf = format!("<package><manifest><item id=\"first\" href=\"first.xhtml\"/><item id=\"chapter\" href=\"chap%20one&amp;two.xhtml\"/><item id=\"toc\" href=\"toc.{format}\" {properties}/></manifest><spine><itemref idref=\"first\"/><itemref idref=\"chapter\"/></spine></package>");
+            let opf = format!("<package><manifest><item id=\"first\" href=\"first.xhtml\"/><item \
+                id=\"chapter\" href=\"chap%20one&amp;two.xhtml\"/><item id=\"toc\" \
+                href=\"toc.{format}\" {properties}/></manifest><spine><itemref idref=\"first\"/><itemref \
+                idref=\"chapter\"/></spine></package>");
             let toc = if format == "ncx" {
                 format!("<ncx><navPoint><navLabel><text>{label}</text></navLabel><content src=\"chap%20one&amp;two.xhtml#part\"/></navPoint></ncx>")
             } else {
@@ -171,7 +262,8 @@ impl Drop for CachedZipFixture {
 }
 
 /// Construct controlled ZIP metadata, including flags/duplicate names the public writer normalizes.
-fn cached_zip_fixture(entries: &[(&str, &str)], unflagged: bool, rename: Option<(&str, &str)>) -> CachedZipFixture {
+/// The UTF-8 flag (general-purpose bit 11) is cleared on the first `unflagged` entries.
+fn cached_zip_fixture(entries: &[(&str, &str)], unflagged: usize, rename: Option<(&str, &str)>) -> CachedZipFixture {
     use std::io::Write;
     let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     for (name, body) in entries {
@@ -179,15 +271,10 @@ fn cached_zip_fixture(entries: &[(&str, &str)], unflagged: bool, rename: Option<
         archive.write_all(body.as_bytes()).unwrap();
     }
     let mut bytes = archive.finish().unwrap().into_inner();
-    if unflagged {
-        for offset in 0..bytes.len().saturating_sub(9) {
-            let flag_offset = match &bytes[offset..offset + 4] {
-                b"PK\x03\x04" => Some(offset + 7),
-                b"PK\x01\x02" => Some(offset + 9),
-                _ => None,
-            };
-            if let Some(flag_offset) = flag_offset { bytes[flag_offset] &= !0x08; }
-        }
+    // The flag's high byte sits 7 bytes into a local header and 9 bytes into a central header.
+    for (signature, flag_offset) in [(b"PK\x03\x04", 7), (b"PK\x01\x02", 9)] {
+        let headers: Vec<usize> = (0..bytes.len().saturating_sub(9)).filter(|&offset| &bytes[offset..offset + 4] == signature).collect();
+        for offset in headers.into_iter().take(unflagged) { bytes[offset + flag_offset] &= !0x08; }
     }
     if let Some((from, to)) = rename {
         assert_eq!(from.len(), to.len());
@@ -204,7 +291,7 @@ fn cached_zip_fixture(entries: &[(&str, &str)], unflagged: bool, rename: Option<
 
 #[test]
 fn cached_zip_page_resolves_legacy_order_subsets_and_flagged_names_without_writes() {
-    let fixture = cached_zip_fixture(&[("é2.png", "second"), ("é10.png", "tenth")], true, None);
+    let fixture = cached_zip_fixture(&[("é2.png", "second"), ("é10.png", "tenth")], 2, None);
     let before = std::fs::read(&fixture.0).unwrap();
     for (names, page, expected) in [
         (vec!["├⌐10.png", "├⌐2.png"], 0, Some("tenth")),
@@ -218,7 +305,7 @@ fn cached_zip_page_resolves_legacy_order_subsets_and_flagged_names_without_write
         assert_eq!(comic::read_cached_page(&fixture.0, &names, page), expected.map(|s| s.as_bytes().to_vec()));
     }
     assert_eq!(std::fs::read(&fixture.0).unwrap(), before);
-    let flagged = cached_zip_fixture(&[("é2.png", "flagged")], false, None);
+    let flagged = cached_zip_fixture(&[("é2.png", "flagged")], 0, None);
     assert_eq!(comic::read_cached_page(&flagged.0, &["├⌐2.png".into()], 0), None);
     assert_eq!(comic::read_cached_page(&flagged.0, &["é2.png".into()], 0), Some(b"flagged".to_vec()));
     assert_eq!(comic::read_zip_entry(&flagged.0, "é2.png"), Some(b"flagged".to_vec()));
@@ -227,7 +314,7 @@ fn cached_zip_page_resolves_legacy_order_subsets_and_flagged_names_without_write
 #[test]
 fn cached_zip_page_holds_colliding_interpretations_and_duplicate_legacy_archives() {
     for unflagged in [false, true] {
-        let collision = cached_zip_fixture(&[("é2.png", "utf8"), ("├⌐2.png", "literal")], unflagged, None);
+        let collision = cached_zip_fixture(&[("é2.png", "utf8"), ("├⌐2.png", "literal")], if unflagged { 2 } else { 0 }, None);
         let names = ["├⌐2.png".into()];
         if unflagged {
             // Two individually unique interpretations point to different physical entries.
@@ -238,24 +325,18 @@ fn cached_zip_page_holds_colliding_interpretations_and_duplicate_legacy_archives
         }
         assert_eq!(comic::read_cached_page(&collision.0, &["é2.png".into()], 0), Some(b"utf8".to_vec()));
     }
-    let mixed_fixture = cached_zip_fixture(&[("é2.png", "utf8"), ("├⌐2.png", "literal")], false, None);
-    let mut mixed = std::fs::read(&mixed_fixture.0).unwrap();
-    // Clear only the first entry's local/central flags; the second remains explicitly UTF8.
-    for signature in [b"PK\x03\x04", b"PK\x01\x02"] {
-        let offset = mixed.windows(4).position(|bytes| bytes == signature).unwrap();
-        mixed[offset + if signature == b"PK\x03\x04" { 7 } else { 9 }] &= !0x08;
-    }
-    std::fs::write(&mixed_fixture.0, mixed).unwrap();
+    // Only the first entry loses its flag; the second stays explicitly UTF-8.
+    let mixed_fixture = cached_zip_fixture(&[("é2.png", "utf8"), ("├⌐2.png", "literal")], 1, None);
     let canonical: [String; 2] = ["é2.png".into(), "├⌐2.png".into()];
     assert_eq!(comic::read_zip_entry(&mixed_fixture.0, &canonical[0]), Some(b"utf8".to_vec()));
     assert_eq!(comic::read_zip_entry(&mixed_fixture.0, &canonical[1]), Some(b"literal".to_vec()));
     assert_eq!(comic::read_cached_page(&mixed_fixture.0, &canonical, 0), Some(b"utf8".to_vec()));
     assert_eq!(comic::read_cached_page(&mixed_fixture.0, &canonical, 1), Some(b"literal".to_vec()));
     assert_eq!(comic::read_cached_page(&mixed_fixture.0, &["├⌐2.png".into()], 0), None, "legacy label has two targets");
-    let duplicate = cached_zip_fixture(&[("é2.png", "first"), ("é3.png", "second")], true, Some(("é3.png", "é2.png")));
+    let duplicate = cached_zip_fixture(&[("é2.png", "first"), ("é3.png", "second")], 2, Some(("é3.png", "é2.png")));
     assert!(zip::ZipArchive::new(std::fs::File::open(&duplicate.0).unwrap()).unwrap().has_duplicate_names());
     assert_eq!(comic::read_cached_page(&duplicate.0, &["├⌐2.png".into()], 0), None);
-    let unrelated = cached_zip_fixture(&[("é2.png", "image"), ("note-a.txt", "one"), ("note-b.txt", "two")], true, Some(("note-b.txt", "note-a.txt")));
+    let unrelated = cached_zip_fixture(&[("é2.png", "image"), ("note-a.txt", "one"), ("note-b.txt", "two")], 3, Some(("note-b.txt", "note-a.txt")));
     assert_eq!(comic::read_cached_page(&unrelated.0, &["é2.png".into()], 0), Some(b"image".to_vec()));
     assert_eq!(comic::read_cached_page(&unrelated.0, &["├⌐2.png".into()], 0), None, "legacy recovery conservatively holds on duplicate archives");
 }

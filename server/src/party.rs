@@ -41,7 +41,6 @@ pub struct Admission {
 
 struct Connection {
     admission: Admission,
-    key: String,
     is_host: bool,
     public_label: String,
     socket: Arc<()>,
@@ -82,6 +81,7 @@ impl Party {
     /// The proof belongs only in the create response and is discarded with this generation.
     pub fn create(&self, host: &str) -> (String, uuid::Uuid) {
         let mut session = self.session.lock().unwrap();
+        // Never reuse the replaced party's code: a fresh authorize with an old join link must miss.
         let code = loop {
             let code = rand::thread_rng()
                 .sample_iter(&rand::distributions::Alphanumeric)
@@ -134,20 +134,19 @@ impl Party {
         let public_label = if is_host {
             "Host".to_string()
         } else {
-            session.guest_ordinal = session.guest_ordinal.checked_add(1)?;
+            session.guest_ordinal += 1;
             format!("Guest {}", session.guest_ordinal)
         };
         let connection = Connection {
             admission,
             is_host,
             public_label,
-            key,
             socket: Arc::new(()),
         };
         // Only proven hosts or retired guests can be replaced; older callbacks lose authority.
-        session.members.retain(|m| m.key != connection.key);
+        session.members.retain(|m| m.key != key);
         session.members.push(Member {
-            key: connection.key.clone(), public_label: connection.public_label.clone(), socket: connection.socket.clone(), tx: tx.clone(),
+            key, public_label: connection.public_label.clone(), socket: connection.socket.clone(), tx: tx.clone(),
         });
         let _ = tx.send(Message::Text(serde_json::json!({
             "type": "state", "state": session.state, "is_host": connection.is_host,
@@ -197,7 +196,9 @@ impl Session {
     /// Guest labels cannot evict a live outbound receiver. Rejoin may fail until that
     /// receiver retires; this occupancy guard does not authenticate first-slot guests.
     fn role(&self, admission: &Admission, key: &str) -> Option<bool> {
-        if self.code.is_none() || !Arc::ptr_eq(&self.generation, &admission.generation) {
+        // Every Session (including the empty default) has its own generation, and admissions exist
+        // only for sessions with a code, so a matching generation implies an active party.
+        if !Arc::ptr_eq(&self.generation, &admission.generation) {
             return None;
         }
         let is_host = self.host.as_deref() == Some(key);
@@ -251,9 +252,6 @@ impl Session {
 
     /// Applies a host command while preserving the existing monotonic playback timeline.
     fn host_update_at(&mut self, msg: &Value, timestamp: i64) -> bool {
-        if self.code.is_none() {
-            return false;
-        }
         let action = msg["type"].as_str();
         if !matches!(action, Some("play" | "pause" | "seek" | "load" | "approve" | "skip")) {
             return false;
@@ -265,7 +263,7 @@ impl Session {
         let timestamp = timestamp.max(st.updated_at);
         // Preserve elapsed playback before replacing the timeline's reference time.
         if st.playing {
-            st.position += timestamp.saturating_sub(st.updated_at).max(0) as f64;
+            st.position += timestamp.saturating_sub(st.updated_at) as f64;
         }
         match action {
             Some("play") => {
@@ -332,7 +330,7 @@ fn now() -> i64 {
         .as_secs() as i64
 }
 
-/// Invalid or ambiguous capability offers carry no sensitive error payload.
+/// A rejected host-proof offer; it carries no detail, so the proof never reaches logs or responses.
 #[derive(Debug)]
 pub struct InvalidHostProof;
 
@@ -681,9 +679,11 @@ mod tests {
         assert_eq!(party.session.lock().unwrap().members.len(), 2);
         party.receive(&host, &json!({"type":"load", "title":"current"}));
         assert!(drain(&mut guest_rx).iter().any(|v| v["state"]["title"] == "current"));
+        let before_end = party.authorize(&code, None).unwrap();
         party.disconnect(&host);
         assert!(drain(&mut guest_rx).iter().any(|v| v["type"] == "ended"));
         assert!(party.authorize(&code, None).is_none());
+        assert!(!party.can_register(&before_end, "late guest"));
         assert!(party.session.lock().unwrap().members.is_empty());
     }
 

@@ -9,7 +9,7 @@ mod native {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     use std::os::unix::process::ExitStatusExt;
     use std::path::{Component, Path, PathBuf};
-    use std::process::{Command, ExitCode};
+    use std::process::ExitCode;
     use walkdir::WalkDir;
 
     type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -18,18 +18,25 @@ mod native {
     const LOCK: &str = ".frayd-lock";
     const CHILD: &str = ".frayd-child.json";
 
+    /// Payload entry type, serialized as "file" or "dir".
+    #[derive(Deserialize, Serialize, PartialEq, Eq)]
+    #[serde(rename_all = "lowercase")]
+    enum Kind {
+        File,
+        Dir,
+    }
     /// Serialized fingerprint of one relative payload path; unknown fields are refused.
-    #[derive(Clone, Deserialize, Serialize)]
+    #[derive(Deserialize, Serialize)]
     #[serde(deny_unknown_fields)]
     struct Entry {
         path: String,
-        kind: String,
+        kind: Kind,
         mode: u32,
         size: u64,
         sha256: String,
     }
     /// Untrusted package identity and payload inventory, validated before creation.
-    #[derive(Clone, Deserialize, Serialize)]
+    #[derive(Deserialize, Serialize)]
     #[serde(deny_unknown_fields)]
     struct Manifest {
         schema: u32,
@@ -59,14 +66,11 @@ mod native {
         path: PathBuf,
         id: String,
     }
-    /// Return a refusal without filesystem or lifecycle effects.
-    /// Callers supply a nonsecret diagnostic; the CLI maps this failure to exit 2.
+    /// Refuse with a nonsecret diagnostic; the CLI exits 2.
     fn reject<T>(message: &str) -> Result<T> {
         Err(message.into())
     }
-    /// Reserve a previously absent directory with owner-only requested permissions.
-    /// The caller must validate the path and obtain confirmation first; an existing
-    /// path or filesystem error fails without adopting that path.
+    /// Create a new 0700 directory; an existing path is an error and is never adopted.
     fn private_dir(path: &Path) -> Result<()> {
         DirBuilder::new().mode(0o700).create(path)?;
         Ok(())
@@ -220,25 +224,12 @@ mod native {
         }
         Ok(())
     }
-    /// Require an existing 0700 directory owned by the invoking Unix user.
-    /// Ownership is read from the process UID on Linux or a read-only macOS UID
-    /// probe. Passing this check alone does not establish payload ownership.
+    /// Require an existing 0700 directory owned by the effective Unix user.
+    /// Passing this check alone does not establish payload ownership.
     fn private_owned_dir(path: &Path) -> Result<()> {
         let meta = fs::symlink_metadata(path)?;
-        // Compare with a file created by this process without requiring a libc dependency.
-        let current_uid = fs::metadata("/proc/self")
-            .map(|m| m.uid())
-            .unwrap_or_else(|_| {
-                // On macOS, the executable's owner is not necessarily the invoking user.
-                // `id` is a platform utility and emits no credentials.
-                Command::new("/usr/bin/id")
-                    .arg("-u")
-                    .output()
-                    .ok()
-                    .and_then(|o| String::from_utf8(o.stdout).ok())
-                    .and_then(|s| s.trim().parse().ok())
-                    .unwrap_or(u32::MAX)
-            });
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let current_uid = unsafe { libc::geteuid() };
         if !meta.is_dir()
             || meta.file_type().is_symlink()
             || meta.mode() & 0o777 != 0o700
@@ -277,7 +268,7 @@ mod native {
         };
         Ok(Entry {
             path: relative.to_owned(),
-            kind: if meta.is_file() { "file" } else { "dir" }.into(),
+            kind: if meta.is_file() { Kind::File } else { Kind::Dir },
             mode: meta.mode() & 0o777,
             size: if meta.is_file() { meta.len() } else { 0 },
             sha256: hash,
@@ -324,7 +315,6 @@ mod native {
                     .any(|c| !matches!(c, Component::Normal(_)))
                 || item.path.contains('\\')
                 || path.components().count() != item.path.split('/').count()
-                || !["file", "dir"].contains(&item.kind.as_str())
                 || item.mode > 0o777
                 || !names.insert(item.path.clone())
             {
@@ -333,26 +323,26 @@ mod native {
             if ["manifest.json", RECEIPT, LOCK, CHILD, DATA_RECEIPT].contains(&item.path.as_str()) {
                 return reject("reserved manifest path");
             }
-            if item.kind == "dir"
+            if item.kind == Kind::Dir
                 && (item.size != 0 || !item.sha256.is_empty() || item.mode & 0o700 != 0o700)
             {
                 return reject("invalid directory entry");
             }
-            if item.kind == "file"
+            if item.kind == Kind::File
                 && (item.sha256.len() != 64 || !item.sha256.bytes().all(|c| c.is_ascii_hexdigit()))
             {
                 return reject("invalid checksum");
             }
         }
         for (required, kind, executable) in [
-            ("frayd-server", "file", true),
-            ("frayd-native", "file", true),
-            ("install.sh", "file", true),
-            ("start.sh", "file", true),
-            ("uninstall.sh", "file", true),
-            ("README.md", "file", false),
-            ("client", "dir", false),
-            ("client/index.html", "file", false),
+            ("frayd-server", Kind::File, true),
+            ("frayd-native", Kind::File, true),
+            ("install.sh", Kind::File, true),
+            ("start.sh", Kind::File, true),
+            ("uninstall.sh", Kind::File, true),
+            ("README.md", Kind::File, false),
+            ("client", Kind::Dir, false),
+            ("client/index.html", Kind::File, false),
         ] {
             let Some(item) = manifest.entries.iter().find(|item| item.path == required) else {
                 return reject("incomplete bundle");
@@ -418,7 +408,7 @@ mod native {
     /// is recorded separately because the manifest cannot checksum itself.
     fn load_bundle(base: &Path) -> Result<(Manifest, Entry)> {
         let manifest_file = entry(&base.join("manifest.json"), "manifest.json")?;
-        if manifest_file.kind != "file" {
+        if manifest_file.kind != Kind::File {
             return reject("manifest is not a regular file");
         }
         let manifest: Manifest = serde_json::from_slice(&fs::read(base.join("manifest.json"))?)?;
@@ -457,7 +447,7 @@ mod native {
         safe_path(prefix)?;
         private_owned_dir(prefix)?;
         let record = entry(&prefix.join(RECEIPT), RECEIPT)?;
-        if record.kind != "file" || record.mode != 0o600 {
+        if record.kind != Kind::File || record.mode != 0o600 {
             return reject("invalid install receipt");
         }
         let receipt: Receipt = serde_json::from_slice(&fs::read(prefix.join(RECEIPT))?)?;
@@ -465,7 +455,7 @@ mod native {
             || receipt.prefix != prefix
             || !disjoint(prefix, &receipt.data)
             || receipt.manifest_file.path != "manifest.json"
-            || receipt.manifest_file.kind != "file"
+            || receipt.manifest_file.kind != Kind::File
         {
             return reject("invalid prefix/data receipt");
         }
@@ -486,7 +476,7 @@ mod native {
             );
         }
         let lock = entry(&prefix.join(LOCK), LOCK)?;
-        if lock.kind != "file" || lock.mode != 0o600 || lock.size != 0 {
+        if lock.kind != Kind::File || lock.mode != 0o600 || lock.size != 0 {
             return reject("invalid lifecycle lock");
         }
         Ok(receipt)
@@ -582,7 +572,7 @@ mod native {
             let mut dirs: Vec<_> = manifest
                 .entries
                 .iter()
-                .filter(|e| e.kind == "dir")
+                .filter(|e| e.kind == Kind::Dir)
                 .collect();
             dirs.sort_by_key(|e| e.path.matches('/').count());
             for item in dirs {
@@ -592,7 +582,7 @@ mod native {
             for item in manifest
                 .entries
                 .iter()
-                .filter(|e| e.kind == "file")
+                .filter(|e| e.kind == Kind::File)
                 .chain(std::iter::once(&manifest_file))
             {
                 let mut source = File::open(bundle.join(&item.path))?;
@@ -608,7 +598,7 @@ mod native {
                 )?;
             }
             // Directory modes are restored only after all private staging writes finish.
-            for item in manifest.entries.iter().filter(|e| e.kind == "dir") {
+            for item in manifest.entries.iter().filter(|e| e.kind == Kind::Dir) {
                 fs::set_permissions(
                     stage.join(&item.path),
                     fs::Permissions::from_mode(item.mode),
@@ -717,11 +707,11 @@ mod native {
     /// SIGINT/SIGTERM terminates and reaps only the owned Child handle; a crash or
     /// SIGKILL leaves its uncertainty marker to block later start/removal safely.
     fn start(prefix: &Path, port: u16) -> Result<()> {
+        // Validate the lock file before opening it, then read the receipt under the lock.
+        load_prefix(prefix, false)?;
+        let _lock = locked(prefix)?;
         let receipt = load_prefix(prefix, false)?;
         validate_start_data(&receipt)?;
-        let _lock = locked(prefix)?;
-        // Revalidate under the lifecycle lock, including orphan markers.
-        validate_start_data(&load_prefix(prefix, false)?)?;
         for found in WalkDir::new(&receipt.data).follow_links(false) {
             let found = found?;
             if found.file_type().is_symlink()
@@ -805,7 +795,7 @@ mod native {
     /// and remove directories only when empty. Preserve all data; retain or restore
     /// receipt metadata on cleanup failure when the filesystem permits recovery.
     fn uninstall(prefix: &Path, yes: bool) -> Result<()> {
-        let receipt = load_prefix(prefix, true)?;
+        load_prefix(prefix, true)?;
         removal_parent_writable(prefix)?;
         if !confirm(
             yes,
@@ -814,12 +804,12 @@ mod native {
             return Ok(());
         }
         let _lock = locked(prefix)?;
-        load_prefix(prefix, true)?;
+        let receipt = load_prefix(prefix, true)?;
         for item in receipt
             .manifest
             .entries
             .iter()
-            .filter(|e| e.kind == "file")
+            .filter(|e| e.kind == Kind::File)
             .chain(std::iter::once(&receipt.manifest_file))
         {
             match fs::remove_file(prefix.join(&item.path)) {
@@ -836,7 +826,7 @@ mod native {
             .manifest
             .entries
             .iter()
-            .filter(|e| e.kind == "dir")
+            .filter(|e| e.kind == Kind::Dir)
             .collect();
         dirs.sort_by_key(|e| std::cmp::Reverse(e.path.matches('/').count()));
         for item in dirs {
@@ -867,11 +857,17 @@ mod native {
             {
                 for (name, bytes) in [(LOCK, b"".as_slice()), (RECEIPT, receipt_bytes.as_slice())] {
                     if !prefix.join(name).try_exists()? {
-                        private_file(&prefix.join(name), bytes).map_err(|restore| format!("final removal failed: {error}; metadata recovery failed at {}: {restore}; retained prefix requires inspection", prefix.display()))?;
+                        private_file(&prefix.join(name), bytes).map_err(|restore| format!("final removal \
+                            failed: {error}; metadata recovery failed at {}: {restore}; retained prefix \
+                            requires inspection", prefix.display()))?;
                     }
                 }
             }
-            return Err(format!("final removal failed: {error}; retained prefix {} and recovery metadata require retry/inspection", prefix.display()).into());
+            return Err(format!(
+                "final removal failed: {error}; retained prefix {} and recovery metadata require retry/inspection",
+                prefix.display()
+            )
+            .into());
         }
         println!(
             "Removed owned installation; all application data preserved at {}",
@@ -929,9 +925,7 @@ mod native {
             _ => reject("unknown command"),
         }
     }
-    /// Expose the Unix CLI outcome as success or a nonsecret exit-2 diagnostic.
-    /// Propagate declined operations as success and never turn an operation failure
-    /// into a completed install, removal or process-management claim.
+    /// Exit 0 on success or a declined confirmation; print the error and exit 2 otherwise.
     pub fn main() -> ExitCode {
         match run() {
             Ok(()) => ExitCode::SUCCESS,
@@ -1036,20 +1030,47 @@ mod native {
         fn nonempty_unmarked_data_is_retained() {
             scenario("nonempty", false);
         }
+
+        #[test]
+        fn manifest_refuses_empty_absolute_reserved_and_redirecting_paths() {
+            let file = |path: &str| Entry { path: path.into(), kind: Kind::File, mode: 0o644, size: 0, sha256: "0".repeat(64) };
+            let dir = |path: &str| Entry { path: path.into(), kind: Kind::Dir, mode: 0o755, size: 0, sha256: String::new() };
+            let executable = |path: &str| Entry { mode: 0o755, ..file(path) };
+            let complete = || {
+                let mut entries: Vec<Entry> = ["frayd-server", "frayd-native", "install.sh", "start.sh", "uninstall.sh"]
+                    .into_iter().map(executable).collect();
+                entries.extend([file("README.md"), dir("client"), file("client/index.html")]);
+                Manifest { schema: 1, version: "1".into(), source: "a".repeat(40), target: "t".into(), toolchain: "t".into(), entries }
+            };
+            assert!(entry_names(&complete()).is_ok());
+            for path in ["", "/frayd-server", "manifest.json", RECEIPT, LOCK, CHILD, DATA_RECEIPT,
+                "client/../README.md", "client//index.html", "client/./index.html", "README.md/x", "client\\x"] {
+                let mut manifest = complete();
+                manifest.entries.push(file(path));
+                assert!(entry_names(&manifest).is_err(), "{path:?} accepted");
+            }
+            let mut duplicate = complete();
+            duplicate.entries.push(file("README.md"));
+            assert!(entry_names(&duplicate).is_err());
+            // Only the exact lowercase kinds deserialize; entry_names does not check kind.
+            let mut document = serde_json::to_value(complete()).unwrap();
+            assert!(serde_json::from_slice::<Manifest>(&serde_json::to_vec(&document).unwrap()).is_ok());
+            for kind in ["symlink", "File"] {
+                document["entries"][0]["kind"] = kind.into();
+                let parsed = serde_json::from_slice::<Manifest>(&serde_json::to_vec(&document).unwrap());
+                assert!(parsed.is_err(), "kind {kind:?} accepted");
+            }
+        }
     }
 }
 
 #[cfg(unix)]
-/// Enter the Unix lifecycle implementation on supported native platforms.
-/// Platform-specific ownership and signal code stays behind the Unix cfg gate.
 fn main() -> std::process::ExitCode {
     native::main()
 }
 
+/// The helper is Unix-only; elsewhere this stub keeps the auto-discovered binary building.
 #[cfg(not(unix))]
-/// Refuse native-helper execution on unsupported platforms with exit 2.
-/// Keep the auto-discovered binary compilable there so existing source bootstrap
-/// builds can continue to launch frayd-server directly; no lifecycle runs here.
 fn main() {
     eprintln!("frayd-native supports Linux/macOS only; the existing source bootstrap starts frayd-server directly");
     std::process::exit(2);

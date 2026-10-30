@@ -14,7 +14,7 @@ fn main() {
     let explicit = env::var("FRAYD_BUILD_COMMIT").ok();
     println!("cargo:rerun-if-changed=build.rs");
     if explicit.is_none() {
-        // Watch files and bounded source directories, never target or private evidence.
+        // Watch source directories and every tracked or unignored file, never target/.
         for relative in ["../client", "src", "../scripts", "../docs", "../.github"] {
             println!("cargo:rerun-if-changed={relative}");
         }

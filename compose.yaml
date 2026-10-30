@@ -3,12 +3,16 @@ services:
   app:
     build:
       context: .
+      # Unset variables are not passed, so the Dockerfile's `unknown` defaults apply.
       args:
-        FRAYD_BUILD_COMMIT: ${FRAYD_BUILD_COMMIT:-unknown}
-        FRAYD_BUILD_COMMITS_SINCE_TAG: ${FRAYD_BUILD_COMMITS_SINCE_TAG:-unknown}
-        FRAYD_BUILD_DIRTY: ${FRAYD_BUILD_DIRTY:-unknown}
+        - FRAYD_BUILD_COMMIT
+        - FRAYD_BUILD_COMMITS_SINCE_TAG
+        - FRAYD_BUILD_DIRTY
     image: frayd:local
     restart: unless-stopped
+    environment:
+      # Only the bundled proxy reaches this service, and it overwrites X-Forwarded-For with the real peer address.
+      FRAYD_TRUSTED_PROXY: "1"
     volumes:
       - data:/data
     read_only: true
