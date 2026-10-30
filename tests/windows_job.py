@@ -9,7 +9,7 @@ https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthread
 import ctypes
 from ctypes import wintypes
 from contextlib import contextmanager
-import locale
+import json
 import os
 import shutil
 import subprocess
@@ -77,14 +77,26 @@ class JobCleanupError(AssertionError):
 def job_fixture(prefix):
     directory = tempfile.mkdtemp(prefix=prefix)
     preserve = False
+    primary_error = None
     try:
         yield directory
     except JobCleanupError:
         preserve = True
         raise
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
         if not preserve:
-            shutil.rmtree(directory)
+            try:
+                shutil.rmtree(directory)
+            except OSError as cleanup_error:
+                note = (f'fixture cleanup failed ({type(cleanup_error).__name__}); '
+                        f'remaining fixture preserved: {directory}')
+                if primary_error is None:
+                    cleanup_error.add_note(note)
+                    raise
+                primary_error.add_note(note)
 
 
 def kernel_api():
@@ -123,12 +135,32 @@ def checked(result):
     return result
 
 
+def wait_for_job_exit(read_state, deadline):
+    """Require both tree accounting and host termination within one budget.
+
+    TerminateJobObject has TerminateProcess semantics (asynchronous). A zero
+    timeout host probe does not wait for termination; never treat it as a wait.
+    https://learn.microsoft.com/windows/win32/api/jobapi2/nf-jobapi2-terminatejobobject
+    https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-terminateprocess
+    """
+    state = read_state()
+    while state['active'] or state['host_wait'] != 0:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.01, remaining))
+        state = read_state()
+    return state
+
+
 def run_windows_job(arguments, *, env, directory):
     """Run the whole owned tree for at most 30s, then allow at most 5s to prove termination.
 
     Assignment happens before the primary thread runs. Breakaway is not enabled,
     so native children remain in this job even if their immediate parent exits.
     A setup failure never resumes the suspended process. No PID lookup or reuse.
+    stdout/stderr are raw bytes: PowerShell and native children need not share an
+    encoding. Callers decode only when their fixture defines an explicit contract.
     """
     if os.name != 'nt':
         raise RuntimeError('Windows Job Object qualification requires Windows')
@@ -145,10 +177,17 @@ def run_windows_job(arguments, *, env, directory):
     tree_empty = False
     cleanup_started = False
 
-    def accounting():
+    def read_state():
         state = Accounting()
         checked(api.QueryInformationJobObject(job, 1, ctypes.byref(state), ctypes.sizeof(state), None))
-        return state
+        host_wait = api.WaitForSingleObject(process.hProcess, 0)
+        if host_wait == 0xFFFFFFFF:  # WAIT_FAILED is an API error, not a live host.
+            raise ctypes.WinError(ctypes.get_last_error())
+        code = wintypes.DWORD()
+        checked(api.GetExitCodeProcess(process.hProcess, ctypes.byref(code)))
+        return {'active': state.ActiveProcesses, 'total': state.TotalProcesses,
+                'terminated_by_limit': state.TotalTerminatedProcesses,
+                'host_wait': host_wait, 'host_exit_code': code.value}
 
     def terminate_job():
         nonlocal cleanup_started
@@ -156,14 +195,11 @@ def run_windows_job(arguments, *, env, directory):
         cleanup_deadline = time.monotonic() + 5
         try:
             checked(api.TerminateJobObject(job, 1))
-            state = accounting()
-            while state.ActiveProcesses and time.monotonic() < cleanup_deadline:
-                time.sleep(0.01)
-                state = accounting()
+            state = wait_for_job_exit(read_state, cleanup_deadline)
         except OSError as error:
             raise JobCleanupError(f'owned job termination unverified; fixture={directory}') from error
-        if state.ActiveProcesses:
-            raise JobCleanupError(f'owned job cleanup exceeded 5s: active={state.ActiveProcesses}; fixture={directory}')
+        if state['active'] or state['host_wait'] != 0:
+            raise JobCleanupError(f'owned job cleanup exceeded 5s: state={state}; fixture={directory}')
         return state
 
     try:
@@ -207,28 +243,29 @@ def run_windows_job(arguments, *, env, directory):
                 if api.ResumeThread(process.hThread) == 0xFFFFFFFF:
                     raise ctypes.WinError(ctypes.get_last_error())
 
-            state = accounting()
-            while state.ActiveProcesses and time.monotonic() < deadline:
-                time.sleep(min(0.05, max(0, deadline - time.monotonic())))
-                state = accounting()
-            timed_out = bool(state.ActiveProcesses)
+            state = wait_for_job_exit(read_state, deadline)
+            timed_out = bool(state['active'] or state['host_wait'] != 0)
             if timed_out:
+                # Fixed nonsecret fields, before termination changes the state.
+                # Markers distinguish host startup, download, and nested script.
+                diagnostic = dict(state, elapsed=time.monotonic() - started,
+                                  markers={name: os.path.isfile(os.path.join(directory, name)) for name in (
+                                      'entry-download-complete', 'entry-script-started', 'entry-script-complete')},
+                                  stdout_bytes=os.fstat(stdout.fileno()).st_size,
+                                  stderr_bytes=os.fstat(stderr.fileno()).st_size)
+                print('Windows job deadline before termination: ' + json.dumps(diagnostic, sort_keys=True), flush=True)
                 state = terminate_job()
             tree_empty = True
-            host_exited = api.WaitForSingleObject(process.hProcess, 0) == 0
-            if not host_exited:
-                raise JobCleanupError(f'retained host handle is not signaled; fixture={directory}')
-            code = wintypes.DWORD()
-            checked(api.GetExitCodeProcess(process.hProcess, ctypes.byref(code)))
+            host_exited = state['host_wait'] == 0
             output = []
             for stream in (stdout, stderr):
                 stream.seek(0)
-                output.append(stream.read().decode(locale.getpreferredencoding(False), 'replace').replace('\r\n', '\n'))
-            result = subprocess.CompletedProcess(arguments, code.value, *output)
+                output.append(stream.read())
+            result = subprocess.CompletedProcess(arguments, state['host_exit_code'], *output)
             if timed_out:
                 result = JobTimeout(arguments, 30, output=output[0], stderr=output[1])
-            result.job_active_processes = state.ActiveProcesses
-            result.job_total_processes = state.TotalProcesses
+            result.job_active_processes = state['active']
+            result.job_total_processes = state['total']
             result.host_exited = host_exited
             result.elapsed = time.monotonic() - started
             if timed_out:

@@ -21,7 +21,9 @@ import time
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import windows_job
 from windows_job import JobTimeout, job_fixture, run_windows_job
 
 TESTS = Path(__file__).resolve().parent
@@ -450,12 +452,12 @@ class QualificationMixin:
                       "& (Join-Path $env:TEMP 'frayd-install.ps1')")
             control = run_windows_job(base + [failure + unsafe], env=env, directory=directory)
             self.assertEqual(control.returncode, 0, control.stderr)
-            self.assertIn('fixture download failure', control.stderr)
+            self.assertIn(b'fixture download failure', control.stderr)
             self.assertTrue(marker.exists(), 'unsafe control must execute the existing harmless script')
             marker.unlink()
             blocked = run_generated_entry(base + [failure + generated_windows_command()], env=env, directory=directory)
             self.assertNotEqual(blocked.returncode, 0)
-            self.assertIn('fixture download failure', blocked.stderr)
+            self.assertIn(b'fixture download failure', blocked.stderr)
             self.assertFalse(marker.exists(), 'failed download must never execute the stale script')
             self.assertEqual(stale.read_text(), contents)
             self.assertEqual(list(root.glob('frayd-install-*.ps1')), [], 'owned fresh download must be removed')
@@ -471,11 +473,29 @@ class QualificationMixin:
                     '-Command', command], env=entry_environment(self.interpreter, directory),
                     directory=directory)
                 self.assertEqual(run.returncode == 0, child_exit == 0, run.stderr)
-                self.assertIn("Owner's $Library with spaces", run.stdout)
+                self.assertIn(b"Owner's $Library with spaces", run.stdout)
                 if child_exit:
-                    self.assertIn('Frayd installer failed', run.stderr)
+                    self.assertIn(b'Frayd installer failed', run.stderr)
                 self.assertEqual(list(root.glob('frayd-install-*.ps1')), [])
                 self.assertTrue(all((root / name).is_file() for name in ENTRY_MARKERS))
+
+    def test_job_output_preserves_explicit_utf8_bytes(self):
+        # The fixture owns this encoding contract; do not infer an encoding for
+        # arbitrary PowerShell/native output or change the console code page.
+        payload = 'Jos\u00e9 M\u00e9dia \u65e5\u672c'
+        encoded = payload.encode('utf-8')
+        values = ','.join(str(value) for value in encoded)
+        command = (f'[byte[]]$bytes = {values}; '
+                   '$out = [Console]::OpenStandardOutput(); $out.Write($bytes, 0, $bytes.Length); '
+                   '$err = [Console]::OpenStandardError(); $err.Write($bytes, 0, $bytes.Length)')
+        with job_fixture(prefix='Frayd output encoding ') as directory:
+            run = run_windows_job([self.interpreter, '-NoProfile', '-NonInteractive', '-Command', command],
+                                  env=entry_environment(self.interpreter, directory), directory=directory)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(run.stdout, encoded)
+            self.assertEqual(run.stderr, encoded)
+            self.assertEqual(run.stdout.decode('utf-8'), payload)
+            self.assertEqual(run.stderr.decode('utf-8'), payload)
 
     def test_generated_entry_deadline_terminates_the_owned_powershell_tree(self):
         with job_fixture(prefix="Frayd deadline owner's ") as directory:
@@ -633,12 +653,12 @@ class WindowsPowerShell51(QualificationMixin, unittest.TestCase):
             blocked = run_windows_job(base + ["& '.\\harmless-source.ps1' -Lib 'harmless fixture'"],
                                       env=env, directory=directory)
             self.assertNotEqual(blocked.returncode, 0, 'Restricted control must refuse the file')
-            self.assertNotIn('harmless fixture', blocked.stdout)
+            self.assertNotIn(b'harmless fixture', blocked.stdout)
             self.assertFalse((Path(directory) / 'entry-script-started').exists())
             command = copy_download_fixture(script) + generated_windows_command(" -Lib 'Owner''s $Library with spaces'")
             allowed = run_generated_entry(base + [command], env=env, directory=directory)
             self.assertEqual(allowed.returncode, 0, allowed.stderr)
-            self.assertEqual(allowed.stdout.strip(), "Owner's $Library with spaces")
+            self.assertEqual(allowed.stdout.strip(), b"Owner's $Library with spaces")
             self.assertTrue(all((Path(directory) / name).is_file() for name in ENTRY_MARKERS))
             self.assertEqual(list(Path(directory).glob('frayd-install-*.ps1')), [])
 
@@ -656,6 +676,51 @@ class PowerShellCore(QualificationMixin, unittest.TestCase):
 @unittest.skipIf(os.environ.get(POLICY_CHILD), 'a policy child run must not start another one')
 class QualificationPolicy(unittest.TestCase):
     """Missing prerequisites skip in ordinary discovery and fail closed under FRAYD_WINDOWS_REQUIRE_QUALIFICATION=1."""
+
+    def test_job_completion_requires_empty_tree_and_signaled_host_within_one_budget(self):
+        # Synthetic ordering oracle only; actual Win32 ownership is qualified on Windows.
+        for pending in ({'active': 0, 'host_wait': 258}, {'active': 1, 'host_wait': 0}):
+            with self.subTest(pending=pending):
+                clock = [0.0]
+
+                def sleep(seconds):
+                    clock[0] += seconds
+
+                complete = {'active': 0, 'host_wait': 0}
+                with (patch('windows_job.time.monotonic', side_effect=lambda: clock[0]),
+                      patch('windows_job.time.sleep', side_effect=sleep)):
+                    def delayed_completion():
+                        return pending if clock[0] < 0.02 else complete
+
+                    state = windows_job.wait_for_job_exit(delayed_completion, 5)
+                    self.assertEqual(state, complete)
+                    self.assertGreaterEqual(clock[0], 0.02)
+                    clock[0] = 0
+                    state = windows_job.wait_for_job_exit(lambda: pending, 5)
+                    self.assertEqual(state, pending, 'a missed deadline must remain incomplete')
+                    self.assertEqual(clock[0], 5, 'all completion conditions share one budget')
+
+    def test_fixture_cleanup_failure_preserves_the_primary_error(self):
+        for primary_fails in (True, False):
+            with self.subTest(primary_fails=primary_fails):
+                primary = AssertionError('fixture primary failure')
+                directory = None
+                try:
+                    with patch('windows_job.shutil.rmtree', side_effect=PermissionError('injected cleanup failure')):
+                        expected = AssertionError if primary_fails else PermissionError
+                        with self.assertRaises(expected) as caught:
+                            with job_fixture(prefix='Frayd cleanup failure ') as directory:
+                                (Path(directory) / 'owned').write_text('fixture')
+                                if primary_fails:
+                                    raise primary
+                        if primary_fails:
+                            self.assertIs(caught.exception, primary)
+                        self.assertTrue(any('cleanup failed (PermissionError)' in note and directory in note
+                                            for note in caught.exception.__notes__))
+                        self.assertTrue((Path(directory) / 'owned').is_file(), 'preserve the remaining fixture')
+                finally:
+                    if directory is not None:
+                        shutil.rmtree(directory)
 
     def discover_without_interpreters(self, required):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as empty:
