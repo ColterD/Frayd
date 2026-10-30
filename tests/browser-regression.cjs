@@ -11,8 +11,6 @@ const { tmpdir } = require('node:os');
 const { setTimeout: delay } = require('node:timers/promises');
 
 const root = resolve(__dirname, '..');
-// The runner writes result.json here; FRAYD_DOM_RESULT_DIR overrides the temporary default.
-const defaultResultDirectory = process.env.FRAYD_DOM_RESULT_DIR || mkdtempSync(join(tmpdir(), 'frayd-dom-regression-'));
 // Every full run must report exactly this many uniquely named cases.
 const EXPECTED_CASES = 45;
 const productionFiles = ['client/index.html', 'client/js/app.js', 'client/js/party.js', 'client/js/build-info.js',
@@ -446,7 +444,7 @@ async function configureOwnedBrowserCache({ profile, fixtureUrl, browser, diagno
  * profile. Record original and cleanup failures separately; remove the profile only
  * after confirmed group shutdown, retaining it when shutdown cannot be established.
  */
-async function main({ removeProfile = rmSync, resultDirectory = defaultResultDirectory, cacheSetup = configureOwnedBrowserCache,
+async function main({ removeProfile = rmSync, resultDirectory = process.env.FRAYD_DOM_RESULT_DIR, cacheSetup = configureOwnedBrowserCache,
   stopGroup = stopBrowserGroup, startupBudgetMs = 30000, caseBudgetMs = 60000 } = {}) {
   if (Number(process.versions.node.split('.')[0]) < 22 || typeof WebSocket !== 'function') {
     throw new Error('Browser regressions require Node.js 22+ with the global WebSocket API');
@@ -767,8 +765,10 @@ async function main({ removeProfile = rmSync, resultDirectory = defaultResultDir
   output.cleanup = { browserExited: !browser?.pid || browser.exitCode !== null || browser.signalCode !== null,
     browserGroupStopped, profileRemoved: !profile || !existsSync(profile), serverClosed: !server.listening };
   if (runError || cleanupErrors.length || heldMedia || pendingMedia || !Object.values(output.cleanup).every(Boolean)) process.exitCode = 1;
-  mkdirSync(resultDirectory, { recursive: true });
-  writeFileSync(join(resultDirectory, 'result.json'), JSON.stringify(output, null, 2) + '\n');
+  // Without FRAYD_DOM_RESULT_DIR, each run writes into its own new private temporary directory.
+  const directory = resultDirectory || mkdtempSync(join(tmpdir(), 'frayd-dom-regression-'));
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(join(directory, 'result.json'), JSON.stringify(output, null, 2) + '\n');
   console.log(JSON.stringify(output, null, 2));
 }
 module.exports = { main, stopBrowserGroup, withLocalPlyrIcons, EXPECTED_CASES };

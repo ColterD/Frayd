@@ -10,7 +10,6 @@ import shutil
 import subprocess
 import tempfile
 import unittest
-from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 BOOTSTRAP_SH = ROOT / 'client/install/bootstrap.sh'
@@ -202,11 +201,9 @@ class BootstrapShell(unittest.TestCase):
         run = self.run_bootstrap(str(self.library), '--tunnel', 'tailscale', tools=('cargo', 'systemctl', 'loginctl'))
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertTrue(run.called('tailscale-install'))
-        curl_call = next(call for call in run.calls if call.startswith('curl'))
-        self.assertIn(' -o ', curl_call)
-        url_token = next((part for part in curl_call.split() if '://' in part), '')
-        host = urlparse(url_token).hostname
-        self.assertTrue(host == 'tailscale.com' or (host and host.endswith('.tailscale.com')))
+        download = next(call for call in run.calls if 'https://tailscale.com/install.sh' in call.split())
+        self.assertTrue(download.startswith('curl '), download)
+        self.assertIn('-o', download.split())
 
     def test_truncated_tailscale_installer_never_runs(self):
         """Guards against the partial output of a failed curl being piped straight into sh, and against leftovers."""

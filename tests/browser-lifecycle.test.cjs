@@ -365,8 +365,8 @@ test('cache discovery waits for a complete valid port and stops on exit or deadl
 test('browser runner rejects unsupported Node and missing global WebSocket before starting resources', async () => {
   for (const scenario of [{ node: '20.0.0', WebSocket: class {} }, { node: '22.0.0', WebSocket: undefined }]) {
     const main = loadSlice(runnerSource, 'async function main(', 'module.exports =', 'main', {
-      process: { versions: { node: scenario.node } }, WebSocket: scenario.WebSocket,
-      rmSync() {}, defaultResultDirectory: 'unused', configureOwnedBrowserCache() {}, stopBrowserGroup() {},
+      process: { versions: { node: scenario.node }, env: {} }, WebSocket: scenario.WebSocket,
+      rmSync() {}, configureOwnedBrowserCache() {}, stopBrowserGroup() {},
       createServer() { throw new Error('Unsupported runtime started fixture resources'); },
     });
     await assert.rejects(main(), /require Node.js 22\+ with the global WebSocket API/);
