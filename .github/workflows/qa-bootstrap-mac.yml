@@ -1,0 +1,142 @@
+name: One-off bootstrap Homebrew dependencies
+
+on:
+  push:
+    branches: [qa/bootstrap-mac-20261030]
+
+permissions:
+  contents: read
+
+jobs:
+  qualify-homebrew:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/qa/bootstrap-mac-20261030'
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      FRAYD_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+      FRAYD_RUNNER_OS: ${{ runner.os }}
+      FRAYD_RUNNER_ARCH: ${{ runner.arch }}
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_ANALYTICS: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+      HOMEBREW_NO_AUTOREMOVE: '1'
+      HOMEBREW_NO_ASK: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Refuse unsupported runner and extract the exact dependency fragment
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$GITHUB_REPOSITORY" = ColterD/Frayd
+          test "$GITHUB_REF" = refs/heads/qa/bootstrap-mac-20261030
+          test "$FRAYD_RUNNER_ENVIRONMENT" = github-hosted
+          test "$FRAYD_RUNNER_OS" = macOS
+          test "$FRAYD_RUNNER_ARCH" = ARM64
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          test "$(sysctl -n sysctl.proc_translated 2>/dev/null || true)" != 1
+          test "$(type -t brew)" = file
+          test "$(command -v brew)" = /opt/homebrew/bin/brew
+          test "$(brew --prefix)" = /opt/homebrew
+          for manager in apt-get dnf pacman; do
+            if command -v "$manager" >/dev/null 2>&1; then
+              printf 'Unexpected package manager: %s\n' "$manager" >&2
+              exit 1
+            fi
+          done
+          mkdir -m 700 "${RUNNER_TEMP:?}/frayd-brew-qualification"
+          python3 - <<'PY'
+          import hashlib, os
+          from pathlib import Path
+          source = Path('client/install/bootstrap.sh').read_bytes()
+          expected = '2e5fc4163263428781b3cda81692d8d4dabd9bd73cb6b8738db292fb8290ece2'
+          if hashlib.sha256(source).hexdigest() != expected:
+              raise SystemExit('Bootstrap source hash mismatch; no dependency mutation permitted')
+          text = source.decode('utf-8')
+          have = [line for line in text.splitlines() if line.startswith('have() {')]
+          if len(have) != 1 or text.count('# --- deps ---\n') != 1 or text.count('\nif ! have cargo; then') != 1:
+              raise SystemExit('Dependency fragment boundaries changed')
+          deps = text.split('# --- deps ---\n', 1)[1].split('\nif ! have cargo; then', 1)[0]
+          fragment = 'set -eo pipefail\n' + have[0] + '\n' + deps + "\nprintf '%s\\n' 'FRAYD_DEPENDENCIES_COMPLETE'\n"
+          path = Path(os.environ['RUNNER_TEMP']) / 'frayd-brew-qualification/dependencies.sh'
+          path.write_text(fragment)
+          print('bootstrap_sha256=' + expected)
+          print('dependency_fragment_sha256=' + hashlib.sha256(fragment.encode()).hexdigest())
+          PY
+          : "${ImageOS:?runner image missing}" "${ImageVersion:?runner image version missing}"
+          git rev-parse HEAD
+          uname -sm
+          printf 'Runner image: %s / %s\n' "$ImageOS" "$ImageVersion"
+          brew --version
+          git -C "$(brew --repository)" rev-parse HEAD
+
+      - name: Separate synthetic dependency failure and package-set oracles
+        shell: bash
+        run: |
+          PYTHONPATH=tests python3 -m unittest \
+            test_bootstrap_installers.BootstrapShell.test_brew_requests_only_required_available_tools \
+            test_bootstrap_installers.BootstrapShell.test_brew_failure_stops_before_clone_build_and_autostart -v
+
+      - name: Formula-absent real install followed by already-installed real install
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          proof="${RUNNER_TEMP:?}/frayd-brew-qualification"
+          test -s "$proof/dependencies.sh"
+          brew list --formula > "$proof/before-names.txt"
+          brew info --json=v2 git ffmpeg > "$proof/before-info.json"
+          for formula in git ffmpeg; do
+            if grep -Fxq "$formula" "$proof/before-names.txt"; then
+              # Authorized only on this disposable VM; discard the whole VM afterward.
+              brew uninstall --formula --force --ignore-dependencies "$formula"
+            fi
+          done
+          brew list --formula > "$proof/absent-names.txt"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'frayd-brew-qualification'
+          names = set((root / 'absent-names.txt').read_text().splitlines())
+          if names.intersection({'git', 'ffmpeg'}):
+              raise SystemExit('Required formula-absent precondition failed')
+          removed = set((root / 'before-names.txt').read_text().splitlines()) - names
+          if not removed.issubset({'git', 'ffmpeg'}):
+              raise SystemExit('Unexpected formula removal outside the two-formula allowlist')
+          before = json.loads((root / 'before-info.json').read_text())
+          for formula in before['formulae']:
+              print(json.dumps({'phase': 'before', 'formula': formula['name'],
+                  'stable': formula['versions']['stable'], 'installed': [v['version'] for v in formula['installed']],
+                  'ruby_source_checksum': formula.get('ruby_source_checksum')}))
+          print('formula_absent=git,ffmpeg; transitive dependencies and runner software remain')
+          PY
+          bash "$proof/dependencies.sh" | tee "$proof/formula-absent.log"
+          grep -Fx FRAYD_DEPENDENCIES_COMPLETE "$proof/formula-absent.log"
+          for formula in git ffmpeg; do
+            brew list --formula --versions "$formula"
+          done
+          "$(brew --prefix git)/bin/git" --version
+          "$(brew --prefix ffmpeg)/bin/ffmpeg" -version > "$proof/ffmpeg-version.txt"
+          "$(brew --prefix ffmpeg)/bin/ffprobe" -version > "$proof/ffprobe-version.txt"
+          sed -n '1,3p' "$proof/ffmpeg-version.txt" "$proof/ffprobe-version.txt"
+          bash "$proof/dependencies.sh" | tee "$proof/already-installed.log"
+          grep -Fx FRAYD_DEPENDENCIES_COMPLETE "$proof/already-installed.log"
+          brew info --json=v2 git ffmpeg > "$proof/after-info.json"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          path = Path(os.environ['RUNNER_TEMP']) / 'frayd-brew-qualification/after-info.json'
+          for formula in json.loads(path.read_text())['formulae']:
+              if not formula['installed']:
+                  raise SystemExit('Required formula missing after qualification')
+              print(json.dumps({'phase': 'after', 'formula': formula['name'],
+                  'stable': formula['versions']['stable'], 'installed': [v['version'] for v in formula['installed']],
+                  'ruby_source_checksum': formula.get('ruby_source_checksum')}))
+          PY
+          printf '%s\n' 'Real Homebrew dependency fragment passed: formula-absent and already-installed.' \
+            'Separate synthetic failure oracle passed; full bootstrap and clean-OS installation are not qualified.' >> "$GITHUB_STEP_SUMMARY"
