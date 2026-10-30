@@ -2,7 +2,7 @@
 
 import argparse
 import hashlib
-import importlib
+import importlib.util
 import json
 import os
 import shutil
@@ -12,6 +12,10 @@ from pathlib import Path
 EXPECTED_HASHES = {
     'windows_job.py': '47c87910e33faef9414d46953663b46004d8a21d60a261caff1a38b7ca949e4e',
     'test_bootstrap_windows.py': 'd36d076c986759636e87878f3b969b66413dabc7ebf955ee4f34107006cd8fb0',
+}
+EXPECTED_BLOBS = {
+    'windows_job.py': '224ccf0d5760802ef95589646a1673159fa91c20',
+    'test_bootstrap_windows.py': 'cd3ba0521853f14a353a4730d8b924b66d45f59b',
 }
 STAGES = {'parent-enter', 'parent-before-child', 'child-enter', 'before-join-path',
           'after-join-path', 'before-sleep'}
@@ -25,11 +29,53 @@ function Write-ProbePhase {
 """
 
 
+class ProbeSetupError(RuntimeError):
+    def __init__(self, stage, reason):
+        super().__init__(reason)
+        self.stage = stage
+        self.reason = reason
+
+
+def setup_stage(name):
+    print('setup_stage=' + name, flush=True)
+
+
+def verify_sources(tests):
+    verified = {}
+    for name, expected in EXPECTED_HASHES.items():
+        setup_stage('verify-' + name)
+        raw = (tests / name).read_bytes()
+        canonical = raw.replace(b'\r\n', b'\n')
+        digest = hashlib.sha256(canonical).hexdigest()
+        blob = hashlib.sha1(b'blob ' + str(len(canonical)).encode('ascii') + b'\0' + canonical).hexdigest()
+        print('source_identity=' + json.dumps({'file': name, 'raw_sha256': hashlib.sha256(raw).hexdigest(),
+              'canonical_lf_sha256': digest, 'canonical_lf_git_blob': blob,
+              'crlf_pairs': raw.count(b'\r\n')}), flush=True)
+        if digest != expected or blob != EXPECTED_BLOBS[name]:
+            raise ProbeSetupError('verify-' + name, 'source_digest_mismatch')
+        verified[name] = raw
+    return verified
+
+
+def load_verified_modules(tests, verified):
+    modules = []
+    for name in EXPECTED_HASHES:
+        setup_stage('import-' + name)
+        module_name = Path(name).stem
+        spec = importlib.util.spec_from_file_location(module_name, tests / name)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        # Compile exactly the bytes verified above: no reread, pyc, or path lookup.
+        exec(compile(verified[name], str(tests / name), 'exec'), module.__dict__)  # noqa: S102 - only hash-pinned bytes; bypass pyc/rereads
+        modules.append(module)
+    return tuple(modules)
+
+
 def instrument_child(fixtures):
     source = fixtures.harmless_entry_script(sleep_seconds=60)
     first = "[IO.File]::WriteAllText((Join-Path $env:TEMP 'entry-script-started'), '1')"
     if source.count(first) != 1 or source.count('Start-Sleep -Seconds 60') != 1:
-        raise RuntimeError('child fixture contract changed')
+        raise ProbeSetupError('construct-child', 'child_fixture_contract_changed')
     source = source.replace(first, PHASE_WRITER + "\nWrite-ProbePhase 'child-enter'\n"
                             "Write-ProbePhase 'before-join-path'\n"
                             "$probeMarker = Join-Path $env:TEMP 'entry-script-started'\n"
@@ -42,7 +88,7 @@ def instrument_parent(fixtures, source):
     command = fixtures.generated_windows_command(" -Lib 'deadline fixture'")
     invocation = '; powershell.exe '
     if command.count(invocation) != 1:
-        raise RuntimeError('parent fixture contract changed')
+        raise ProbeSetupError('construct-parent', 'parent_fixture_contract_changed')
     command = command.replace(invocation, "; Write-ProbePhase 'parent-before-child'; powershell.exe ")
     return PHASE_WRITER + "\nWrite-ProbePhase 'parent-enter'; " + fixtures.copy_download_fixture(source) + command
 
@@ -76,7 +122,9 @@ def report_phases(directory):
 def run_case(engine, interpreter, fixtures, controller):
     with controller.job_fixture(prefix='Frayd startup probe ') as directory:
         source = Path(directory) / 'harmless-source.ps1'
+        setup_stage('construct-child')
         source.write_text(instrument_child(fixtures), encoding='ascii')
+        setup_stage('construct-parent')
         command = instrument_parent(fixtures, source)
         print('case=' + engine, flush=True)
         try:
@@ -101,20 +149,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--tests-dir', type=Path, default=Path.cwd() / 'tests')
     args = parser.parse_args()
+    setup_stage('platform')
     if os.name != 'nt':
-        raise RuntimeError('actual Windows execution required')
+        raise ProbeSetupError('platform', 'windows_required')
+    setup_stage('tests-directory')
     tests = args.tests_dir.resolve(strict=True)
-    for name, expected in EXPECTED_HASHES.items():
-        if hashlib.sha256((tests / name).read_bytes()).hexdigest() != expected:
-            raise RuntimeError('frozen fixture source mismatch')
-    sys.path.insert(0, str(tests))
-    controller = importlib.import_module('windows_job')
-    fixtures = importlib.import_module('test_bootstrap_windows')
+    verified = verify_sources(tests)
+    controller, fixtures = load_verified_modules(tests, verified)
     succeeded = True
     for engine in ('pwsh', 'powershell'):
+        setup_stage('resolve-' + engine)
         interpreter = shutil.which(engine)
         if interpreter is None:
-            raise RuntimeError('required interpreter missing')
+            raise ProbeSetupError('resolve-' + engine, 'required_interpreter_missing')
         succeeded = run_case(engine, interpreter, fixtures, controller) and succeeded
     # A diagnostic exit0 proves bounded ownership cleanup only, not startup acceptance.
     return 0 if succeeded else 1
@@ -126,5 +173,9 @@ if __name__ == '__main__':
     except (OSError, RuntimeError, AssertionError, ValueError, ImportError) as error:
         # TimeoutExpired repr/tracebacks contain argv; never print them here.
         print('probe_error_type=' + type(error).__name__, flush=True)
+        if isinstance(error, ProbeSetupError):
+            print('probe_setup_failure=' + json.dumps({'stage': error.stage, 'reason': error.reason}), flush=True)
+        else:
+            print('probe_error_reason=unclassified_failure_at_last_stage', flush=True)
         status = 2
     sys.exit(status)
