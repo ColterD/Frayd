@@ -226,7 +226,11 @@ def run_generated_entry(arguments, *, env, directory):
 
 
 class QualificationMixin:
-    """The qualification cases; each concrete class binds them to one PowerShell interpreter."""
+    """Direct installer cases run under the bound interpreter.
+
+    Generated-entry cases run the outer command under that interpreter; the production command
+    launches the downloaded installer with powershell.exe, including when the outer host is pwsh.
+    """
 
     interpreter_name = ''
 
@@ -554,6 +558,7 @@ class QualificationMixin:
                 run = self.install(case, tunnel='tailscale', fake=fake)
                 self.assert_installed(run, case)
                 self.assertIn(expected, run.stdout, run.describe())
+                self.assertEqual(run.outcome, ('returned', '0'), run.describe())
                 self.assertEqual(next((event[1] for event in run.of('process')), None), 'tailscale', run.describe())
 
     def test_no_network_or_service_effects(self):

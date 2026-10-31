@@ -1616,7 +1616,16 @@ class NativeOwnership(unittest.TestCase):
                             os.killpg(process.pid, cancellation)
                         else:
                             os.kill(process.pid, cancellation)
-                    self.assertEqual(process.wait(timeout=15), 0)
+                    status = process.wait(timeout=15)
+                    # A surviving worker may retain the pipe: never block reading
+                    # helper diagnostics after its exit or discard them in finally.
+                    os.set_blocking(process.stderr.fileno(), False)
+                    diagnostic = process.stderr.read(65536) or b''
+                    self.assertEqual(status, 0,
+                                     f'helper stderr={diagnostic!r}; worker lease held={lease_held()}; '
+                                     f'worker done={done.exists()}; '
+                                     f'prefix child receipt={(self.prefix / ".frayd-child.json").exists()}; '
+                                     f'data child receipt={(self.data / ".frayd-child.json").exists()}')
                     # Assert before receipt checks or ANY cooperative cleanup stop.
                     self.assertFalse(lease_held(), 'owned descendant lease must be released before receipt cleanup')
                     with self.assertRaises(ProcessLookupError, msg='owned descendant must be absent before cleanup stop'):

@@ -81,6 +81,8 @@ if ($Tunnel -eq "tailscale") {
   }
   if ($addressExitCode -eq 0 -and $address) { Write-Host "[OK] Your server's Tailscale address: $address  (or run: tailscale ip -4)" }
   else { Write-Host "[!] No Tailscale address yet - log in, then run: tailscale ip -4" }
+  # The lookup failure is handled; in-process callers should observe a successful install.
+  $global:LASTEXITCODE = 0
   Write-Host "     Install Tailscale on your phone/laptop, same account, then open that address:8484"
 } elseif ($Tunnel -eq "cloudflared") {
   Write-Host "`n== Cloudflare Tunnel remote access =="
