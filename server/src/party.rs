@@ -83,8 +83,8 @@ impl Party {
         let mut session = self.session.lock().unwrap();
         // Never reuse the replaced party's code: a fresh authorize with an old join link must miss.
         let code = loop {
-            let code = rand::thread_rng()
-                .sample_iter(&rand::distributions::Alphanumeric)
+            let code = rand::rng()
+                .sample_iter(&rand::distr::Alphanumeric)
                 .filter(|c| c.is_ascii_alphabetic())
                 .take(4)
                 .map(char::from)
@@ -151,7 +151,7 @@ impl Party {
         let _ = tx.send(Message::Text(serde_json::json!({
             "type": "state", "state": session.state, "is_host": connection.is_host,
             "self_label": connection.public_label,
-        }).to_string()));
+        }).to_string().into()));
         session.broadcast_members();
         Some(connection)
     }
@@ -222,7 +222,7 @@ impl Session {
 
     /// Enqueues synchronously while the caller holds the session transition lock.
     fn broadcast(&self, value: &Value) {
-        let text = Message::Text(value.to_string());
+        let text = Message::Text(value.to_string().into());
         for member in &self.members {
             let _ = member.tx.send(text.clone());
         }
@@ -856,36 +856,32 @@ mod tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod dependency_tests {
     use super::*;
 
     #[test]
     fn join_code_is_four_uppercase_ascii_letters() {
         let party = Party::new();
-        let code = party.create("host");
+        let (code, proof) = party.create("host");
         assert_eq!(code.len(), 4);
         assert!(code.bytes().all(|byte| byte.is_ascii_uppercase()));
-        assert_eq!(party.code.lock().unwrap().as_deref(), Some(code.as_str()));
-        assert!(party.is_host("host"));
+        let admission = party.authorize(&code, Some(proof)).unwrap();
+        assert!(party.can_register(&admission, "host"));
     }
 
     #[tokio::test]
-    async fn broadcast_delivers_json_text_and_removes_closed_members() {
+    async fn broadcast_delivers_unicode_json_text() {
         let party = Party::new();
+        let (code, _) = party.create("host");
+        let admission = party.authorize(&code, None).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let (closed, closed_rx) = mpsc::unbounded_channel();
-        drop(closed_rx);
-        party
-            .members
-            .lock()
-            .unwrap()
-            .extend([("live".into(), tx), ("closed".into(), closed)]);
+        let _connection = party.register(admission, "guest".into(), tx).unwrap();
+        while rx.try_recv().is_ok() {}
         let payload = serde_json::json!({"type": "state", "title": "Unicode 🎵"});
-        party.broadcast(&payload);
+        party.session.lock().unwrap().broadcast(&payload);
         let Some(Message::Text(text)) = rx.recv().await else {
             panic!("expected outbound text")
         };
         assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), payload);
-        assert_eq!(party.members.lock().unwrap().len(), 1);
     }
 }

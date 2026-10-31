@@ -143,45 +143,7 @@ async fn main() {
         run_scan(state.clone(), ScanRequest { roots: library.roots, for_ingest: false });
     }
 
-    let app = Router::new()
-        .route("/api/health", get(health))
-        .route("/api/build", get(build_info::handler))
-        .route("/api/media/:id", axum::routing::delete(delete_media))
-        .route("/api/admin/users/:id", axum::routing::delete(remove_user))
-        .route("/api/library", get(library_handler))
-        .route("/api/stream/:id", get(stream))
-        .route("/api/progress", post(set_progress))
-        .route("/api/progress/:media_id", get(get_progress))
-        .route("/api/auth/login", post(auth_login))
-        .route("/api/auth/logout", post(auth_logout))
-        .route("/api/auth/me", get(auth_me))
-        .route("/api/auth/password", post(auth_change_password))
-        .route("/api/setup", get(setup_status).post(auth_setup))
-        .route("/api/admin/perms", get(list_perms).post(set_perm))
-        .route("/api/admin/settings", get(get_settings).post(set_setting))
-        .route("/api/thumb/:id", get(thumb))
-        .route("/api/scan", post(trigger_scan))
-        .route("/api/ingest", post(ingest))
-        .route("/api/scan/status", get(scan_status))
-        .route("/api/party", post(party_create))
-        .route("/api/party/:code/ws", get(party_ws))
-        .route("/api/comic/:id/pages", get(comic_pages))
-        .route("/api/comic/:id/page/:n", get(comic_page))
-        .route("/api/epub/:id/spine", get(epub_spine))
-        .route("/api/epub/:id/toc", get(epub_toc))
-        .route("/api/epub/:id/chunk/:n", get(epub_chunk))
-        .route("/api/epub/:id/asset/*path", get(epub_asset))
-        .route("/api/annotations/:id", get(list_annotations))
-        .route("/api/annotations", post(create_annotation))
-        .route("/api/annotations", axum::routing::delete(delete_annotation))
-        .nest_service("/", ServeDir::new(client_dir()))
-        .layer(
-            tower_http::cors::CorsLayer::new()
-                .allow_origin(tower_http::cors::Any)
-                .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::DELETE])
-                .allow_headers([axum::http::header::AUTHORIZATION, axum::http::header::CONTENT_TYPE]),
-        )
-        .with_state(state.clone());
+    let app = app_router(state.clone(), client_dir());
 
     // Port: FRAYD_PORT env > settings.port > 8484
     let port: u16 = std::env::var("FRAYD_PORT")
@@ -256,6 +218,7 @@ async fn main() {
 fn app_router(state: Arc<App>, client: PathBuf) -> Router {
     Router::new()
         .route("/api/health", get(health))
+        .route("/api/build", get(build_info::handler))
         .route("/api/media/{id}", axum::routing::delete(delete_media))
         .route("/api/admin/users/{id}", axum::routing::delete(remove_user))
         .route("/api/library", get(library_handler))
@@ -2344,7 +2307,7 @@ mod backend_regressions {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let router = Router::new()
-            .route("/api/thumb/:id", get(thumb))
+            .route("/api/thumb/{id}", get(thumb))
             .with_state(app);
         let server = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
@@ -2769,8 +2732,8 @@ mod backend_regressions {
             let metadata = serde_json::json!({"pages": names, "synopsis": "keep"}).to_string();
             app.db.lock().unwrap().execute("UPDATE media SET meta_json=?1 WHERE id=1", [&metadata]).unwrap();
             let router = Router::new()
-                .route("/api/comic/:id/pages", get(comic_pages))
-                .route("/api/comic/:id/page/:n", get(comic_page)).with_state(app.clone());
+                .route("/api/comic/{id}/pages", get(comic_pages))
+                .route("/api/comic/{id}/page/{n}", get(comic_page)).with_state(app.clone());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
@@ -5334,4 +5297,120 @@ mod direct_download_tests {
         assert_eq!(ingest(State(app),axum::http::HeaderMap::new(),query(),Json(IngestReq{url:"https://example.invalid/video".into()})).await,StatusCode::NOT_IMPLEMENTED);
     }
 
+}
+
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[tokio::test]
+    async fn production_router_serves_api_nested_epub_assets_and_static_files() {
+        let root = std::env::temp_dir().join(format!("frayd-router-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        struct RemoveDirectoryOnDrop(PathBuf);
+        impl Drop for RemoveDirectoryOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = RemoveDirectoryOnDrop(root.clone());
+        std::fs::write(root.join("index.html"), b"static root fixture").unwrap();
+        let book = root.join("fixture.epub");
+        let mut archive = zip::ZipWriter::new(std::fs::File::create(&book).unwrap());
+        archive
+            .start_file(
+                "OEBPS/images/pixel.png",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        let asset = b"nested asset bytes\0\xff";
+        archive.write_all(asset).unwrap();
+        archive.finish().unwrap();
+        let db = store::open(":memory:");
+        db.execute(
+            "INSERT INTO media (id, kind, path, title) VALUES (1, 'ebook', ?1, 'fixture')",
+            [book.to_str().unwrap()],
+        )
+        .unwrap();
+        let state = Arc::new(App::new(db, String::new(), LibraryConfig { roots: Vec::new(), locked: false }));
+        let router = app_router(state, root.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        tokio::task::spawn_blocking(move || {
+            let agent = ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_secs(5))
+                .build();
+            let health: serde_json::Value = serde_json::from_reader(
+                agent
+                    .get(&format!("http://{address}/api/health"))
+                    .call()
+                    .unwrap()
+                    .into_reader(),
+            )
+            .unwrap();
+            assert_eq!(health, serde_json::json!({"status": "ok"}));
+            let build_response = agent.get(&format!("http://{address}/api/build")).call().unwrap();
+            assert_eq!(build_response.header("Cache-Control"), Some("no-store"));
+            let build: serde_json::Value = serde_json::from_reader(build_response.into_reader()).unwrap();
+            assert_eq!(build["version"], env!("CARGO_PKG_VERSION"));
+            for (path, expected) in [
+                ("/", b"static root fixture".as_slice()),
+                ("/api/epub/1/asset/OEBPS/images/pixel.png", asset.as_slice()),
+            ] {
+                let mut body = Vec::new();
+                agent
+                    .get(&format!("http://{address}{path}"))
+                    .call()
+                    .unwrap()
+                    .into_reader()
+                    .read_to_end(&mut body)
+                    .unwrap();
+                assert_eq!(body, expected, "{path}");
+            }
+            for path in [
+                "/missing",
+                "/api/epub/1/asset/OEBPS/images/missing.png",
+                "/api/epub/999/asset/OEBPS/images/pixel.png",
+            ] {
+                assert!(
+                    matches!(
+                        agent.get(&format!("http://{address}{path}")).call(),
+                        Err(ureq::Error::Status(404, _))
+                    ),
+                    "{path}"
+                );
+            }
+        })
+        .await
+        .unwrap();
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[test]
+    fn account_passwords_verify_reject_invalid_logins_and_use_distinct_salts() {
+        let db = store::open(":memory:");
+        let password = uuid::Uuid::new_v4().to_string();
+        let wrong_password = uuid::Uuid::new_v4().to_string();
+        for key in ["first@example.invalid", "second@example.invalid"] {
+            auth::create_account(&db, key, &password).unwrap();
+            assert!(auth::verify_login(&db, key, &password).unwrap());
+            assert!(!auth::verify_login(&db, key, &wrong_password).unwrap());
+        }
+        assert!(!auth::verify_login(&db, "missing@example.invalid", &password).unwrap());
+        let hashes: Vec<String> = db
+            .prepare("SELECT secret_hash FROM identities ORDER BY key")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let first = argon2::password_hash::PasswordHash::new(&hashes[0]).unwrap();
+        let second = argon2::password_hash::PasswordHash::new(&hashes[1]).unwrap();
+        assert!(first.salt.is_some());
+        assert!(second.salt.is_some());
+        assert!(first.salt != second.salt);
+    }
 }
