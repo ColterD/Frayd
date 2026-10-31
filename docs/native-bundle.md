@@ -67,7 +67,7 @@ Some Unix systems hide an exited child from group lookup before it is reaped. A 
 
 On macOS, a TERM or KILL group call can report `EPERM` after the owned server exits. A fresh `WNOWAIT` check must confirm that same child exited and remains unreaped before cleanup can continue. A live child or a failed wait check stops cleanup and preserves both child records. This exception permits progress only. It does not prove the group disappeared.
 
-After reaping, the final signal-zero probe must report `ESRCH` before either child record can be removed. A successful probe means the group still exists. `EPERM` or any unknown probe error preserves both records.
+After reaping, the final signal-zero probe must report `ESRCH` before either child record can be removed. A successful probe means the group still exists. The helper retries successful probes within a five-second wait, with 20 milliseconds between attempts. On macOS, it also retries `EPERM` within that same wait; `EPERM` does not prove absence. If the wait expires, both records stay. On other platforms, `EPERM` preserves both records immediately. Any other probe error also preserves both records immediately.
 
 No termination signal is sent using a group ID after its leader is reaped; a reused ID causes a conservative hold. Descendants that deliberately leave the group with `setsid` or `setpgid` are outside this containment guarantee, so this is not whole-system process-tree tracking.
 

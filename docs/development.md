@@ -25,6 +25,8 @@ The default database is `frayd.db` under the server source directory that was co
 
 From the repository root, with Node.js 22 or later, Python 3.11 or later, Docker Engine and Compose:
 
+Run Python qualification commands with optimization disabled: do not pass `-O` or `-OO`, and leave `PYTHONOPTIMIZE` unset. The scripts require assertions and refuse optimized execution.
+
 On macOS, the full Python test command below requires Python 3.13 or later for the native harness's `os.waitid` child-custody checks. See [native checks](native-bundle.md#checks). Other platforms retain the Python 3.11 minimum.
 
 ```sh

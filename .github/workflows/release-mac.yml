@@ -1,7 +1,6 @@
 name: Native macOS qualification (no publication)
 
 on:
-  workflow_dispatch:
   push:
     branches: [qa/native-final53-20261030]
 
@@ -31,7 +30,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-          ref: e0e7d5459ec08aaa307f14015413d59d3dcb81e8
+          ref: 40b077b20ed08f88cf13ae110c2455a06ab5b507
 
       - name: Verify actual native architecture (reject Rosetta)
         shell: bash
@@ -74,6 +73,18 @@ jobs:
           rm -r -- "${RUNNER_TEMP:?}/frayd-build-source"
           printf 'FRAYD_NATIVE_ARCHIVE=%s\n' "$RUNNER_TEMP"/frayd-packages/*.tar.gz >> "$GITHUB_ENV"
           printf 'FRAYD_NATIVE_BUILD_SOURCE=%s\n' "$RUNNER_TEMP/frayd-build-source/server" >> "$GITHUB_ENV"
+
+      - name: Repeat owned descendant cleanup after transient macOS probe fix
+        shell: bash
+        run: |
+          PYTHONPATH=tests python3 - <<'PYFOCUS'
+          import unittest
+          name = 'test_native_bundle.NativeOwnership.test_owned_server_group_stops_descendants_and_preserves_foreign_group'
+          suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromName(name) for _ in range(8))
+          assert suite.countTestCases() == 8
+          result = unittest.TextTestRunner(verbosity=2, failfast=True).run(suite)
+          raise SystemExit(0 if result.wasSuccessful() and not result.skipped else 1)
+          PYFOCUS
 
       - name: Actual helper and server lifecycle, HTTP reader and persistence
         shell: bash

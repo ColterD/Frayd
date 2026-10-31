@@ -20,7 +20,7 @@ import time
 import unittest
 import urllib.error
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, call as mock_call, patch
 
 SPEC = importlib.util.spec_from_file_location('integration', Path(__file__).parents[1] / 'scripts/integration.py')
 integration = importlib.util.module_from_spec(SPEC)
@@ -284,6 +284,57 @@ class DockerDeadlineTests(unittest.TestCase):
         for timeout in [0, -1, float('inf'), float('nan')]:
             with self.subTest(timeout=timeout), self.assertRaises(ValueError):
                 integration.docker('inspect', 'owned', timeout=timeout)
+
+    def test_sanitized_timeout_retains_only_owned_cleanup_note(self):
+        """Keep cleanup uncertainty visible without copying private timeout details."""
+        for cleanup_times_out in (False, True):
+            with self.subTest(cleanup_times_out=cleanup_times_out):
+                original = subprocess.TimeoutExpired(['docker', 'inspect', 'private argv'], 7,
+                                                     output=b'private stdout', stderr=b'private stderr')
+                original.add_note('private original note')
+                process = Mock(pid=12345)
+                cleanup = subprocess.TimeoutExpired(['private cleanup argv'], 10) if cleanup_times_out else (b'', b'')
+                process.communicate.side_effect = [original, cleanup]
+                with (patch.object(integration.subprocess, 'Popen', return_value=process),
+                      patch.object(integration.os, 'killpg') as kill,
+                      self.assertRaises(subprocess.TimeoutExpired) as caught):
+                    integration.run_docker(('inspect', 'private argv'), 7, b'private stdin')
+                self.assertEqual(process.communicate.call_args_list,
+                                 [mock_call(b'private stdin', timeout=7), mock_call(timeout=10)])
+                kill.assert_called_once_with(process.pid, signal.SIGKILL)
+                for stream in (process.stdin, process.stdout, process.stderr):
+                    stream.close.assert_called_once_with()
+                error = caught.exception
+                self.assertIsNot(error, original)
+                self.assertEqual(error.cmd, ['docker', 'inspect'])
+                self.assertEqual(error.timeout, 7)
+                self.assertIsNone(error.output)
+                self.assertIsNone(error.stderr)
+                self.assertTrue(error.__suppress_context__)
+                expected = ['Docker local process cleanup exceeded 10 s'] if cleanup_times_out else []
+                self.assertEqual(getattr(error, '__notes__', []), expected)
+                self.assertNotIn('private', str(error) + repr(error.__dict__))
+
+    def test_non_timeout_failures_keep_identity_and_cleanup_detail(self):
+        """Ordinary failures and interrupts keep their original exception and bounds."""
+        for exception_type in (RuntimeError, KeyboardInterrupt):
+            for cleanup_times_out in (False, True):
+                with self.subTest(exception_type=exception_type, cleanup_times_out=cleanup_times_out):
+                    original = exception_type('original failure')
+                    process = Mock(pid=12345)
+                    cleanup = subprocess.TimeoutExpired(['docker'], 10) if cleanup_times_out else (b'', b'')
+                    process.communicate.side_effect = [original, cleanup]
+                    with (patch.object(integration.subprocess, 'Popen', return_value=process),
+                          patch.object(integration.os, 'killpg'),
+                          self.assertRaises(exception_type) as caught):
+                        integration.run_docker(('inspect', 'owned'), 7)
+                    self.assertIs(caught.exception, original)
+                    self.assertEqual(process.communicate.call_args_list,
+                                     [mock_call(None, timeout=7), mock_call(timeout=10)])
+                    expected = ['Docker local process cleanup exceeded 10 s'] if cleanup_times_out else []
+                    self.assertEqual(getattr(original, '__notes__', []), expected)
+                    for stream in (process.stdin, process.stdout, process.stderr):
+                        stream.close.assert_called_once_with()
 
     def test_actual_timeout_stops_child_after_cli_parent_exits(self):
         """Kill a Compose descendant holding pipes after its CLI parent has exited."""

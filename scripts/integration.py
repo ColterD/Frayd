@@ -41,6 +41,8 @@ def run_docker(args, timeout, input_data=None):
     try:
         stdout, stderr = process.communicate(input_data, timeout=timeout)
     except BaseException as error:
+        if isinstance(error, subprocess.TimeoutExpired):
+            error = subprocess.TimeoutExpired(['docker', args[0]], timeout)
         # The CLI may already have exited while its Compose plugin still owns pipes.
         try:
             os.killpg(process.pid, signal.SIGKILL)
@@ -56,7 +58,7 @@ def run_docker(args, timeout, input_data=None):
                 if stream is not None:
                     stream.close()
         if isinstance(error, subprocess.TimeoutExpired):
-            raise subprocess.TimeoutExpired(['docker', args[0]], timeout) from None
+            raise error from None
         raise
     result = subprocess.CompletedProcess(['docker', args[0]], process.returncode, stdout, stderr)
     result.check_returncode()
