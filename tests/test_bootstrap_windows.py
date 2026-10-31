@@ -513,13 +513,15 @@ class QualificationMixin:
                                 directory=directory)
             error = caught.exception
             self.assertTrue((root / 'entry-download-complete').is_file())
+            # Missing readiness fails qualification within the total process budget;
+            # it must not reset the deadline after the nested child starts.
             self.assertTrue((root / 'entry-script-started').is_file(), 'the actual nested file child must run')
             self.assertFalse((root / 'entry-script-complete').exists(), 'the sleeping child must be interrupted')
             self.assertGreaterEqual(error.job_total_processes, 2, 'the job must own both PowerShell hosts')
             self.assertEqual(error.job_active_processes, 0, 'no owned descendant may outlive the deadline')
             self.assertTrue(error.host_exited, 'the retained host handle must confirm termination')
             self.assertGreaterEqual(error.elapsed, 30)
-            self.assertLess(error.elapsed, 36, '30s execution budget plus at most 5s cleanup')
+            self.assertLess(error.elapsed, 36, '30s total process budget plus at most 5s cleanup')
             print(f'{self.interpreter_name} deadline proof: elapsed={error.elapsed:.3f}s '
                   f'active={error.job_active_processes} total={error.job_total_processes} '
                   f'host_exited={error.host_exited}')

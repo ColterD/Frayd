@@ -261,8 +261,10 @@ def snapshot(root):
     return [(str(p.relative_to(root)), p.lstat().st_mode, os.readlink(p) if p.is_symlink() else p.read_bytes() if p.is_file() else None) for p in sorted(root.rglob('*'))]
 
 
-def package(output, target=TARGET, server=SERVER, helper=HELPER, **options):
-    return run_bounded([sys.executable, str(PACKAGE), str(output), target, str(server), str(helper)], **options)
+def package(output, target=TARGET, server=SERVER, helper=HELPER, runner=None, **options):
+    if runner is None:
+        runner = run_bounded
+    return runner([sys.executable, str(PACKAGE), str(output), target, str(server), str(helper)], **options)
 
 
 def setUpModule():
@@ -869,12 +871,16 @@ class NativeOwnership(unittest.TestCase):
             entries.append({'path': p.relative_to(self.bundle).as_posix(), 'kind': 'dir' if p.is_dir() else 'file', 'mode': stat.S_IMODE(p.stat().st_mode), 'size': p.stat().st_size if p.is_file() else 0, 'sha256': hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else ''})
         (self.bundle / 'manifest.json').write_text(json.dumps({'schema': 1, 'version': '0.1.1', 'source': 'a' * 40, 'target': 'fixture', 'toolchain': 'fixture', 'entries': entries}))
 
-    def run_helper(self, command, *args, code=0, answer='', environment=None, timeout=60):
+    def run_fixture(self, arguments, **options):
         try:
-            result = run_bounded([str(HELPER), command, '--prefix', str(self.prefix), *args], input=answer, text=True, capture_output=True, env=environment, timeout=timeout)
-        except RunBoundedCleanupUncertain:
+            return run_bounded(arguments, **options)
+        except (RunBoundedCleanupUncertain, subprocess.TimeoutExpired):
+            # Reaping a helper does not establish exit of its separate server group.
             self.preserve_fixture = True
             raise
+
+    def run_helper(self, command, *args, code=0, answer='', environment=None, timeout=60):
+        result = self.run_fixture([str(HELPER), command, '--prefix', str(self.prefix), *args], input=answer, text=True, capture_output=True, env=environment, timeout=timeout)
         self.assertEqual(result.returncode, code, result.stderr)
         return result
 
@@ -910,9 +916,93 @@ class NativeOwnership(unittest.TestCase):
             self.preserve_fixture = True
             raise AssertionError(f'cleanup uncertain; native fixture retained at {self.base}') from None
 
+    def test_start_timeout_retains_separately_grouped_server_fixture(self):
+        stop = self.base / 'timeout-server-stop'
+        ready = self.base / 'timeout-server-ready'
+        lease = self.base / 'timeout-server-lease'
+        done = self.base / 'timeout-server-done'
+        (self.bundle / 'frayd-server').write_text(
+            '#!' + sys.executable + '\nimport fcntl,json,os,pathlib,time\n'
+            'handle=open(' + repr(str(lease)) + ', "w")\n'
+            'fcntl.flock(handle,fcntl.LOCK_EX)\n'
+            'pathlib.Path(' + repr(str(ready)) + ').write_text(json.dumps([os.getpid(),os.getpgrp()]))\n'
+            'stop=pathlib.Path(' + repr(str(stop)) + ')\n'
+            'for _ in range(1500):\n if stop.exists(): break\n time.sleep(.02)\n'
+            'fcntl.flock(handle,fcntl.LOCK_UN)\n'
+            'pathlib.Path(' + repr(str(done)) + ').touch()\n')
+        self.manifest()
+        self.install('--yes')
+        communicate = subprocess.Popen.communicate
+        helper_pids = []
+
+        def lease_held():
+            with lease.open('a') as handle:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return True
+                fcntl.flock(handle, fcntl.LOCK_UN)
+                return False
+
+        def communicate_after_ready(process, *args, **options):
+            helper_pids.append(process.pid)
+            wait_for(lambda: ready.exists() and shared_running_child_pid(self.prefix, self.data),
+                     'separately grouped server readiness')
+            # Isolate the communication timeout from interpreter/helper startup.
+            options['timeout'] = 0.05
+            return communicate(process, *args, **options)
+
+        try:
+            with mock.patch.object(subprocess.Popen, 'communicate', communicate_after_ready):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    self.run_helper('start', timeout=20)
+            child, group = json.loads(ready.read_text())
+            self.assertEqual(shared_running_child_pid(self.prefix, self.data), child)
+            self.assertEqual(group, child)
+            self.assertNotEqual(group, helper_pids[0])
+            self.assertTrue(lease_held(), 'server must survive helper-group cleanup')
+            self.assertTrue(self.preserve_fixture, 'timeout must retain the live server fixture')
+            before = self.snapshot()
+            with self.assertRaisesRegex(AssertionError, 'uncertain native fixture retained'):
+                self.cleanup_fixture()
+            self.assertFalse(self.temp._finalizer.alive, 'retained fixture must outlive its finalizer')
+            self.assertEqual(self.snapshot(), before, 'cleanup must retain receipts and live process data')
+            self.assertTrue(lease_held())
+        finally:
+            # This fixture owns a stop-file protocol, not custody of the orphan PID.
+            stop.touch()
+            try:
+                wait_for(lambda: done.exists() and not lease_held(), 'orphan fixture cooperative exit')
+            except BaseException:
+                self.preserve_fixture = True
+                raise
+            else:
+                self.preserve_fixture = False
+                self.temp.cleanup()
+
+    def test_direct_install_cleanup_uncertainty_retains_fixture(self):
+        self.prefix.mkdir()
+        (self.prefix / '.frayd-install.json').write_text('NONSECRET fixture receipt')
+        before = self.snapshot()
+        failure = RunBoundedCleanupUncertain('injected direct-install cleanup failure')
+        try:
+            with mock.patch.object(self, 'install'), mock.patch(__name__ + '.run_bounded', side_effect=failure):
+                with self.assertRaises(RunBoundedCleanupUncertain) as raised:
+                    self.test_permissive_umask_and_unknown_existing_data()
+            self.assertIs(raised.exception, failure)
+            self.assertTrue(self.preserve_fixture)
+            with self.assertRaisesRegex(AssertionError, 'uncertain native fixture retained'):
+                self.cleanup_fixture()
+            self.assertFalse(self.temp._finalizer.alive, 'retained fixture must outlive its finalizer')
+            self.assertEqual(self.snapshot(), before)
+        finally:
+            # The injected runner never spawns; this test retains no live child.
+            self.preserve_fixture = False
+            self.temp.cleanup()
+
     def test_package_complete_manifest_and_architecture(self):
         output = self.base / 'package output'
-        result = package(output, capture_output=True, text=True)
+        result = package(output, runner=self.run_fixture, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         archive = next(output.glob('*.tar.gz'))
         self.assertEqual(archive.with_suffix(archive.suffix + '.sha256').read_text().split()[0], hashlib.sha256(archive.read_bytes()).hexdigest())
@@ -925,19 +1015,19 @@ class NativeOwnership(unittest.TestCase):
         self.assertTrue(expected.issubset({item['path'] for item in manifest['entries']}))
         self.assertFalse(any('.env' in item['path'] for item in manifest['entries']))
         self.assertEqual(manifest['target'], TARGET)
-        identity = json.loads(run_bounded([str(SERVER), '--build-info'], check=True, capture_output=True, text=True).stdout)
+        identity = json.loads(self.run_fixture([str(SERVER), '--build-info'], check=True, capture_output=True, text=True).stdout)
         self.assertEqual(json.loads((payload / 'build-info.json').read_text()), identity)
         self.assertEqual(identity['commit'], manifest['source'])
         self.bundle = payload
         self.install('--yes')
         self.run_helper('uninstall', '--yes')
         fake_output = self.base / 'helper is not server'
-        rejected = package(fake_output, server=HELPER, capture_output=True)
+        rejected = package(fake_output, runner=self.run_fixture, server=HELPER, capture_output=True)
         self.assertNotEqual(rejected.returncode, 0)
         self.assertFalse(fake_output.exists())
         wrong_target = ('x86_64' if ARCHITECTURE == 'aarch64' else 'aarch64') + TARGET[len(ARCHITECTURE):]
         before = self.snapshot()
-        result = package(self.base / 'wrong architecture output', target=wrong_target, capture_output=True)
+        result = package(self.base / 'wrong architecture output', runner=self.run_fixture, target=wrong_target, capture_output=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.snapshot(), before)
 
@@ -959,13 +1049,13 @@ class NativeOwnership(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, 'Server and helper binaries must differ'):
                     packager.main()
             self.assertFalse(output.exists())
-            rejected = package(output, server=server, helper=helper, capture_output=True, text=True)
+            rejected = package(output, runner=self.run_fixture, server=server, helper=helper, capture_output=True, text=True)
             self.assertNotEqual(rejected.returncode, 0)
             self.assertIn('Server and helper binaries must differ', rejected.stderr)
             self.assertFalse(output.exists())
 
     def test_package_rejects_invalid_helper_identity_without_output(self):
-        identity = json.loads(run_bounded([str(SERVER), '--build-info'], check=True, capture_output=True, text=True).stdout)
+        identity = json.loads(self.run_fixture([str(SERVER), '--build-info'], check=True, capture_output=True, text=True).stdout)
         valid = dict(identity, role='frayd-native')
         invalid = [
             ('wrong role', dict(valid, role='frayd-server')),
@@ -1000,19 +1090,19 @@ class NativeOwnership(unittest.TestCase):
     def test_helper_build_info_is_read_only_and_strict(self):
         before = self.snapshot()
         environment = dict(os.environ, FRAYD_DB=str(self.base / 'must not create.db'), FRAYD_LIBRARY=str(self.base / 'must not create library'))
-        result = run_bounded([str(HELPER), '--build-info'], cwd=self.base, env=environment, capture_output=True, text=True)
+        result = self.run_fixture([str(HELPER), '--build-info'], cwd=self.base, env=environment, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         identity = json.loads(result.stdout)
         self.assertEqual(identity.pop('role'), 'frayd-native')
-        server_identity = json.loads(run_bounded([str(SERVER), '--build-info'], check=True, capture_output=True, text=True).stdout)
+        server_identity = json.loads(self.run_fixture([str(SERVER), '--build-info'], check=True, capture_output=True, text=True).stdout)
         self.assertEqual(identity, server_identity)
-        rejected = run_bounded([str(HELPER), '--build-info', '--prefix', str(self.prefix)], cwd=self.base, env=environment, capture_output=True)
+        rejected = self.run_fixture([str(HELPER), '--build-info', '--prefix', str(self.prefix)], cwd=self.base, env=environment, capture_output=True)
         self.assertEqual(rejected.returncode, 2)
         self.assertEqual(self.snapshot(), before)
 
     def test_tar_preserved_modes_under_restrictive_umask(self):
         output = self.base / 'umask package'
-        package(output, check=True, capture_output=True)
+        package(output, runner=self.run_fixture, check=True, capture_output=True)
         archive = next(output.glob('*.tar.gz'))
         original = next(path for path in output.iterdir() if path.is_dir())
         self.assertIn('tar -xpzf', (original / 'README.md').read_text())
@@ -1020,19 +1110,19 @@ class NativeOwnership(unittest.TestCase):
         preserved = self.base / 'preserved extraction'
         plain.mkdir(mode=0o700)
         preserved.mkdir(mode=0o700)
-        run_bounded(['tar', '-xzf', str(archive), '-C', str(plain)], umask=0o077, check=True, capture_output=True)
-        run_bounded(['tar', '-xpzf', str(archive), '-C', str(preserved)], umask=0o077, check=True, capture_output=True)
+        self.run_fixture(['tar', '-xzf', str(archive), '-C', str(plain)], umask=0o077, check=True, capture_output=True)
+        self.run_fixture(['tar', '-xpzf', str(archive), '-C', str(preserved)], umask=0o077, check=True, capture_output=True)
         plain_bundle = next(plain.iterdir())
         preserved_bundle = next(preserved.iterdir())
         self.assertNotEqual(stat.S_IMODE((plain_bundle / 'client/index.html').stat().st_mode), 0o644)
         self.assertEqual(stat.S_IMODE((preserved_bundle / 'client/index.html').stat().st_mode), 0o644)
         self.assertEqual(stat.S_IMODE((preserved_bundle / 'install.sh').stat().st_mode), 0o755)
         before = self.snapshot()
-        refused = run_bounded([str(plain_bundle / 'install.sh'), '--prefix', str(self.prefix), '--data-dir', str(self.data), '--yes'], capture_output=True)
+        refused = self.run_fixture([str(plain_bundle / 'install.sh'), '--prefix', str(self.prefix), '--data-dir', str(self.data), '--yes'], capture_output=True)
         self.assertEqual(refused.returncode, 2)
         self.assertEqual(self.snapshot(), before)
-        run_bounded([str(preserved_bundle / 'install.sh'), '--prefix', str(self.prefix), '--data-dir', str(self.data), '--yes'], check=True, capture_output=True)
-        run_bounded([str(preserved_bundle / 'uninstall.sh'), '--prefix', str(self.prefix), '--yes'], check=True, capture_output=True)
+        self.run_fixture([str(preserved_bundle / 'install.sh'), '--prefix', str(self.prefix), '--data-dir', str(self.data), '--yes'], check=True, capture_output=True)
+        self.run_fixture([str(preserved_bundle / 'uninstall.sh'), '--prefix', str(self.prefix), '--yes'], check=True, capture_output=True)
         self.assertFalse(self.prefix.exists())
         self.assertTrue((self.data / '.frayd-data.json').is_file())
 
@@ -1070,13 +1160,9 @@ class NativeOwnership(unittest.TestCase):
                         options = {'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE}
                         if control != 'redirected':
                             options[stream] = slave
-                        try:
-                            result = run_bounded([str(HELPER), 'start', '--prefix', str(self.prefix)],
-                                                 stdin=subprocess.DEVNULL, timeout=10, terminal_master=master,
-                                                 preexec_fn=lambda terminal=slave: fcntl.ioctl(terminal, termios.TIOCSCTTY, 0), **options)
-                        except RunBoundedCleanupUncertain:
-                            self.preserve_fixture = True
-                            raise
+                        result = self.run_fixture([str(HELPER), 'start', '--prefix', str(self.prefix)],
+                                                  stdin=subprocess.DEVNULL, timeout=10, terminal_master=master,
+                                                  preexec_fn=lambda terminal=slave: fcntl.ioctl(terminal, termios.TIOCSCTTY, 0), **options)
                         if control == 'blocked':
                             self.assertEqual(result.returncode, 2)
                             diagnostic = result.stderr if stream == 'stdout' else result.terminal_output
@@ -1259,7 +1345,7 @@ class NativeOwnership(unittest.TestCase):
         (self.data / '.env').unlink()
         (self.data / 'frayd.db').unlink()
         self.data.rmdir()
-        result = run_bounded([str(HELPER), 'install', '--bundle', str(self.bundle), '--prefix', str(self.prefix), '--data-dir', str(self.data), '--yes'], umask=0, capture_output=True)
+        result = self.run_fixture([str(HELPER), 'install', '--bundle', str(self.bundle), '--prefix', str(self.prefix), '--data-dir', str(self.data), '--yes'], umask=0, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(stat.S_IMODE(self.prefix.stat().st_mode), 0o700)
         self.assertEqual(stat.S_IMODE(self.data.stat().st_mode), 0o700)
@@ -1643,7 +1729,7 @@ class NativeOwnership(unittest.TestCase):
     def test_invalid_targets_and_flags_zero_effects(self):
         before = self.snapshot()
         for target in ['relative', '/', '/usr/frayd', str(ROOT / 'native-test-prefix'), str(self.base) + '/./unsafe', str(self.base) + '//unsafe', str(self.base / '.cargo/new'), str(self.base / '.rustup/new'), str(self.base / 'original checkout/new')]:
-            result = run_bounded([str(HELPER), 'install', '--bundle', str(self.bundle), '--prefix', target, '--data-dir', str(self.data), '--yes'], capture_output=True)
+            result = self.run_fixture([str(HELPER), 'install', '--bundle', str(self.bundle), '--prefix', target, '--data-dir', str(self.data), '--yes'], capture_output=True)
             self.assertEqual(result.returncode, 2, result.stderr)
         self.run_helper('uninstall', '--purge-library', code=2)
         self.assertEqual(self.snapshot(), before)
@@ -1751,7 +1837,7 @@ class NativeRuntime(unittest.TestCase):
             allowed.update(bundle_name + '/' + entry['path'] for entry in manifest['entries'])
             self.assertEqual(set(names), allowed, 'archive members must match the manifest exactly')
         # Match the documented user workflow: preserve manifest modes even under umask 077.
-        run_bounded(['tar', '-xpzf', str(archive), '-C', str(extracted)],
+        self.run_fixture(['tar', '-xpzf', str(archive), '-C', str(extracted)],
                     umask=0o077, check=True, capture_output=True)
         bundles = list(extracted.iterdir())
         self.assertEqual(len(bundles), 1)
@@ -1760,7 +1846,7 @@ class NativeRuntime(unittest.TestCase):
         self.data = self.base / 'application data'
         self.library = self.base / 'library fixture'
         self.library.mkdir(mode=0o700)
-        run_bounded([str(self.bundle / 'install.sh'), '--prefix', str(self.prefix), '--data-dir', str(self.data), '--yes'], check=True, capture_output=True)
+        self.run_fixture([str(self.bundle / 'install.sh'), '--prefix', str(self.prefix), '--data-dir', str(self.data), '--yes'], check=True, capture_output=True)
         with socket.socket() as probe:
             probe.bind(('127.0.0.1', 0))
             self.port = probe.getsockname()[1]
@@ -1775,6 +1861,7 @@ class NativeRuntime(unittest.TestCase):
         self.addCleanup(self.kill_server)
 
     cleanup_fixture = NativeOwnership.cleanup_fixture
+    run_fixture = NativeOwnership.run_fixture
 
     def kill_server(self):
         if self.process is not None and self.process.poll() is None:
@@ -1820,7 +1907,7 @@ class NativeRuntime(unittest.TestCase):
             os.killpg(self.process.pid, signal.SIGINT)
         else:
             child = json.loads(receipt.read_text())['pid']
-            parent = run_bounded(['ps', '-o', 'ppid=', '-p', str(child)], text=True, capture_output=True, check=True, timeout=10).stdout.strip()
+            parent = self.run_fixture(['ps', '-o', 'ppid=', '-p', str(child)], text=True, capture_output=True, check=True, timeout=10).stdout.strip()
             self.assertEqual(int(parent), self.process.pid)
             os.kill(child, signal.SIGTERM)
         self.assertEqual(self.process.wait(timeout=10), 0)
@@ -1863,7 +1950,7 @@ class NativeRuntime(unittest.TestCase):
         self.request('/api/progress', {'media_id': media_id, 'position': 0.5}, token, expected=204)
         # Active lifecycle refusal must leave every installed byte unchanged.
         before = snapshot(self.prefix)
-        refused = run_bounded([str(self.bundle / 'uninstall.sh'), '--prefix', str(self.prefix), '--yes'], capture_output=True)
+        refused = self.run_fixture([str(self.bundle / 'uninstall.sh'), '--prefix', str(self.prefix), '--yes'], capture_output=True)
         self.assertEqual(refused.returncode, 2)
         self.assertEqual(snapshot(self.prefix), before)
         self.stop()
@@ -1896,7 +1983,7 @@ class NativeRuntime(unittest.TestCase):
         self.assertEqual(self.request_json(f'/api/progress/{media_id}', token=offline_login['token'])['position'], 0.5)
         self.stop(group_interrupt=True)
         preserved = snapshot(self.data)
-        run_bounded([str(self.bundle / 'uninstall.sh'), '--prefix', str(self.prefix), '--yes'], check=True, capture_output=True)
+        self.run_fixture([str(self.bundle / 'uninstall.sh'), '--prefix', str(self.prefix), '--yes'], check=True, capture_output=True)
         self.assertFalse(self.prefix.exists())
         self.assertEqual(snapshot(self.data), preserved, 'application data changed during removal')
 

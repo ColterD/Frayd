@@ -791,10 +791,11 @@ def main():
         print(f"STOP: init={stopped['HostConfig'].get('Init')}, elapsed={stopped_in:.3f}s, "
               f"status={state['Status']}, exit={state['ExitCode']}, OOMKilled={state['OOMKilled']}")
         assert stopped['HostConfig'].get('Init') is True
-        assert stopped_in < 10, stopped_in
+        # Docker's 10s shutdown grace excludes CLI setup/return; allow 2s for that overhead.
+        assert stopped_in < 10 + 2, stopped_in
         assert state['Status'] == 'exited' and state['Running'] is False
         assert state['ExitCode'] in (0, 143) and state['OOMKilled'] is False, state
-        print('PASS: idle Compose stop exits without OOM or SIGKILL before the 10s budget')
+        print('PASS: idle Compose stop exits without OOM or SIGKILL within 10s grace + 2s CLI overhead')
         compose('rm', '-f', 'app')
         config['services']['reserve'] = {
             'image': args.proxy_image, 'entrypoint': ['sleep', '120'],
