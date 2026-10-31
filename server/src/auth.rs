@@ -12,9 +12,11 @@ pub fn create_account(db: &Connection, key: &str, password: &str) -> Result<(), 
         .hash_password(password.as_bytes(), &salt)
         .map_err(|e| e.to_string())?
         .to_string();
-    let exists: bool = db
+    let exists = db
         .query_row("SELECT 1 FROM identities WHERE key = ?1", [key], |r| r.get::<_, i64>(0))
-        .is_ok();
+        .optional()
+        .map_err(|e| e.to_string())?
+        .is_some();
     if exists {
         return Err("account exists".into());
     }
@@ -26,7 +28,7 @@ pub fn create_account(db: &Connection, key: &str, password: &str) -> Result<(), 
     Ok(())
 }
 
-/// Verify password for an existing account key. Ok(false) if no such account.
+/// Verify password for an existing account key. Ok(false) if no such account; Err on database failure.
 pub fn verify_login(db: &Connection, key: &str, password: &str) -> Result<bool, String> {
     let hash: Option<Option<String>> = db
         .query_row(
@@ -35,8 +37,7 @@ pub fn verify_login(db: &Connection, key: &str, password: &str) -> Result<bool, 
             |r| r.get::<_, Option<String>>(0),
         )
         .optional()
-        .ok()
-        .flatten();
+        .map_err(|e| e.to_string())?;
     let hash = match hash {
         Some(Some(h)) => h,
         _ => return Ok(false), // no account, or no password set
@@ -55,11 +56,10 @@ pub fn session_ttl_secs() -> i64 {
         .clamp(1, 365) * 24 * 3600
 }
 
-/// Mint a session token for identity. 128-bit random, hex-encoded.
+/// Mint a session token for identity: two random v4 UUIDs as 64 hex characters (244 random bits).
 pub fn create_session(db: &Connection, identity_id: i64) -> Result<String, String> {
     let token = Uuid::new_v4().to_string().replace('-', "")
         + &Uuid::new_v4().to_string().replace('-', "");
-    // hex of 2 uuids = 64 chars; trim to 32 bytes (64 hex chars) — fine as opaque token
     db.execute(
         "INSERT INTO sessions (token, identity_id, expires_at)
          VALUES (?1, ?2, unixepoch() + ?3)",
@@ -69,53 +69,72 @@ pub fn create_session(db: &Connection, identity_id: i64) -> Result<String, Strin
     Ok(token)
 }
 
-/// Sliding-window rate limiter (in-process). Key = bucket name + client ip.
+/// Sliding-window rate limiter (in-process). Key = bucket name + [`client_ip`].
 pub struct RateLimiter {
-    hits: std::sync::Mutex<std::collections::HashMap<String, Vec<i64>>>,
+    /// Hit times per key, and the time keys without a hit inside the window were last dropped.
+    hits: std::sync::Mutex<(std::collections::HashMap<String, Vec<i64>>, i64)>,
     window: i64,
     max: usize,
 }
 
 impl RateLimiter {
     pub fn new(window_secs: i64, max_hits: usize) -> Self {
-        Self { hits: std::sync::Mutex::new(std::collections::HashMap::new()), window: window_secs, max: max_hits }
+        Self { hits: std::sync::Mutex::new((std::collections::HashMap::new(), 0)), window: window_secs, max: max_hits }
     }
     /// true = allowed, false = rate-limited
     pub fn check(&self, key: &str) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-        let mut map = self.hits.lock().unwrap();
+        self.check_at(key, now)
+    }
+    /// `check` at `now` (Unix seconds). At most once per window, drop every key with no hit inside the
+    /// window, so the map holds only keys seen in the last two windows instead of every client ever seen.
+    fn check_at(&self, key: &str, now: i64) -> bool {
+        let mut guard = self.hits.lock().unwrap();
+        let (map, pruned_at) = &mut *guard;
+        let cutoff = now - self.window;
+        if now - *pruned_at >= self.window {
+            map.retain(|_, hits| hits.iter().any(|t| *t > cutoff));
+            *pruned_at = now;
+        }
         let v = map.entry(key.to_string()).or_default();
-        v.retain(|t| *t > now - self.window);
+        v.retain(|t| *t > cutoff);
         if v.len() >= self.max { return false; }
         v.push(now);
         true
     }
 }
 
-/// Best-effort client IP from proxy headers, else socket addr text.
-pub fn client_ip(headers: &axum::http::HeaderMap, fallback: &str) -> String {
-    headers.get("x-forwarded-for")
+/// Rate-limit key for a request. By default the key is the TCP `peer` address and X-Forwarded-For is
+/// ignored, because any client can send that header. With `trust_proxy` (FRAYD_TRUSTED_PROXY=1) the last
+/// X-Forwarded-For entry replaces the peer when it parses as an IP address: the trusted proxy writes that
+/// entry itself, both when it overwrites the header and when it appends to the client's value.
+/// An IPv6 address keys by its /64 prefix, so one host cannot rotate source addresses inside its subnet;
+/// IPv4 and IPv4-mapped IPv6 addresses key by the single IPv4 address.
+pub fn client_ip(headers: &axum::http::HeaderMap, peer: std::net::IpAddr, trust_proxy: bool) -> String {
+    let forwarded = headers.get_all("x-forwarded-for").iter().next_back()
+        .filter(|_| trust_proxy)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| fallback.to_string())
+        .and_then(|v| v.rsplit(',').next())
+        .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok());
+    match forwarded.unwrap_or(peer) {
+        std::net::IpAddr::V6(address) => match address.to_ipv4_mapped() {
+            Some(mapped) => mapped.to_string(),
+            None => format!("{}/64", std::net::Ipv6Addr::from(u128::from(address) & (u128::MAX << 64))),
+        },
+        address => address.to_string(),
+    }
 }
 
 /// Resolve an Authorization: Bearer token to identity_id, sliding-expiry refresh.
-pub fn identity_from_token(db: &Connection, token: &str) -> Option<i64> {
-    let id: i64 = db
-        .query_row(
-            "SELECT identity_id FROM sessions WHERE token = ?1 AND expires_at > unixepoch()",
-            [token],
-            |r| r.get(0),
-        )
-        .ok()?;
-    let _ = db.execute(
-        "UPDATE sessions SET expires_at = unixepoch() + ?2 WHERE token = ?1",
-        rusqlite::params![token, session_ttl_secs()],
-    );
-    Some(id)
+pub fn identity_from_token(db: &Connection, token: &str) -> rusqlite::Result<Option<i64>> {
+    let id:Option<i64>=db.query_row(
+        "SELECT identity_id FROM sessions WHERE token=?1 AND expires_at>unixepoch()",[token],|r|r.get(0)).optional()?;
+    if id.is_some() {
+        db.execute("UPDATE sessions SET expires_at=unixepoch()+?2 WHERE token=?1",
+            rusqlite::params![token,session_ttl_secs()])?;
+    }
+    Ok(id)
 }
 
 /// Change password: verify old, write new argon2id hash. Returns Err on bad old pw.
@@ -137,8 +156,73 @@ pub fn change_password(db: &Connection, key: &str, old: &str, new: &str) -> Resu
     Ok(())
 }
 
+/// Delete a session token; logout succeeds even if the row is already gone.
 pub fn delete_session(db: &Connection, token: &str) {
-    let _ = db.execute("DELETE FROM sessions WHERE token = ?1", [token]);
+    if let Err(e) = db.execute("DELETE FROM sessions WHERE token = ?1", [token]) {
+        tracing::warn!("session delete failed: {e}");
+    }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    use crate::test_support::fixture_password;
+
+    /// IPv6 peers share one key per /64; IPv4 and IPv4-mapped IPv6 peers key by the single IPv4 address.
+    #[test]
+    fn client_ip_groups_ipv6_by_64_prefix_and_maps_ipv4() {
+        let key = |peer: &str| client_ip(&axum::http::HeaderMap::new(), peer.parse().unwrap(), false);
+        assert_eq!(key("2001:db8:1:2::1"), key("2001:db8:1:2:ffff:ffff:ffff:ffff"));
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+        assert_eq!(key("::ffff:203.0.113.7"), key("203.0.113.7"));
+        assert_ne!(key("203.0.113.7"), key("203.0.113.8"));
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-forwarded-for", "2001:db8:1:2::9".parse().unwrap());
+        assert_eq!(client_ip(&headers, "198.51.100.1".parse().unwrap(), true), key("2001:db8:1:2::1"));
+    }
+
+    /// Keys whose hits have all left the window are dropped; keys with a live hit stay limited.
+    #[test]
+    fn rate_limiter_drops_keys_without_live_hits() {
+        let limiter = RateLimiter::new(300, 10);
+        assert!(limiter.check_at("old", 1_000));
+        for _ in 0..10 { assert!(limiter.check_at("busy", 1_200)); }
+        assert!(limiter.check_at("new", 1_301));
+        assert!(!limiter.check_at("busy", 1_301));
+        let mut keys: Vec<String> = limiter.hits.lock().unwrap().0.keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["busy", "new"]);
+    }
+
+    /// Move the rows to `identities_rows` behind an `identities` view whose key lookups fail
+    /// while inserts still reach the rows.
+    fn break_key_lookup(db: &Connection) {
+        db.execute_batch(
+            "INSERT INTO identities(kind,key) VALUES('account','lookup-poison');
+             ALTER TABLE identities RENAME TO identities_rows;
+             CREATE VIEW identities AS SELECT id, kind, CASE WHEN key='lookup-poison' THEN json(key) ELSE key END AS key,
+                 secret_hash FROM identities_rows;
+             CREATE TRIGGER identities_insert INSTEAD OF INSERT ON identities BEGIN
+                 INSERT INTO identities_rows(kind,key,secret_hash) VALUES(NEW.kind,NEW.key,NEW.secret_hash); END;",
+        ).unwrap();
+    }
+
+    /// A failed existence check refuses account creation instead of inserting a possible duplicate.
+    #[test]
+    fn create_account_lookup_failure_inserts_nothing() {
+        let db = crate::store::open(":memory:");
+        break_key_lookup(&db);
+        assert!(create_account(&db, "new@example.invalid", &fixture_password()).is_err());
+        let created: i64 = db.query_row("SELECT COUNT(*) FROM identities_rows WHERE key='new@example.invalid'", [], |r| r.get(0)).unwrap();
+        assert_eq!(created, 0);
+    }
+
+    /// A failed account lookup is a login error, not "no such account".
+    #[test]
+    fn verify_login_lookup_failure_is_an_error() {
+        let db = crate::store::open(":memory:");
+        break_key_lookup(&db);
+        assert!(verify_login(&db, "new@example.invalid", &fixture_password()).is_err());
+    }
+}

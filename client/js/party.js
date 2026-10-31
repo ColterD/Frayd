@@ -6,79 +6,165 @@ const PartyUI = (() => {
   const YT_RE = /(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/)|youtu\.be\/)([\w-]{11})/;
   let ws = null;
   let isHost = false;
+  let selfLabel = null;
   let state = null;
+  let partyCode = null;
+  let pendingStart = null;
+  let pending = [];
+  let members = [];
+  // Host-only markers for the media each party state has already loaded.
+  let hostLoadedMedia = null;
+  let hostLoadedExt = null;
 
+  /**
+   * Return the first party DOM node matching a selector.
+   * @param {string} s
+   * @returns {Element|null}
+   */
   const $ = (s) => document.querySelector(s);
 
+  /** Show the party panel and render its current session without disconnecting. */
   function open() { $('#party-modal').classList.add('on'); render(); }
+  /** Hide the party panel while retaining the active socket and state. */
+  function hide() { $('#party-modal').classList.remove('on'); }
+  /** Retire the socket identity, role, requests and loaded-media markers before stale callbacks run. */
+  function resetSession() {
+    pendingStart = null;
+    ws = null; partyCode = null; isHost = false; selfLabel = null; state = null; pending = []; members = [];
+    hostLoadedMedia = null; hostLoadedExt = null;
+    window.partySend = null;
+  }
+  /** Leave the current party, close its socket and hide the panel. */
   function close() {
-    $('#party-modal').classList.remove('on');
-    if (ws) { ws.close(); ws = null; }
+    const socket = ws;
+    resetSession();
+    hide();
+    if (socket) socket.close();
   }
 
+  /**
+   * Use the persisted device identity or make a temporary guest identity for this call.
+   * @returns {string}
+   */
   function identity() {
     return localStorage.frayd_identity || 'guest-' + Math.random().toString(36).slice(2, 8);
   }
 
+  /**
+   * Create a party for the current identity and connect with its private host capability.
+   * The capability stays in this call; a missing or malformed one fails the start.
+   * A session reset cancels the start across both awaits.
+   */
   async function host() {
-    const r = await fetch('/api/party', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ identity: identity() })
-    });
-    if (!r.ok) return renderError('Could not start party (' + r.status + ')');
-    const { code } = await r.json();
-    connect(code);
+    if (pendingStart) return;
+    // This token spans both awaits; session reset cancels its authority to connect.
+    const start = {};
+    const hostIdentity = identity();
+    pendingStart = start;
+    try {
+      const r = await fetch('/api/party', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ identity: hostIdentity })
+      });
+      if (pendingStart !== start) return;
+      if (!r.ok) return renderError('Could not start party (' + r.status + ')');
+      const { code, host_capability: capability } = await r.json();
+      if (pendingStart !== start) return;
+      if (typeof capability !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(capability))
+        return renderError('Could not start party');
+      connect(code, capability, hostIdentity);
+    } catch {
+      if (pendingStart === start) renderError('Could not start party');
+    } finally {
+      if (pendingStart === start) pendingStart = null;
+    }
   }
 
+  /** Validate the entered four-character code and connect as a guest. */
   function join() {
     const code = $('#party-code-input').value.trim().toUpperCase();
     if (!/^[A-Z0-9]{4}$/.test(code)) return renderError('Enter the 4-character code');
     connect(code);
   }
 
-  function connect(code) {
-    if (ws) ws.close();
-    const url = `/api/party/${code}/ws?identity=${encodeURIComponent(identity())}`;
-    ws = new WebSocket(url);
-    ws.onerror = () => renderError('Party not found or rejected');
-    ws.onclose = () => { if ($('#party-modal').classList.contains('on')) renderEnded(); };
-    ws.onmessage = (e) => handle(JSON.parse(e.data), code);
+  /**
+   * Replace the current party session and give its socket exclusive ownership of
+   * incoming updates. Identity checks on every callback prevent a superseded
+   * socket's messages, errors, or close event from changing the new session.
+   * The creator's capability lives only in this connection call and the upgrade
+   * protocol offer; it never enters a URL, storage, or a party message.
+   * @param {string} code Party code used by the WebSocket endpoint and panel.
+   * @param {string|null} capability Private creator proof; absent for guest joins.
+   * @param {string} key Identity captured at creation, or the current guest identity.
+   */
+  function connect(code, capability = null, key = identity()) {
+    const previous = ws;
+    resetSession();
+    if (previous) previous.close();
+    partyCode = code;
+    const url = `/api/party/${code}/ws?identity=${encodeURIComponent(key)}`;
+    const protocols = capability ? ['frayd-party', 'frayd-host.' + capability] : ['frayd-party'];
+    const socket = new WebSocket(url, protocols);
+    ws = socket;
+    let admitted = false;
+    let rejectedBeforeAdmission = false;
+    socket.onerror = () => {
+      if (ws !== socket) return;
+      rejectedBeforeAdmission = !admitted;
+      renderError('Party not found or rejected');
+    };
+    socket.onclose = () => {
+      if (ws === socket) renderEnded(rejectedBeforeAdmission ? 'Party not found or rejected' : 'Party ended');
+    };
+    socket.onmessage = (e) => {
+      if (ws !== socket) return;
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'state') admitted = true;
+      handle(msg);
+    };
     renderConnecting(code);
   }
 
-  function handle(msg, code) {
+  /**
+   * Apply a message admitted by the active socket's callback. State snapshots
+   * replace shared playback state; only an explicit host flag changes our role.
+   * Guests follow authoritative playback, while hosts load changed media without
+   * replaying their own player events. Requests and membership update the panel;
+   * an ended message retires the entire session.
+   * @param {Object} msg Parsed server message with a type-specific payload.
+   */
+  function handle(msg) {
     if (msg.type === 'state') {
       if (typeof msg.is_host === 'boolean') isHost = msg.is_host;
+      if (typeof msg.self_label === 'string') selfLabel = msg.self_label;
       state = msg.state;
       if (isHost) { hookHost(); followMediaChangeOnly(); } else followState();
-      render(code);
+      render();
     } else if (msg.type === 'request') {
       pending.push(msg);
-      render(code);
+      render();
     } else if (msg.type === 'members') {
       members = msg.members || [];
-      render(code);
+      render();
     } else if (msg.type === 'ended') {
       renderEnded();
     }
   }
-  let pending = [];
-  let members = [];
 
+  /**
+   * Send a JSON party command only while the current socket is open.
+   * @param {Object} obj
+   */
   function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
 
   // ---- guest follow: drive local audio player from host state ----
-  let hostLoadedMedia = null;
-  const DRIFT = 1.5; // seconds — resync beyond this
-
+  /** Apply authoritative host playback to a guest player. */
   function followState() {
     if (state && state.external_url) {
-      if (typeof window.partyFollowExternal === 'function')
-        window.partyFollowExternal(state.external_url, state.title, state.position, state.playing, state.updated_at, false);
+      window.partyFollowExternal(state.external_url, state.title, state.position, state.playing, state.updated_at);
       return;
     }
-    if (typeof window.partyFollow !== 'function') return;
     if (state && state.media_id != null) {
       window.partyFollow(state.media_id, state.title, state.position, state.playing, state.updated_at);
     }
@@ -86,30 +172,56 @@ const PartyUI = (() => {
 
   // host: only load tracks the party state changed to (skip/queue-advance) —
   // never follow play/pause/seek (those originate from host's own player events)
+  /**
+   * Load each changed external or library media identifier once for the host.
+   * Local host events own play, pause, seek, and resume position, so these loads
+   * start at zero instead of following the echoed server position. The library
+   * callback keeps a matching local load and its resume position.
+   * Guests use followState for authoritative position and playback updates.
+   */
   function followMediaChangeOnly() {
     // external (YouTube) load → mirror into YT player, host events handled separately
     const ext = state?.external_url;
-    if (ext && ext !== hostLoadedExt && typeof window.partyFollowExternal === 'function') {
-      hostLoadedExt = ext;
-      window.partyFollowExternal(ext, state.title, 0, state.playing, state.updated_at, true);
+    if (ext) {
+      hostLoadedMedia = null;
+      if (ext !== hostLoadedExt) {
+        hostLoadedExt = ext;
+        window.partyFollowExternal(ext, state.title, 0, state.playing, state.updated_at);
+      }
       return;
     }
+    hostLoadedExt = null;
     const id = state?.media_id;
-    if (id != null && id !== hostLoadedMedia && typeof window.partyFollow === 'function') {
+    if (id != null && id !== hostLoadedMedia) {
       hostLoadedMedia = id;
-      window.partyFollow(id, state.title, 0, state.playing, state.updated_at);
+      window.partyFollow(id, state.title, 0, state.playing, state.updated_at, { preserveLocalPlayback: true });
     }
   }
-  let hostLoadedExt = null;
 
   // ---- host hooks: local player actions become party state ----
+  /**
+   * Publish a local player command only while this session has host authority.
+   * @param {Object} obj
+   */
+  function sendHost(obj) { if (isHost) send(obj); }
+
+  /**
+   * Restore the current session's public sender on every host snapshot, while
+   * installing player listeners only once for this page. Their shared sendHost
+   * callback reads the current role and socket, allowing rehosting without
+   * duplicate listeners or broadcasts from a later guest session.
+   */
   function hookHost() {
+    window.partySend = sendHost;
     if (hookHost.done) return;
     hookHost.done = true;
-    if (typeof window.partyHostHook === 'function') window.partyHostHook(send);
-    window.partySend = send;
+    window.partyHostHook(sendHost);
   }
 
+  /**
+   * Render escaped playback details and host controls, or an empty state.
+   * @returns {string}
+   */
   function nowPlaying() {
     if (!state) return '<div class="party-empty">Nothing playing.</div>';
     let html = `<div class="party-now">
@@ -130,17 +242,24 @@ const PartyUI = (() => {
     return html + '</div>';
   }
 
+  /**
+   * Render escaped party membership with the local participant marked.
+   * @returns {string}
+   */
   function membersHtml() {
-    const me = identity();
-    const list = isHost ? [me + ' (host)', ...members.filter(m => !m.endsWith('(host)'))] : members;
+    const list = members;
     if (!list.length) return '';
     return `<div class="party-sec">Members · ${list.length}</div><ul class="party-queue">` +
       list.map(m => {
-        const isMe = m === me || (isHost && m === me + ' (host)');
+        const isMe = selfLabel !== null && (m === selfLabel || (isHost && m === selfLabel + ' (host)'));
         return `<li class="${isMe ? 'me' : ''}">${esc(m)}${isMe ? ' <span class="s">(you)</span>' : ''}</li>`;
       }).join('') + '</ul>';
   }
 
+  /**
+   * Render the current queued requests, or empty markup when there are none.
+   * @returns {string}
+   */
   function queueHtml() {
     const q = state?.queue || [];
     if (!q.length) return '';
@@ -149,6 +268,10 @@ const PartyUI = (() => {
       '</ul>';
   }
 
+  /**
+   * Render pending approval controls for hosts only.
+   * @returns {string}
+   */
   function requestsHtml() {
     if (!isHost || !pending.length) return '';
     return '<div class="party-sec">Requests</div><ul class="party-queue">' +
@@ -157,16 +280,23 @@ const PartyUI = (() => {
       ).join('') + '</ul>';
   }
 
+  /** Render up to twenty items supported by the party's video and audio players. */
   function libraryPickerHtml() {
     if (isHost) return '';
-    const library = window.getLibrary?.() || [];
     return '<div class="party-sec">Request a track</div><ul class="party-queue">' +
-      library.slice(0, 20).map(it =>
+      window.getLibrary().filter(it => ['movie', 'episode', 'music', 'audiobook'].includes(it.kind)).slice(0, 20).map(it =>
         `<li>${esc(it.title)} <button data-media="${it.id}" data-title="${esc(it.title)}" class="pt-request">Request</button></li>`
       ).join('') + '</ul>';
   }
 
-  function render(code) {
+  /**
+   * Rebuild controls from the current session and bind actions to its live state.
+   * Socket ownership selects entry, connecting, or active-party content; modal
+   * visibility is independent, so Hide and reopen retain the connection and its
+   * updates. Leave clears the session separately before entry controls return.
+   * Host playback controls act through the local player, which publishes events.
+   */
+  function render() {
     const stage = $('#party-stage');
     if (!ws) {
       stage.innerHTML = `
@@ -179,19 +309,25 @@ const PartyUI = (() => {
       $('#pt-join').onclick = join;
       return;
     }
+    if (!state) return renderConnecting(partyCode);
+    const priorInput = isHost ? $('#pt-yt') : null;
+    const draft = priorInput ? { value: priorInput.value, start: priorInput.selectionStart,
+      end: priorInput.selectionEnd, direction: priorInput.selectionDirection, focused: document.activeElement === priorInput } : null;
     stage.innerHTML = `
-      <div class="party-code">Code: <b>${esc(code)}</b> <span class="s">${isHost ? '(you are host)' : '(guest)'}</span></div>
+      <div class="party-code">Code: <b>${esc(partyCode)}</b> <span class="s">${isHost ? '(you are host)' : '(guest)'}</span></div>
       ${nowPlaying()}
       ${membersHtml()}
       ${queueHtml()}
       ${requestsHtml()}
       ${libraryPickerHtml()}`;
     const bind = (id, fn) => { const b = $(id); if (b) b.onclick = fn; };
-    bind('#pt-play', () => send({ type: 'play' }));
-    bind('#pt-pause', () => send({ type: 'pause' }));
+    const control = async type => {
+      try { await window.partyControlPlayback(type, state); }
+      catch (error) { renderError(error.message); }
+    };
+    bind('#pt-play', () => control('play'));
+    bind('#pt-pause', () => control('pause'));
     bind('#pt-skip', () => send({ type: 'skip' }));
-    bind('#pt-host', host);
-    bind('#pt-join', join);
     document.querySelectorAll('.pt-approve').forEach(b => {
       b.onclick = () => {
         const r = pending.splice(+b.dataset.req, 1)[0];
@@ -207,29 +343,52 @@ const PartyUI = (() => {
       if (!m) return renderError('Paste a YouTube URL (youtube.com/watch?v=… or youtu.be/…)');
       const id = m[1];
       send({ type: 'load', external_url: id, title: 'YouTube · ' + id, position: 0 });
-      window.partyFollowExternal(id, 'YouTube · ' + id, 0, true, Math.floor(Date.now() / 1000), true);
+      window.partyFollowExternal(id, 'YouTube · ' + id, 0, true, Math.floor(Date.now() / 1000));
     });
+    const input = $('#pt-yt');
+    if (input && draft) {
+      input.value = draft.value;
+      if (draft.focused) {
+        input.focus();
+        input.setSelectionRange(draft.start, draft.end, draft.direction);
+      }
+    }
     $('#pt-yt')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#pt-yt-go').click(); });
   }
 
+  /**
+   * Show the code for a socket awaiting admission.
+   * @param {string} code
+   */
   function renderConnecting(code) {
     $('#party-stage').innerHTML = `<div class="party-code">Connecting to <b>${esc(code)}</b>…</div>`;
   }
+  /**
+   * Prepend an escaped party error to the current panel.
+   * @param {string} msg
+   */
   function renderError(msg) {
     $('#party-stage').insertAdjacentHTML('afterbegin', `<div class="party-error">${esc(msg)}</div>`);
   }
-  function renderEnded() {
-    ws = null; isHost = false; state = null; pending = []; members = [];
+  /**
+   * Retire an ended session before closing its socket so late callbacks cannot
+   * restore stale state. Clear role, sender, members, requests, and loaded-media
+   * markers, then show entry controls with an ended notice. Preserve visibility
+   * so a remotely ended hidden panel stays hidden until the user reopens it.
+   */
+  function renderEnded(message = 'Party ended') {
+    const socket = ws;
+    resetSession();
+    if (socket && socket.readyState < 2) socket.close();
     render();
-    renderError('Party ended');
+    renderError(message);
   }
 
-  return { open, close };
+  return { open, hide, close };
 })();
 
 document.addEventListener('DOMContentLoaded', () => {
-  const btn = $('#party-btn');
-  if (btn) btn.onclick = PartyUI.open;
-  const x = $('#pt-close');
-  if (x) x.onclick = PartyUI.close;
+  $('#party-btn').onclick = PartyUI.open;
+  $('#pt-hide').onclick = PartyUI.hide;
+  $('#pt-close').onclick = PartyUI.close;
 });

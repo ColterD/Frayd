@@ -1,0 +1,3 @@
+# CI-only Ruff wheel for ubuntu-24.04 x86_64; MIT license.
+# Source release: https://github.com/astral-sh/ruff/releases/tag/0.17.3
+ruff==0.17.3 --hash=sha256:7fa4b0f931cdbcb8a52044f370a3eb429fb42eb88807b0e800fcaa98dd42b24e
