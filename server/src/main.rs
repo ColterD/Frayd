@@ -215,6 +215,8 @@ async fn main() {
     }
 }
 
+/// Share the production route table with HTTP regression tests so wildcard EPUB assets,
+/// the static-file fallback and CORS are checked with the same routing precedence.
 fn app_router(state: Arc<App>, client: PathBuf) -> Router {
     Router::new()
         .route("/api/health", get(health))
@@ -283,6 +285,8 @@ struct LoginReq {
 const MIN_NEW_PASSWORD_CODE_POINTS: usize = 8;
 const NEW_PASSWORD_ERROR: &str = "Password must contain at least 8 characters";
 
+/// Count Unicode scalar values, matching client string iteration rather than UTF-8 bytes
+/// or grapheme clusters; apply this creation policy without invalidating legacy logins.
 fn valid_new_password(password: &str) -> bool {
     password.chars().count() >= MIN_NEW_PASSWORD_CODE_POINTS
 }
@@ -299,6 +303,9 @@ async fn auth_login(
         .unwrap_or_else(|_|StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// Keep SQLite and password hashing on the blocking worker. Existing accounts verify
+/// before creation policy is applied; read permissions before issuing a session so a
+/// failed permission lookup cannot leave an unreturned token.
 fn auth_login_blocking(app:Arc<App>,peer:std::net::SocketAddr,headers:axum::http::HeaderMap,req:LoginReq) -> impl IntoResponse {
     if !app.auth_rl.check(&auth::client_ip(&headers, peer.ip(), app.trust_proxy)) {
         return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error": "too many attempts — wait 5 minutes"})));
@@ -425,6 +432,9 @@ async fn auth_change_password(
         .unwrap_or_else(|_|StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// Require a policy-valid replacement, a bearer session identifying an account and
+/// verification of that account's old password before replacing its stored hash.
+/// Use a separate rate-limit key from login attempts for the same client address.
 fn auth_change_password_blocking(app:Arc<App>,peer:std::net::SocketAddr,headers:axum::http::HeaderMap,req:ChangePwReq) -> impl IntoResponse {
     if !app.auth_rl.check(&format!("pw:{}", auth::client_ip(&headers, peer.ip(), app.trust_proxy))) {
         return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error": "too many attempts — wait 5 minutes"}))).into_response();
@@ -486,6 +496,9 @@ async fn auth_setup(
         .unwrap_or_else(|_|StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// Serialize the empty-account check with owner creation, admin grant and session
+/// issuance in an immediate transaction. A failed step rolls back all setup writes,
+/// and a competing setup observes the committed account instead of creating another owner.
 fn auth_setup_blocking(app:Arc<App>,peer:std::net::SocketAddr,headers:axum::http::HeaderMap,req:SetupReq) -> impl IntoResponse {
     if !app.auth_rl.check(&auth::client_ip(&headers, peer.ip(), app.trust_proxy)) {
         return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error": "too many attempts — wait 5 minutes"}))).into_response();
@@ -3924,6 +3937,9 @@ mod integration_regressions {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// Exercise library, search and permission-filtered HTTP responses with private paths.
+    /// Only recognized media-owned filenames may become artwork versions; missing or
+    /// mismatched names yield null, and neither source paths nor thumb_path may escape.
     #[tokio::test]
     async fn artwork_api_library_and_search_expose_only_opaque_versions() {
         let (root,app)=fixture();
@@ -5356,6 +5372,9 @@ mod router_tests {
     use super::*;
     use std::io::{Read, Write};
 
+    /// Start the production router on loopback to catch route-construction and precedence
+    /// regressions. Check nested binary EPUB bytes, static ranges, CORS preflight, build
+    /// cache policy and missing-resource 404s through an HTTP client with proxies disabled.
     #[tokio::test]
     async fn production_router_serves_api_nested_epub_assets_and_static_files() {
         let root = std::env::temp_dir().join(format!("frayd-router-{}", uuid::Uuid::new_v4()));
@@ -5458,6 +5477,9 @@ mod router_tests {
         let _ = server.await;
     }
 
+    /// Equal plaintexts must verify independently while producing distinct PHC salts;
+    /// wrong passwords and unknown accounts must fail verification. This checks stored
+    /// hash semantics without assuming a particular random salt value.
     #[test]
     fn account_passwords_verify_reject_invalid_logins_and_use_distinct_salts() {
         let db = store::open(":memory:");
@@ -5504,6 +5526,9 @@ mod password_policy_tests {
         ]
     }
 
+    /// Compare seven/eight scalar-value boundaries using ASCII, emoji and combining
+    /// marks on both creation paths. Rejected input must leave identities, sessions and
+    /// permissions empty; accepted input must create exactly one row in each table.
     #[test]
     fn setup_and_auto_create_enforce_eight_unicode_code_points() {
         for (password, accepted) in boundaries() {
@@ -5525,6 +5550,9 @@ mod password_policy_tests {
         }
     }
 
+    /// Seed a short legacy credential to separate login compatibility from replacement
+    /// policy. Rejection must preserve the old credential; acceptance must verify only
+    /// the replacement across the same ASCII, emoji and combining-mark boundaries.
     #[test]
     fn legacy_login_remains_valid_and_password_change_enforces_code_points() {
         for (new, accepted) in boundaries() {

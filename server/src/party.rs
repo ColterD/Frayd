@@ -869,6 +869,9 @@ mod protocol_tests {
         assert!(party.can_register(&admission, "host"));
     }
 
+    /// Discard registration state, then require the synchronous broadcast to enqueue a
+    /// text frame whose parsed JSON preserves Unicode. A nonblocking receive makes a
+    /// missing frame fail immediately instead of waiting on an open channel.
     #[test]
     fn broadcast_delivers_unicode_json_text() {
         let party = Party::new();
