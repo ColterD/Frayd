@@ -860,13 +860,21 @@ mod protocol_tests {
     use super::*;
 
     #[test]
-    fn join_code_is_four_uppercase_ascii_letters() {
+    fn replacement_codes_keep_the_public_format_and_revoke_previous_admission() {
         let party = Party::new();
-        let (code, proof) = party.create("host");
-        assert_eq!(code.len(), 4);
-        assert!(code.bytes().all(|byte| byte.is_ascii_uppercase()));
-        let admission = party.authorize(&code, Some(proof)).unwrap();
-        assert!(party.can_register(&admission, "host"));
+        let mut previous: Option<String> = None;
+        for _ in 0..64 {
+            let (code, proof) = party.create("host");
+            assert_eq!(code.len(), 4);
+            assert!(code.bytes().all(|byte| byte.is_ascii_uppercase()));
+            let admission = party.authorize(&code, Some(proof)).unwrap();
+            assert!(party.can_register(&admission, "host"));
+            if let Some(old) = previous {
+                assert_ne!(code, old);
+                assert!(party.authorize(&old, None).is_none());
+            }
+            previous = Some(code);
+        }
     }
 
     /// Discard registration state, then require the synchronous broadcast to enqueue a
