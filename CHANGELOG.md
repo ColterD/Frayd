@@ -11,15 +11,16 @@ These notes use [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) categor
 - Add Recently Added shelves with date sorting and versioned local cover art.
 - Add an Account entry so signed-in users can change their own password. Administrators can also use the form in Settings.
 - Add an experimental native bundle for a private install directory. Check separate server and helper files before packaging.
-- Give party members clear Host and Guest labels. Give the host a private proof for host controls.
+- Give party members clear Host and Guest labels. Give the host a private capability token for host controls.
 - Add optional direct MP4 downloads in Docker through the existing app image. Enable downloads and outbound access only with the download override.
 - Show the active download backend and setup guidance in Settings. Refuse downloads when backend configuration is invalid.
 
 ### Changed
 
+- Require at least 8 Unicode code points for new passwords during account creation and password changes. Preserve sign-in with existing passwords.
 - Update HTTP middleware (tower-http 0.7.1), SQLite access (rusqlite 0.41.1), direct HTTP downloads (ureq 3.5.0), password hashing (argon2 0.6.0) and ZIP archive reading (zip 9.2.0).
 - Check library settings before saving them together. Use a separate database connection for scans.
-- Run synchronous database, configuration and root-admission work on blocking workers across request handlers. Keep authorization checks with the protected operations.
+- Run synchronous database, configuration and library-root validation work on blocking workers across request handlers. Keep authorization checks with the protected operations.
 - Use one ordered list of library roots for scans, downloads and cache checks. An explicit library override locks root edits.
 - Let an empty configured root list disable the library. Keep unavailable saved roots separate from valid new roots.
 - Support bounded, open-ended and suffix byte ranges for media requests. Keep converted output in a separate cache.
@@ -37,7 +38,7 @@ These notes use [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) categor
 
 ### Fixed
 
-- Restore startup with the updated route syntax, including build information and EPUB asset routes.
+- Restore startup with Axum 0.8 route syntax, including build information and EPUB asset routes.
 - Keep direct downloads independent of inherited HTTP proxy settings.
 - Enable Docker's built-in init for the Compose app so stop signals reach the server without waiting for a forced kill. Active requests and jobs are not guaranteed to drain gracefully.
 - Keep indexed media, progress and notes when a configured root is unavailable. Keep media IDs after source replacement.
@@ -91,7 +92,7 @@ These notes use [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) categor
 ### Security
 
 - Use the connection address for login limits unless trusted-proxy handling is enabled. Bound address groups and expire idle entries.
-- Require the creator identity and private proof for party host registration. Keep guest device keys separate from account identities.
+- Require the creator identity and private capability token for party host registration. Keep guest device keys separate from account identities.
 - Require sign-in for highlights. Check reader offsets and page fields before use.
 - Refuse media deletion while saved references or active conversions protect the item. Keep original source files intact.
 - Check native install-directory ownership and permissions. Refuse concurrent starts and preserve uncertain process records for inspection.
