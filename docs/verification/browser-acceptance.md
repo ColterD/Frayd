@@ -1,0 +1,610 @@
+# Browser acceptance
+
+[Documentation index](../README.md) · [Development](../development.md) · [Historical review ledger](coderabbit-follow-up.md)
+
+This records bounded manual acceptance using an isolated library and database.
+It does not authorize deployment or qualify arbitrary media, browsers or public hosting.
+
+## Current source and historical visual boundary
+
+Pending, held and staged statuses in this record are as of the 2026-10-29 pre-cutover `8d87905` checkpoint. Later sections name their own boundaries.
+
+At the initial checkpoint, production source was `8d879054a16637619b7efc1e1e79ce6d38e568d2`, incorporating pinned upstream `dd8eaf42d692dee118525b6d98d883cbe76967f4` and synced fork-main base `21b2e9b6bf4cff26254f5dfcec9deecd02453718`. Its local fixture passed Node 334/334 and Chrome 47/47 with zero browser errors. These source-bound fixture results do not substitute for the current image pipeline, final patched-reader gates, actual-server workflows or hosted/platform acceptance.
+
+The fixture runs production hero rendering at 320, 768, 1024 and 1440 CSS pixels, with an archive URL title and a 195-character unbroken author tag. It checks title/tag/button containment, nonoverlap, auth input/reveal reachability, native decoded playback and visible control geometry. Modeled YouTube div/iframe transitions verify that only one player surface is visible. The earlier `bda4733` layout controls failed before correction (43 pass, four failures) and passed afterward; their source hashes matched that commit. Later controls retain this coverage and add short-screen sign-in, party/Settings wrapping and a long native title with reachable Back/Party actions. This is real DOM and native fixture decoding with modeled APIs/external-player mode, not actual YouTube playback or a final live-account workflow. The precise invocations remain `node --test tests/*.test.cjs` and `BROWSER_BIN=/path/to/existing/chrome node tests/browser-regression.cjs`; see [Development](../development.md#real-dom-regression) for prerequisites and cleanup.
+
+Current comic/EPUB readers keep page/chunk unknown until resume completes, disable loading-time navigation/search controls and suppress premature saves during close, resize or keyboard input. Ten focused regressions reproduce then correct bookmark loss. Actual-server `bda4733` observations for the 14-work fixture, conversion, mixed-author navigation, account/permissions/deletion and native party paths retain only their recorded scope; they do not qualify this later reader correction or the current images. The fixture has 14 works across seven categories, plus two conversion derivatives and one copied record: 17 indexed rows do not mean 17 new works.
+
+The earlier actual-server baseline uses source `4d09a102943d001ae15346f199db79864c2af86d`, app image `sha256:f874cdffe2266d22206819206ffff37d4fc7fc32c9e8945f84ffb20b8bbf981a` and proxy `sha256:70303339f3025d285fd532d08fea55f02cecdb9360f531ea1142ed366a5ddc58`. Its isolated UI scan indexed 12 public works, but visual checks failed: a 320px login had horizontal overflow; a long archive URL clipped inside the hero; and movie playback decoded while a small left-aligned player left pause/seek controls unreachable. Broader workflows stopped for the upstream merge. Those source-bound failures and that source's passing automation remain historical evidence. The current layout fixture addresses the reproduced geometry; final actual-server rechecks are still required.
+
+### `438837c` YouTube correction and reader diagnostic
+
+The later production snapshot `438837cae29a81bb0899bafbecbf4039b7347de8` corrects an actual paused YouTube join that advanced from about 16 to 29 seconds while the host remained paused. First-ready paused state now cues; reused paused/cued seeks include zero, and CUED/UNSTARTED Play cannot mistake a zero clock for the prepared start. Ten vendor-faithful controls pass after eight baseline failures/two positive passes; Node 344/344 and modeled-API DOM 47/47 pass with zero runtime errors. These controls do not load a real YouTube iframe; the rebuilt-image actual retest remains pending at this checkpoint.
+
+A richer cold-EPUB diagnostic on unchanged `8d87905` passes at one, five and thirty seconds: complete response 13,937 bytes with expected hash, generated srcdoc 23,832 bytes, actual `about:srcdoc` displaying page 2/4, no errors. Earlier blank observations had incomplete capture and remain unattributed; this diagnostic is no production repair or proof of their cause. Historical hosted results belong to `a300f15`; subsequent-head hosted qualification remains separate.
+
+### `0d69af2` source-bound follow-up
+
+At source `0d69af2e1c70bf37d924d5f37a8f716bbe000676`, changed paused YouTube positions poll without stationary seek echoes, Back/Party become visible on external entry and remain pointer reachable above an idle iframe, and native video still hides controls on idle. `node --test tests/*.test.cjs` passed 346/346. The fresh modeled-API Chrome run passed 47/47 in 56.189 seconds with zero runtime, unexpected-request or cleanup errors; its index/app/driver SHA-256 prefixes are `a069d44e`/`7e341a4a`/`3c1810da`. These checks exercise the production DOM and fixture player, not actual YouTube playback or the rebuilt application image. Five disabled, uninstantiated UI templates retain design intent without adding live controls; [Development](../development.md#unwired-ui-design-fragments) gives their contracts.
+
+A separate retained-profile EPUB observation on the earlier source found published `about:srcdoc` with a zero-size body and `p1/1`; one Close/reopen showed readable `p1/21` through 30 seconds. The later frame-bound probe observed the active child reset to a 39-byte empty body despite full 23,832-character srcdoc, then recover in the order empty → full → readable with its highlight. The navigation step causing that reset was not observed. Close wrote progress 2 and reopen read 2, versus an older recorded 2.333; no immediate pre-close GET establishes when the first reduction occurred. The initial trace held a mutable event-array reference, so its later events cannot establish initial completion chronology. Rendering cause and bookmark-loss timing remain unverified; no EPUB fix is claimed.
+
+### `a8b1f8e` source and lifecycle checkpoint
+
+Runtime code at `6dde68109eb596cff5ef24c0f7ffcf46214bf7f2` also updates the external video's `#vm-title`, including the `YouTube` fallback; client and DOM assertions cover it. An actual `0d69af2` image session earlier passed paused seek at position 42 through host wire to a paused guest without stationary spam, idle Back/Party input, and decoded native handoff. The newer `6dde681` image's caption and reader workflow remained pending at this pre-cutover checkpoint. The retained-profile Vivaldi comparison remains separate; these observations do not qualify a reader repair.
+
+Final tracked source `a8b1f8ed49df1bc66c12c3923269373f9c91c504` changes only the browser lifecycle oracle after that runtime commit. The former fixed 40 ms writer check was replaced with bounded polling; `6dde681`'s hosted PR check then failed `ENOTEMPTY` during profile deletion, despite its push workflow passing 346 Node, 47 DOM, 23 required native and HTTP gates. The final oracle pauses the known writer, waits for acknowledgment, verifies successful profile deletion, resumes that same writer and checks recreation, then verifies process-group cleanup prevents further writes. The interim ENOENT write guard was removed in simplification. Focused and full local Node checks pass 346/346; both `a8b1f8e` push and PR Client test and Real DOM steps pass on hosted Node 22. Builds and current-image actual-server acceptance remain separate gates in [PR #2](https://github.com/ColterD/Frayd/pull/2).
+
+### `76ac314` dashboard, artwork and mobile checkpoint
+
+The 2026-10-29 source `76ac31459f9025f80f9eeb92cd2036dc16994996` labels all seven dashboard shelves “Recently Added …”, defaults to newest first and offers a per-category oldest toggle. Folder order uses member date extremes while episode order and progress reads retain their own rules. TV, music, audiobook and ebook folders scroll horizontally at 768/1024/1440 CSS pixels; 320px remains one column. Local covers or representative member art appear across all seven kinds when source art exists; absent art falls back to a symbol. Node 350/350 and the 47/47 modeled-API DOM fixture of that checkpoint pass; the seven-kind backend artwork fixture, 110 Rust unit plus six archive tests and strict Clippy pass. Current-image Docker, HTTP, native and actual owner browser qualification were still running at this checkpoint.
+
+[CodeRabbit finding 4415914938](https://github.com/ColterD/Frayd/pull/2#discussion_r4415914938) identified a real 320×568 reachability failure: the 168px player bar began at y=400 while the last card/title fell beneath it with only 140px clearance. The corrected mobile player bar uses document flow and 180px clearance; navigation resets scroll. The real-DOM oracle finds the last card bottom at 380.36, before the bar at 400, and checks a trusted title click and both audio controls. This is a new current finding, separate from the 129 historical dispositions. The owner's normal Vivaldi Jekyll first page loaded, but category/artwork acceptance in that browser and the separate beta blank-page cause remain unverified.
+
+### `b42a37e` artwork availability and reader mitigation
+
+Actual `76ac314` QA found generated JPEG files but a library response without artwork availability, so clients showed fallback symbols. Source `b42a37e0e9b3bf11f6c7fa840ec629b9a06fb646` adds nullable `artwork_version` to the same library/search DTO: only a same-ID canonical UUID or legacy basename is exposed, never an absolute path. The client uses that field for art and encoded URL versioning. Three local actual-HTTP library/search/restricted requests plus seven source fixtures pass, including NULL/invalid values and path nondisclosure; Node 353/353, modeled-API DOM 47/47, Rust 112 unit plus six archive tests and strict Clippy pass on the new source. The old `76ac314` canonical integration run failed looking for `id.jpg`; the corrected test selects the exact database UUID JPEG and verifies rollback, deletion and legacy/source preservation. Its 20 focused Python cases pass; full new-image integration remained in progress at this checkpoint.
+
+An isolated, source-independent EPUB first-open probe reproduced the blank in 3/16 runs; fresh controls passed 16/16 with a 1 ms timing difference, so Chromium's internal trigger remains unproven. The new bounded mitigation configures a detached clone with complete srcdoc, then replaces the iframe on success/error. Existing generation and current-window guards remain. Focused tests and the 47-case DOM fixture pass fresh-frame body, retired-message, highlight, resize and reopen controls. Actual first-open behavior on the new application image remained pending; this does not claim the reader defect closed.
+
+### `e7bee5f` reader, cover and review checkpoint
+
+At `f339352`, an actual first-book run in three disposable profiles restored GET 2.333 to page 2/4 with scroll 820 and one highlight, without a premature POST; TOC and resize passed. This is evidence for that image only. `e7bee5fae9f985f1341c61b4416e4c9942d047d4` additionally waits for fonts and positive frame geometry before pagination, wakes after resize, and publishes a visible “Chapter unavailable” state for 404/500/empty/missing-heading responses without a false save or stale document overwrite. A separate actual cover-cropping failure was corrected with contained, height-bounded cover layout; tall 500×862 DOM controls failed before and pass after. Node 367/367, 47/47 DOM at that checkpoint, Rust 118 unit plus 14 archive tests, strict Clippy and the 210-package audit pass. Actual first-open and current-image acceptance for `e7bee5f` remain pending in [PR #2](https://github.com/ColterD/Frayd/pull/2); the prior Chromium empty-frame cause remains unknown.
+
+The same source truncates unusually tall author text to one visible line while retaining its full DOM text, includes synopsis matches in the existing identity-filtered library search, and delays thumbnail decode until scroll owns the item. At 320×568, author text height fell from 278.53 to 168 CSS pixels while the title and controls remained clickable; a thumbnail 8,000px below the viewport had not decoded before scroll. These controls do not establish a performance benchmark or owner-browser acceptance. The new current review observations are listed separately from the 129 historical dispositions in the [changelog](pr-2-changelog.md#current-review-follow-ups-after-76ac314).
+
+### Public sample expansion and held TV import
+
+The retained provenance receipts were checked 2026-10-29. Twelve additional works were published across six categories and copied into the older isolated fixture; this does not establish final-source reader/playback acceptance. At this checkpoint, the two TV samples below were staged only for live publication. The isolated actual-server fixture has 14 works across seven categories; the local operator library at this checkpoint had the twelve additions across six categories and no live TV import. Current-image acceptance is pending.
+
+| Category | Two works and primary provenance | Scope/status |
+|---|---|---|
+| Movie | [Duck and Cover](https://archive.org/details/DuckandC1951), [A Date With Your Family](https://archive.org/details/DateWith1950) | Retained Prelinger public-domain dedication records; published before current QA |
+| Music | Semper Fidelis March; Stars and Stripes Forever March — [NPS Edison recordings](https://www.nps.gov/edis/learn/photosmultimedia/recordings.htm), [LOC use statement](https://citizen-dj.labs.loc.gov/loc-edison/use/) | Historical Edison recordings; published before current QA |
+| Audiobook | [The Raven](https://www.gutenberg.org/files/23901/23901-index.html), [The Slant Book](https://www.gutenberg.org/files/26271/26271-index.html) | Complete LibriVox readings with retained public-domain dedication; published before current QA |
+| Ebook | [Dr Jekyll and Mr Hyde](https://www.gutenberg.org/ebooks/43), [Frankenstein](https://www.gutenberg.org/ebooks/84) | Project Gutenberg notices retained; published before current QA |
+| Comic | [Max und Moritz](https://www.gutenberg.org/ebooks/17161), [The Hole Book](https://www.gutenberg.org/ebooks/67144) | Complete illustrated stories rendered to ordered CBZ pages, including notices; published before current QA |
+| Manga | [Hokusai Manga volume 1](https://archive.org/details/denshinkaishuhov1kats), [volume 2](https://archive.org/details/denshinkaishuhov2kats) | Smithsonian public-domain scans; historical Japanese sketchbooks, not modern narrative manga; published before current QA |
+| TV episode import | [Feline Follies (1919)](https://archive.org/details/FelixTheCat-FelineFollies1919), [Felix Saves the Day (1922)](https://archive.org/details/FelixTheCat-FelixSavesTheDay1922) | Staged video-only archival copies; synthetic `Frayd PD Test Import S01E01/S01E02` labels test importing and do not assert original television metadata |
+
+Public-domain statements are scoped to the USA and retained source records. Some later rights-page refetches returned 403; original primary records/notices and downloaded identities remain the provenance, not a fresh rights determination by this page. Staged TV remuxes preserve the complete downloadable video stream and omit later scores whose rights were unqualified; release-print completeness was not independently established. No sample binaries are added to the repository. Original media files remain outside the additive import scope. Live TV import, source preservation and final current-image workflows require separate runtime receipts.
+
+## `b755e6f` installer browser-budget follow-up
+
+The [PR browser job](https://github.com/ColterD/Frayd/actions/runs/40857799994/job/123393074707) failed its 60-second case budget with 47 cases passed and no assertion failure. Case 48 began 48.103 seconds into the case phase, leaving 11.897 seconds for a production installer five-poll scenario whose real 3-second × four-gap schedule needs about 12 seconds. The test-only driver now starts its isolated polling iframe before independent responsive cases 43–46, retaining the production timing, five attempts, no sixth request, retry/pagehide/logout guards, separate 15-second completion deadline and unchanged 30/60-second startup/case budgets. One paired local Chrome run moved case time 55.383 → 48.114 seconds and the case-48 wait 12.279 → 5.017 seconds; all 49 cases passed, the browser/profile were removed, and focused 26/full Node 266 passed. This is one measured scheduling recovery, not a general speed guarantee. The new harness bytes are later than `b755e6f`; a committed-head hosted rerun remains pending.
+
+## `2aca11c` browser checkpoint
+
+The [`2aca11c` structured checkpoint](acceptance-checkpoints.json) records the exact source/image/archive identities, fresh Node/Python/native results and 49/49 Chrome regression in 56.042 seconds. The Chrome inputs were verified byte-identical before commit; this is exact-input carry, not a second post-commit execution. Its owned browser/profile/server cleanup passed. The fixture includes decoded native playback and modeled API/party responses.
+
+The `cdce17c` actual two-peer fixture remains a historical source-bound pass: its 110 steps, 60 WebSocket events, first-load 64-second audio/movie resumes, one close pause and advancing YouTube peer clock do not qualify the new video-takeover behavior. A separate `2aca11c` two-context actual server/UI/WebSocket fixture exits 0 with **30 steps and 14 events**: the server playing state occurs before host Play wire; actual browser Skip input through CDP produces one host Play wire, then two peer playing states, with both native players playing. Releasing the delayed old progress GET leaves the same video/source, pending false and time advancing. The input bypassed an old toolbar play control whose pointer events were disabled; the keyboard fallback was not needed after the core pass. Both contexts closed, the browser/profile were removed and five public samples stayed unchanged. No owner Vivaldi, physical audio, live service or authenticated-account acceptance is established.
+
+## Upstream and native integration boundary
+
+That historical integration combined upstream v0.1.1 (`fe320ba`, through fork main `62dc`) with the fork corrections and experimental [native bundle](../native-bundle.md). Working-tree receipts from that integration can be invalidated by concurrent changes, so treat its commands, counts and source hashes as historical. The multi-root/settings, unavailable-root, queued-ingestion and administrator-deletion checks are HTTP/storage proof; they do not establish interactive browser acceptance. Client checks include six actual decoded-video controls alongside synthetic cases. Later working-tree changes require a new committed image and platform qualification; Linux results do not transfer to either Mac architecture.
+
+## `56a79d3` native audio resume fixture checkpoint
+
+The [browser regression](../../tests/browser-regression.cjs) uses actual decoded
+native audio and modeled party state. A focused working-tree run before the final
+host-close guard adjustment passed 49/49 Chrome for Testing cases with cleanup.
+After a trusted visible browser gesture,
+the native audio player retained approximately 64.044 seconds on host resume,
+64.042 after metadata and 41.043 after a later seek; the production host state
+handler produced no extra seek. The corresponding Settings close/reopen and
+successor-monitor controls pass in the later 230-test Node suite. Those Settings API
+responses are modeled, and the browser run does not prove live scan ingestion.
+
+Earlier attempts failed because autoplay blocked playback and the test's audio
+target was hidden. The fixture corrected those prerequisites before recording
+the trusted-input pass; those attempts do not establish a product defect.
+The final host-close adjustment corrects a VM baseline with two failures and
+six passing controls; the combined 230-test Node suite passes. It has no new real-browser execution in
+this checkpoint. Physical audio, owner browser/session, distinct live clients,
+a fresh image and hosted acceptance for the combined changes remain unqualified.
+
+## Historical review follow-up
+
+Full review [5690203516](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5690203516)
+and incremental review [5690407263](https://github.com/ColterD/Frayd/pull/2#pullrequestreview-5690407263)
+are accounted for with the earlier findings in the [review ledger](coderabbit-follow-up.md).
+Native follow retires external playback after transferring ownership and clears
+its modal class. External follow likewise pauses native audio/video after taking
+ownership, without broadcasting stale native pause events. Separate API/player readiness, current-player checks and latest
+desired state prevent unready calls, stale native restarts and lost pause/seek
+updates. Host/guest controls exercise fresh and retained audio/video with a mocked
+YouTube API. That suite does not qualify actual external playback by itself;
+the real-player checkpoint below is separate.
+
+Party updates clamp captured timestamps under the state lock, preventing stale
+updates from counting elapsed playback twice. At pre-upstream commit
+`7e3a7ee6eefbbbd7c9f19223d2c9c84a19670c62`, the Docker build stage's
+`cargo test --locked` passed 59 server unit tests and six archive tests (65 total)
+with normal parallel execution. That historical count excludes the later upstream
+and native integration. CI also requires Clippy and release compilation; warnings
+in unchanged code remain. Current revision-bound commands and results are in the
+[draft PR](https://github.com/ColterD/Frayd/pull/2).
+That checkpoint's client/harness passes 144 Node tests and 32 actual-DOM cases, including
+real native decoding, parser-gated reader restoration and real protocol setup
+after an injected initial transport failure. Owned HTTP nonresponse and early
+exit controls verify bounded failure and cleanup. The effective-stream regression waits
+for the requested stream and the video progress request; it uses no fixed pause
+delay and imposes no audio progress-save requirement. The Linux-only replacement
+retirement oracle is compiled only on Linux, matching its production contract. Native progress
+saves also require the latest tracker, metadata readiness and the matching stream.
+The audio regression reproduces a prior local item receiving the party position;
+the corrected stream keeps that old item untouched. Following party audio still
+does not create a new bookmark tracker.
+
+The harness waits for a complete port field and retries transient target-list
+readiness failures within one startup deadline. Unexpected targets stay fatal.
+Equals signs in owned profile paths are preserved. CI reuses an exact valid Node 22.23.4 cache entry or verifies the pinned official
+archive checksum before extracting a temporary runtime, without a new action dependency; local checks require
+Node 22+ with global WebSocket. Native host events retain the original media
+element and check its actual state. Delayed native loads require the current
+generation, playback owner, element and stream; an external handoff invalidates
+them. Party Start keeps one pending request owner, and reused external players
+consult the current host sender rather than a role captured by an earlier session.
+Native source changes compare the actual configured stream, preventing a local
+selection from confusing the last party-follow ID and another item's progress.
+Server generation and socket tokens isolate replacement parties and duplicate
+connections; old frames and disconnects cannot alter the current session. Host registration
+also requires the creator's private proof, bound to identity and generation; a
+disclosed member label alone cannot grant authority or evict its owner. A guest key
+also cannot replace a registration whose outbound receiver is still open. Rejoin
+works after that receiver retires; this is active-slot continuity, not first-slot
+or inactive device-identity authentication. A decoded-video case proves queued stale pause suppression while preserving
+a legitimate pause. Synthetic metadata fixtures explicitly model and restore
+metadata readiness rather than treating an event dispatch as a state change. Complex player, party and harness contracts were
+documented without changing the hosted 80% coverage threshold; its next measured
+result remains a separate gate.
+
+Current hosted outcomes, immutable source/image bindings and remaining manual
+gates are reported in the [draft PR](https://github.com/ColterD/Frayd/pull/2).
+Historical `1ece1df` / `5d8c4f…` results remain bound to that artifact. The historical
+runtime checkpoint below uses its recorded server; no merge or live deployment
+is authorized.
+
+## `5d63ac2` actual YouTube session checkpoint
+
+Checked 2026-10-28. Runtime source `5d63ac240e25878daa0ecb1df862c70610764b59`
+builds app `sha256:767fe73fa6ae69b488588e0d5d79315cf893a3d9deb19a1b94eb94d7615e7c77`,
+with server binary `ea5bebfbb197e46b6484f958c7cbd603e13cc1791f25fa424f6f15612d9f4221`
+and the unchanged `70c865…` proxy. Fresh Docker Rust tests (57), Clippy, release,
+full HTTP/storage integration and controlled DNS recovery pass. All qualification
+projects have zero remaining containers, networks and volumes, including stopped
+containers. The owned test app retains its data/config and all five sample hashes.
+
+Two fresh isolated headless contexts load the exact production app `1d7211…`
+and party `4816…` payloads. They use the actual public YouTube API and official
+video `aqz-KE-bpKQ`, with both players muted. A leaves its guest session with no
+sender, then hosts the same ID using its exact original player object. B leaves
+its old host session and joins A; the replacement party survives.
+
+Actual A `pauseVideo()` emits an outbound pause, B receives authoritative
+`playing:false`, and both APIs report paused state 2. Actual A `playVideo()`
+emits play, B receives `playing:true`, and both report state 1. B's clock advances
+4.39715 → 6.90061 seconds over 2.504 seconds. This is one behavioral observation,
+not a latency or general synchronization benchmark. No Party UI play/pause
+shortcut or synthetic player callback supplies the result.
+
+Both owned contexts/parties close, the browser exits, its profile is removed,
+and both old room codes reject WebSocket upgrades with HTTP 404. The owner
+browser is untouched. Audible output, iframe-button input, cross-machine and
+long-duration playback remain unqualified; API states/clocks are not decoded
+frame or physical-audio measurements.
+
+## `6810cc2` reader-ready checkpoint
+
+Checked 2026-10-28. Tested source `6810cc2488bc1a6a0284ff2bdf140d43bd2a1fd5`
+builds app `sha256:5926bed415ff0455796396218dc1851a1139818fb40588b84561666c424fa8fe`
+with proxy `sha256:70c8658365d70d40979de2f191387b2e5e08bea22b44f960c0e77f751f67fb83`.
+The app script is `d676ea713c0975ea5a3236ea98e1bb6e98f11b9c4ab7823d6c1165a5dee29646`.
+All 31 build, 19 verification and 20 backend inputs match the tested commit.
+
+That checkpoint passed 90 Node tests, 20 Python tests and 25 real-DOM cases,
+including five native H.264 decoding controls and parser-gated reader restoration.
+The normal build reuses the qualified 51-test Rust/Clippy/release stage after
+confirming identical backend inputs and output binary; it is not fresh Rust
+execution. New-image health and seven exact-byte HTTP asset checks pass, with
+zero remaining smoke-project resources. Full local HTTP/storage and DNS suites
+were **not rerun** on this image; their earlier full pass belongs to image `055`.
+
+**The reader fix passes actual Vivaldi acceptance on image `5926`.** Three full
+close/reopen cycles returned the saved raw-LF annotation and visibly painted it.
+Chapter II→I restored the mark, and page 3/8 survived close/reopen. A guest
+selection returned HTTP 401 with sign-in feedback and no optimistic mark.
+A targeted movie check restored the actual HTTP progress value 190.989149 seconds,
+then advanced to 204.628872 with readyState 4 and a decoded 1920-pixel frame.
+The host and peer loaded app/party response bodies match the tested hashes;
+index bytes were verified on the server, without a captured browser index body.
+
+**That checkpoint’s party smoke was held.** Browser control detached twice at action
+boundaries; the approach stopped without a reset. The earlier `1bf` image passed
+the five-category and two-client party matrix. Those observations remain bound
+to that image; no current two-client pass is claimed. New whitespace selection
+and unsupported-selection checks were not repeated in this targeted run.
+The controlled parser gate proves the lost-message lifecycle class; the precise
+scheduling trigger of the earlier Vivaldi failure remains an inference.
+
+## Hosted browser startup budget
+
+The initial five-second discovery budget rejected a browser that later created
+its owned endpoint file at **8.719 seconds** on GitHub job `123031020202`.
+The diagnostic retained a failed verdict, observed only file existence and process
+liveness, and never opened that late endpoint. It did not establish a policy or
+DBus failure. Another matched run passed the browser cases.
+
+The historical correction used one 15-second deadline for port discovery, the
+HTTP target-list response, WebSocket opening and bootstrap commands, with a shared
+60-second guard. It required loopback endpoint validation and successful protocol
+setup before navigation. Bounded, redacted startup stderr remained available on
+failure. The temporary late-file observer was removed after establishing the
+insufficient startup budget. A controlled 8.7-second delay before launching the
+same real browser distinguished the old and 15-second discovery budgets. A separate
+controlled 3.2-second delay on the real target-list fetch failed under the old
+three-second phase timeout and passed all 29 cases with that historical startup
+deadline. These were separate controlled delays, not one combined-delay test.
+
+The `a4027b8` harness gives startup 30 seconds for discovery, target-list response,
+socket opening and bootstrap. After setup and navigation acknowledgment, the
+browser case phase has a separate 60-second budget. Loopback endpoint validation,
+protocol setup and bounded cleanup remain required. Local timeout controls and
+49 actual-browser cases pass on this source; its hosted workflow has a separate
+result gate. The 15-second values above describe only the
+earlier source and hosted attempts.
+
+## `a4027b8` actual-browser fixture checkpoint
+
+Checked 2026-10-29 on exact source `a4027b8220b2b8c2f511ae6675d1696b2639a25b`.
+The [public checkpoint](acceptance-checkpoints.json)
+matches app image `sha256:670d14d9403ccfcb44a03871040ded86f0958ab1011eaadfa58c28bf151e0334`,
+proxy image `sha256:8af98fa579fe88e34b3ccdc1e4e7d2cdd68ecbc57a089e7e3033f5c85eb91598`
+and the served index, app script and party script bytes. The checkpoint records
+PASS for 60 steps and 28 WebSocket events; the tracked
+[browser harness](../../tests/browser-regression.cjs) gives the reproducible test entrypoint. A real unknown-code join
+received HTTP 404. Its error-then-close sequence kept “Party not found or rejected”
+visible, left Join available and left no sender. This confirms the preadmission
+rejection path for that code, not every rejection cause.
+
+The same fixture used the actual YouTube API: after guest-to-host rehosting, the
+player object was retained, host pause and play reached the peer, and the peer
+clock advanced 4.4386 → 6.9473 seconds. Both owned browser contexts exited,
+their profiles were removed and both old room codes rejected upgrades with
+HTTP 404. The five public sample copies
+matched before and after the browser run. The original `/data` bind remained
+opaque and unchanged. Audible output, owner Vivaldi, authenticated accounts,
+other providers and live deployment remain untested here.
+
+The separate [runtime checkpoint](acceptance-checkpoints.json)
+records 49/49 actual Chrome cases on the same `a4027b8` source with 320 ms
+startup and approximately 49.9 seconds in the case phase. Its local HTTP/storage
+and controlled DNS suites exited 0 using the same app and proxy images; the
+checkpoint binds those commands and records zero remaining resources in all three
+owned QA projects. Its public CI job links preserve the hosted result boundaries.
+The browser suite exercises real DOM and decoded-media controls against a
+fixture; its modeled API behavior does not replace the separate actual YouTube
+API and peer observation above. These a402 results do not claim that runtime
+tests ran at a later documentation commit.
+
+Earlier verification head `f16897334b55e5d6c3da201a00791c9bd4855662` had
+[one complete hosted pass](https://github.com/ColterD/Frayd/actions/runs/40747689066/job/123025739721)
+through browser, lint, Rust/Clippy, images and HTTP/storage/DNS integration, plus
+one startup failure before any browser case. That success does not erase the
+failure. The [PR checks](https://github.com/ColterD/Frayd/pull/2/checks) and current
+PR evidence identify the latest tested head and hosted outcome.
+
+The remaining sections retain historical source/image observations and their
+original gates. They do not qualify later artifacts. The final
+[ordering and reader readiness](#deterministic-native-ordering-and-reader-readiness)
+section records the controlled product regressions. No merge or deployment is
+authorized by these checks.
+
+## Historical source and fixture boundaries
+
+- Baseline application: `sha256:cd880c88f8c97dbebe771a3303455c714b3a03dde732cc8474634575b7f4cf58`, matching source `b852a7f87bc1ad9e3921d7b98202ccc2b719b70c`; prior accepted PR head `ccaa308e1395f0080e8c5b7de209f8ca043efb24` adds historical documentation.
+- First corrected runtime source: `407afbccb94697738025ae8c394d755814e79997`, committed before its image build. Application image: `sha256:958c9f9011cbeedec1d81433a8cae89efdc58bfbd990b2e33568f31b6b656b2d`. Its pinned build passes 45 Rust tests, Clippy and release compilation; observations below apply only to this first corrected image.
+- Proxy: `sha256:543d71e7db7b987f1e41dfb0a297efe5f020c141b2dbc39a859fd2473df7bbe2`.
+- Separate loopback fixture, fresh guest/device and disposable account, extension-browser host and an independent in-app-browser guest for party checks. No production database or sessions were imported; only the identified free samples were copied.
+- Exact copies of the five free samples were hash-checked before and after baseline testing; original live samples were not modified. The download receipts below are from 2026-10-28. Source URLs may change; these hashes identify the tested media bytes. Extract the MP4 from the movie ZIP; the comic ZIP is retained as a CBZ-compatible archive. Other samples are direct media files.
+
+## Media provenance
+
+| Category | Retained source and credit | Media SHA-256 |
+|---|---|---|
+| movie | [Sample source](https://download.blender.org/demo/movies/BBB/bbb_sunflower_1080p_30fps_normal.mp4.zip); CC BY 3.0; Blender Foundation; full embedded end credits retained. [Notice](https://peach.blender.org/about/) | `ae51005850b0ff757fe60c3dd7a12d754d3cd2397d87d939b55235e457f97658` |
+| music | [Sample source](https://incompetech.com/music/royalty-free/mp3-royaltyfree/Carefree.mp3); Carefree by Kevin MacLeod (incompetech.com), Licensed under Creative Commons: By Attribution 4.0 License https://creativecommons.org/licenses/by/4.0/. [Notice](https://incompetech.com/music/royalty-free/licenses/) | `8433b770a630d9b1594fd484442c677907ece899a4d149954cd2e74fd733e311` |
+| audiobook | [Sample source](https://archive.org/download/alice_in_wonderland_librivox/AliceInWonderland_librivox.m4b); Public domain in USA; LibriVox volunteer readers; complete recording. [Notice](https://librivox.org/alices-adventures-in-wonderland-by-lewis-carroll/) | `1ba22e284ee80e8cf25077bc8f10b81f0fadef6b8e61ac7964f059402e8ee1d3` |
+| ebook | [Sample source](https://www.gutenberg.org/cache/epub/11/pg11-images-3.epub); Public domain in USA; Project Gutenberg notice retained. [Notice](https://www.gutenberg.org/ebooks/11) | `4f81245d31380ac1d6eafb9a321e3691369bc70985736ae4bccf849a4f784036` |
+| comic | [Sample source](https://raw.githubusercontent.com/jydie5/MangaCrisp/4e851dc019cb6707444dd5a074292b6468c59f68/demo/Pepper-and-Carrot%20v01%20The-Potion-of-Flight.zip); CC BY 4.0 David Revoy; attribution packaged in archive retained. [Notice](https://www.peppercarrot.com/en/about/index.html) | `eae7b064a393cdfda43325f97c4790b92d72c339003de4467f62985c8e9fce07` |
+
+No sample media are added to the repository by this documentation. Embedded notices/credits remain in the test copies; public-domain statements in the retained receipts are scoped to the USA.
+
+## `bf3cb58` selection bounds and conversion recovery follow-up
+
+Source `bf3cb589881542cb0f6c4d47d467a9909c7b697d` builds application
+`sha256:858879bf50c7050dfb55f93723e8fa74fbde77e4a2447e00eb574d9e45bca0b5`.
+The normal build passes 51 Rust tests, Clippy and release; 43 client and 16 Python
+tests also pass. This follow-up rejects selections spanning text nodes or element
+boundaries, keeps raw selection text/offsets aligned, and adds conservative
+interrupted-conversion recovery. The test-wrapper extraction correction is
+included without a scanner suppression.
+
+The earlier `958c9f9` image passes below remain historical observations of that exact
+artifact; they are not presented as browser qualification of this later image.
+At that checkpoint, browser acceptance was held for input recovery and
+a fresh script-payload binding. The later owner-correlated Vivaldi tab now responds;
+current-image payload binding and media rechecks remain required. At that historical checkpoint, full HTTP/storage integration and same-version stopped-volume recovery pass; these automated/storage results do not close the browser gates.
+
+## `c4cde98` HTTP, DNS and first real-DOM qualification
+
+Runtime source `c4cde98a36b781ea0a0f5f512b0d5001a3fbd2fc` builds app
+`sha256:9fe2f139cece83cd1151a416cb45fe8fd6e80b85bce1268cc26e002b9a276a44`
+and proxy `sha256:70c8658365d70d40979de2f191387b2e5e08bea22b44f960c0e77f751f67fb83`.
+Verification source `bb26bdc04d3476270ac96721af843618e8997e00` adds the browser
+harness and CI wiring without changing runtime inputs. Both immutable images pass
+the full HTTP/storage and controlled DNS-failure suites; their disposable projects
+have zero remaining resources. All 47 client and 17 Python tests pass at that checkpoint. The normal
+build reused the qualified 51-test Rust/Clippy/release stage with identical server
+inputs and output binary; no fresh Rust execution is claimed for that cache hit.
+Nine real-DOM cases pass separately, as described below.
+
+At that checkpoint, the retained interactive fixture ran the earlier `858879b` image.
+Manual media acceptance required a new image, loaded-payload binding and
+actual media actions. Browser control has now recovered as described below. Earlier
+`958c9f9` observations, `858879b` backup recovery and these new automated results each retain
+their own source/image limits.
+
+## `407afbc` acceptance matrix, baseline and first corrected image
+
+| Scenario and exact action | Baseline observation | First corrected image (`958c9f9`) |
+|---|---|---|
+| Movie: open, confirm decoded playback, seek, Back, read saved progress, reopen | Decode/seek pass. Saved 203.002927 seconds; reopen starts at zero. A second seek/reopen also restarts. | Blocked on browser input recovery. A pre-binding restart observation is inconclusive; two bound-payload iterations and the actual progress response are still required. |
+| Music: play, seek, close, reopen | Carefree advances; saved/resumed near 106 seconds. | Blocked on post-fix browser input recovery. |
+| Audiobook: play, seek, close, reopen | Alice advances; saved/resumed near 1,076 seconds. | Blocked on post-fix browser input recovery. |
+| EPUB: navigate, close, reopen | Chapter 3, page 2/3 restores. | Blocked on post-fix browser input recovery. |
+| Account highlight: select real text, close, reopen | Annotation persists and text appears yellow. | Pass: HTTP 201, confirmed save message and paint, immediate chapter revisit and reopening retain the mark. |
+| Guest selection | UI says Highlighted despite an unauthorized save and no persisted annotation. | Blocked on browser input recovery; automated failure/success controls pass, but a bound-payload guest selection is still required. |
+| Comic: navigate, close, reopen | Page 2/4 and actual image restore. | Pass: decoded page 2/4 restores on the corrected image. |
+| Distinct-client party: request, approve, queue, skip | Both clients play the requested music. | Blocked on post-fix browser input recovery. |
+| Party panel Pause then Play | Guest pauses at zero while host continues beyond 47 seconds. | Blocked: both test origins time out on automated input; two-client music/video controls remain unqualified. |
+
+## Contract and corrected paths
+
+The correction preserves account-only highlight creation. Guest selections are
+not newly made persistent: the UI must explain that sign-in is required. Account
+success is reported only after the server confirms creation, updates local reading
+state and paints through the existing frame protocol. Failed writes must not claim
+success. Movie resume waits for source metadata. Party panel controls act on the
+active player, publish its current position and preserve the server timeline.
+
+Detailed local QA receipts retain actions, HTTP/database observations, screenshots
+and source/image bindings. Automated regression tests cover the related identity
+isolation correction separately; this page does not make account/device identifiers
+into a private boundary for guest library/media access.
+
+## Historical control recovery and cleanup
+
+The owned fixture and test tabs remain available for current-source media checks.
+Earlier input attempts timed out while accessibility reads worked; those receipts
+remain historical control failures, not product results. The owner then opened a
+uniquely tagged test URL in Vivaldi. Its exact tab appeared in the extension
+provider and guest entry responded in 0.34 seconds. The provider's “Chrome” label
+was not evidence of an installed Google Chrome browser. This correlation restores
+control on the newly identified tab; it does not explain the earlier timeouts.
+
+That control recovery used the older `858879b` image and did not qualify later images
+or their loaded payloads. These test resources
+remain separate from the live deployment. Browser observations do not establish
+physical audio output, full-duration playback, every codec/archive, external
+YouTube behavior, latency/soak/reconnect, public-hosting security or deployment.
+Same-version backup/restore has its separate bounded qualification in
+[Operations](../operations.md#backup-and-restore).
+
+## Automated integration follow-up
+
+Image inputs remain those committed at `407afbccb94697738025ae8c394d755814e79997`.
+Runner commit `fd67409bd97e7983e4634076843197c2f7820790` adds the existing
+20-second readiness gate after the read-only-library app recreation, before
+asserting exact stream bytes. This changes only the test runner; image/backend
+inputs are unchanged. The earlier explicit proxy DNS-recovery deadline and proxy
+identity/start-time assertions remain in place.
+
+One initial run returned HTTP 502 immediately after that recreation. Its receipt
+is retained and the cause remains unproven. One unchanged retry passed, then
+the committed readiness-corrected runner passed the complete suite against the
+same immutable image. Both successes do not retroactively erase the first failure
+or establish its cause. This automated HTTP/storage result does not close the
+blocked browser oracles above.
+
+## Transient DNS error follow-up
+
+Hosted head `f3206f3` had one explicit app-IP-change recovery timeout and one
+successful same-head run. The failed job did not retain DNS answers, so its
+specific cause remains unknown. A separate controlled regression replaced the
+real app IP, verified direct health on the new app and injected one DNS SERVFAIL.
+With the original configuration, the unchanged proxy retained the old peer and
+returned 502 beyond 20 seconds. With `resolver_timeout 2s`, the same scenario
+requeried DNS after 2.000 seconds and recovered in 2.01 seconds.
+
+This follows the [pinned Nginx error retry path](https://github.com/nginx/nginx/blob/140aa942711868a8daeb95810bc9a81f272ada72/src/http/modules/ngx_http_upstream_zone_module.c#L761-L767):
+non-NXDOMAIN errors use the resolver timeout, whose default is 30 seconds, rather
+than the five-second answer-validity setting. The readiness deadline stays at
+20 seconds. `tests/test_dns_recovery.py` repeats the controlled fault in CI;
+the normal integration runner also captures bounded diagnostics before cleanup
+if its real Docker DNS recovery gate fails. These controlled config-mounted
+results do not qualify a newly built image or the held browser cases.
+
+## Real DOM regression follow-up
+
+The standalone `node tests/browser-regression.cjs` harness passes nine cases
+against production scripts and the actual vendored player in an isolated
+headless browser. It checks exact CFI/text and restored marks for plain text,
+leading/trailing whitespace, existing search/highlight splits, and body style or
+script text before the selection. Cross-node, next-node offset-zero and
+whitespace-only selections follow the explicit no-save contract. Annotation
+paint waits for HTTP 201, and a repeated saved selection sends no second POST.
+
+The actual Plyr source setter replaces and detaches the media element twice.
+Current-element play/pause/seek events reach host callbacks once per event, and
+follower seeks affect that current element. Synthetic events on detached elements
+can still be forwarded by the vendored library; the probe records this behavior
+without claiming a naturally occurring late-event failure. Empty fixture streams
+and synthetic events do not establish decoded playback or two-client timing.
+
+The runner records the supplied browser version/executable hash and production
+file hashes, and verifies cleanup of its own temporary profile/process/listener.
+It uses fixture APIs and a local icon sprite override. This closes the bounded
+mocked-DOM coverage gap; it does not close the held manual media matrix or
+qualify an immutable browser environment. See [Development](../development.md#real-dom-regression)
+for the repeatable command and browser provisioning limits.
+
+### Browser harness cleanup correction
+
+A hosted browser run failed while removing its temporary profile (`ENOTEMPTY`),
+masking the preceding outcome. A controlled launcher/child fixture reproduced the
+lifecycle gap: stopping only the launcher leaves a descendant writing and
+recreating the profile. The runner now stops only its newly created process group
+with bounded TERM/KILL waits before one profile removal, and reports original
+runner errors separately from cleanup errors. The two lifecycle controls bring the Node total to 49; all nine
+real-DOM cases also pass locally. Full Chrome was unavailable locally during that qualification. Hosted browser
+checks subsequently passed on `bf40d875`; the original masked outcome remains unknown.
+
+The controlled DNS fixture also binds only to its resolved container interface,
+instead of all interfaces. Its real DNS recovery test still passes against the
+same qualified images. No CodeQL suppression or dismissal was added; fresh hosted
+analysis must confirm the alert disposition.
+
+## Host echo and cleanup follow-up
+
+A full review of `bf40d875` found that the first host party state can overwrite a
+locally resumed video's source and position. The correction passes a host-only
+`preserveLocalPlayback` option and recognizes the exact configured stream through
+the active video attribute, Plyr source child or loaded source. The guard precedes
+both ID and drift branches, including stale same-media IDs. Guest initial and
+subsequent synchronization retains the host's position and play/pause state.
+
+Red Node and actual-DOM controls reproduce a host resume of 203 seconds resetting
+to zero before and after metadata. The corrected source passes 67 Node tests and
+18 actual-DOM cases, including fresh/stale host IDs, guest synchronization,
+changed media and URL/precedence controls. Media events/transport remain synthetic
+in that harness; decoded playback and distinct-client timing still need the
+current-image media checks.
+
+The DNS fixture also bounds every cleanup command to five seconds and attempts
+all owned resources. It preserves an existing scenario failure when diagnostics,
+removal or inventory fail, while cleanup failure remains fatal after scenario
+success. Real fake-Docker hangs/errors reproduce the old masking behavior and
+pass the corrected controls; all 20 Python tests pass. Three accompanying AST
+command-injection diagnostics have separate static dispositions in the ledger;
+cleanup timeouts are not presented as a security mitigation.
+
+### Active-video eligibility and actual UI baseline
+
+Candidate source `2bbedcb20fa15ee50379406706d581758c91b350`, app
+`sha256:0559037b661010cb38cdddabc24de9966bed397bef529b58ca2a3706196e3f14`,
+passes its full HTTP/DNS suites, but actual Vivaldi QA exposes an additional guard
+case. With loaded `5e8364` app and `69fb7e` party payloads bound, a queued movie
+decodes at 1920 pixels wide. After closing it, playing music, and queuing that same
+movie again, the old source match leaves music playing and the movie hidden and
+paused. Party state incorrectly reports the movie as playing.
+
+The current correction captures the prior playback kind and requires an already
+open video modal before preserving a matching host stream. An active paused video
+remains eligible; an inactive cached video follows the reactivation path. Node
+and real-DOM baseline failures precede the patch; 67 Node and 18 real-DOM cases
+pass afterward. A replacement image and actual-media recheck remain required.
+Earlier movie-reopen observations with stale `903` browser code are excluded from
+the `055` verdict. Resource-content hashes after an explicit documented cache-bypassed
+reload establish the browser payload used for the actual UI regression above.
+
+## Native metadata resume and connected controls
+
+Actual Vivaldi QA on `aff7ed25` received HTTP 200 with saved movie position
+64.624054, yet decoded playback started near zero. This is a source-bound product
+failure, separate from earlier stale-browser observations. The native regression
+uses a [generated 120-second H.264 fixture](../../tests/fixtures/native-resume.mp4)
+and its [generation command](../../tests/fixtures/generate-native-resume.sh).
+The 24,997-byte fixture contains black 160×90 video frames, uses no downloaded
+media, and was generated with the existing app image's ffmpeg 5.1.9.
+
+The controlled native baseline observes trusted metadata from a retired media
+element's cancellation clip before the replacement video has a duration. Plyr
+forwards that event through its container, consuming the one-shot resume callback;
+new playback settles at 0.3049 seconds despite saved progress 64. The correction
+listens on the captured replacement video and checks its item, open generation and
+configured stream. Closed, superseded or different-source requests cannot apply an
+old resume response. Five native decoding controls now restore near 64.30–64.31
+seconds, while new zero-progress playback starts near 0.315 seconds; each decodes
+6–10 frames. These are controlled short-run observations, not a performance or
+full-duration quality claim.
+
+Party controls now distinguish **Hide** (remain connected) from **Leave**
+(disconnect). Reopening retains the active code/state, hidden closure clears
+session state, and stale socket callbacks cannot change a new connection.
+Audio following retires the old video surface and pauses its player before both
+fresh and retained-audio paths. The video party button uses the same reopen API.
+These corrections address the actual overlay hit-test gap and the reproduced
+state where video and audio remained active together.
+
+At that earlier checkpoint, the combined source passed 85 Node tests, 20 Python
+tests and 24 browser cases, including five native decoding cases. Its then-pending
+image, Vivaldi and hosted gates are historical; see the current checkpoint above.
+
+## Deterministic native ordering and reader readiness
+
+One `eb386fe` hosted browser job restored the movie correctly at 64.3081 seconds
+but failed its timing precondition: requested metadata arrived before retired
+metadata. Another job passed. The corrected test explicitly holds requested bytes
+until trusted retired metadata is observed, then releases them. Cache is disabled
+before navigation in the harness's own fresh headless profile, with observable
+held/released counts; cache bypass cannot silently turn the scenario into a pass.
+A missing event fails within a bound, and both driver and runner cleanup release
+holds. No existing browser profile or Vivaldi connection is controlled by this
+harness protocol. The same gate reproduces the old app's native resume failure and
+passes the corrected app; the fixed 150 ms timing margin is removed.
+
+Actual `eb386fe` Vivaldi checks pass all five media categories and party controls,
+but a bounded account-highlight reopen case has no yellow paint through 9.9
+seconds despite a correct annotation HTTP 200. The parent `srcdoc` already contains
+the prepared restore marker. One ordinary Chapter II → I round trip restores the
+paint without another annotation POST. This isolates a lifecycle/delivery problem
+from persistence but does not identify its exact scheduling trigger.
+
+A real DOM parser gate reproduces the lost-listener class: the correct saved
+annotation remains unpainted after the old timer sends before the reader listener
+is ready. The correction waits for a generated reader-ready acknowledgement after
+listeners and body load, binds restoration and messages to the active document
+generation, and ignores stale book/chapter callbacks. Close clears `srcdoc` and
+pending resize work. Repeated restore cannot nest duplicate marks. The opaque
+origin and exact WindowProxy checks remain in force.
+
+The combined source passes 90 Node tests, 20 Python tests and 25 browser cases,
+including parser-gated restoration, actual open/close/reopen, chapter revisits,
+stale ready messages and all five native H.264 controls. Earlier Vivaldi category
+passes remain bound to their recorded image. The rebuilt `5926` reader passes
+the three actual Vivaldi reopen cycles described above. Current two-client party
+smoke remains held by browser detachment. The controlled lost-listener class is
+proven; the precise trigger of the earlier live observation remains an inference.
+
+## bd2cd36 SVG cover and reader acceptance
+
+The disposable app at `bd2cd36ee3c8fbd0683cfe9c2793116bcf889543` fixes a natural EPUB cover wrapped in SVG: the earlier image-only rule left its 693×1194.72 box taller than the reader. Both image formats now share the height/width cap. Actual 320/768/1440-pixel screenshots show the complete cover with no vertical clipping. The owner fixture retains bookmark 2.333 at page 2/4 and one highlight; TOC navigation and resize to page 4/9 then back to 2/4 pass. Three-profile readability from the earlier checkpoint is separate from this exact bookmark oracle.
+
+The client layer was derived from the immutable `e7bee5f` app, with exact archived client bytes; app ID `676b945632fd0d5547b3dee6586849a3f214840223fe5aec42bacce2dfbc435d`, proxy ID `fc94053ebcdf71cdc8d2dfc097c7808ac1a0fad9547194668423b6db9de89887`. The server binary remains byte-identical (`57fa33a4d1b480edd742b676bfd67ac0dfe0d5f6d17669978c02b6501c32ec1e`); this is no new backend build. Actual guest sign-out/re-entry and muted audio footer controls also pass at desktop/phone widths. Final hosted checks and live upgrade preservation remain separate gates.
+
+## 074e4f5 failed-chapter close and resume acceptance
+
+The combined disposable app uses client `074e4f53c4a5b3e6cb8c7a2b636ada68cee2dc80` and fresh backend `5cfc14bdbee35976cb032af731aa12350de5afbd`: app image `9286e7086097381f3f230863216ec216dc43d49721bddc2d6b4c61a06a762308`, proxy `508e1c1f57e79699cf092eec3f91e0efdac4852458f36012c488cd8fe2e19c11`. All ten client files match final code checkpoint `fd8e67e`; the server binary matches its fresh build/export. This is a derived client layer, not a claim that the entire image was built from `fd8e67e`.
+
+Actual guest actions open an EPUB with a missing ZIP chapter: HTTP 404, visible unavailable state, then Close and Music navigation produce zero progress POSTs. A separate real resume HTTP 200 is held after spine/TOC responses; Close and release produce no new chapter read or progress write. Earlier probes that held a card's lazy progress read are retained as setup failures, not reader proof. Legitimate ready-close HTTP 204 and reopen retain the owner fixture's bookmark 2.333 at page 2/4 and one highlight; TOC, next, resize and the complete SVG cover pass. Seven category headings and default-current Newest controls remain present. All playback stays muted/paused.
+
+The original 17 fixture rows remain exact. The missing-chapter test row and its 895-byte EPUB remain only in this disposable environment because supported deletion refuses its guest progress reference; no direct database mutation was used. The temporary synopsis item was removed through the supported API and its exact owned source removed. Live port 3101, operator guest/session and library were untouched. Full parties, physical audio and credential-submission acceptance retain their earlier boundaries.
+
+## 6a4d202 comic and registered-auth regression
+
+The fresh normal Docker build at `6a4d2023d52d57fe3957c6da7827ea78813a0737` supplies app `9a1c5861628837a88a305f075db7ad285fbbff494af88711b9c7b40ffab822d9` and proxy `9038f4e1bd2ec70ea45154239a16d7dbcce77b5ca4a6845a2de1af95d5ed7d02`; server `70a48bc5019274178886233cf3e4f91824493d4677ba01ac8b7365d8282c9234` matches its native export. Actual CBZ and loose-manga Next/Close/reopen restore page 2 with decoded images; the owner ebook retains bookmark 2.333, its highlight and plain TOC labels. Full SVG cover, both sort directions, seven headings and guest sign-out/re-entry pass. Fourteen fresh screenshots were inspected.
+
+An additional disposable registered account completed creation/login HTTP 200, wrong-password HTTP 401, successful re-login and registered sign-out at desktop/phone widths. The sign-in form stayed centered and the app hidden; four further screenshots were inspected. No credential/token values were retained. This synthetic account remains test data because its creation response lacks an ID and the required before/after ownership baseline was not captured; no uncertain deletion was forced. All operator data and live port 3101 remain outside this fixture.
+
+The legacy CP437 repair has a separate real-TCP byte/order/metadata/progress oracle inside the 143-test Rust suite; these screenshots do not claim to exercise a legacy cache. Source/input equality supports the existing reader/party controls; physical audio and unsupported platforms retain their earlier limits.

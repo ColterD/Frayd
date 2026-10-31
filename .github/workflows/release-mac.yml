@@ -1,11 +1,5 @@
-name: Native macOS qualification held on main
+name: Native macOS qualification (no publication)
 
-# Temporary main-only safety guard: upstream tag-triggered packaging/publication
-# has not been qualified or accepted. Keep this workflow slot discoverable for
-# explicit feature-ref dispatch without enabling any default-main runner work.
-# Functional nonpublishing qualification is prepared on fork PR2, pending acceptance:
-# https://github.com/ColterD/Frayd/blob/fix/coderabbit-all-findings/.github/workflows/release-mac.yml
-# Replace this placeholder when the accepted draft PR2 is merged.
 on:
   workflow_dispatch:
 
@@ -13,9 +7,86 @@ permissions:
   contents: read
 
 jobs:
-  qualification-held:
-    if: ${{ false }}
-    runs-on: ubuntu-24.04
+  qualify-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            architecture: arm64
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            architecture: x86_64
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    env:
+      FRAYD_NATIVE_REQUIRE_QUALIFICATION: '1'
+      CARGO_BUILD_JOBS: '2'
+      FRAYD_NATIVE_EXPECT_ARCH: ${{ matrix.architecture }}
     steps:
-      - name: Qualification remains held on main
-        run: ':'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Verify actual native architecture (reject Rosetta)
+        shell: bash
+        run: |
+          test "$(uname -m)" = "$FRAYD_NATIVE_EXPECT_ARCH"
+          # Rosetta passes the x86_64 uname check but reports proc_translated=1.
+          test "$(sysctl -n sysctl.proc_translated 2>/dev/null || true)" != 1
+          printf 'CARGO_TARGET_DIR=%s/frayd-native-target\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          uname -sm
+          printf 'Runner image: %s / %s\n' "$ImageOS" "$ImageVersion"
+
+      - name: Exact Rust toolchain and isolated source
+        shell: bash
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component clippy
+          rustc +1.99.1 --version --verbose
+          # Build a disposable source copy; remove it before runtime qualification.
+          python3 scripts/build-metadata.py --env >> "$GITHUB_ENV"
+          mkdir "$RUNNER_TEMP/frayd-build-source"
+          cp -R server "$RUNNER_TEMP/frayd-build-source/server"
+          mkdir -p "$RUNNER_TEMP/frayd-build-source/tests/fixtures"
+          cp tests/fixtures/native-resume.mp4 "$RUNNER_TEMP/frayd-build-source/tests/fixtures/native-resume.mp4"
+          printf 'FRAYD_NATIVE_HELPER=%s/%s/release/frayd-native\n' "$CARGO_TARGET_DIR" '${{ matrix.target }}' >> "$GITHUB_ENV"
+
+      - name: Locked native diagnostics and both binaries
+        shell: bash
+        run: |
+          cargo +1.99.1 test --locked --manifest-path "$RUNNER_TEMP/frayd-build-source/server/Cargo.toml" --bin frayd-native --target '${{ matrix.target }}'
+          cargo +1.99.1 test --locked --manifest-path "$RUNNER_TEMP/frayd-build-source/server/Cargo.toml" --bin frayd-server --target '${{ matrix.target }}' -- transcode::retained_job_tests::unqualified_rescans_hold_one_job_and_preserve_other_media --exact --nocapture | tee "$RUNNER_TEMP/frayd-retained-job-test.log"
+          # An obsolete exact filter must fail qualification instead of passing zero tests.
+          grep -F 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/frayd-retained-job-test.log"
+          cargo +1.99.1 clippy --locked --manifest-path "$RUNNER_TEMP/frayd-build-source/server/Cargo.toml" --bin frayd-native --target '${{ matrix.target }}' -- -D warnings
+          cargo +1.99.1 build --locked --release --manifest-path "$RUNNER_TEMP/frayd-build-source/server/Cargo.toml" --bin frayd-server --bin frayd-native --target '${{ matrix.target }}'
+
+      - name: Package complete per-architecture archive
+        shell: bash
+        run: |
+          python3 scripts/native/package.py "$RUNNER_TEMP/frayd-packages" '${{ matrix.target }}' "$CARGO_TARGET_DIR/${{ matrix.target }}/release/frayd-server" "$FRAYD_NATIVE_HELPER"
+          # Runtime tests must not find the compile-time source; the checkout stays intact.
+          rm -r -- "${RUNNER_TEMP:?}/frayd-build-source"
+          printf 'FRAYD_NATIVE_ARCHIVE=%s\n' "$RUNNER_TEMP"/frayd-packages/*.tar.gz >> "$GITHUB_ENV"
+          printf 'FRAYD_NATIVE_BUILD_SOURCE=%s\n' "$RUNNER_TEMP/frayd-build-source/server" >> "$GITHUB_ENV"
+
+      - name: Actual helper and server lifecycle, HTTP reader and persistence
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import unittest
+          suite = unittest.defaultTestLoader.discover('tests', pattern='test_native_bundle.py')
+          if suite.countTestCases() == 0:
+              raise SystemExit('No native qualification tests were discovered')
+          result = unittest.TextTestRunner(verbosity=2, failfast=True).run(suite)
+          if not result.wasSuccessful() or result.skipped:
+              raise SystemExit(1)
+          PY
+
+      - name: Nonsecret package provenance in retained job logs
+        shell: bash
+        run: |
+          cat "$RUNNER_TEMP"/frayd-packages/*.tar.gz.sha256 "$RUNNER_TEMP"/frayd-packages/*/manifest.json
+          printf '%s\n' 'Native lifecycle qualification passed. Media codecs, signing, artifact retention and publication are not qualified.' >> "$GITHUB_STEP_SUMMARY"

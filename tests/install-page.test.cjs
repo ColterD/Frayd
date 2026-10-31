@@ -37,7 +37,7 @@ test('installer requires typed health and setup JSON and keeps setup inside the 
     const b=installer(async url=>json(url.endsWith('/health')?{status:'ok'}:{needed}));
     await flush();
     assert.match(b.nodes.get('#stat').textContent,/verified/i);
-    assert.match(b.nodes.get('#s-stat').textContent,needed?/create.*owner.*in.*Frayd/i:/sign in.*Frayd/i);
+    assert.match(b.nodes.get('#s-stat').textContent,needed?/Sign in.*first login.*creates the owner account/i:/sign in.*Frayd/i);
     assert.match(page,/<a[^>]+href="http:\/\/127\.0\.0\.1:8484\/"[^>]*>Open Frayd/i);
     assert.equal(b.requests.length,2);
     assert.equal(b.requests.every(({url,options})=>url.startsWith('http://127.0.0.1:8484/') && !options.method && options.credentials==='omit'),true);
@@ -93,13 +93,15 @@ test('new retry aborts prior request and ignores its later response',async()=>{
   assert.equal(b.requests.length,3);assert.equal(b.nodes.get('#s-stat').textContent,text);assert.equal(b.timers.size,0);
 });
 
+const expectedWindowsCommand=(base,args='')=>`& { $ErrorActionPreference = 'Stop'; $fraydInstall = Join-Path $env:TEMP ('frayd-install-' + [guid]::NewGuid().ToString() + '.ps1'); ([IO.File]::Open($fraydInstall, [IO.FileMode]::CreateNew)).Dispose(); try { irm "${base}/bootstrap.ps1" -OutFile $fraydInstall -ErrorAction Stop; powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$fraydInstall"${args}; if ($LASTEXITCODE -ne 0) { throw 'Frayd installer failed' } } finally { Remove-Item -LiteralPath $fraydInstall -Force -ErrorAction Stop } }`;
+
 test('download command links remain available for Linux, macOS and Windows',()=>{
   const b=installer();
   const shellCommand = 'curl -fsSL "https://raw.githubusercontent.com/kattiest/Frayd/main/client/install/bootstrap.sh" -o frayd-install.sh && bash frayd-install.sh';
   const commands = {
     linux: shellCommand,
     mac: shellCommand,
-    win: 'cd $env:TEMP; irm "https://raw.githubusercontent.com/kattiest/Frayd/main/client/install/bootstrap.ps1" -OutFile frayd-install.ps1; & .\\frayd-install.ps1',
+    win: expectedWindowsCommand('https://raw.githubusercontent.com/kattiest/Frayd/main/client/install'),
   };
   for(const os of ['linux','mac','win']){
     b.run(`os=${JSON.stringify(os)};gen()`);
@@ -112,6 +114,7 @@ test('configured commands pass quoted library and tunnel arguments for each plat
   const b=installer();
   const base='https://raw.githubusercontent.com/kattiest/Frayd/main/client/install';
   const cases=[
+    {lib:'-weird-dir with spaces',tunnel:'tailscale',posixLib:"'-weird-dir with spaces'",posixTunnel:"'tailscale'",windowsLib:"'-weird-dir with spaces'",windowsTunnel:"'tailscale'"},
     {lib:'Media with spaces',tunnel:'tailscale',posixLib:"'Media with spaces'",posixTunnel:"'tailscale'",windowsLib:"'Media with spaces'",windowsTunnel:"'tailscale'"},
     {lib:"Owner's $Library with spaces",tunnel:"cloud'flare$Tunnel",posixLib:String.raw`'Owner'\''s $Library with spaces'`,posixTunnel:String.raw`'cloud'\''flare$Tunnel'`,windowsLib:"'Owner''s $Library with spaces'",windowsTunnel:"'cloud''flare$Tunnel'"},
   ];
@@ -122,26 +125,29 @@ test('configured commands pass quoted library and tunnel arguments for each plat
     for(const os of ['linux','mac','win']){
       b.run(`os=${JSON.stringify(os)};gen()`);
       const expected=os==='win'
-        ? `cd $env:TEMP; irm "${base}/bootstrap.ps1" -OutFile frayd-install.ps1; & .\\frayd-install.ps1 -Lib ${fixture.windowsLib} -Tunnel ${fixture.windowsTunnel}`
-        : `curl -fsSL "${base}/bootstrap.sh" -o frayd-install.sh && bash frayd-install.sh ${fixture.posixLib} --tunnel ${fixture.posixTunnel}`;
+        ? expectedWindowsCommand(base, ` -Lib ${fixture.windowsLib} -Tunnel ${fixture.windowsTunnel}`)
+        : `curl -fsSL "${base}/bootstrap.sh" -o frayd-install.sh && bash frayd-install.sh --tunnel ${fixture.posixTunnel} -- ${fixture.posixLib}`;
       assert.equal(b.nodes.get('#cmd').textContent,expected);
     }
   }
 });
 
-test('POSIX generated commands preserve configured values at the actual shell argument boundary',()=>{
+test('POSIX generated commands preserve dash-leading library paths and options at the actual shell argument boundary',()=>{
   const b=installer();
-  const library="Owner's $Library with spaces";
-  const tunnel="cloud'flare$Tunnel";
-  b.nodes.get('#lib').value=library;
-  b.nodes.get('#tunnel-cb').checked=true;
-  b.nodes.get('#tunnel').value=tunnel;
-  for(const os of ['linux','mac']){
-    b.run(`os=${JSON.stringify(os)};gen()`);
-    // Owned shell functions replace both commands; no downloader or installer executes.
-    const stubs='curl() { return 0; }\nbash() { printf "%s\\0" "$@"; }\n';
-    const result=spawnSync('/bin/sh',['-c',stubs+b.nodes.get('#cmd').textContent],{encoding:'utf8',env:{Library:'must-not-expand',Tunnel:'must-not-expand'}});
-    assert.equal(result.status,0,result.stderr);
-    assert.deepEqual(result.stdout.split('\0'),['frayd-install.sh',library,'--tunnel',tunnel,'']);
+  for(const library of ["-weird-dir with spaces", "Owner's $Library with spaces"]){
+    for(const tunnel of ['', 'tailscale', "cloud'flare$Tunnel"]){
+      b.nodes.get('#lib').value=library;
+      b.nodes.get('#tunnel-cb').checked=Boolean(tunnel);
+      b.nodes.get('#tunnel').value=tunnel;
+      for(const os of ['linux','mac']){
+        b.run(`os=${JSON.stringify(os)};gen()`);
+        // Fixture shell functions replace both commands; no downloader or installer executes.
+        const stubs='curl() { return 0; }\nbash() { printf "%s\\0" "$@"; }\n';
+        const result=spawnSync('/bin/sh',['-c',stubs+b.nodes.get('#cmd').textContent],{encoding:'utf8',env:{Library:'must-not-expand',Tunnel:'must-not-expand'}});
+        assert.equal(result.status,0,result.stderr);
+        const options=tunnel?['--tunnel',tunnel]:[];
+        assert.deepEqual(result.stdout.split('\0'),['frayd-install.sh',...options,'--',library,'']);
+      }
+    }
   }
 });

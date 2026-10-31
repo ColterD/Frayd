@@ -1,8 +1,8 @@
-#!/bin/sh
-# Temporary default-main guard until qualified PR2 native removal is merged.
-# Source checkouts have no installer ownership receipt; global cleanup is unsupported.
-printf '%s\n' \
-  'Removal refused: this source checkout is not installer-owned.' \
-  'Use the qualified PR2 native bundle and its ownership-checked removal after acceptance.' \
-  'All files and services are preserved; this command performs no removal.' >&2
-exit 2
+#!/usr/bin/env bash
+set -euo pipefail
+FRAYD_BUNDLE=$(cd -- "$(dirname -- "$0")" && pwd -P)
+if [[ ! -x "$FRAYD_BUNDLE/frayd-native" ]]; then
+  printf '%s\n' 'Run this script from an extracted native bundle or installed prefix.' >&2
+  exit 2
+fi
+exec "$FRAYD_BUNDLE/frayd-native" uninstall "$@"

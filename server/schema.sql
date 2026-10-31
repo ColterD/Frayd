@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS media (
 );
 CREATE INDEX IF NOT EXISTS idx_media_kind ON media(kind);
 CREATE INDEX IF NOT EXISTS idx_media_title ON media(title);
+CREATE INDEX IF NOT EXISTS idx_media_transcode_path ON media(transcode_path);
 
 CREATE TABLE IF NOT EXISTS identities (
   id INTEGER PRIMARY KEY,
@@ -85,3 +86,15 @@ CREATE TABLE IF NOT EXISTS playlist_items (
   pos INTEGER NOT NULL,
   PRIMARY KEY (playlist_id, pos)
 );
+
+-- Exact ownership records only: file-name suffixes never establish ownership.
+CREATE TABLE IF NOT EXISTS transcode_artifacts (
+  path TEXT PRIMARY KEY,
+  owner_media_id INTEGER NOT NULL REFERENCES media(id),
+  owner_source_path TEXT NOT NULL,
+  role TEXT NOT NULL CHECK(role IN ('temp','final')),
+  provenance TEXT NOT NULL CHECK(provenance IN ('generated','legacy_reference')),
+  lifecycle TEXT NOT NULL DEFAULT 'unknown' CHECK(lifecycle IN ('unknown','pending','completed','retiring')),
+  CHECK(path != owner_source_path)
+);
+CREATE INDEX IF NOT EXISTS idx_transcode_artifacts_owner ON transcode_artifacts(owner_media_id);
