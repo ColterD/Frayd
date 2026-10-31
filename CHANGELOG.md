@@ -17,6 +17,7 @@ These notes use [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) categor
 
 ### Changed
 
+- Update HTTP middleware (tower-http 0.7.1), SQLite access (rusqlite 0.41.1), direct HTTP downloads (ureq 3.5.0), password hashing (argon2 0.6.0) and ZIP archive reading (zip 9.2.0).
 - Check library settings before saving them together. Use a separate database connection for scans.
 - Run synchronous database, configuration and root-admission work on blocking workers across request handlers. Keep authorization checks with the protected operations.
 - Use one ordered list of library roots for scans, downloads and cache checks. An explicit library override locks root edits.
@@ -36,6 +37,8 @@ These notes use [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) categor
 
 ### Fixed
 
+- Restore startup with the updated route syntax, including build information and EPUB asset routes.
+- Keep direct downloads independent of inherited HTTP proxy settings.
 - Enable Docker's built-in init for the Compose app so stop signals reach the server without waiting for a forced kill. Active requests and jobs are not guaranteed to drain gracefully.
 - Keep indexed media, progress and notes when a configured root is unavailable. Keep media IDs after source replacement.
 - Hold invalid older saved root settings for repair instead of stopping startup. Show the configuration error in Settings.

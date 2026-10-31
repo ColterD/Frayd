@@ -149,7 +149,7 @@ Container paths must exist inside the container and have the required access. Co
 
 ### Account password
 
-Signed-in users can open **Account** to change their own password. Administrators can use the same password form in Settings. Enter the current password and the new password. A successful change keeps existing sessions valid; it does not sign out other devices. Guests must sign in first.
+Signed-in users can open **Account** to change their own password. Administrators can use the same password form in Settings. Enter the current password and the new password. New accounts (including first-account setup) and password changes require at least 8 Unicode code points. Existing accounts can still sign in with shorter passwords. A successful change keeps existing sessions valid; it does not sign out other devices. Guests must sign in first.
 
 ### Administrator deletion
 

@@ -6,7 +6,7 @@ Run these commands in an isolated checkout, with disposable data. Passing checks
 
 ## Native server
 
-Install a current Rust toolchain, Clippy and a C compiler. On Linux, the Rust tests also need `ffmpeg` and `ffprobe` on `PATH` for the replacement-duration check. The Docker build stage supplies both tools before it runs the tests. Keep `client/` beside `server/`. To run a packaged install instead, follow the [native bundle guide](native-bundle.md). From `server/`:
+The server package declares Rust 1.89 as its minimum version. Install a current Rust toolchain, Clippy and a C compiler. On Linux, the Rust tests also need `ffmpeg` and `ffprobe` on `PATH` for the replacement-duration check. The Docker build stage supplies both tools before it runs the tests. Keep `client/` beside `server/`. To run a packaged install instead, follow the [native bundle guide](native-bundle.md). From `server/`:
 
 ```sh
 cargo test --locked
