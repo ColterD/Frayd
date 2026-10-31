@@ -498,7 +498,8 @@ async fn auth_setup(
 
 /// Serialize the empty-account check with owner creation, admin grant and session
 /// issuance in an immediate transaction. A failed step rolls back all setup writes,
-/// and a competing setup observes the committed account instead of creating another owner.
+/// leaving no owner without an admin grant for a later login to claim bootstrap admin.
+/// A competing setup observes the committed account instead of creating another owner.
 fn auth_setup_blocking(app:Arc<App>,peer:std::net::SocketAddr,headers:axum::http::HeaderMap,req:SetupReq) -> impl IntoResponse {
     if !app.auth_rl.check(&auth::client_ip(&headers, peer.ip(), app.trust_proxy)) {
         return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error": "too many attempts — wait 5 minutes"}))).into_response();
@@ -507,8 +508,6 @@ fn auth_setup_blocking(app:Arc<App>,peer:std::net::SocketAddr,headers:axum::http
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": NEW_PASSWORD_ERROR}))).into_response();
     }
     let mut db = app.db.lock().unwrap();
-    // Count, create, grant and mint the session in one write transaction. Any failure rolls the account
-    // back, so no owner without the admin grant is left for a later login to claim bootstrap admin.
     let Ok(tx) = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
