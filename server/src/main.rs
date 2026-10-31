@@ -73,44 +73,7 @@ async fn main() {
         run_scan(state.clone(), vec![lib]);
     }
 
-    let app = Router::new()
-        .route("/api/health", get(health))
-        .route("/api/media/:id", axum::routing::delete(delete_media))
-        .route("/api/admin/users/:id", axum::routing::delete(remove_user))
-        .route("/api/library", get(library_handler))
-        .route("/api/stream/:id", get(stream))
-        .route("/api/progress", post(set_progress))
-        .route("/api/progress/:media_id", get(get_progress))
-        .route("/api/auth/login", post(auth_login))
-        .route("/api/auth/logout", post(auth_logout))
-        .route("/api/auth/me", get(auth_me))
-        .route("/api/auth/password", post(auth_change_password))
-        .route("/api/setup", get(setup_status).post(auth_setup))
-        .route("/api/admin/perms", get(list_perms).post(set_perm))
-        .route("/api/admin/settings", get(get_settings).post(set_setting))
-        .route("/api/thumb/:id", get(thumb))
-        .route("/api/scan", post(trigger_scan))
-        .route("/api/ingest", post(ingest))
-        .route("/api/scan/status", get(scan_status))
-        .route("/api/party", post(party_create))
-        .route("/api/party/:code/ws", get(party_ws))
-        .route("/api/comic/:id/pages", get(comic_pages))
-        .route("/api/comic/:id/page/:n", get(comic_page))
-        .route("/api/epub/:id/spine", get(epub_spine))
-        .route("/api/epub/:id/toc", get(epub_toc))
-        .route("/api/epub/:id/chunk/:n", get(epub_chunk))
-        .route("/api/epub/:id/asset/*path", get(epub_asset))
-        .route("/api/annotations/:id", get(list_annotations))
-        .route("/api/annotations", post(create_annotation))
-        .route("/api/annotations", axum::routing::delete(delete_annotation))
-        .nest_service("/", ServeDir::new(client_dir()))
-        .layer(
-            tower_http::cors::CorsLayer::new()
-                .allow_origin(tower_http::cors::Any)
-                .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::DELETE])
-                .allow_headers([axum::http::header::AUTHORIZATION, axum::http::header::CONTENT_TYPE]),
-        )
-        .with_state(state.clone());
+    let app = app_router(state.clone(), client_dir());
 
     // Port: FRAYD_PORT env > settings.port > 8484
     let port: u16 = std::env::var("FRAYD_PORT")
@@ -181,6 +144,47 @@ async fn main() {
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
         axum::serve(listener, app).await.unwrap();
     }
+}
+
+fn app_router(state: Arc<App>, client: PathBuf) -> Router {
+    Router::new()
+        .route("/api/health", get(health))
+        .route("/api/media/{id}", axum::routing::delete(delete_media))
+        .route("/api/admin/users/{id}", axum::routing::delete(remove_user))
+        .route("/api/library", get(library_handler))
+        .route("/api/stream/{id}", get(stream))
+        .route("/api/progress", post(set_progress))
+        .route("/api/progress/{media_id}", get(get_progress))
+        .route("/api/auth/login", post(auth_login))
+        .route("/api/auth/logout", post(auth_logout))
+        .route("/api/auth/me", get(auth_me))
+        .route("/api/auth/password", post(auth_change_password))
+        .route("/api/setup", get(setup_status).post(auth_setup))
+        .route("/api/admin/perms", get(list_perms).post(set_perm))
+        .route("/api/admin/settings", get(get_settings).post(set_setting))
+        .route("/api/thumb/{id}", get(thumb))
+        .route("/api/scan", post(trigger_scan))
+        .route("/api/ingest", post(ingest))
+        .route("/api/scan/status", get(scan_status))
+        .route("/api/party", post(party_create))
+        .route("/api/party/{code}/ws", get(party_ws))
+        .route("/api/comic/{id}/pages", get(comic_pages))
+        .route("/api/comic/{id}/page/{n}", get(comic_page))
+        .route("/api/epub/{id}/spine", get(epub_spine))
+        .route("/api/epub/{id}/toc", get(epub_toc))
+        .route("/api/epub/{id}/chunk/{n}", get(epub_chunk))
+        .route("/api/epub/{id}/asset/{*path}", get(epub_asset))
+        .route("/api/annotations/{id}", get(list_annotations))
+        .route("/api/annotations", post(create_annotation))
+        .route("/api/annotations", axum::routing::delete(delete_annotation))
+        .fallback_service(ServeDir::new(client))
+        .layer(
+            tower_http::cors::CorsLayer::new()
+                .allow_origin(tower_http::cors::Any)
+                .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::DELETE])
+                .allow_headers([axum::http::header::AUTHORIZATION, axum::http::header::CONTENT_TYPE]),
+        )
+        .with_state(state)
 }
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1515,3 +1519,92 @@ async fn auth_me(
 
 
 
+
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[tokio::test]
+    async fn production_router_serves_api_nested_epub_assets_and_static_files() {
+        let root = std::env::temp_dir().join(format!("frayd-router-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("index.html"), b"static root fixture").unwrap();
+        let book = root.join("fixture.epub");
+        let mut archive = zip::ZipWriter::new(std::fs::File::create(&book).unwrap());
+        archive
+            .start_file(
+                "OEBPS/images/pixel.png",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        let asset = b"nested asset bytes\0\xff";
+        archive.write_all(asset).unwrap();
+        archive.finish().unwrap();
+        let db = store::open(":memory:");
+        db.execute(
+            "INSERT INTO media (id, kind, path, title) VALUES (1, 'ebook', ?1, 'fixture')",
+            [book.to_str().unwrap()],
+        )
+        .unwrap();
+        let state = Arc::new(App {
+            db: Mutex::new(db),
+            db_path: String::new(),
+            library: std::sync::RwLock::new(None),
+            scanning: std::sync::atomic::AtomicBool::new(false),
+            auth_rl: auth::RateLimiter::new(300, 10),
+            party: Arc::new(party::Party::new()),
+            ingest_status: Mutex::new(None),
+        });
+        let router = app_router(state, root.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        tokio::task::spawn_blocking(move || {
+            let agent = ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_secs(5))
+                .build();
+            let health: serde_json::Value = serde_json::from_reader(
+                agent
+                    .get(&format!("http://{address}/api/health"))
+                    .call()
+                    .unwrap()
+                    .into_reader(),
+            )
+            .unwrap();
+            assert_eq!(health["ok"], true);
+            for (path, expected) in [
+                ("/", b"static root fixture".as_slice()),
+                ("/api/epub/1/asset/OEBPS/images/pixel.png", asset.as_slice()),
+            ] {
+                let mut body = Vec::new();
+                agent
+                    .get(&format!("http://{address}{path}"))
+                    .call()
+                    .unwrap()
+                    .into_reader()
+                    .read_to_end(&mut body)
+                    .unwrap();
+                assert_eq!(body, expected, "{path}");
+            }
+            for path in [
+                "/missing",
+                "/api/epub/1/asset/OEBPS/images/missing.png",
+                "/api/epub/999/asset/OEBPS/images/pixel.png",
+            ] {
+                assert!(
+                    matches!(
+                        agent.get(&format!("http://{address}{path}")).call(),
+                        Err(ureq::Error::Status(404, _))
+                    ),
+                    "{path}"
+                );
+            }
+        })
+        .await
+        .unwrap();
+        server.abort();
+        let _ = server.await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

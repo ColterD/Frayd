@@ -4,7 +4,7 @@
 
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
-use rand::Rng;
+use rand::RngExt;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,7 +77,7 @@ impl Party {
 
     /// Broadcast JSON to every live member.
     pub fn broadcast(&self, v: &Value) {
-        let text = Message::Text(v.to_string());
+        let text = Message::Text(v.to_string().into());
         self.members.lock().unwrap().retain(|(_, tx)| {
             tx.send(text.clone()).is_ok()
         });
@@ -85,8 +85,8 @@ impl Party {
 
     /// Host creates a party, returns join code.
     pub fn create(&self, host: &str) -> String {
-        let code: String = rand::thread_rng()
-            .sample_iter(&rand::distributions::Alphanumeric)
+        let code: String = rand::rng()
+            .sample_iter(&rand::distr::Alphanumeric)
             .filter(|c| c.is_ascii_alphabetic())
             .take(4)
             .map(char::from)
@@ -192,7 +192,7 @@ pub async fn member_socket(party: Arc<Party>, socket: WebSocket, key: String, is
         let st = party.state.lock().unwrap();
         serde_json::json!({ "type": "state", "state": *st, "is_host": is_host })
     };
-    if sink.send(Message::Text(snapshot.to_string())).await.is_err() {
+    if sink.send(Message::Text(snapshot.to_string().into())).await.is_err() {
         return;
     }
     if !is_host {
@@ -248,4 +248,39 @@ pub async fn member_socket(party: Arc<Party>, socket: WebSocket, key: String, is
         party.broadcast(&serde_json::json!({ "type": "members", "members": names }));
     }
     out_task.abort();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_code_is_four_uppercase_ascii_letters() {
+        let party = Party::new();
+        let code = party.create("host");
+        assert_eq!(code.len(), 4);
+        assert!(code.bytes().all(|byte| byte.is_ascii_uppercase()));
+        assert_eq!(party.code.lock().unwrap().as_deref(), Some(code.as_str()));
+        assert!(party.is_host("host"));
+    }
+
+    #[tokio::test]
+    async fn broadcast_delivers_json_text_and_removes_closed_members() {
+        let party = Party::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (closed, closed_rx) = mpsc::unbounded_channel();
+        drop(closed_rx);
+        party
+            .members
+            .lock()
+            .unwrap()
+            .extend([("live".into(), tx), ("closed".into(), closed)]);
+        let payload = serde_json::json!({"type": "state", "title": "Unicode 🎵"});
+        party.broadcast(&payload);
+        let Some(Message::Text(text)) = rx.recv().await else {
+            panic!("expected outbound text")
+        };
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), payload);
+        assert_eq!(party.members.lock().unwrap().len(), 1);
+    }
 }
