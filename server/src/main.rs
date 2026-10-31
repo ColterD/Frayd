@@ -1529,6 +1529,13 @@ mod router_tests {
     async fn production_router_serves_api_nested_epub_assets_and_static_files() {
         let root = std::env::temp_dir().join(format!("frayd-router-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
+        struct RemoveDirectoryOnDrop(PathBuf);
+        impl Drop for RemoveDirectoryOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = RemoveDirectoryOnDrop(root.clone());
         std::fs::write(root.join("index.html"), b"static root fixture").unwrap();
         let book = root.join("fixture.epub");
         let mut archive = zip::ZipWriter::new(std::fs::File::create(&book).unwrap());
@@ -1605,6 +1612,30 @@ mod router_tests {
         .unwrap();
         server.abort();
         let _ = server.await;
-        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn account_passwords_verify_reject_invalid_logins_and_use_distinct_salts() {
+        let db = store::open(":memory:");
+        let password = uuid::Uuid::new_v4().to_string();
+        let wrong_password = uuid::Uuid::new_v4().to_string();
+        for key in ["first@example.invalid", "second@example.invalid"] {
+            auth::create_account(&db, key, &password).unwrap();
+            assert!(auth::verify_login(&db, key, &password).unwrap());
+            assert!(!auth::verify_login(&db, key, &wrong_password).unwrap());
+        }
+        assert!(!auth::verify_login(&db, "missing@example.invalid", &password).unwrap());
+        let hashes: Vec<String> = db
+            .prepare("SELECT secret_hash FROM identities ORDER BY key")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let first = argon2::password_hash::PasswordHash::new(&hashes[0]).unwrap();
+        let second = argon2::password_hash::PasswordHash::new(&hashes[1]).unwrap();
+        assert!(first.salt.is_some());
+        assert!(second.salt.is_some());
+        assert!(first.salt != second.salt);
     }
 }
