@@ -3,7 +3,7 @@
 
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
-use rand::Rng;
+use rand::RngExt;
 use serde_json::Value;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::mpsc;
@@ -83,8 +83,8 @@ impl Party {
         let mut session = self.session.lock().unwrap();
         // Never reuse the replaced party's code: a fresh authorize with an old join link must miss.
         let code = loop {
-            let code = rand::thread_rng()
-                .sample_iter(&rand::distributions::Alphanumeric)
+            let code = rand::rng()
+                .sample_iter(&rand::distr::Alphanumeric)
                 .filter(|c| c.is_ascii_alphabetic())
                 .take(4)
                 .map(char::from)
@@ -151,7 +151,7 @@ impl Party {
         let _ = tx.send(Message::Text(serde_json::json!({
             "type": "state", "state": session.state, "is_host": connection.is_host,
             "self_label": connection.public_label,
-        }).to_string()));
+        }).to_string().into()));
         session.broadcast_members();
         Some(connection)
     }
@@ -222,7 +222,7 @@ impl Session {
 
     /// Enqueues synchronously while the caller holds the session transition lock.
     fn broadcast(&self, value: &Value) {
-        let text = Message::Text(value.to_string());
+        let text = Message::Text(value.to_string().into());
         for member in &self.members {
             let _ = member.tx.send(text.clone());
         }
@@ -399,6 +399,23 @@ pub async fn member_socket(party: Arc<Party>, socket: WebSocket, admission: Admi
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn replacement_codes_keep_the_public_format_and_revoke_previous_admission() {
+        let party = Party::new();
+        let mut previous: Option<String> = None;
+        for _ in 0..64 {
+            let (code, proof) = party.create("host");
+            assert_eq!(code.len(), 4);
+            assert!(code.bytes().all(|byte| byte.is_ascii_uppercase()));
+            assert!(party.authorize(&code, Some(proof)).is_some());
+            if let Some(old) = previous {
+                assert_ne!(code, old);
+                assert!(party.authorize(&old, None).is_none());
+            }
+            previous = Some(code);
+        }
+    }
 
     /// Seeds a deterministic timeline without depending on wall-clock progress.
     fn playing_party() -> Party {
