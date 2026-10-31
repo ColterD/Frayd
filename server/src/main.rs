@@ -116,6 +116,49 @@ fn upnp_mapping_requested(bind: std::net::IpAddr, environment: bool, stored: boo
     !loopback && (environment || stored)
 }
 
+/// Build the HTTP routes used by production and router regression tests.
+fn app_router(state: Arc<App>, client_directory: PathBuf) -> Router {
+    Router::new()
+        .route("/api/health", get(health))
+        .route("/api/build", get(build_info::handler))
+        .route("/api/media/{id}", axum::routing::delete(delete_media))
+        .route("/api/admin/users/{id}", axum::routing::delete(remove_user))
+        .route("/api/library", get(library_handler))
+        .route("/api/stream/{id}", get(stream))
+        .route("/api/progress", post(set_progress))
+        .route("/api/progress/{media_id}", get(get_progress))
+        .route("/api/auth/login", post(auth_login))
+        .route("/api/auth/logout", post(auth_logout))
+        .route("/api/auth/me", get(auth_me))
+        .route("/api/auth/password", post(auth_change_password))
+        .route("/api/setup", get(setup_status).post(auth_setup))
+        .route("/api/admin/perms", get(list_perms).post(set_perm))
+        .route("/api/admin/settings", get(get_settings).post(set_setting))
+        .route("/api/thumb/{id}", get(thumb))
+        .route("/api/scan", post(trigger_scan))
+        .route("/api/ingest", post(ingest))
+        .route("/api/scan/status", get(scan_status))
+        .route("/api/party", post(party_create))
+        .route("/api/party/{code}/ws", get(party_ws))
+        .route("/api/comic/{id}/pages", get(comic_pages))
+        .route("/api/comic/{id}/page/{n}", get(comic_page))
+        .route("/api/epub/{id}/spine", get(epub_spine))
+        .route("/api/epub/{id}/toc", get(epub_toc))
+        .route("/api/epub/{id}/chunk/{n}", get(epub_chunk))
+        .route("/api/epub/{id}/asset/{*path}", get(epub_asset))
+        .route("/api/annotations/{id}", get(list_annotations))
+        .route("/api/annotations", post(create_annotation))
+        .route("/api/annotations", axum::routing::delete(delete_annotation))
+        .fallback_service(ServeDir::new(client_directory))
+        .layer(
+            tower_http::cors::CorsLayer::new()
+                .allow_origin(tower_http::cors::Any)
+                .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::DELETE])
+                .allow_headers([axum::http::header::AUTHORIZATION, axum::http::header::CONTENT_TYPE]),
+        )
+        .with_state(state)
+}
+
 /// Initialize schemas, background scanning, and HTTP routes before accepting requests.
 #[tokio::main]
 async fn main() {
@@ -143,45 +186,7 @@ async fn main() {
         run_scan(state.clone(), ScanRequest { roots: library.roots, for_ingest: false });
     }
 
-    let app = Router::new()
-        .route("/api/health", get(health))
-        .route("/api/build", get(build_info::handler))
-        .route("/api/media/:id", axum::routing::delete(delete_media))
-        .route("/api/admin/users/:id", axum::routing::delete(remove_user))
-        .route("/api/library", get(library_handler))
-        .route("/api/stream/:id", get(stream))
-        .route("/api/progress", post(set_progress))
-        .route("/api/progress/:media_id", get(get_progress))
-        .route("/api/auth/login", post(auth_login))
-        .route("/api/auth/logout", post(auth_logout))
-        .route("/api/auth/me", get(auth_me))
-        .route("/api/auth/password", post(auth_change_password))
-        .route("/api/setup", get(setup_status).post(auth_setup))
-        .route("/api/admin/perms", get(list_perms).post(set_perm))
-        .route("/api/admin/settings", get(get_settings).post(set_setting))
-        .route("/api/thumb/:id", get(thumb))
-        .route("/api/scan", post(trigger_scan))
-        .route("/api/ingest", post(ingest))
-        .route("/api/scan/status", get(scan_status))
-        .route("/api/party", post(party_create))
-        .route("/api/party/:code/ws", get(party_ws))
-        .route("/api/comic/:id/pages", get(comic_pages))
-        .route("/api/comic/:id/page/:n", get(comic_page))
-        .route("/api/epub/:id/spine", get(epub_spine))
-        .route("/api/epub/:id/toc", get(epub_toc))
-        .route("/api/epub/:id/chunk/:n", get(epub_chunk))
-        .route("/api/epub/:id/asset/*path", get(epub_asset))
-        .route("/api/annotations/:id", get(list_annotations))
-        .route("/api/annotations", post(create_annotation))
-        .route("/api/annotations", axum::routing::delete(delete_annotation))
-        .nest_service("/", ServeDir::new(client_dir()))
-        .layer(
-            tower_http::cors::CorsLayer::new()
-                .allow_origin(tower_http::cors::Any)
-                .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::DELETE])
-                .allow_headers([axum::http::header::AUTHORIZATION, axum::http::header::CONTENT_TYPE]),
-        )
-        .with_state(state.clone());
+    let app = app_router(state.clone(), client_dir());
 
     // Port: FRAYD_PORT env > settings.port > 8484
     let port: u16 = std::env::var("FRAYD_PORT")
@@ -2303,7 +2308,7 @@ mod backend_regressions {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let router = Router::new()
-            .route("/api/thumb/:id", get(thumb))
+            .route("/api/thumb/{id}", get(thumb))
             .with_state(app);
         let server = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
@@ -2494,6 +2499,46 @@ mod backend_regressions {
         }
         archive.finish().unwrap();
     }
+    #[tokio::test]
+    async fn production_router_dispatches_api_wildcard_and_static_fallback() {
+        let directory = std::env::temp_dir().join(format!("frayd-router-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let epub = directory.join("book.epub");
+        let chapter = b"<html><body>nested asset</body></html>";
+        write_epub_fixture(&epub, &[("chapters/one.xhtml", chapter)]);
+        let app = app_for(epub.to_str().unwrap());
+        let client = directory.join("client");
+        std::fs::create_dir(&client).unwrap();
+        let index = b"<!doctype html><title>router fixture</title>";
+        std::fs::write(client.join("index.html"), index).unwrap();
+        let router = app_router(app, client);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+        let responses = tokio::task::spawn_blocking(move || {
+            ["/api/health", "/api/epub/1/asset/chapters/one.xhtml", "/", "/missing-router-fixture"]
+                .map(|path| {
+                    let response = match ureq::get(&format!("http://{address}{path}")).call() {
+                        Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+                        Err(error) => panic!("owned HTTP transport: {error}"),
+                    };
+                    let status = response.status();
+                    let mut bytes = Vec::new();
+                    std::io::Read::read_to_end(&mut response.into_reader(), &mut bytes).unwrap();
+                    (status, bytes)
+                })
+        }).await;
+        server.abort();
+        let _ = server.await;
+        let responses = responses.unwrap();
+        assert_eq!(responses[0].0, 200);
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&responses[0].1).unwrap()["status"], "ok");
+        assert_eq!(responses[1], (200, chapter.to_vec()));
+        assert_eq!(responses[2], (200, index.to_vec()));
+        assert_eq!(responses[3].0, 404);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     /// Replace a warmed EPUB and observe current chapter bytes after rescan without losing user state.
     #[tokio::test]
     async fn rescan_invalidates_replaced_epub_spine_and_lazy_reads_current_chapters() {
@@ -2728,8 +2773,8 @@ mod backend_regressions {
             let metadata = serde_json::json!({"pages": names, "synopsis": "keep"}).to_string();
             app.db.lock().unwrap().execute("UPDATE media SET meta_json=?1 WHERE id=1", [&metadata]).unwrap();
             let router = Router::new()
-                .route("/api/comic/:id/pages", get(comic_pages))
-                .route("/api/comic/:id/page/:n", get(comic_page)).with_state(app.clone());
+                .route("/api/comic/{id}/pages", get(comic_pages))
+                .route("/api/comic/{id}/page/{n}", get(comic_page)).with_state(app.clone());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
