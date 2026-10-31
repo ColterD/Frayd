@@ -280,6 +280,13 @@ struct LoginReq {
     password: String,
 }
 
+const MIN_NEW_PASSWORD_CODE_POINTS: usize = 8;
+const NEW_PASSWORD_ERROR: &str = "Password must contain at least 8 Unicode code points";
+
+fn valid_new_password(password: &str) -> bool {
+    password.chars().count() >= MIN_NEW_PASSWORD_CODE_POINTS
+}
+
 /// Household account login: create an Argon2id password hash on first login,
 /// verify the stored hash on subsequent logins, and issue a session token.
 async fn auth_login(
@@ -319,6 +326,10 @@ fn auth_login_blocking(app:Arc<App>,peer:std::net::SocketAddr,headers:axum::http
             }
         }
         None => {
+            // Enforce creation policy only for new accounts; legacy credentials still verify above.
+            if !valid_new_password(&req.password) {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": NEW_PASSWORD_ERROR})));
+            }
             // first login mints the account (household bootstrap)
             if let Err(e) = auth::create_account(&db, &req.email, &req.password) {
                 tracing::warn!("account create failed: {e}");
@@ -418,8 +429,8 @@ fn auth_change_password_blocking(app:Arc<App>,peer:std::net::SocketAddr,headers:
     if !app.auth_rl.check(&format!("pw:{}", auth::client_ip(&headers, peer.ip(), app.trust_proxy))) {
         return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error": "too many attempts — wait 5 minutes"}))).into_response();
     }
-    if req.new.len() < 4 {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "new password too short (min 4)"}))).into_response();
+    if !valid_new_password(&req.new) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": NEW_PASSWORD_ERROR}))).into_response();
     }
     let db = app.db.lock().unwrap();
     let Some(tok) = bearer_token(&headers) else {
@@ -479,8 +490,8 @@ fn auth_setup_blocking(app:Arc<App>,peer:std::net::SocketAddr,headers:axum::http
     if !app.auth_rl.check(&auth::client_ip(&headers, peer.ip(), app.trust_proxy)) {
         return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error": "too many attempts — wait 5 minutes"}))).into_response();
     }
-    if req.password.len() < 4 {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "password too short (min 4)"}))).into_response();
+    if !valid_new_password(&req.password) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": NEW_PASSWORD_ERROR}))).into_response();
     }
     let mut db = app.db.lock().unwrap();
     // Count, create, grant and mint the session in one write transaction. Any failure rolls the account
@@ -1078,7 +1089,13 @@ fn download_direct(url:&str,staging:&StdPath,limits:DirectDownloadLimits) -> Res
         let parsed=direct_url(&current)?;
         let remaining=deadline.checked_duration_since(std::time::Instant::now()).ok_or("Direct transfer deadline exceeded")?;
         // Preserve the prior client feature policy: environment variables never select a proxy.
-        let agent=ureq::Agent::config_builder().proxy(None).max_redirects(0).timeout_connect(Some(limits.connect_timeout.min(remaining))).timeout_global(Some(remaining)).build().new_agent();
+        let agent = ureq::Agent::config_builder()
+            .proxy(None)
+            .max_redirects(0)
+            .timeout_connect(Some(limits.connect_timeout.min(remaining)))
+            .timeout_global(Some(remaining))
+            .build()
+            .new_agent();
         let response=agent.get(parsed.as_str()).header("Accept-Encoding","identity").header("Connection","close")
             .call().map_err(|_|"Direct HTTP request failed")?;
         if matches!(response.status().as_u16(),301|302|303|307|308) {
@@ -5464,5 +5481,70 @@ mod router_tests {
         assert!(first.salt.is_some());
         assert!(second.salt.is_some());
         assert!(first.salt != second.salt);
+    }
+}
+
+
+#[cfg(test)]
+mod password_policy_tests {
+    use super::*;
+
+    fn fixture() -> Arc<App> {
+        test_support::app(store::open(":memory:"), String::new(), Vec::new())
+    }
+
+    fn peer() -> std::net::SocketAddr { "127.0.0.1:9".parse().unwrap() }
+
+    fn boundaries() -> Vec<(String, bool)> {
+        let ascii = test_support::fixture_password();
+        vec![
+            (ascii[..7].to_owned(), false), (ascii[..8].to_owned(), true),
+            ("🎵".repeat(7), false), ("🎵".repeat(8), true),
+            (format!("{}x", "e\u{301}".repeat(3)), false), ("e\u{301}".repeat(4), true),
+        ]
+    }
+
+    #[test]
+    fn setup_and_auto_create_enforce_eight_unicode_code_points() {
+        for (password, accepted) in boundaries() {
+            for setup in [true, false] {
+                let app = fixture();
+                let email = "boundary@example.invalid".to_owned();
+                let response = if setup {
+                    auth_setup_blocking(app.clone(), peer(), Default::default(), SetupReq {email, password: password.clone()}).into_response()
+                } else {
+                    auth_login_blocking(app.clone(), peer(), Default::default(), LoginReq {email, password: password.clone()}).into_response()
+                };
+                assert_eq!(response.status(), if accepted {StatusCode::OK} else {StatusCode::BAD_REQUEST}, "setup={setup}, code points={}", password.chars().count());
+                let db = app.db.lock().unwrap();
+                for table in ["identities", "sessions", "user_perms"] {
+                    let count: i64 = db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap();
+                    assert_eq!(count, i64::from(accepted), "unexpected {table} mutation");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_login_remains_valid_and_password_change_enforces_code_points() {
+        for (new, accepted) in boundaries() {
+            let app = fixture();
+            let old = test_support::fixture_password()[..3].to_owned();
+            let email = "legacy@example.invalid";
+            let mut headers = axum::http::HeaderMap::new();
+            {
+                let db = app.db.lock().unwrap();
+                auth::create_account(&db, email, &old).unwrap();
+                let id: i64 = db.query_row("SELECT id FROM identities WHERE key=?1", [email], |r| r.get(0)).unwrap();
+                let token = auth::create_session(&db, id).unwrap();
+                headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+            }
+            assert_eq!(auth_login_blocking(app.clone(), peer(), Default::default(), LoginReq {email: email.into(), password: old.clone()}).into_response().status(), StatusCode::OK);
+            let response = auth_change_password_blocking(app.clone(), peer(), headers, ChangePwReq {old: old.clone(), new: new.clone()}).into_response();
+            assert_eq!(response.status(), if accepted {StatusCode::NO_CONTENT} else {StatusCode::BAD_REQUEST});
+            let db = app.db.lock().unwrap();
+            assert!(auth::verify_login(&db, email, if accepted { &new } else { &old }).unwrap());
+            if accepted { assert!(!auth::verify_login(&db, email, &old).unwrap()); }
+        }
     }
 }

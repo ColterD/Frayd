@@ -1000,3 +1000,25 @@ for (const scenario of [
     }
   });
 }
+
+
+for (const unit of ['a', '🎵', 'e\u0301']) {
+  test(`password change counts Unicode code points for ${unit}`, async () => {
+    const b = browser();
+    await settle();
+    const { control } = passwordPanel(b);
+    b.run('account={name:"Member",isAdmin:false};openAccount()');
+    const short = [...unit.repeat(7)].slice(0,7).join('');
+    control('.pw-old').value = 'old';
+    control('.pw-new').value = short;
+    b.requests.length = 0;
+    await control('#s-pw-save').onclick();
+    assert.equal(b.requests.length, 0);
+    assert.match(control('#s-pw-save').textContent, /8/);
+    control('.pw-new').value = short + 'x';
+    b.respond(async () => ({ok:true,status:204}));
+    await control('#s-pw-save').onclick();
+    assert.equal(b.requests.filter(r => r.url === '/api/auth/password').length, 1);
+    assert.equal(control('.pw-new').value, '');
+  });
+}

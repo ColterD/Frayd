@@ -856,7 +856,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod dependency_tests {
+mod protocol_tests {
     use super::*;
 
     #[test]
@@ -869,8 +869,8 @@ mod dependency_tests {
         assert!(party.can_register(&admission, "host"));
     }
 
-    #[tokio::test]
-    async fn broadcast_delivers_unicode_json_text() {
+    #[test]
+    fn broadcast_delivers_unicode_json_text() {
         let party = Party::new();
         let (code, _) = party.create("host");
         let admission = party.authorize(&code, None).unwrap();
@@ -879,7 +879,7 @@ mod dependency_tests {
         while rx.try_recv().is_ok() {}
         let payload = serde_json::json!({"type": "state", "title": "Unicode 🎵"});
         party.session.lock().unwrap().broadcast(&payload);
-        let Some(Message::Text(text)) = rx.recv().await else {
+        let Ok(Message::Text(text)) = rx.try_recv() else {
             panic!("expected outbound text")
         };
         assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), payload);
