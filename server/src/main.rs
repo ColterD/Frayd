@@ -1030,18 +1030,18 @@ const DIRECT_DOWNLOAD_LIMITS:DirectDownloadLimits=DirectDownloadLimits {
 };
 
 /// Inspect through the existing URL parser without retaining/logging the input or transport errors.
-fn direct_url(value:&str) -> Result<ureq::RequestUrl,&'static str> {
+fn direct_url(value:&str) -> Result<url::Url,&'static str> {
     if value.chars().any(char::is_control) {return Err("Direct URL contains a control character");}
-    let parsed=ureq::get(value).request_url().map_err(|_|"Direct URL is invalid")?;
-    if !matches!(parsed.as_url().scheme(),"http"|"https") || parsed.as_url().host_str().is_none() {
+    let parsed=url::Url::parse(value).map_err(|_|"Direct URL is invalid")?;
+    if !matches!(parsed.scheme(),"http"|"https") || parsed.host_str().is_none() {
         return Err("Direct URL must use HTTP or HTTPS");
     }
     Ok(parsed)
 }
 
 /// Preserve a portable single MP4 component only; neither query nor fragment contributes a name.
-fn direct_filename(url:&ureq::RequestUrl) -> String {
-    let candidate=url.as_url().path_segments().and_then(|mut parts|parts.next_back())
+fn direct_filename(url:&url::Url) -> String {
+    let candidate=url.path_segments().and_then(|mut parts|parts.next_back())
         .and_then(|name|urlencoding::decode(name).ok()).map(|name|name.into_owned());
     if let Some(name)=candidate {
         let stem=StdPath::new(&name).file_stem().and_then(|value|value.to_str()).unwrap_or("");
@@ -1077,22 +1077,23 @@ fn download_direct(url:&str,staging:&StdPath,limits:DirectDownloadLimits) -> Res
     for redirects in 0..=5 {
         let parsed=direct_url(&current)?;
         let remaining=deadline.checked_duration_since(std::time::Instant::now()).ok_or("Direct transfer deadline exceeded")?;
-        let agent=ureq::AgentBuilder::new().redirects(0).timeout_connect(limits.connect_timeout.min(remaining)).build();
-        let response=agent.get(&current).timeout(remaining).set("Accept-Encoding","identity").set("Connection","close")
+        let agent=ureq::Agent::config_builder().max_redirects(0).timeout_connect(Some(limits.connect_timeout.min(remaining))).timeout_global(Some(remaining)).build().new_agent();
+        let response=agent.get(parsed.as_str()).header("Accept-Encoding","identity").header("Connection","close")
             .call().map_err(|_|"Direct HTTP request failed")?;
-        if matches!(response.status(),301|302|303|307|308) {
+        if matches!(response.status().as_u16(),301|302|303|307|308) {
             if redirects==5 {return Err("Direct redirect limit exceeded");}
-            let location=response.header("Location").ok_or("Direct redirect missing location")?;
+            let location=response.headers().get("Location").and_then(|value|value.to_str().ok()).ok_or("Direct redirect missing location")?;
             if location.chars().any(char::is_control) {return Err("Direct redirect is invalid");}
-            let next=parsed.as_url().join(location).map_err(|_|"Direct redirect is invalid")?;
+            let next=parsed.join(location).map_err(|_|"Direct redirect is invalid")?;
             if !matches!(next.scheme(),"http"|"https") {return Err("Direct redirect must use HTTP or HTTPS");}
             current=next.to_string();continue;
         }
         if response.status()!=200 {return Err("Direct response must be a complete successful file");}
-        if response.all("Content-Encoding").len()>1 || response.header("Content-Encoding").is_some_and(|value|!value.eq_ignore_ascii_case("identity")) {
+        if response.headers().get_all("Content-Encoding").iter().count()>1 || response.headers().get("Content-Encoding").is_some_and(|value|!value.as_bytes().eq_ignore_ascii_case(b"identity")) {
             return Err("Direct response encoding is unsupported");
         }
-        let lengths=response.all("Content-Length");let transfers=response.all("Transfer-Encoding");
+        let lengths=response.headers().get_all("Content-Length").iter().map(|value|value.to_str()).collect::<Result<Vec<_>,_>>().map_err(|_|"Direct content length is invalid")?;
+        let transfers=response.headers().get_all("Transfer-Encoding").iter().map(|value|value.to_str()).collect::<Result<Vec<_>,_>>().map_err(|_|"Direct response framing is ambiguous")?;
         if lengths.len()>1 || transfers.len()>1 || (!lengths.is_empty() && !transfers.is_empty())
             || transfers.first().is_some_and(|value|!value.eq_ignore_ascii_case("chunked")) {
             return Err("Direct response framing is ambiguous");
@@ -1104,7 +1105,7 @@ fn download_direct(url:&str,staging:&StdPath,limits:DirectDownloadLimits) -> Res
         if expected.is_some_and(|length|length==0 || length>limits.max_bytes) {return Err("Direct response size is unsupported");}
         let partial=staging.join(format!("{}.part",uuid::Uuid::new_v4()));
         let mut output=std::fs::OpenOptions::new().write(true).create_new(true).open(&partial).map_err(|_|"Direct staging creation failed")?;
-        let mut reader=response.into_reader();let mut buffer=[0_u8;64*1024];let mut count=0_u64;
+        let mut reader=response.into_body().into_reader();let mut buffer=[0_u8;64*1024];let mut count=0_u64;
         loop {
             if std::time::Instant::now()>=deadline {return Err("Direct transfer deadline exceeded");}
             let read=reader.read(&mut buffer).map_err(|_|"Direct response body failed")?;
@@ -2317,9 +2318,9 @@ mod backend_regressions {
                 .call()
                 .unwrap();
             (
-                response.status(),
-                response.header("Content-Length").unwrap().to_string(),
-                response.header("Content-Type").unwrap().to_string(),
+                response.status().as_u16(),
+                response.headers()["Content-Length"].to_str().unwrap().to_string(),
+                response.headers()["Content-Type"].to_str().unwrap().to_string(),
             )
         })
         .await
@@ -2742,13 +2743,13 @@ mod backend_regressions {
                 let routes = std::iter::once("pages".to_string())
                     .chain((0..=page_count).map(|index| format!("page/{index}")));
                 routes.map(|route| {
-                    let response = match ureq::get(&format!("http://{address}/api/comic/1/{route}")).call() {
-                        Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+                    let response = match ureq::get(&format!("http://{address}/api/comic/1/{route}")).config().http_status_as_error(false).build().call() {
+                        Ok(response) => response,
                         Err(error) => panic!("owned HTTP transport: {error}"),
                     };
                     let status = response.status();
                     let mut bytes = Vec::new();
-                    std::io::Read::read_to_end(&mut response.into_reader(), &mut bytes).unwrap();
+                    std::io::Read::read_to_end(&mut response.into_body().into_reader(), &mut bytes).unwrap();
                     (status, bytes)
                 }).collect::<Vec<_>>()
             }).await;
@@ -2977,10 +2978,11 @@ mod backend_regressions {
         });
         let statuses = tokio::task::spawn_blocking(move || {
             forwarded.into_iter().map(|value| {
-                let mut request = ureq::post(&format!("http://{address}/api/setup")).set("Content-Type", "application/json");
-                if let Some(value) = value { request = request.set("X-Forwarded-For", value); }
-                match request.send_string(r#"{"email":"owner@example.test","password":"x"}"#) {
-                    Ok(response) | Err(ureq::Error::Status(_, response)) => response.status(),
+                let mut request = ureq::post(&format!("http://{address}/api/setup")).header("Content-Type", "application/json");
+                if let Some(value) = value { request = request.header("X-Forwarded-For", value); }
+                match request.send(r#"{"email":"owner@example.test","password":"x"}"#) {
+                    Ok(response) => response.status().as_u16(),
+                    Err(ureq::Error::StatusCode(status)) => status,
                     Err(error) => panic!("owned HTTP transport: {error}"),
                 }
             }).collect::<Vec<_>>()
@@ -3957,11 +3959,11 @@ mod integration_regressions {
             let body = tokio::task::spawn_blocking(move || {
                 let request = ureq::get(&url);
                 let request = if restricted {
-                    request.set("Authorization", &format!("Bearer {token}"))
+                    request.header("Authorization", &format!("Bearer {token}"))
                 } else {
                     request
                 };
-                request.call().unwrap().into_string().unwrap()
+                request.call().unwrap().into_body().read_to_string().unwrap()
             })
             .await
             .unwrap();
@@ -5339,21 +5341,37 @@ mod router_tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         tokio::task::spawn_blocking(move || {
-            let agent = ureq::AgentBuilder::new()
-                .timeout(std::time::Duration::from_secs(5))
-                .build();
+            let agent = ureq::Agent::config_builder()
+                .timeout_global(Some(std::time::Duration::from_secs(5)))
+                .build().new_agent();
+            let preflight = ureq::options(format!("http://{address}/api/annotations"))
+                .header("Origin", "https://reader.example.invalid")
+                .header("Access-Control-Request-Method", "DELETE")
+                .header("Access-Control-Request-Headers", "authorization,content-type")
+                .call().unwrap();
+            assert!(preflight.status().is_success());
+            assert_eq!(preflight.headers()["access-control-allow-origin"], "*");
+            assert_eq!(preflight.headers()["access-control-allow-methods"], "GET,POST,DELETE");
+            assert_eq!(preflight.headers()["access-control-allow-headers"], "authorization,content-type");
+            let range = agent.get(format!("http://{address}/index.html"))
+                .header("Origin", "https://reader.example.invalid")
+                .header("Range", "bytes=0-5").call().unwrap();
+            assert_eq!(range.status(), 206);
+            assert_eq!(range.headers()["access-control-allow-origin"], "*");
+            assert_eq!(range.headers()["content-range"], "bytes 0-5/19");
+            assert_eq!(range.into_body().read_to_vec().unwrap(), b"static");
             let health: serde_json::Value = serde_json::from_reader(
                 agent
                     .get(&format!("http://{address}/api/health"))
                     .call()
                     .unwrap()
-                    .into_reader(),
+                    .into_body().into_reader(),
             )
             .unwrap();
             assert_eq!(health, serde_json::json!({"status": "ok"}));
             let build_response = agent.get(&format!("http://{address}/api/build")).call().unwrap();
-            assert_eq!(build_response.header("Cache-Control"), Some("no-store"));
-            let build: serde_json::Value = serde_json::from_reader(build_response.into_reader()).unwrap();
+            assert_eq!(build_response.headers().get("Cache-Control").and_then(|value|value.to_str().ok()), Some("no-store"));
+            let build: serde_json::Value = serde_json::from_reader(build_response.into_body().into_reader()).unwrap();
             assert_eq!(build["version"], env!("CARGO_PKG_VERSION"));
             for (path, expected) in [
                 ("/", b"static root fixture".as_slice()),
@@ -5364,7 +5382,7 @@ mod router_tests {
                     .get(&format!("http://{address}{path}"))
                     .call()
                     .unwrap()
-                    .into_reader()
+                    .into_body().into_reader()
                     .read_to_end(&mut body)
                     .unwrap();
                 assert_eq!(body, expected, "{path}");
@@ -5377,7 +5395,7 @@ mod router_tests {
                 assert!(
                     matches!(
                         agent.get(&format!("http://{address}{path}")).call(),
-                        Err(ureq::Error::Status(404, _))
+                        Err(ureq::Error::StatusCode(404))
                     ),
                     "{path}"
                 );
@@ -5407,8 +5425,8 @@ mod router_tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        let first = argon2::password_hash::PasswordHash::new(&hashes[0]).unwrap();
-        let second = argon2::password_hash::PasswordHash::new(&hashes[1]).unwrap();
+        let first = argon2::password_hash::phc::PasswordHash::new(&hashes[0]).unwrap();
+        let second = argon2::password_hash::phc::PasswordHash::new(&hashes[1]).unwrap();
         assert!(first.salt.is_some());
         assert!(second.salt.is_some());
         assert!(first.salt != second.salt);
