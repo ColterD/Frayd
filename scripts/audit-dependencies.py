@@ -16,11 +16,14 @@ def fetch_json(request):
 
 
 def classify(packages, results, primary_fetch=fetch_json):
+    """Reject incomplete batches and resolve only the exact verified publisher exception."""
     if len(results) != len(packages):
         raise ValueError('OSV result count differs from lockfile package count')
+    if any(result.get('next_page_token') for result in results):
+        raise ValueError('OSV results are incomplete: pagination requires a complete audit')
     affected = []
     resolved = []
-    for package, result in zip(packages, results):
+    for package, result in zip(packages, results, strict=True):
         for advisory in result.get('vulns', []):
             finding = {'name': package['name'], 'version': package['version'], 'advisory': advisory['id']}
             if (package['name'], package['version'], advisory['id']) != DISPUTED_FINDING:

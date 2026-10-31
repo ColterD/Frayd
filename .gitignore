@@ -1,16 +1,34 @@
+# Build output and dependency caches
 target/
 node_modules/
 __pycache__/
 *.pyc
+.ruff_cache/
+.pytest_cache/
+.venv/
+
+# Local databases and generated media
 *.db
 *.db-wal
 *.db-shm
 *.sqlite
 *.sqlite-*
 server/thumbs/
-DONOTUPLOAD/
-.codex/
+server/transcodes/
+
+# Local configuration and secrets
 .env
 .env.*
 !.env.example
 compose.override.yaml
+
+# Editor and OS leftovers
+.DS_Store
+*~
+*.swp
+*.orig
+*.rej
+
+# Agent and private working directories
+DONOTUPLOAD/
+.codex/
