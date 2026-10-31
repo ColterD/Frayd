@@ -612,7 +612,7 @@ fn thumbnail_path_blocking(app:Arc<App>,id:i64) -> Option<String> {
     db.query_row("SELECT thumb_path FROM media WHERE id=?1",[id],|r|r.get(0)).ok()
 }
 
-/// GET /api/comic/:id/pages → ["p001.jpg", ...] natural-sorted.
+/// GET /api/comic/{id}/pages → ["p001.jpg", ...] natural-sorted.
 async fn comic_pages(
     State(app): State<std::sync::Arc<App>>,
     Path(id): Path<i64>,
@@ -626,7 +626,7 @@ async fn comic_pages(
     }
 }
 
-/// GET /api/comic/:id/page/:n → image bytes for nth (0-based) page.
+/// GET /api/comic/{id}/page/{n} → image bytes for nth (0-based) page.
 async fn comic_page(
     State(app): State<std::sync::Arc<App>>,
     Path((id, n)): Path<(i64, i64)>,
@@ -1237,7 +1237,7 @@ fn party_identity_key(db:&Connection,headers:&axum::http::HeaderMap,identity:Opt
     db.query_row("SELECT key FROM identities WHERE id=?1",[id],|r|r.get(0)).map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-/// GET /api/party/:code/ws — join party socket. Identity via ?identity= or Bearer.
+/// GET /api/party/{code}/ws — join party socket. Identity via ?identity= or Bearer.
 async fn party_ws(
     State(app): State<std::sync::Arc<App>>,
     Path(code): Path<String>,
@@ -1291,7 +1291,7 @@ fn scan_status_blocking(app:Arc<App>) -> Json<serde_json::Value> {
     }))
 }
 
-/// GET /api/epub/:id/asset/OEBPS/images/x.png → raw zip entry bytes.
+/// GET /api/epub/{id}/asset/OEBPS/images/x.png → raw zip entry bytes.
 /// Path traversal guard: reject absolute paths, "..", backslashes.
 async fn epub_asset(
     State(app): State<std::sync::Arc<App>>,
@@ -1321,7 +1321,7 @@ async fn epub_asset(
     }
 }
 
-/// GET /api/epub/:id/spine → [chunk hrefs] in reading order.
+/// GET /api/epub/{id}/spine → [chunk hrefs] in reading order.
 async fn epub_spine(
     State(app): State<std::sync::Arc<App>>,
     Path(id): Path<i64>,
@@ -1335,7 +1335,7 @@ async fn epub_spine(
     }
 }
 
-/// GET /api/epub/:id/toc → [{title, spine_idx}] in reading order.
+/// GET /api/epub/{id}/toc → [{title, spine_idx}] in reading order.
 async fn epub_toc(
     State(app): State<std::sync::Arc<App>>,
     Path(id): Path<i64>,
@@ -1358,7 +1358,7 @@ async fn epub_toc(
     }
 }
 
-/// GET /api/epub/:id/chunk/:n → XHTML bytes of nth spine item, sandboxed MIME.
+/// GET /api/epub/{id}/chunk/{n} → XHTML bytes of nth spine item, sandboxed MIME.
 async fn epub_chunk(
     State(app): State<std::sync::Arc<App>>,
     Path((id, n)): Path<(i64, i64)>,
