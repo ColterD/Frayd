@@ -1,6 +1,8 @@
 """No-network policy tests; real queries run separately in CI."""
 import copy
 import importlib.util
+import subprocess
+import sys
 from pathlib import Path
 import unittest
 
@@ -10,6 +12,8 @@ spec.loader.exec_module(audit)
 
 
 class AuditPolicyTests(unittest.TestCase):
+    """Keep incomplete scans and unverified exceptions from reporting a clean audit."""
+
     def setUp(self):
         self.packages = [{'name': 'block-buffer', 'version': '0.10.4'}]
         self.results = [{'vulns': [{'id': 'GHSA-qwgh-2vcv-g2f7'}]}]
@@ -63,9 +67,58 @@ class AuditPolicyTests(unittest.TestCase):
         self.assertEqual(report['affected'][0]['classification_error'], 'offline')
         self.assertEqual(report['resolved'], [])
 
-    def test_result_count_mismatch_fails(self):
-        with self.assertRaises(ValueError):
-            audit.classify(self.packages, [])
+    def test_paginated_results_fail_before_classifying_any_finding(self):
+        for advisory in [[], [{'id': 'GHSA-qwgh-2vcv-g2f7'}]]:
+            with self.subTest(advisory=advisory):
+                with self.assertRaisesRegex(ValueError, 'incomplete'):
+                    audit.classify(
+                        self.packages * 2,
+                        [self.results[0], {'vulns': advisory, 'next_page_token': 'more-results'}],
+                        lambda url: self.fail('Incomplete batches must not reach publisher policy'))
+
+    def test_complete_clean_result_stays_clean(self):
+        for result in [{}, {'vulns': []}, {'vulns': [], 'next_page_token': ''}]:
+            with self.subTest(result=result):
+                report = audit.classify(self.packages, [result])
+                self.assertEqual(report['affected'], [])
+                self.assertEqual(report['resolved'], [])
+                self.assertEqual(report['checked_packages'], 1)
+
+    def test_cli_exits_nonzero_without_report_on_truncated_response(self):
+        """Exercise the CLI entry point with an incomplete network response."""
+        script = Path(__file__).resolve().parents[1] / 'scripts/audit-dependencies.py'
+        program = """
+import io
+import json
+import runpy
+import sys
+from unittest.mock import patch
+
+def response(request, timeout):
+    '''Return one truncated OSV result for every real lockfile query.'''
+    count = len(json.loads(request.data)['queries'])
+    return io.StringIO(json.dumps({'results': [{'next_page_token': 'more-results'}] * count}))
+
+with patch('urllib.request.urlopen', response):
+    runpy.run_path(sys.argv[1], run_name='__main__')
+"""
+        result = subprocess.run([sys.executable, '-c', program, str(script)],
+                                capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, '')
+        self.assertIn('incomplete', result.stderr)
+
+    def test_result_count_mismatch_fails_before_any_publisher_fetch(self):
+        """A short or long batch is rejected before a row is classified, so the disputed row never reaches the network."""
+        fetched = []
+
+        def record(url):
+            fetched.append(url)
+            return self.primary
+        for results in ([], self.results * 2, self.results + [{}]):
+            with self.subTest(results=len(results)), self.assertRaisesRegex(ValueError, 'count'):
+                audit.classify(self.packages, results, record)
+        self.assertEqual(fetched, [])
 
 
 if __name__ == '__main__':

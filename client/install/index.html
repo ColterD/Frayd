@@ -64,20 +64,16 @@
 
   <div class="status" id="stat"></div>
 
-  <div id="setup" style="display:none; margin-top:18px; border-top:1px solid var(--line); padding-top:16px">
-    <label>Create your owner account (this becomes the admin)</label>
-    <input type="email" id="s-email" placeholder="you@example.com" style="margin-bottom:8px">
-    <input type="password" id="s-pw" placeholder="Password (min 4 chars)">
-    <button class="btn" id="s-go">Create owner &amp; sign in</button>
-    <div class="status" id="s-stat"></div>
-  </div>
+  <p><a href="http://127.0.0.1:8484/" id="open-frayd">Open Frayd →</a></p>
+  <button class="btn" id="retry">Retry server check</button>
+  <div class="status" id="s-stat">Open Frayd and use Sign in. On a new server, the first login creates the owner account.</div>
 
   <ol class="steps">
     <li>Pick your OS, enter your media folder path</li>
     <li>Copy the command, paste it in a terminal (PowerShell on Windows)</li>
     <li>It installs everything, builds, and starts on boot — a few minutes</li>
-    <li>This page turns <span class="ok">green</span> when your server answers</li>
-    <li>Log in — first account becomes the admin</li>
+    <li>Use Open Frayd to open your local app; this page can check its server protocol if your browser permits it</li>
+    <li>Use Sign in inside Frayd; on a new server, the first login creates the owner account</li>
   </ol>
   <p class="sub" style="margin-top:14px">Opening this to the public internet? Add <code>FRAYD_SESSION_DAYS=7</code> to <code>server/.env</code> for shorter sessions. Login attempts are rate-limited automatically.</p>
 </div>
@@ -99,7 +95,8 @@ document.querySelectorAll('.os button').forEach(b => b.onclick = () => {
 
 const lib = () => $('#lib').value.trim() || '';
 const tunnel = () => $('#tunnel-cb').checked ? $('#tunnel').value : '';
-const q = (s) => new URLSearchParams({ os, lib: s, tunnel: tunnel() }).toString();
+const quotePowerShellArgument = value => "'" + value.replaceAll("'", "''") + "'";
+const quotePosixArgument = value => "'" + value.replaceAll("'", "'\\''") + "'";
 
 function gen() {
   if (!os) return;
@@ -108,14 +105,14 @@ function gen() {
   let cmd;
   if (os === 'win') {
     const args = [];
-    if (l) args.push(`-Lib "${l}"`);
-    if (tunnel()) args.push(`-Tunnel ${tunnel()}`);
+    if (l) args.push(`-Lib ${quotePowerShellArgument(l)}`);
+    if (tunnel()) args.push(`-Tunnel ${quotePowerShellArgument(tunnel())}`);
     const argStr = args.length ? ' ' + args.join(' ') : '';
-    cmd = `cd $env:TEMP; irm "${base}/bootstrap.ps1?$(q(l))" | iex; # or:\n# irm "${base}/bootstrap.ps1" -OutFile frayd-install.ps1; .\\frayd-install.ps1${argStr}`;
+    cmd = `& { $ErrorActionPreference = 'Stop'; $fraydInstall = Join-Path $env:TEMP ('frayd-install-' + [guid]::NewGuid().ToString() + '.ps1'); ([IO.File]::Open($fraydInstall, [IO.FileMode]::CreateNew)).Dispose(); try { irm "${base}/bootstrap.ps1" -OutFile $fraydInstall -ErrorAction Stop; powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$fraydInstall"${argStr}; if ($LASTEXITCODE -ne 0) { throw 'Frayd installer failed' } } finally { Remove-Item -LiteralPath $fraydInstall -Force -ErrorAction Stop } }`;
   } else {
     const args = [];
-    if (l) args.push(`'${l}'`);
-    if (tunnel()) args.push(`--tunnel ${tunnel()}`);
+    if (tunnel()) args.push(`--tunnel ${quotePosixArgument(tunnel())}`);
+    if (l) args.push(`-- ${quotePosixArgument(l)}`);
     const argStr = args.length ? ' ' + args.join(' ') : '';
     cmd = `curl -fsSL "${base}/bootstrap.sh" -o frayd-install.sh && bash frayd-install.sh${argStr}`;
   }
@@ -129,93 +126,75 @@ $('#tunnel-cb').onchange = () => { $('#tunnel-opts').style.display = $('#tunnel-
 $('#tunnel').onchange = gen;
 $('#copy').onclick = () => { navigator.clipboard.writeText($('#cmd').textContent); $('#copy').textContent = 'Copied!'; setTimeout(() => $('#copy').textContent = 'Copy command', 1500); };
 
-// poll for a live server: localhost then LAN hostname
-const targets = ['http://localhost:8484', `http://${location.hostname}:8484`].filter((v, i, a) => a.indexOf(v) === i);
-let liveBase = null;
-async function poll() {
-  for (const t of targets) {
-    try {
-      const r = await fetch(t + '/api/library', { mode: 'no-cors', signal: AbortSignal.timeout(2500) });
-      if (r.type === 'opaque' || r.ok) { liveBase = t; break; }
-    } catch {}
-  }
-  if (!liveBase) { $('#stat').textContent = 'Waiting for your server to come up…'; setTimeout(poll, 3000); return; }
-  $('#stat').innerHTML = `<span class="ok">✓ Server is live at ${liveBase}</span> <a href="${liveBase}" style="color:var(--acc)">open Frayd →</a>`;
-  // setup needed? (only works same-origin or with CORS; best-effort) — check BEFORE redirecting,
-  // otherwise we land in the app with no owner account (guest-only limbo)
-  let needsSetup = null; // null = couldn't tell (CORS)
-  try {
-    const s = await (await fetch(liveBase + '/api/setup', { signal: AbortSignal.timeout(2500) })).json();
-    needsSetup = !!s.needed;
-    if (needsSetup) $('#setup').style.display = 'block';
-    else $('#s-stat').innerHTML = '<span class="ok">Owner already set up — just log in.</span>';
-  } catch {
-    $('#s-stat').innerHTML = 'Can’t check setup from here — open Frayd and log in; first account becomes admin.';
-  }
-  // only auto-redirect once owner account exists (or server is set up)
-  if (needsSetup === false) {
-    $('#stat').innerHTML = `<span class="ok">✓ Server is live — taking you to Frayd…</span>`;
-    setTimeout(() => location.href = liveBase, 1500);
-  }
-}
-poll();
+// Only the fixed loopback app is checked; credentials stay inside the app.
+const appBase = 'http://127.0.0.1:8484';
+const maxChecks = 5;
+let checkGeneration = 0;
+let checkTimer = null;
+let checkTimeout = null;
+let checkController = null;
 
-// Admin claim: cache credentials + a locally generated key in the browser, then
-// retry the one-shot /api/setup write until the server's database exists and
-// accepts it. On success the admin session token is cached too, so the redirect
-// lands you signed in as admin (not guest).
-const PENDING_KEY = 'frayd_pending_admin';
-function makeKey() {
-  const b = new Uint8Array(32); crypto.getRandomValues(b);
-  return Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
+function retireChecks() {
+  ++checkGeneration;
+  clearTimeout(checkTimer);
+  checkTimer = null;
+  clearTimeout(checkTimeout);
+  checkTimeout = null;
+  checkController?.abort();
+  checkController = null;
 }
-async function trySetup(claim) {
-  const r = await fetch(liveBase + '/api/setup', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email: claim.email, password: claim.password, key: claim.key }),
-  });
-  return { r, j: await r.json().catch(() => ({})) };
+
+async function protocolJSON(path, signal) {
+  const response = await fetch(appBase + path, { signal, credentials: 'omit', cache: 'no-store' });
+  if (!response.ok || response.type === 'opaque'
+    || !/^application\/json(?:\s*;|$)/i.test(response.headers.get('content-type') || '')) {
+    throw new Error('Unreadable server protocol');
+  }
+  const value = await response.json();
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid server protocol');
+  return value;
 }
-async function flushPending() {
-  const raw = sessionStorage.getItem(PENDING_KEY);
-  if (!raw || !liveBase) return;
-  const claim = JSON.parse(raw);
+
+async function checkServer(generation, attempt) {
+  if (generation !== checkGeneration) return;
+  const controller = new AbortController();
+  checkController = controller;
+  const timeout = checkTimeout = setTimeout(() => controller.abort(), 2500);
   try {
-    const { r, j } = await trySetup(claim);
-    if (r.ok) {
-      sessionStorage.removeItem(PENDING_KEY);
-      localStorage.frayd_token = j.token; // signed-in admin when we land in the app
-      $('#s-stat').innerHTML = '<span class="ok">✓ Owner created — taking you to Frayd…</span>';
-      $('#setup').style.display = 'none';
-      setTimeout(() => location.href = liveBase, 1500);
-    } else if (r.status === 409) {
-      // owner already exists — just go sign in
-      sessionStorage.removeItem(PENDING_KEY);
-      $('#s-stat').innerHTML = '<span class="err">Owner already set up — open Frayd and log in.</span>';
-    } else if (r.status >= 500 || r.status === 429) {
-      // server booting / DB not ready / rate-limited — claim stays cached, retry with backoff
-      const wait = r.status === 429 ? 30000 : 3000;
-      $('#s-stat').innerHTML = r.status === 429
-        ? 'Server busy — retrying in 30s…'
-        : 'Server is still starting — writing your owner account…';
-      setTimeout(flushPending, wait);
-    } else {
-      $('#s-stat').innerHTML = `<span class="err">${j.error || 'Failed (' + r.status + ')'}</span>`;
-    }
+    const health = await protocolJSON('/api/health', controller.signal);
+    if (generation !== checkGeneration) return;
+    if (health.status !== 'ok') throw new Error('Unknown health response');
+    const setup = await protocolJSON('/api/setup', controller.signal);
+    if (generation !== checkGeneration) return;
+    if (typeof setup.needed !== 'boolean') throw new Error('Unknown setup response');
+    $('#stat').textContent = 'Server protocol verified at ' + appBase + '. Open Frayd manually.';
+    $('#s-stat').textContent = setup.needed
+      ? 'Use Open Frayd, then Sign in; the first login on a new server creates the owner account.'
+      : 'Sign in inside Frayd using Open Frayd.';
   } catch {
-    $('#s-stat').innerHTML = 'Waiting for server to finish starting…';
-    setTimeout(flushPending, 3000);
+    if (generation !== checkGeneration) return;
+    $('#stat').textContent = attempt < maxChecks
+      ? 'Server unverified: unavailable or browser access blocked. You can open Frayd manually. Checking again…'
+      : 'Server unverified. Open Frayd manually, or choose Retry server check.';
+    if (attempt < maxChecks) {
+      checkTimer = setTimeout(() => { checkTimer = null; return checkServer(generation, attempt + 1); }, 3000);
+    }
+  } finally {
+    clearTimeout(timeout);
+    if (checkTimeout === timeout) checkTimeout = null;
+    if (checkController === controller) checkController = null;
   }
 }
-$('#s-go')?.addEventListener('click', () => {
-  const email = $('#s-email').value.trim(), pw = $('#s-pw').value;
-  if (!email.includes('@') || pw.length < 4) { $('#s-stat').innerHTML = '<span class="err">Email + password (min 4) required</span>'; return; }
-  const claim = { email, password: pw, key: makeKey(), created: Date.now() };
-  sessionStorage.setItem(PENDING_KEY, JSON.stringify(claim));
-  flushPending();
-});
-// resume an interrupted claim (page reloaded mid-install)
-if (sessionStorage.getItem(PENDING_KEY)) flushPending();
+
+function retryChecks() {
+  retireChecks();
+  $('#stat').textContent = 'Checking local server protocol…';
+  $('#s-stat').textContent = 'Open Frayd and use Sign in. On a new server, the first login creates the owner account.';
+  return checkServer(checkGeneration, 1);
+}
+$('#retry').onclick = retryChecks;
+addEventListener('pagehide', retireChecks);
+retryChecks();
 </script>
 </body>
 </html>

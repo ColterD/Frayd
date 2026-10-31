@@ -12,17 +12,91 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
+      - name: Set up Node.js 22.23.4
+        shell: bash
+        run: |
+          FRAYD_NODE_BIN_DIRECTORY="$RUNNER_TOOL_CACHE/node/22.23.4/x64/bin"
+          if ! test -x "$FRAYD_NODE_BIN_DIRECTORY/node" || test "$("$FRAYD_NODE_BIN_DIRECTORY/node" --version)" != "v22.23.4"; then
+            FRAYD_NODE_TEMP_DIRECTORY="$(mktemp -d "$RUNNER_TEMP/frayd-node-22.23.4.XXXXXXXX")"
+            FRAYD_NODE_ARCHIVE="$FRAYD_NODE_TEMP_DIRECTORY/node-v22.23.4-linux-x64.tar.xz"
+            trap 'rm -f -- "$FRAYD_NODE_ARCHIVE"' EXIT
+            curl --fail --silent --show-error --location --retry 2 --max-time 120 \
+              --output "$FRAYD_NODE_ARCHIVE" https://nodejs.org/dist/v22.23.4/node-v22.23.4-linux-x64.tar.xz
+            # Official v22.23.4 SHASUMS256.txt; verify before extracting or executing.
+            printf '%s  %s\n' 1805bcd35e6815559bd2eb97db438d3fdb0eb3a5e6a977b7c1badca76337e9ce "$FRAYD_NODE_ARCHIVE" | sha256sum --check --status
+            tar -xJf "$FRAYD_NODE_ARCHIVE" -C "$FRAYD_NODE_TEMP_DIRECTORY"
+            FRAYD_NODE_BIN_DIRECTORY="$FRAYD_NODE_TEMP_DIRECTORY/node-v22.23.4-linux-x64/bin"
+          fi
+          test "$("$FRAYD_NODE_BIN_DIRECTORY/node" --version)" = "v22.23.4"
+          printf '%s\n' "$FRAYD_NODE_BIN_DIRECTORY" >> "$GITHUB_PATH"
       - name: Client tests
         run: |
           node --check client/js/app.js
           node --check client/js/party.js
-          node --test tests/client.test.cjs
+          node --check client/js/build-info.js
+          bash -n tests/fixtures/generate-native-resume.sh
+          node --test tests/*.test.cjs
+      - name: Real browser DOM regressions
+        run: node tests/browser-regression.cjs
+      - name: Python lint (locked Ruff)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/frayd-python-lint"
+          "$RUNNER_TEMP/frayd-python-lint/bin/python" -m pip install --disable-pip-version-check --require-hashes --no-deps --only-binary=:all: -r .github/requirements-ci.txt
+          "$RUNNER_TEMP/frayd-python-lint/bin/ruff" check --no-cache --select E4,E7,E9,F,B905 scripts tests
       - name: Compose validation
-        run: docker compose config --quiet
+        run: |
+          docker compose config --quiet
+          docker compose -f compose.yaml -f compose.downloads.yaml config --quiet
       - name: Locked Rust tests, Clippy, release build and runtime images
-        run: docker compose build
+        run: |
+          python3 scripts/build-metadata.py -- docker build -t frayd-qa:local .
+          docker build -f Dockerfile.proxy -t frayd-proxy-qa:local .
+      - name: Export and qualify Linux native bundle
+        shell: bash
+        env:
+          FRAYD_NATIVE_REQUIRE_QUALIFICATION: '1'
+          FRAYD_NATIVE_BUILD_SOURCE: /app/server
+          FRAYD_NATIVE_EXPECT_ARCH: x86_64
+        run: |
+          test ! -e "$FRAYD_NATIVE_BUILD_SOURCE"
+          FRAYD_NATIVE_EXPORT="$(mktemp -d "$RUNNER_TEMP/frayd-native-export.XXXXXXXX")"
+          # Reuse the exact preceding normal Docker build; record its actual compiler.
+          python3 scripts/build-metadata.py -- docker build --target native-export --output "type=local,dest=$FRAYD_NATIVE_EXPORT" .
+          export FRAYD_NATIVE_HELPER="$FRAYD_NATIVE_EXPORT/frayd-native"
+          export FRAYD_NATIVE_TOOLCHAIN_FILE="$FRAYD_NATIVE_EXPORT/rustc-version.txt"
+          test -x "$FRAYD_NATIVE_EXPORT/frayd-server"
+          test -x "$FRAYD_NATIVE_HELPER"
+          test -s "$FRAYD_NATIVE_TOOLCHAIN_FILE"
+          cat "$FRAYD_NATIVE_TOOLCHAIN_FILE"
+          FRAYD_NATIVE_PACKAGE_ROOT="$(mktemp -d "$RUNNER_TEMP/frayd-native-packages.XXXXXXXX")"
+          python3 scripts/native/package.py "$FRAYD_NATIVE_PACKAGE_ROOT/bundle" x86_64-unknown-linux-gnu "$FRAYD_NATIVE_EXPORT/frayd-server" "$FRAYD_NATIVE_HELPER"
+          FRAYD_NATIVE_ARCHIVES=("$FRAYD_NATIVE_PACKAGE_ROOT/bundle/"*.tar.gz)
+          test "${#FRAYD_NATIVE_ARCHIVES[@]}" -eq 1
+          export FRAYD_NATIVE_ARCHIVE="${FRAYD_NATIVE_ARCHIVES[0]}"
+          test -f "$FRAYD_NATIVE_ARCHIVE"
+          python3 - <<'PY'
+          import unittest
+          suite = unittest.defaultTestLoader.discover('tests', pattern='test_native_bundle.py')
+          if suite.countTestCases() == 0:
+              raise SystemExit('No native qualification tests were discovered')
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          if not result.wasSuccessful() or result.skipped:
+              raise SystemExit(1)
+          PY
       - name: Disposable HTTP and persistence integration
-        run: python3 scripts/integration.py
+        run: |
+          python3 scripts/check-build-context.py
+          python3 scripts/integration.py
+          python3 tests/test_dns_recovery.py
+      - name: Opt-in direct HTTP downloads and same-volume rollback qualification
+        env:
+          FRAYD_EXTERNAL_FIXTURE_URL: https://raw.githubusercontent.com/${{ github.event.pull_request.head.repo.full_name || github.repository }}/${{ github.event.pull_request.head.sha || github.sha }}/tests/fixtures/native-resume.mp4
+        run: |
+          node --check scripts/qualify-download-playback.cjs
+          python3 scripts/qualify-downloads.py
+          python3 scripts/qualify-downloads.py --external-tls --external-url "$FRAYD_EXTERNAL_FIXTURE_URL"
+          python3 scripts/qualify-downloads.py --private-assets
   dependency-audit:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -30,7 +104,208 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
+      - name: Python unit tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
       - name: Query OSV for locked crates (fails on applicable advisories)
+        run: python3 scripts/audit-dependencies.py
+  windows-bootstrap:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    env:
+      FRAYD_WINDOWS_REQUIRE_QUALIFICATION: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Record Windows qualification environment
+        shell: pwsh
         run: |
-          python3 -m unittest discover -s tests -p 'test_*.py'
-          python3 scripts/audit-dependencies.py
+          git rev-parse HEAD
+          python --version
+          $PSVersionTable
+          powershell.exe -NoProfile -NonInteractive -Command '$PSVersionTable'
+          Write-Output "Runner image: $env:ImageOS / $env:ImageVersion"
+      - name: Execute installer and startup regressions without installing software
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath tests/test_bootstrap_windows.py -PathType Leaf)) {
+            throw 'Required Windows qualification suite is missing'
+          }
+          @'
+          import unittest
+          suite = unittest.defaultTestLoader.discover('tests', pattern='test_bootstrap_windows.py')
+          if suite.countTestCases() == 0:
+              raise SystemExit('No Windows bootstrap tests were discovered')
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          if not result.wasSuccessful() or result.skipped:
+              raise SystemExit(1)
+          '@ | python
+  windows-native-build:
+    runs-on: windows-2025
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install official Rust 1.99.1 and record compiler and OS
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install 1.99.1 --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain installation failed' }
+          rustc +1.99.1 --version --verbose
+          if ($LASTEXITCODE -ne 0) { throw 'Rust compiler identity failed' }
+          [System.Environment]::OSVersion.VersionString
+          $PSVersionTable
+          Write-Output "Runner image: $env:ImageOS / $env:ImageVersion"
+      - name: Build both auto-discovered binaries with locked source identity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python scripts/build-metadata.py -- cargo +1.99.1 build --locked --release --manifest-path server/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw 'Locked Windows release build failed' }
+      - name: Qualify binary identity, helper refusal and disposable HTTP startup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          import json
+          import os
+          import re
+          from pathlib import Path
+          import shutil
+          import socket
+          import subprocess
+          import sys
+          import tempfile
+          import time
+          import tomllib
+          import urllib.error
+          import urllib.request
+
+          def require(condition, message):
+              if not condition:
+                  raise RuntimeError(message)
+
+          root = Path.cwd()
+          release = root / 'server/target/release'
+          server = release / 'frayd-server.exe'
+          helper = release / 'frayd-native.exe'
+          commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True, timeout=15).strip()
+          version = tomllib.loads((root / 'server/Cargo.toml').read_text())['package']['version']
+          identity = json.loads(subprocess.check_output([str(server), '--build-info'], text=True, timeout=10))
+          require(identity['commit'] == commit, 'Binary source commit mismatch')
+          require(identity['dirty'] is False, 'Binary source must be clean')
+          require(identity['version'] == version, 'Binary package version mismatch')
+          refusal = subprocess.run([str(helper), '--build-info'], capture_output=True, text=True, timeout=10, check=False)
+          require(refusal.returncode == 2, 'Non-Unix helper must refuse with exit 2')
+          require(not refusal.stdout and refusal.stderr.strip() ==
+                  'frayd-native supports Linux/macOS only; the existing source bootstrap starts frayd-server directly',
+                  'Non-Unix helper refusal changed')
+          print('PASS: exact clean source identity and non-Unix helper refusal', flush=True)
+
+          fixture = Path(tempfile.mkdtemp(prefix='frayd-windows-http-', dir=os.environ['RUNNER_TEMP']))
+          fixture.chmod(0o700)
+          library = fixture / 'empty-library'
+          library.mkdir()
+          with socket.socket() as reservation:
+              reservation.bind(('127.0.0.1', 0))
+              port = reservation.getsockname()[1]
+          env = {key: value for key, value in os.environ.items() if not key.upper().startswith('FRAYD_')}
+          env.update(FRAYD_BIND='127.0.0.1', FRAYD_PORT=str(port), FRAYD_UPNP='0',
+                     FRAYD_DOWNLOADS_ENABLED='0', FRAYD_LIBRARY=str(library),
+                     FRAYD_DB=str(fixture / 'frayd.db'), FRAYD_THUMBS=str(fixture / 'thumbs'),
+                     FRAYD_TRANSCODES=str(fixture / 'transcodes'), FRAYD_CLIENT_DIR=str(root / 'client'))
+          opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+          def get(path):
+              with opener.open(f'http://127.0.0.1:{port}{path}', timeout=2) as response:
+                  return response.read(4 * 1024 * 1024 + 1)
+
+          child = None
+          succeeded = False
+          cleanup_ok = True
+          try:
+              with (fixture / 'server.log').open('wb') as log:
+                  child = subprocess.Popen([str(server)], cwd=fixture, env=env, stdin=subprocess.DEVNULL,
+                                           stdout=log, stderr=subprocess.STDOUT)
+                  deadline = time.monotonic() + 30
+                  while True:
+                      require(child.poll() is None, 'Server exited before readiness')
+                      try:
+                          require(json.loads(get('/api/health')) == {'status': 'ok'}, 'Unexpected health response')
+                          break
+                      except (OSError, urllib.error.URLError):
+                          require(time.monotonic() < deadline, 'HTTP readiness deadline exceeded')
+                          time.sleep(0.2)
+                  require(json.loads(get('/api/build')) == identity, 'HTTP build identity mismatch')
+                  assets = ('index.html', 'css/frayd.css', 'js/app.js', 'js/party.js', 'js/build-info.js',
+                            'vendor/plyr/plyr.min.js', 'vendor/plyr/plyr.min.css', 'vendor/plyr/plyr.svg')
+                  for asset in assets:
+                      require(get('/' if asset == 'index.html' else '/' + asset) ==
+                              (root / 'client' / asset).read_bytes(), f'HTTP asset mismatch: {asset}')
+                  require((fixture / 'frayd.db').is_file(), 'Private fixture database missing')
+                  require(not list(library.iterdir()), 'Synthetic empty library changed')
+                  print('PASS: loopback health, build identity and all eight public asset bytes', flush=True)
+                  succeeded = True
+          finally:
+              scenario_failed = sys.exc_info()[0] is not None
+              # Popen retains one server handle; never look up or kill a PID/name.
+              # Empty library, UPnP off and downloads off create no startup children.
+              # Any future startup child requires a containment upgrade.
+              if child is not None:
+                  try:
+                      if child.poll() is None:
+                          child.terminate()
+                      child.wait(timeout=10)
+                  except Exception as error:
+                      cleanup_ok = False
+                      print(f'Cleanup held: {error}', file=sys.stderr)
+              log_ok = False
+              if child is not None and cleanup_ok:
+                  try:
+                      # The writer is closed and the owned child has exited before this bounded read.
+                      with (fixture / 'server.log').open('rb') as log:
+                          log_bytes = log.read(1024 * 1024 + 1)
+                      require(len(log_bytes) <= 1024 * 1024, 'Startup log exceeds 1 MiB acceptance limit')
+                      text = re.sub(r'\x1b\[[0-9;]*m', '', log_bytes.decode('utf-8'))
+                      counts = {level: len(re.findall(r'\b' + level + r'\b', text))
+                                for level in ('WARN', 'ERROR')}
+                      counts['panic'] = len(re.findall(r'\bpanic(?:ked|king)?\b', text, re.IGNORECASE))
+                      print('Startup log counts: ' + json.dumps(counts, sort_keys=True), flush=True)
+                      require(counts['ERROR'] == 0 and counts['panic'] == 0,
+                              'Startup log contains ERROR or panic; fixture retained')
+                      log_ok = True
+                  except Exception as error:
+                      print(f'Log acceptance failed: {error}', file=sys.stderr)
+              if succeeded and not scenario_failed and cleanup_ok and log_ok:
+                  try:
+                      shutil.rmtree(fixture)
+                  except Exception as error:
+                      cleanup_ok = False
+                      print(f'Fixture cleanup failed: {error}', file=sys.stderr)
+                  else:
+                      print('PASS: owned child reaped, startup log accepted and disposable fixture removed', flush=True)
+              if scenario_failed or not succeeded or not cleanup_ok or not log_ok:
+                  print(f'Fixture kept until runner cleanup: {fixture}', file=sys.stderr)
+                  try:
+                      # Only this synthetic fixture log; seek/read bounds also hold for oversized logs.
+                      with (fixture / 'server.log').open('rb') as log:
+                          log.seek(0, os.SEEK_END)
+                          log.seek(max(0, log.tell() - 4096))
+                          tail = log.read(4096)
+                      text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', tail.decode('utf-8', errors='replace'))
+                      for line in text.splitlines():
+                          print('server.log tail | ' + line, file=sys.stderr)
+                  except Exception as error:
+                      # Diagnostic failure must never replace the scenario or acceptance failure.
+                      print(f'Server log tail unavailable: {type(error).__name__}', file=sys.stderr)
+              if not scenario_failed and (not cleanup_ok or not log_ok):
+                  raise RuntimeError('Windows log acceptance or cleanup failed; inspect retained fixture')
+          '@ | python
+          if ($LASTEXITCODE -ne 0) { throw 'Windows binary/runtime qualification failed' }
