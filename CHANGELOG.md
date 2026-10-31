@@ -1,9 +1,6 @@
 # Changelog
 
 These notes use [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) categories.
-See the [verification appendix](https://gist.github.com/ColterD/599a8a4532de0f60e31573cccb27d179) for source identities, test status and limits.
-The appendix records the current source, results and remaining limits.
-Historical results apply only to their named source.
 
 ## [Unreleased]
 
@@ -106,4 +103,3 @@ Historical results apply only to their named source.
 - Native shutdown covers descendants that stay in the owned process group. A process that leaves that group is outside this guarantee.
 - Keep uncertain native child records after incomplete cleanup. This behavior does not provide complete process-tree containment.
 - Public hosting, signing, physical audio and broad upgrade compatibility remain unqualified.
-- Support ticket #39355 recovered approval-only counts for an older review. The full raw diagnostic output was not retained.

@@ -8,6 +8,8 @@ Install and uninstall prompt before they write anything. `--yes` skips the promp
 
 ## Build and package
 
+From the repository root, with Rust 1.99.1, Python 3.11 or later and a C compiler installed:
+
 ```sh
 cargo +1.99.1 build --locked --release --manifest-path server/Cargo.toml \
   --bin frayd-server --bin frayd-native

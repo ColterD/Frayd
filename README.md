@@ -36,7 +36,7 @@ The default named volume stores accounts, progress, thumbnails, conversions and 
 ## Documentation
 
 - [Documentation index](docs/README.md): guides by task.
-- [Changelog](CHANGELOG.md): unreleased product changes and verification status.
+- [Changelog](CHANGELOG.md): unreleased product changes.
 - [Operations](docs/operations.md): media mounts, permissions, storage, cache limits, stopping and removal, backup and troubleshooting.
 - [Development](docs/development.md): native setup, the checks CI runs, disposable QA and dependency-audit policy.
 - [Native bundle](docs/native-bundle.md): the experimental private native install.

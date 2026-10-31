@@ -19,7 +19,7 @@ Use a disposable media directory. A native run has no Compose network isolation,
 
 The default database is `frayd.db` under the server source directory that was compiled in, and thumbnails and conversions default to the same place. Moving a bare server binary does not relocate them. Leave `FRAYD_TRUSTED_PROXY` unset for a direct native run, so login rate limits use the connection address. Set `FRAYD_DB`, `FRAYD_THUMBS` and `FRAYD_TRANSCODES` to writable disposable paths, separate from any read-only source library, and set `FRAYD_CLIENT_DIR` to the client assets you intend to serve. The packaged launcher sets all of these to private paths and binds to loopback.
 
-`default-run = "frayd-server"` keeps `cargo run` working now that the `frayd-native` helper binary exists. The helper also depends directly on `libc`, for `geteuid`. Tokio already locks the same version, so the lockfile gains no package. See [configuration and storage](operations.md#configuration-and-storage) for the environment overrides and cache limits. Install `ffmpeg` and `ffprobe` yourself for native runs. The Docker image includes them.
+See [configuration and storage](operations.md#configuration-and-storage) for the environment overrides and cache limits. Install `ffmpeg` and `ffprobe` yourself for native runs. The Docker image includes them.
 
 ## Canonical checks
 
@@ -32,6 +32,7 @@ On macOS, the full Python test command below requires Python 3.13 or later for t
 ```sh
 node --check client/js/app.js
 node --check client/js/party.js
+node --check client/js/build-info.js
 node --test tests/*.test.cjs
 python3 -m unittest discover -s tests -p 'test_*.py'
 docker compose config --quiet
@@ -90,6 +91,8 @@ The separate `windows-native-build` job uses `windows-2025`, official Rust 1.99.
 - Cleanup of the child through its retained process handle. After child exit, a bounded startup-log check requires zero errors and panics, and reports warnings separately.
 
 This covers basic source builds and startup. The separate `windows-bootstrap` job uses fixtures and stubbed Cargo. Neither job qualifies a full Windows installation, browser playback, media tools or production deployment. The native bundle helper supports Linux and macOS only. A configured job is not proof of a pass; Windows qualification requires a passing run at the exact source revision.
+
+The bootstrap regressions in `tests/test_bootstrap_windows.py` run `bootstrap.ps1` under Windows PowerShell 5.1 and PowerShell 7 with stub commands and run the generated startup launcher. They do not install real Git, Rust, FFmpeg or tunnel software. Generated-command tests use both parent engines; the generated command always starts a Windows PowerShell 5.1 child, including from a PowerShell 7 parent. The Windows PowerShell 5.1 policy control requires direct file execution under `Restricted` to fail and the generated child under `Bypass` to succeed. These controls qualify observed behavior; they do not certify that Group Policy is absent. The tests bound the owned process tree and use a disposable harmless child to check entry-file cleanup. Required Windows qualification runs both parent shells and rejects missing engines or skipped cases.
 
 The manual [macOS workflow](../.github/workflows/release-mac.yml) builds the native bundle on `macos-15` (ARM64) and `macos-15-intel` (x86_64), with a 35-minute limit per job. It checks the actual architecture and runs each platform's native lifecycle suite. It has no tag trigger, publishes nothing and uploads no artifact.
 
