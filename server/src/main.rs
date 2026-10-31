@@ -1077,7 +1077,8 @@ fn download_direct(url:&str,staging:&StdPath,limits:DirectDownloadLimits) -> Res
     for redirects in 0..=5 {
         let parsed=direct_url(&current)?;
         let remaining=deadline.checked_duration_since(std::time::Instant::now()).ok_or("Direct transfer deadline exceeded")?;
-        let agent=ureq::Agent::config_builder().max_redirects(0).timeout_connect(Some(limits.connect_timeout.min(remaining))).timeout_global(Some(remaining)).build().new_agent();
+        // Preserve the prior client feature policy: environment variables never select a proxy.
+        let agent=ureq::Agent::config_builder().proxy(None).max_redirects(0).timeout_connect(Some(limits.connect_timeout.min(remaining))).timeout_global(Some(remaining)).build().new_agent();
         let response=agent.get(parsed.as_str()).header("Accept-Encoding","identity").header("Connection","close")
             .call().map_err(|_|"Direct HTTP request failed")?;
         if matches!(response.status().as_u16(),301|302|303|307|308) {
@@ -5114,6 +5115,42 @@ mod direct_download_tests {
     }
     fn response(body:&[u8],headers:&str) -> Vec<u8> {
         let mut output=format!("HTTP/1.1 200 OK\r\n{headers}Connection: close\r\n\r\n").into_bytes();output.extend_from_slice(body);output
+    }
+
+    /// Proxy settings belong only to the child, so parallel tests keep their environment.
+    #[test]
+    fn direct_download_ignores_environment_proxies() {
+        if std::env::var_os("FRAYD_TEST_DIRECT_PROXY").is_none() {
+            for closed in [true, false] {
+                let proxy=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address=format!("http://{}",proxy.local_addr().unwrap());
+                proxy.set_nonblocking(true).unwrap();
+                let proxy=if closed {drop(proxy);None} else {Some(proxy)};
+                let mut child=test_support::child("direct_download_tests::direct_download_ignores_environment_proxies");
+                child.env("FRAYD_TEST_DIRECT_PROXY","1").env("NO_PROXY","").env("no_proxy","");
+                for key in ["HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy"] {
+                    child.env(key,&address);
+                }
+                test_support::assert_child_passes(&mut child);
+                if let Some(proxy)=proxy {
+                    assert_eq!(proxy.accept().unwrap_err().kind(),std::io::ErrorKind::WouldBlock,
+                        "direct download connected to the synthetic proxy");
+                }
+            }
+            return;
+        }
+        let staging=std::env::temp_dir().join(format!("frayd-direct-proxy-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir(&staging).unwrap();
+        let bytes=include_bytes!("../../tests/fixtures/native-resume.mp4");
+        let (url,server)=response_server(response(bytes,&format!("Content-Length: {}\r\n",bytes.len())),None);
+        let limits=DirectDownloadLimits{max_bytes:bytes.len() as u64,
+            transfer_timeout:std::time::Duration::from_secs(2),connect_timeout:std::time::Duration::from_secs(1)};
+        let result=download_direct(&url,&staging,limits);
+        if result.is_err() {std::fs::remove_dir_all(&staging).unwrap();}
+        assert_eq!(result,Ok(()),"loopback download must ignore inherited proxy settings");
+        server.join().unwrap();
+        assert_eq!(std::fs::read(staging.join("owned.mp4")).unwrap(),bytes);
+        std::fs::remove_dir_all(staging).unwrap();
     }
 
     /// Build and independently decode a small public MP4 gzip fixture using the system test tool.
