@@ -995,6 +995,35 @@ mod native {
         }
     }
 
+    async fn wait_for_group_absence(
+        mut probe: impl FnMut() -> io::Result<()>,
+        retry_permission_denied: bool,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        // Only ESRCH establishes absence. The caller has already reaped and
+        // must never send another nonzero signal to this reusable group ID.
+        loop {
+            let result = probe();
+            // Darwin can report EPERM while only exited group members remain.
+            // This is unresolved, never absence: require ESRCH within the same deadline.
+            let absent = match result {
+                Err(error)
+                    if retry_permission_denied && error.raw_os_error() == Some(libc::EPERM) =>
+                {
+                    false
+                }
+                result => group_probe_absent(result)?,
+            };
+            if absent {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return reject("child group still exists after cleanup; child receipts retained");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
     fn owned_group_signal(pid: libc::pid_t, signal: i32) -> Result<()> {
         // ECHILD rejects signalling before any numeric PID/PGID lookup or kill.
         // WNOWAIT also checks custody immediately before each nonzero signal.
@@ -1060,21 +1089,20 @@ mod native {
         // No further nonzero signal may use this now-reusable ID. A surviving,
         // permission-denied or reused group conservatively retains both receipts.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            // SAFETY: signal zero only probes existence and cannot terminate a process.
-            let probe = if unsafe { libc::killpg(pid, 0) } == 0 {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
-            };
-            if group_probe_absent(probe)? {
-                return Ok(status);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return reject("child group still exists after cleanup; child receipts retained");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        wait_for_group_absence(
+            || {
+                // SAFETY: signal zero only probes existence and cannot terminate a process.
+                if unsafe { libc::killpg(pid, 0) } == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            },
+            cfg!(target_os = "macos"),
+            deadline,
+        )
+        .await?;
+        Ok(status)
     }
 
     #[cfg(any(target_os = "macos", test))]
@@ -1669,6 +1697,80 @@ mod native {
                     .to_string();
                 assert!(error.contains("child group cleanup uncertain"), "{error}");
                 assert!(error.contains("child receipts retained"), "{error}");
+            }
+        }
+
+        #[tokio::test]
+        async fn macos_group_probe_retries_until_confirmed_absence() {
+            let mut results = [Err(libc::EPERM), Ok(()), Err(libc::ESRCH)].into_iter();
+            let mut calls = 0;
+            wait_for_group_absence(
+                || {
+                    calls += 1;
+                    results
+                        .next()
+                        .expect("probe after absence")
+                        .map_err(io::Error::from_raw_os_error)
+                },
+                true,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            assert_eq!(calls, 3, "only ESRCH may establish absence");
+        }
+
+        #[tokio::test]
+        async fn unresolved_group_probe_keeps_its_original_deadline() {
+            for permission_denied in [false, true] {
+                let mut calls = 0;
+                let error = wait_for_group_absence(
+                    || {
+                        calls += 1;
+                        if permission_denied {
+                            Err(io::Error::from_raw_os_error(libc::EPERM))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    true,
+                    tokio::time::Instant::now(),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+                assert_eq!(calls, 1, "expired deadline must never be renewed");
+                assert!(
+                    error.contains("child group still exists after cleanup"),
+                    "{error}"
+                );
+                assert!(error.contains("child receipts retained"), "{error}");
+            }
+        }
+
+        #[tokio::test]
+        async fn group_probe_other_errors_fail_without_retry() {
+            for retry_permission_denied in [false, true] {
+                for errno in [libc::EPERM, libc::EIO, libc::EINVAL] {
+                    if retry_permission_denied && errno == libc::EPERM {
+                        continue;
+                    }
+                    let mut calls = 0;
+                    let error = wait_for_group_absence(
+                        || {
+                            calls += 1;
+                            Err(io::Error::from_raw_os_error(errno))
+                        },
+                        retry_permission_denied,
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+                    )
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                    assert_eq!(calls, 1, "unexpected error must fail immediately");
+                    assert!(error.contains("child group cleanup uncertain"), "{error}");
+                    assert!(error.contains("child receipts retained"), "{error}");
+                }
             }
         }
 

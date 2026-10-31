@@ -27,8 +27,8 @@ Historical results apply only to their named source.
 - Support bounded, open-ended and suffix byte ranges for media requests. Keep converted output in a separate cache.
 - Limit the files Docker can copy into an image. Limit package download waits. Let nginx resolve the app address after replacement.
 - Run macOS qualification by manual request with read-only access. Check separate ARM64 and Intel archives. Publish nothing from that workflow.
-- Reject optimized Python for build-context, HTTP integration and DNS qualification. Keep required assertions active before those commands create test resources.
-- Bound Windows entry-point qualification with an owned process-tree deadline. Use a disposable harmless child to check script cleanup and process-only execution-policy behavior.
+- Reject optimized Python for build-context, HTTP integration and DNS qualification. Document that these checks need assertions: no `-O` or `-OO`, with `PYTHONOPTIMIZE` unset.
+- Bound Windows entry-point qualification with an owned process-tree deadline. Use a disposable harmless child to check script cleanup and process-only execution-policy behavior. Test both outer PowerShell hosts; the nested installer still runs under `powershell.exe`.
 - Give each native terminal test a separate terminal. Read its output and bound timeout cleanup while preserving child ownership.
 
 ### Removed
@@ -76,14 +76,16 @@ Historical results apply only to their named source.
 - Preserve UTF-8 library paths in Windows setup. Use an explicit child-process execution policy for the generated Windows install command.
 - Report Homebrew prerequisite failures. Explain that the first login creates the owner account on a new server.
 - Reserve a fresh Windows installer filename. Stop on download or child-process failure and remove only that attempt’s file.
-- Limit relaxed PowerShell 5.1 error handling to the optional Tailscale address lookup. Restore the previous error policy afterward.
+- Limit relaxed PowerShell 5.1 error handling to the optional Tailscale address lookup. Restore the previous error policy and clear the lookup's native exit status before setup continues.
 - Install only required Homebrew tools. Leave CBR support optional instead of requesting an unavailable unrar formula.
 - Check native install cancellation before owned writes, between copy chunks and before publication. Roll back only paths whose recorded identities still match.
 - Preserve paths whose install identity could not be recorded. Remove only an empty reservation whose recorded identity still matches.
 - Give the native server null input. Refuse start when an output terminal uses TOSTOP, before creating child records or starting the server.
 - Accept verified `/dev/null` output on macOS. Keep closed descriptors and unknown device errors as startup failures.
 - Handle INT, TERM, HUP and QUIT during native supervision. Stop the owned server process group before removing its child records.
-- Allow macOS group-signal EPERM progress only after a fresh wait confirms the owned server exited without reaping. Keep child records until final group absence.
+- Allow macOS group-signal EPERM progress only after a fresh wait confirms the owned server exited without reaping. After reaping, retry signal-zero EPERM within the existing five-second wait. Remove child records only after ESRCH confirms group absence.
+- Keep native test fixtures and receipts when a timed-out helper may leave a server or cleanup cannot be confirmed.
+- Keep Docker cleanup-timeout warnings visible on the sanitized command-timeout error.
 - Document source-install removal separately from native-bundle removal. Clarify fresh-clone upstream checks and canonical temporary-directory paths.
 
 ### Security
