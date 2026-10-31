@@ -25,7 +25,7 @@ See [configuration and storage](operations.md#configuration-and-storage) for the
 
 From the repository root, with Node.js 22 or later, Python 3.11 or later, Docker Engine and Compose:
 
-Run Python qualification commands with optimization disabled: do not pass `-O` or `-OO`, and leave `PYTHONOPTIMIZE` unset. The scripts require assertions and refuse optimized execution.
+Run Python qualification commands with optimization disabled: do not pass `-O` or `-OO`, and leave `PYTHONOPTIMIZE` unset. The integration, build-context, DNS-recovery and download-qualification scripts refuse optimized execution; keep the unittest suites unoptimized because some checks use plain `assert`.
 
 On macOS, the full Python test command below requires Python 3.13 or later for the native harness's `os.waitid` child-custody checks. See [native checks](native-bundle.md#checks). Other platforms retain the Python 3.11 minimum.
 
