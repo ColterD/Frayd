@@ -2,6 +2,8 @@ name: Native macOS qualification (no publication)
 
 on:
   workflow_dispatch:
+  push:
+    branches: [qa/native-final53-20261030]
 
 permissions:
   contents: read
