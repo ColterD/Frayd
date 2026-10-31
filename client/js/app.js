@@ -291,7 +291,7 @@ async function saveSettings(payload, generation) {
 function passwordMarkup() {
   return account ? `<div class="party-sec">Your password</div>
       <div class="perm-row"><label class="k" for="account-pw-old">Current</label><input id="account-pw-old" autocomplete="current-password" type="password" class="pw-old" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px"></div>
-      <div class="perm-row"><label class="k" for="account-pw-new">New (min 8 code points)</label><input id="account-pw-new" autocomplete="new-password" type="password" class="pw-new" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px"></div>
+      <div class="perm-row"><label class="k" for="account-pw-new">New (min 8 characters)</label><input id="account-pw-new" autocomplete="new-password" type="password" class="pw-new" style="background:#0D0E12;color:#fff;border:1px solid #262833;border-radius:6px;padding:5px 8px"></div>
       <button id="s-pw-save" style="margin-top:10px;width:100%;background:#16181E;color:#fff;border:1px solid #2a2d36;border-radius:8px;padding:10px;cursor:pointer">Change password</button>` : '';
 }
 /** Bind one panel's password submission to its account and panel lifetime. */
@@ -303,7 +303,7 @@ function bindPassword(stage, generation) {
   button.onclick = async () => {
     if (!current() || button.disabled) return;
     const oldInput = stage.querySelector('.pw-old'), newInput = stage.querySelector('.pw-new');
-    if ([...newInput.value].length < 8) { button.textContent = 'Too short (min 8 code points)'; return; }
+    if ([...newInput.value].length < 8) { button.textContent = 'Too short (min 8 characters)'; return; }
     button.disabled = true;
     try {
       const r = await fetch('/api/auth/password', {
@@ -561,7 +561,7 @@ async function doLogin(ev) {
       const body = await r.json().catch(() => null);
       if (!current()) return;
       const fallback = r.status === 400
-        ? 'New passwords require at least 8 Unicode code points.'
+        ? 'New accounts require a password of at least 8 characters. Existing accounts can sign in with their current password.'
         : 'Too many sign-in attempts. Wait 5 minutes and try again.';
       throw new Error(typeof body?.error === 'string' && body.error.trim() ? body.error : fallback);
     }

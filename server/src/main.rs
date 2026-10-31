@@ -281,7 +281,7 @@ struct LoginReq {
 }
 
 const MIN_NEW_PASSWORD_CODE_POINTS: usize = 8;
-const NEW_PASSWORD_ERROR: &str = "Password must contain at least 8 Unicode code points";
+const NEW_PASSWORD_ERROR: &str = "Password must contain at least 8 characters";
 
 fn valid_new_password(password: &str) -> bool {
     password.chars().count() >= MIN_NEW_PASSWORD_CODE_POINTS

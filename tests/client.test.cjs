@@ -3201,8 +3201,8 @@ for (const scenario of [
   { name: '429 empty body fallback', status: 429, invalidJSON: true, expected:'Too many sign-in attempts. Wait 5 minutes and try again.' },
   { name: '429 nonstring error fallback', status: 429, body: {error:42}, expected:'Too many sign-in attempts. Wait 5 minutes and try again.' },
   { name: '429 markup remains text', status: 429, body: {error:'<img src=x onerror=alert(1)> wait 5 minutes'}, expected:'<img src=x onerror=alert(1)> wait 5 minutes' },
-  { name: '400 empty body fallback', status: 400, invalidJSON: true, expected:'New passwords require at least 8 Unicode code points.' },
-  { name: '400 password policy guidance', status: 400, body: {error:'Password must contain at least 8 Unicode code points'}, expected:'Password must contain at least 8 Unicode code points' },
+  { name: '400 empty body fallback', status: 400, invalidJSON: true, expected:'New accounts require a password of at least 8 characters. Existing accounts can sign in with their current password.' },
+  { name: '400 password policy guidance', status: 400, body: {error:'Password must contain at least 8 characters'}, expected:'Password must contain at least 8 characters' },
   { name: '401 keeps credential message', status: 401, body: {error:'private internal detail'}, expected:'Invalid email or password' },
   { name: '500 hides server detail', status: 500, body: {error:'private internal detail'}, expected:'Server error (500)' },
 ]) {
