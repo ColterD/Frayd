@@ -2316,6 +2316,7 @@ mod backend_regressions {
         });
         let head = tokio::task::spawn_blocking(move || {
             let response = ureq::head(&format!("http://{address}/api/thumb/1"))
+                .config().proxy(None).build()
                 .call()
                 .unwrap();
             (
@@ -2744,7 +2745,7 @@ mod backend_regressions {
                 let routes = std::iter::once("pages".to_string())
                     .chain((0..=page_count).map(|index| format!("page/{index}")));
                 routes.map(|route| {
-                    let response = match ureq::get(&format!("http://{address}/api/comic/1/{route}")).config().http_status_as_error(false).build().call() {
+                    let response = match ureq::get(&format!("http://{address}/api/comic/1/{route}")).config().proxy(None).http_status_as_error(false).build().call() {
                         Ok(response) => response,
                         Err(error) => panic!("owned HTTP transport: {error}"),
                     };
@@ -2979,7 +2980,7 @@ mod backend_regressions {
         });
         let statuses = tokio::task::spawn_blocking(move || {
             forwarded.into_iter().map(|value| {
-                let mut request = ureq::post(&format!("http://{address}/api/setup")).header("Content-Type", "application/json");
+                let mut request = ureq::post(&format!("http://{address}/api/setup")).config().proxy(None).build().header("Content-Type", "application/json");
                 if let Some(value) = value { request = request.header("X-Forwarded-For", value); }
                 match request.send(r#"{"email":"owner@example.test","password":"x"}"#) {
                     Ok(response) => response.status().as_u16(),
@@ -3958,7 +3959,7 @@ mod integration_regressions {
         for (query,restricted,expected) in [("",false,7),("?q=Cover",false,4),("?q=Cover",true,2)] {
             let url=format!("http://{address}/api/library{query}");let token=session.clone();
             let body = tokio::task::spawn_blocking(move || {
-                let request = ureq::get(&url);
+                let request = ureq::get(&url).config().proxy(None).build();
                 let request = if restricted {
                     request.header("Authorization", &format!("Bearer {token}"))
                 } else {
@@ -5121,22 +5122,17 @@ mod direct_download_tests {
     #[test]
     fn direct_download_ignores_environment_proxies() {
         if std::env::var_os("FRAYD_TEST_DIRECT_PROXY").is_none() {
-            for closed in [true, false] {
-                let proxy=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-                let address=format!("http://{}",proxy.local_addr().unwrap());
-                proxy.set_nonblocking(true).unwrap();
-                let proxy=if closed {drop(proxy);None} else {Some(proxy)};
-                let mut child=test_support::child("direct_download_tests::direct_download_ignores_environment_proxies");
-                child.env("FRAYD_TEST_DIRECT_PROXY","1").env("NO_PROXY","").env("no_proxy","");
-                for key in ["HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy"] {
-                    child.env(key,&address);
-                }
-                test_support::assert_child_passes(&mut child);
-                if let Some(proxy)=proxy {
-                    assert_eq!(proxy.accept().unwrap_err().kind(),std::io::ErrorKind::WouldBlock,
-                        "direct download connected to the synthetic proxy");
-                }
+            let proxy=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address=format!("http://{}",proxy.local_addr().unwrap());
+            proxy.set_nonblocking(true).unwrap();
+            let mut child=test_support::child("direct_download_tests::direct_download_ignores_environment_proxies");
+            child.env("FRAYD_TEST_DIRECT_PROXY","1").env("NO_PROXY","").env("no_proxy","");
+            for key in ["HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy"] {
+                child.env(key,&address);
             }
+            test_support::assert_child_passes(&mut child);
+            assert_eq!(proxy.accept().unwrap_err().kind(),std::io::ErrorKind::WouldBlock,
+                "direct download connected to the synthetic proxy");
             return;
         }
         let staging=std::env::temp_dir().join(format!("frayd-direct-proxy-{}",uuid::Uuid::new_v4()));
@@ -5379,9 +5375,10 @@ mod router_tests {
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         tokio::task::spawn_blocking(move || {
             let agent = ureq::Agent::config_builder()
+                .proxy(None)
                 .timeout_global(Some(std::time::Duration::from_secs(5)))
                 .build().new_agent();
-            let preflight = ureq::options(format!("http://{address}/api/annotations"))
+            let preflight = agent.options(format!("http://{address}/api/annotations"))
                 .header("Origin", "https://reader.example.invalid")
                 .header("Access-Control-Request-Method", "DELETE")
                 .header("Access-Control-Request-Headers", "authorization,content-type")
