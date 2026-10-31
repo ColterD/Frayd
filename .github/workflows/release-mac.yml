@@ -31,6 +31,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+          ref: e0e7d5459ec08aaa307f14015413d59d3dcb81e8
 
       - name: Verify actual native architecture (reject Rosetta)
         shell: bash
