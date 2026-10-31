@@ -3,7 +3,7 @@
 
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
-use rand::Rng;
+use rand::RngExt;
 use serde_json::Value;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::mpsc;
@@ -852,5 +852,40 @@ mod tests {
         let initial_states = [&mut first_rx, &mut second_rx].into_iter()
             .flat_map(drain).filter(|v| v["type"] == "state").count();
         assert_eq!(initial_states, 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_code_is_four_uppercase_ascii_letters() {
+        let party = Party::new();
+        let code = party.create("host");
+        assert_eq!(code.len(), 4);
+        assert!(code.bytes().all(|byte| byte.is_ascii_uppercase()));
+        assert_eq!(party.code.lock().unwrap().as_deref(), Some(code.as_str()));
+        assert!(party.is_host("host"));
+    }
+
+    #[tokio::test]
+    async fn broadcast_delivers_json_text_and_removes_closed_members() {
+        let party = Party::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (closed, closed_rx) = mpsc::unbounded_channel();
+        drop(closed_rx);
+        party
+            .members
+            .lock()
+            .unwrap()
+            .extend([("live".into(), tx), ("closed".into(), closed)]);
+        let payload = serde_json::json!({"type": "state", "title": "Unicode 🎵"});
+        party.broadcast(&payload);
+        let Some(Message::Text(text)) = rx.recv().await else {
+            panic!("expected outbound text")
+        };
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), payload);
+        assert_eq!(party.members.lock().unwrap().len(), 1);
     }
 }
