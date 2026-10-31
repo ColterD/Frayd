@@ -859,6 +859,8 @@ mod tests {
 mod protocol_tests {
     use super::*;
 
+    /// Repeated creations preserve four-letter public codes and creator-proof admission,
+    /// while each replacement immediately retires the prior code's authorization.
     #[test]
     fn replacement_codes_keep_the_public_format_and_revoke_previous_admission() {
         let party = Party::new();
