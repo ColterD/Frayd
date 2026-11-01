@@ -38,6 +38,7 @@ These notes use [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) categor
 
 ### Fixed
 
+- Wrap long sign-in and password-change feedback within narrow screens.
 - Restore startup with Axum 0.8 route syntax, including build information and EPUB asset routes.
 - Keep direct downloads independent of inherited HTTP proxy settings.
 - Enable Docker's built-in init for the Compose app so stop signals reach the server without waiting for a forced kill. Active requests and jobs are not guaranteed to drain gracefully.
