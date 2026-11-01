@@ -1000,3 +1000,44 @@ for (const scenario of [
     }
   });
 }
+
+
+for (const unit of ['a', '🎵', 'e\u0301']) {
+  test(`password change counts Unicode code points for ${unit}`, async () => {
+    const b = browser();
+    await settle();
+    const { control } = passwordPanel(b);
+    b.run('account={name:"Member",isAdmin:false};openAccount()');
+    const short = [...unit.repeat(7)].slice(0,7).join('');
+    control('#s-pw-save').disabled = false;
+    control('.pw-old').value = 'old';
+    control('.pw-new').value = short;
+    b.requests.length = 0;
+    await control('#s-pw-save').onclick();
+    assert.equal(b.requests.length, 0);
+    const policyMessage = 'Password must contain at least 8 characters';
+    assert.equal(control('#s-pw-save').textContent, policyMessage);
+    assert.equal(control('#s-pw-save').disabled, false);
+    assert.equal(control('.pw-new').value, short);
+    control('.pw-new').value = short + 'x';
+    let reset;
+    b.context.setTimeout = (callback, milliseconds) => {
+      assert.equal(milliseconds, 2500);
+      reset = callback;
+    };
+    b.respond(async () => ({ok:false,status:400,json:async () => ({error:policyMessage})}));
+    await control('#s-pw-save').onclick();
+    assert.equal(control('#s-pw-save').textContent, policyMessage);
+    assert.equal(control('#s-pw-save').disabled, false);
+    assert.equal(control('.pw-new').value, short + 'x');
+    reset();
+    assert.equal(control('#s-pw-save').textContent, 'Change password');
+    b.respond(async () => ({ok:true,status:204}));
+    await control('#s-pw-save').onclick();
+    assert.equal(b.requests.filter(r => r.url === '/api/auth/password').length, 2);
+    assert.equal(control('.pw-new').value, '');
+    assert.equal(control('#s-pw-save').textContent, '✓ Changed');
+    reset();
+    assert.equal(control('#s-pw-save').textContent, 'Change password');
+  });
+}

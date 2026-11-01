@@ -1,5 +1,5 @@
 use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    password_hash::{phc::PasswordHash, PasswordHasher, PasswordVerifier},
     Argon2,
 };
 use rusqlite::{Connection, OptionalExtension};
@@ -7,9 +7,8 @@ use uuid::Uuid;
 
 /// Create a new account with argon2id password hash. Fails if key exists.
 pub fn create_account(db: &Connection, key: &str, password: &str) -> Result<(), String> {
-    let salt = SaltString::generate(&mut OsRng);
     let hash = Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map_err(|e| e.to_string())?
         .to_string();
     let exists = db
@@ -143,9 +142,8 @@ pub fn change_password(db: &Connection, key: &str, old: &str, new: &str) -> Resu
         Ok(true) => {}
         _ => return Err("current password is wrong".into()),
     }
-    let salt = SaltString::generate(&mut OsRng);
     let hash = Argon2::default()
-        .hash_password(new.as_bytes(), &salt)
+        .hash_password(new.as_bytes())
         .map_err(|e| e.to_string())?
         .to_string();
     db.execute(
@@ -168,6 +166,20 @@ mod tests {
     use super::*;
 
     use crate::test_support::fixture_password;
+
+    /// Persisted Argon2 0.5.3 default-parameter PHC hashes must survive the upgrade.
+    #[test]
+    fn legacy_password_hash_verifies_and_can_be_changed() {
+        let db = crate::store::open(":memory:");
+        let legacy = "$argon2id$v=19$m=19456,t=2,p=1$ZnJheWQtbGVnYWN5LXRlc3Q$i3NrfxDb6El/rvY3K6xw12yFSRv88IM1tSj207PmOeA";
+        db.execute("INSERT INTO identities(kind,key,secret_hash) VALUES('account','legacy',?1)", [legacy]).unwrap();
+        assert!(verify_login(&db, "legacy", "legacy-fixture-password").unwrap());
+        let replacement = fixture_password();
+        assert!(!verify_login(&db, "legacy", &replacement).unwrap());
+        change_password(&db, "legacy", "legacy-fixture-password", &replacement).unwrap();
+        assert!(verify_login(&db, "legacy", &replacement).unwrap());
+        assert!(!verify_login(&db, "legacy", "legacy-fixture-password").unwrap());
+    }
 
     /// IPv6 peers share one key per /64; IPv4 and IPv4-mapped IPv6 peers key by the single IPv4 address.
     #[test]

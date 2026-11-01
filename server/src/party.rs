@@ -83,8 +83,8 @@ impl Party {
         let mut session = self.session.lock().unwrap();
         // Never reuse the replaced party's code: a fresh authorize with an old join link must miss.
         let code = loop {
-            let code = rand::thread_rng()
-                .sample_iter(&rand::distributions::Alphanumeric)
+            let code = rand::rng()
+                .sample_iter(&rand::distr::Alphanumeric)
                 .filter(|c| c.is_ascii_alphabetic())
                 .take(4)
                 .map(char::from)
@@ -151,7 +151,7 @@ impl Party {
         let _ = tx.send(Message::Text(serde_json::json!({
             "type": "state", "state": session.state, "is_host": connection.is_host,
             "self_label": connection.public_label,
-        }).to_string()));
+        }).to_string().into()));
         session.broadcast_members();
         Some(connection)
     }
@@ -222,7 +222,7 @@ impl Session {
 
     /// Enqueues synchronously while the caller holds the session transition lock.
     fn broadcast(&self, value: &Value) {
-        let text = Message::Text(value.to_string());
+        let text = Message::Text(value.to_string().into());
         for member in &self.members {
             let _ = member.tx.send(text.clone());
         }
@@ -856,36 +856,45 @@ mod tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod protocol_tests {
     use super::*;
 
+    /// Repeated creations preserve four-letter public codes and creator-proof admission,
+    /// while each replacement immediately retires the prior code's authorization.
     #[test]
-    fn join_code_is_four_uppercase_ascii_letters() {
+    fn replacement_codes_keep_the_public_format_and_revoke_previous_admission() {
         let party = Party::new();
-        let code = party.create("host");
-        assert_eq!(code.len(), 4);
-        assert!(code.bytes().all(|byte| byte.is_ascii_uppercase()));
-        assert_eq!(party.code.lock().unwrap().as_deref(), Some(code.as_str()));
-        assert!(party.is_host("host"));
+        let mut previous: Option<String> = None;
+        for _ in 0..64 {
+            let (code, proof) = party.create("host");
+            assert_eq!(code.len(), 4);
+            assert!(code.bytes().all(|byte| byte.is_ascii_uppercase()));
+            let admission = party.authorize(&code, Some(proof)).unwrap();
+            assert!(party.can_register(&admission, "host"));
+            if let Some(old) = previous {
+                assert_ne!(code, old);
+                assert!(party.authorize(&old, None).is_none());
+            }
+            previous = Some(code);
+        }
     }
 
-    #[tokio::test]
-    async fn broadcast_delivers_json_text_and_removes_closed_members() {
+    /// Discard registration state, then require the synchronous broadcast to enqueue a
+    /// text frame whose parsed JSON preserves Unicode. A nonblocking receive makes a
+    /// missing frame fail immediately instead of waiting on an open channel.
+    #[test]
+    fn broadcast_delivers_unicode_json_text() {
         let party = Party::new();
+        let (code, _) = party.create("host");
+        let admission = party.authorize(&code, None).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let (closed, closed_rx) = mpsc::unbounded_channel();
-        drop(closed_rx);
-        party
-            .members
-            .lock()
-            .unwrap()
-            .extend([("live".into(), tx), ("closed".into(), closed)]);
+        let _connection = party.register(admission, "guest".into(), tx).unwrap();
+        while rx.try_recv().is_ok() {}
         let payload = serde_json::json!({"type": "state", "title": "Unicode 🎵"});
-        party.broadcast(&payload);
-        let Some(Message::Text(text)) = rx.recv().await else {
+        party.session.lock().unwrap().broadcast(&payload);
+        let Ok(Message::Text(text)) = rx.try_recv() else {
             panic!("expected outbound text")
         };
         assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), payload);
-        assert_eq!(party.members.lock().unwrap().len(), 1);
     }
 }

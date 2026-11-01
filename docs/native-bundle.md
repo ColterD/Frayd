@@ -91,7 +91,7 @@ The private prefix and the ancestor checks keep other Unix users out. The checks
 
 The native bundle helper supports Linux and macOS only. Its non-Unix entry point refuses with exit code 2; it does not install or supervise a Windows server. The separate [Windows source bootstrap](../client/install/bootstrap.ps1) builds and starts `frayd-server` directly. Checks CI includes a real Windows source-build and basic HTTP qualification job, separate from the stubbed bootstrap regressions. A configured job does not prove a passing Windows run. Neither Windows job tests native bundle installation or lifecycle on Windows.
 
-`frayd-native` holds all ownership logic and the shell wrappers only call it. It uses crates the server already depends on (`serde`, `serde_json`, `sha2`, `hex`, `walkdir`, `uuid` and Tokio), plus a direct `libc` dependency for `geteuid` at the version Tokio already locks, and Rust 1.99.1 standard filesystem locking. It needs no Python at launch or removal. It reads the effective user ID with `geteuid`, so Linux and macOS use the same path.
+`frayd-native` holds all ownership logic and the shell wrappers only call it. It uses crates the server already depends on (`serde`, `serde_json`, `sha2`, `hex`, `walkdir`, `uuid` and Tokio), plus a direct `libc` dependency for `geteuid` at the version Tokio already locks, and standard-library filesystem locking. It needs no Python at launch or removal. It reads the effective user ID with `geteuid`, so Linux and macOS use the same path.
 
 ## Checks
 

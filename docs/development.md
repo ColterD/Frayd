@@ -6,7 +6,7 @@ Run these commands in an isolated checkout, with disposable data. Passing checks
 
 ## Native server
 
-Install a current Rust toolchain, Clippy and a C compiler. On Linux, the Rust tests also need `ffmpeg` and `ffprobe` on `PATH` for the replacement-duration check. The Docker build stage supplies both tools before it runs the tests. Keep `client/` beside `server/`. To run a packaged install instead, follow the [native bundle guide](native-bundle.md). From `server/`:
+The server package declares Rust 1.89 as its minimum version. Install a current Rust toolchain, Clippy and a C compiler. On Linux, the Rust tests also need `ffmpeg` and `ffprobe` on `PATH` for the replacement-duration check. The Docker build stage supplies both tools before it runs the tests. Keep `client/` beside `server/`. To run a packaged install instead, follow the [native bundle guide](native-bundle.md). From `server/`:
 
 ```sh
 cargo test --locked
@@ -218,6 +218,6 @@ python3 scripts/build-metadata.py -- docker build -t frayd:local .
 python3 scripts/build-metadata.py -- docker compose build
 ```
 
-The wrapper supplies `FRAYD_BUILD_COMMIT`, `FRAYD_BUILD_COMMITS_SINCE_TAG` and `FRAYD_BUILD_DIRTY`. `--env` prints only those nonsecret values, which CI writes to an environment file before it copies the source for the macOS build. Docker accepts the three values as build arguments and Compose forwards them to the builder. A plain Docker or Compose build without the wrapper reports an unknown identity, because `.git` stays out of the context. A plain Cargo build in a checkout reads Git itself, while an isolated build must be given the values. Each Git probe has a 15-second deadline. A timeout or unavailable Git command leaves that field unknown. Missing or malformed fields read as unknown. Never derive the identity from runtime environment variables.
+The wrapper supplies `FRAYD_BUILD_COMMIT`, `FRAYD_BUILD_COMMITS_SINCE_TAG` and `FRAYD_BUILD_DIRTY`. `--env` prints only those nonsecret values, which CI writes to an environment file before it copies the source for the macOS build. Docker accepts the three values as build arguments and Compose forwards them to the builder. A plain Docker or Compose build without the wrapper reports an unknown identity, because `.git` stays out of the context. A plain Cargo build in a checkout reads Git itself, while an isolated build must be given the values. Each Git probe in `scripts/build-metadata.py` has a 15-second deadline. A timeout or unavailable Git command leaves that field unknown. The Git probes in `server/build.rs` have no timeout. Missing or malformed fields read as unknown. Never derive the identity from runtime environment variables.
 
 The Linux export uses the same Docker arguments as the image. Native packaging asks both binaries for their compile-time identity. It refuses identical binary bytes, a helper without the `frayd-native` role, or malformed or mismatched helper version, commit, dirty state or tag distance. The server base commit and package version must match the packaging checkout. The hashed `build-info.json` records the binary's identity, and `manifest.json` records the packaging checkout under `source`. This assumes a native binary running on the host it was built for. It does not cover cross-built binaries, and it does not attest build arguments that a caller supplied.

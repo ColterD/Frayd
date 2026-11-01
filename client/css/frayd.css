@@ -66,6 +66,7 @@ body.auth .auth-brand { text-align: center; }
 }
 .btn-primary:hover { background: #4c3ae0; }
 body.auth .auth-footer { text-align: center; color: var(--fg-muted); font-size: 13px; }
+.auth-error, #s-pw-save { overflow-wrap: anywhere; }
 .auth-error { color: #ff6b6b; font-size: 13px; margin-bottom: 12px; display: none; }
 
 /* ===== APP SHELL ===== */

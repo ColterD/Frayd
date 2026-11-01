@@ -58,6 +58,27 @@ async function isolatedResponsiveCase(width) {
       const loginStyle = login.getAttribute('style'), appClass = app.className, bodyClass = document.body.className;
       const rect = node => { const r = node.getBoundingClientRect();
         return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height }; };
+      measured.apiErrorGeometry = [];
+      async function measureApiErrors(path, submit, errorNode, container) {
+        const originalFetch = window.fetch;
+        const literal = 'LONG_' + 'Unbroken'.repeat(32) + '<img src=x onerror="window.injected=true">';
+        try {
+          for (const status of [400, 429]) {
+            errorNode.textContent = '';
+            window.fetch = async (url, options) => new URL(String(url), location.origin).pathname === path
+              ? new Response(JSON.stringify({ error: literal }), { status, headers: { 'Content-Type': 'application/json' } })
+              : originalFetch(url, options);
+            submit();
+            await until(() => errorNode.textContent === literal, 'production handler renders literal API error');
+            equal(errorNode.children.length, 0, 'API error remains text with no markup children');
+            check(window.injected === undefined, 'API error cannot execute markup');
+            measured.apiErrorGeometry.push({ path, status, viewport: { width: innerWidth, height: innerHeight },
+              container: { clientWidth: container.clientWidth, scrollWidth: container.scrollWidth },
+              error: { clientWidth: errorNode.clientWidth, scrollWidth: errorNode.scrollWidth, ...rect(errorNode) },
+              documentWidth: document.documentElement.scrollWidth, literalText: true, childCount: errorNode.children.length });
+          }
+        } finally { window.fetch = originalFetch; }
+      }
       const contains = (outer, inner) => inner.left >= outer.left - 1 && inner.right <= outer.right + 1 && inner.top >= outer.top - 1
         && inner.bottom <= outer.bottom + 1;
       const buildBrand = rect(document.querySelector('#sidebar .brand')), buildLabel = rect(document.querySelector('#sidebar > [data-build-info]'));
@@ -85,6 +106,13 @@ async function isolatedResponsiveCase(width) {
           check(brandRect.top >= 0 && brandRect.bottom <= cardRect.top && cardRect.bottom <= footerRect.top,
             'Authentication brand, form and guest footer never overlap at short height');
           check(document.documentElement.scrollWidth <= innerWidth + 1, 'Short authentication document stays within viewport width');
+          document.getElementById('email').value = 'wrap@example.invalid';
+          document.getElementById('password').value = 'fixture-password';
+          const loginError = document.getElementById('auth-error');
+          await measureApiErrors('/api/auth/login', () => document.getElementById('login-form').requestSubmit(),
+            loginError, document.querySelector('.auth-card'));
+          loginError.textContent = ''; loginError.style.display = 'none';
+          document.getElementById('email').value = document.getElementById('password').value = '';
           const controls = [...login.querySelectorAll('input,button,a')];
           measured.authFlowGeometry.controlOrder = controls.map(control => control.id || control.getAttribute('type'));
           equal(measured.authFlowGeometry.controlOrder, ['email', 'password', 'pw-toggle', 'submit', 'guest'],
@@ -315,6 +343,24 @@ async function isolatedResponsiveCase(width) {
       equal(fixture.requests.length, accountRequestCount, 'Account opens without shelf or admin requests');
       measured.accountNavigation = { kindBefore: 'movie', kindAfter: activeKind, selectedShelf: selectedShelf.dataset.kind,
         passwordPanel: true, retainedDOM: true, retainedDrills: true, requests: fixture.requests.length - accountRequestCount };
+      try {
+        await api('viewport', { width, height: width === 320 ? 568 : 1000 });
+        await until(() => innerHeight === (width === 320 ? 568 : 1000), 'password error viewport settles');
+        document.getElementById('account-pw-old').value = 'fixture-old-password';
+        document.getElementById('account-pw-new').value = 'fixture-new-password';
+        const passwordButton = document.getElementById('s-pw-save');
+        await measureApiErrors('/api/auth/password', () => passwordButton.click(), passwordButton,
+          document.querySelector('#settings-modal .modal-panel'));
+        for (const sample of measured.apiErrorGeometry) {
+          check(sample.container.scrollWidth <= sample.container.clientWidth + 1
+            && sample.error.scrollWidth <= sample.error.clientWidth + 1 && sample.documentWidth <= width + 1,
+          'Literal API error wraps within its container and viewport: ' + JSON.stringify(sample));
+        }
+        reachable(passwordButton);
+      } finally {
+        await api('viewport', { width, height: 1000 });
+        await until(() => innerHeight === 1000, 'password error viewport restores');
+      }
       document.getElementById('settings-close').click();
       reachable(document.getElementById('settings-btn')); document.getElementById('settings-btn').click();
       await until(() => !!document.querySelector('.p-scan'), 'Visible Settings opens usable controls');
@@ -530,7 +576,7 @@ async function isolatedResponsiveCase(width) {
       } finally { iframe.replaceWith(external); modal.classList.remove('yt'); document.getElementById('vm-back').click(); }
       return { viewport: { width: innerWidth, height: innerHeight }, sizes, grids, ratios, folderGrids: measured.folderGrids,
         shortAudioFooter: measured.shortAudioFooter,
-        layoutGeometry: { login: measured.loginGeometry, authFlow: measured.authFlowGeometry, settings: measured.settingsGeometry,
+        layoutGeometry: { apiErrors: measured.apiErrorGeometry, login: measured.loginGeometry, authFlow: measured.authFlowGeometry, settings: measured.settingsGeometry,
         party: measured.partyGeometry, modalHeaders: measured.modalHeaders, hero: measured.heroGeometry, native: measured.videoGeometry,
         youtubeModel: measured.youtubeLayoutModel }, navigationLabels: nav.map(n => n.textContent.trim()), audioPauseUi: measured.audioPauseUi,
         nativeDiagnostics: fixture };

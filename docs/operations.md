@@ -67,7 +67,7 @@ Root changes follow these rules:
 - A newly submitted root that does not exist returns 400.
 - A settings change is validated in full before one atomic database transaction. Malformed settings return 400 before any busy refusal. A valid root edit returns 409 while a root lock is set or a scan, conversion or ingestion job is active. The conversion worker counts as active while it only checks whether a file needs converting, so retry the edit later. A database failure returns 500 and publishes no partial settings.
 
-Scan admission uses one compare-and-set worker owner with scope-bound cleanup. Successful downloads queue indexing through that worker and become `done` only after indexing completes; an abandoned download becomes `failed`. Status exposes `scanning`, `library_configured`, `library_count` and `ingesting` (`null`, `downloading`, `indexing`, `done` or `failed`). Public `/api/health` returns exactly `{"status":"ok"}` without root paths. Server version and effective paths belong to administrator settings metadata.
+Scan admission uses one compare-and-set worker owner with scope-bound cleanup. Successful downloads queue indexing through that worker and become `done` only after indexing completes; an abandoned download becomes `failed`. Status exposes `scanning`, `library_configured`, `library_count` and `ingesting` (`null`, `downloading`, `indexing`, `done` or `failed`). Public `/api/health` returns exactly `{"status":"ok"}` without root paths. Public `/api/build` exposes the server version and, when available, the build commit. Effective paths are available in administrator settings metadata.
 
 Alternatively, copy regular files and directories into a new subdirectory of the default library volume, using additional disk space. Symlinks, including any source path component, and special files are rejected without following them. Keep the source unchanged throughout the preflight and copy: these steps are not atomic. Run this block in Bash with GNU `find` and GNU `tar`, set the absolute source directory, and choose a new import name using only letters, digits, underscores or hyphens:
 
@@ -149,7 +149,7 @@ Container paths must exist inside the container and have the required access. Co
 
 ### Account password
 
-Signed-in users can open **Account** to change their own password. Administrators can use the same password form in Settings. Enter the current password and the new password. A successful change keeps existing sessions valid; it does not sign out other devices. Guests must sign in first.
+Signed-in users can open **Account** to change their own password. Administrators can use the same password form in Settings. Enter the current password and the new password. New accounts (including first-account setup) and password changes require at least 8 Unicode code points. Existing accounts can still sign in with shorter passwords. A successful change keeps existing sessions valid; it does not sign out other devices. Guests must sign in first.
 
 ### Administrator deletion
 

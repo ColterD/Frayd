@@ -143,45 +143,7 @@ async fn main() {
         run_scan(state.clone(), ScanRequest { roots: library.roots, for_ingest: false });
     }
 
-    let app = Router::new()
-        .route("/api/health", get(health))
-        .route("/api/build", get(build_info::handler))
-        .route("/api/media/:id", axum::routing::delete(delete_media))
-        .route("/api/admin/users/:id", axum::routing::delete(remove_user))
-        .route("/api/library", get(library_handler))
-        .route("/api/stream/:id", get(stream))
-        .route("/api/progress", post(set_progress))
-        .route("/api/progress/:media_id", get(get_progress))
-        .route("/api/auth/login", post(auth_login))
-        .route("/api/auth/logout", post(auth_logout))
-        .route("/api/auth/me", get(auth_me))
-        .route("/api/auth/password", post(auth_change_password))
-        .route("/api/setup", get(setup_status).post(auth_setup))
-        .route("/api/admin/perms", get(list_perms).post(set_perm))
-        .route("/api/admin/settings", get(get_settings).post(set_setting))
-        .route("/api/thumb/:id", get(thumb))
-        .route("/api/scan", post(trigger_scan))
-        .route("/api/ingest", post(ingest))
-        .route("/api/scan/status", get(scan_status))
-        .route("/api/party", post(party_create))
-        .route("/api/party/:code/ws", get(party_ws))
-        .route("/api/comic/:id/pages", get(comic_pages))
-        .route("/api/comic/:id/page/:n", get(comic_page))
-        .route("/api/epub/:id/spine", get(epub_spine))
-        .route("/api/epub/:id/toc", get(epub_toc))
-        .route("/api/epub/:id/chunk/:n", get(epub_chunk))
-        .route("/api/epub/:id/asset/*path", get(epub_asset))
-        .route("/api/annotations/:id", get(list_annotations))
-        .route("/api/annotations", post(create_annotation))
-        .route("/api/annotations", axum::routing::delete(delete_annotation))
-        .nest_service("/", ServeDir::new(client_dir()))
-        .layer(
-            tower_http::cors::CorsLayer::new()
-                .allow_origin(tower_http::cors::Any)
-                .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::DELETE])
-                .allow_headers([axum::http::header::AUTHORIZATION, axum::http::header::CONTENT_TYPE]),
-        )
-        .with_state(state.clone());
+    let app = app_router(state.clone(), client_dir());
 
     // Port: FRAYD_PORT env > settings.port > 8484
     let port: u16 = std::env::var("FRAYD_PORT")
@@ -253,9 +215,12 @@ async fn main() {
     }
 }
 
+/// Share the production route table with HTTP regression tests so wildcard EPUB assets,
+/// the static-file fallback and CORS are checked with the same routing precedence.
 fn app_router(state: Arc<App>, client: PathBuf) -> Router {
     Router::new()
         .route("/api/health", get(health))
+        .route("/api/build", get(build_info::handler))
         .route("/api/media/{id}", axum::routing::delete(delete_media))
         .route("/api/admin/users/{id}", axum::routing::delete(remove_user))
         .route("/api/library", get(library_handler))
@@ -317,6 +282,15 @@ struct LoginReq {
     password: String,
 }
 
+const MIN_NEW_PASSWORD_CODE_POINTS: usize = 8;
+const NEW_PASSWORD_ERROR: &str = "Password must contain at least 8 characters";
+
+/// Count Unicode scalar values, matching client string iteration rather than UTF-8 bytes
+/// or grapheme clusters; apply this creation policy without invalidating legacy logins.
+fn valid_new_password(password: &str) -> bool {
+    password.chars().count() >= MIN_NEW_PASSWORD_CODE_POINTS
+}
+
 /// Household account login: create an Argon2id password hash on first login,
 /// verify the stored hash on subsequent logins, and issue a session token.
 async fn auth_login(
@@ -329,6 +303,9 @@ async fn auth_login(
         .unwrap_or_else(|_|StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// Keep SQLite and password hashing on the blocking worker. Existing accounts verify
+/// before creation policy is applied; read permissions before issuing a session so a
+/// failed permission lookup cannot leave an unreturned token.
 fn auth_login_blocking(app:Arc<App>,peer:std::net::SocketAddr,headers:axum::http::HeaderMap,req:LoginReq) -> impl IntoResponse {
     if !app.auth_rl.check(&auth::client_ip(&headers, peer.ip(), app.trust_proxy)) {
         return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error": "too many attempts — wait 5 minutes"})));
@@ -356,6 +333,10 @@ fn auth_login_blocking(app:Arc<App>,peer:std::net::SocketAddr,headers:axum::http
             }
         }
         None => {
+            // Enforce creation policy only for new accounts; legacy credentials still verify above.
+            if !valid_new_password(&req.password) {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": NEW_PASSWORD_ERROR})));
+            }
             // first login mints the account (household bootstrap)
             if let Err(e) = auth::create_account(&db, &req.email, &req.password) {
                 tracing::warn!("account create failed: {e}");
@@ -451,12 +432,15 @@ async fn auth_change_password(
         .unwrap_or_else(|_|StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// Require a policy-valid replacement, a bearer session identifying an account and
+/// verification of that account's old password before replacing its stored hash.
+/// Use a separate rate-limit key from login attempts for the same client address.
 fn auth_change_password_blocking(app:Arc<App>,peer:std::net::SocketAddr,headers:axum::http::HeaderMap,req:ChangePwReq) -> impl IntoResponse {
     if !app.auth_rl.check(&format!("pw:{}", auth::client_ip(&headers, peer.ip(), app.trust_proxy))) {
         return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error": "too many attempts — wait 5 minutes"}))).into_response();
     }
-    if req.new.len() < 4 {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "new password too short (min 4)"}))).into_response();
+    if !valid_new_password(&req.new) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": NEW_PASSWORD_ERROR}))).into_response();
     }
     let db = app.db.lock().unwrap();
     let Some(tok) = bearer_token(&headers) else {
@@ -512,16 +496,18 @@ async fn auth_setup(
         .unwrap_or_else(|_|StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// Serialize the empty-account check with owner creation, admin grant and session
+/// issuance in an immediate transaction. A failed step rolls back all setup writes,
+/// leaving no owner without an admin grant for a later login to claim bootstrap admin.
+/// A competing setup observes the committed account instead of creating another owner.
 fn auth_setup_blocking(app:Arc<App>,peer:std::net::SocketAddr,headers:axum::http::HeaderMap,req:SetupReq) -> impl IntoResponse {
     if !app.auth_rl.check(&auth::client_ip(&headers, peer.ip(), app.trust_proxy)) {
         return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error": "too many attempts — wait 5 minutes"}))).into_response();
     }
-    if req.password.len() < 4 {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "password too short (min 4)"}))).into_response();
+    if !valid_new_password(&req.password) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": NEW_PASSWORD_ERROR}))).into_response();
     }
     let mut db = app.db.lock().unwrap();
-    // Count, create, grant and mint the session in one write transaction. Any failure rolls the account
-    // back, so no owner without the admin grant is left for a later login to claim bootstrap admin.
     let Ok(tx) = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
@@ -648,7 +634,7 @@ fn thumbnail_path_blocking(app:Arc<App>,id:i64) -> Option<String> {
     db.query_row("SELECT thumb_path FROM media WHERE id=?1",[id],|r|r.get(0)).ok()
 }
 
-/// GET /api/comic/:id/pages → ["p001.jpg", ...] natural-sorted.
+/// GET /api/comic/{id}/pages → ["p001.jpg", ...] natural-sorted.
 async fn comic_pages(
     State(app): State<std::sync::Arc<App>>,
     Path(id): Path<i64>,
@@ -662,7 +648,7 @@ async fn comic_pages(
     }
 }
 
-/// GET /api/comic/:id/page/:n → image bytes for nth (0-based) page.
+/// GET /api/comic/{id}/page/{n} → image bytes for nth (0-based) page.
 async fn comic_page(
     State(app): State<std::sync::Arc<App>>,
     Path((id, n)): Path<(i64, i64)>,
@@ -1067,18 +1053,18 @@ const DIRECT_DOWNLOAD_LIMITS:DirectDownloadLimits=DirectDownloadLimits {
 };
 
 /// Inspect through the existing URL parser without retaining/logging the input or transport errors.
-fn direct_url(value:&str) -> Result<ureq::RequestUrl,&'static str> {
+fn direct_url(value:&str) -> Result<url::Url,&'static str> {
     if value.chars().any(char::is_control) {return Err("Direct URL contains a control character");}
-    let parsed=ureq::get(value).request_url().map_err(|_|"Direct URL is invalid")?;
-    if !matches!(parsed.as_url().scheme(),"http"|"https") || parsed.as_url().host_str().is_none() {
+    let parsed=url::Url::parse(value).map_err(|_|"Direct URL is invalid")?;
+    if !matches!(parsed.scheme(),"http"|"https") || parsed.host_str().is_none() {
         return Err("Direct URL must use HTTP or HTTPS");
     }
     Ok(parsed)
 }
 
 /// Preserve a portable single MP4 component only; neither query nor fragment contributes a name.
-fn direct_filename(url:&ureq::RequestUrl) -> String {
-    let candidate=url.as_url().path_segments().and_then(|mut parts|parts.next_back())
+fn direct_filename(url:&url::Url) -> String {
+    let candidate=url.path_segments().and_then(|mut parts|parts.next_back())
         .and_then(|name|urlencoding::decode(name).ok()).map(|name|name.into_owned());
     if let Some(name)=candidate {
         let stem=StdPath::new(&name).file_stem().and_then(|value|value.to_str()).unwrap_or("");
@@ -1114,22 +1100,30 @@ fn download_direct(url:&str,staging:&StdPath,limits:DirectDownloadLimits) -> Res
     for redirects in 0..=5 {
         let parsed=direct_url(&current)?;
         let remaining=deadline.checked_duration_since(std::time::Instant::now()).ok_or("Direct transfer deadline exceeded")?;
-        let agent=ureq::AgentBuilder::new().redirects(0).timeout_connect(limits.connect_timeout.min(remaining)).build();
-        let response=agent.get(&current).timeout(remaining).set("Accept-Encoding","identity").set("Connection","close")
+        // Preserve the prior client feature policy: environment variables never select a proxy.
+        let agent = ureq::Agent::config_builder()
+            .proxy(None)
+            .max_redirects(0)
+            .timeout_connect(Some(limits.connect_timeout.min(remaining)))
+            .timeout_global(Some(remaining))
+            .build()
+            .new_agent();
+        let response=agent.get(parsed.as_str()).header("Accept-Encoding","identity").header("Connection","close")
             .call().map_err(|_|"Direct HTTP request failed")?;
-        if matches!(response.status(),301|302|303|307|308) {
+        if matches!(response.status().as_u16(),301|302|303|307|308) {
             if redirects==5 {return Err("Direct redirect limit exceeded");}
-            let location=response.header("Location").ok_or("Direct redirect missing location")?;
+            let location=response.headers().get("Location").and_then(|value|value.to_str().ok()).ok_or("Direct redirect missing location")?;
             if location.chars().any(char::is_control) {return Err("Direct redirect is invalid");}
-            let next=parsed.as_url().join(location).map_err(|_|"Direct redirect is invalid")?;
+            let next=parsed.join(location).map_err(|_|"Direct redirect is invalid")?;
             if !matches!(next.scheme(),"http"|"https") {return Err("Direct redirect must use HTTP or HTTPS");}
             current=next.to_string();continue;
         }
         if response.status()!=200 {return Err("Direct response must be a complete successful file");}
-        if response.all("Content-Encoding").len()>1 || response.header("Content-Encoding").is_some_and(|value|!value.eq_ignore_ascii_case("identity")) {
+        if response.headers().get_all("Content-Encoding").iter().count()>1 || response.headers().get("Content-Encoding").is_some_and(|value|!value.as_bytes().eq_ignore_ascii_case(b"identity")) {
             return Err("Direct response encoding is unsupported");
         }
-        let lengths=response.all("Content-Length");let transfers=response.all("Transfer-Encoding");
+        let lengths=response.headers().get_all("Content-Length").iter().map(|value|value.to_str()).collect::<Result<Vec<_>,_>>().map_err(|_|"Direct content length is invalid")?;
+        let transfers=response.headers().get_all("Transfer-Encoding").iter().map(|value|value.to_str()).collect::<Result<Vec<_>,_>>().map_err(|_|"Direct response framing is ambiguous")?;
         if lengths.len()>1 || transfers.len()>1 || (!lengths.is_empty() && !transfers.is_empty())
             || transfers.first().is_some_and(|value|!value.eq_ignore_ascii_case("chunked")) {
             return Err("Direct response framing is ambiguous");
@@ -1141,7 +1135,7 @@ fn download_direct(url:&str,staging:&StdPath,limits:DirectDownloadLimits) -> Res
         if expected.is_some_and(|length|length==0 || length>limits.max_bytes) {return Err("Direct response size is unsupported");}
         let partial=staging.join(format!("{}.part",uuid::Uuid::new_v4()));
         let mut output=std::fs::OpenOptions::new().write(true).create_new(true).open(&partial).map_err(|_|"Direct staging creation failed")?;
-        let mut reader=response.into_reader();let mut buffer=[0_u8;64*1024];let mut count=0_u64;
+        let mut reader=response.into_body().into_reader();let mut buffer=[0_u8;64*1024];let mut count=0_u64;
         loop {
             if std::time::Instant::now()>=deadline {return Err("Direct transfer deadline exceeded");}
             let read=reader.read(&mut buffer).map_err(|_|"Direct response body failed")?;
@@ -1273,7 +1267,7 @@ fn party_identity_key(db:&Connection,headers:&axum::http::HeaderMap,identity:Opt
     db.query_row("SELECT key FROM identities WHERE id=?1",[id],|r|r.get(0)).map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-/// GET /api/party/:code/ws — join party socket. Identity via ?identity= or Bearer.
+/// GET /api/party/{code}/ws — join party socket. Identity via ?identity= or Bearer.
 async fn party_ws(
     State(app): State<std::sync::Arc<App>>,
     Path(code): Path<String>,
@@ -1327,7 +1321,7 @@ fn scan_status_blocking(app:Arc<App>) -> Json<serde_json::Value> {
     }))
 }
 
-/// GET /api/epub/:id/asset/OEBPS/images/x.png → raw zip entry bytes.
+/// GET /api/epub/{id}/asset/OEBPS/images/x.png → raw zip entry bytes.
 /// Path traversal guard: reject absolute paths, "..", backslashes.
 async fn epub_asset(
     State(app): State<std::sync::Arc<App>>,
@@ -1357,7 +1351,7 @@ async fn epub_asset(
     }
 }
 
-/// GET /api/epub/:id/spine → [chunk hrefs] in reading order.
+/// GET /api/epub/{id}/spine → [chunk hrefs] in reading order.
 async fn epub_spine(
     State(app): State<std::sync::Arc<App>>,
     Path(id): Path<i64>,
@@ -1371,7 +1365,7 @@ async fn epub_spine(
     }
 }
 
-/// GET /api/epub/:id/toc → [{title, spine_idx}] in reading order.
+/// GET /api/epub/{id}/toc → [{title, spine_idx}] in reading order.
 async fn epub_toc(
     State(app): State<std::sync::Arc<App>>,
     Path(id): Path<i64>,
@@ -1394,7 +1388,7 @@ async fn epub_toc(
     }
 }
 
-/// GET /api/epub/:id/chunk/:n → XHTML bytes of nth spine item, sandboxed MIME.
+/// GET /api/epub/{id}/chunk/{n} → XHTML bytes of nth spine item, sandboxed MIME.
 async fn epub_chunk(
     State(app): State<std::sync::Arc<App>>,
     Path((id, n)): Path<(i64, i64)>,
@@ -2344,19 +2338,20 @@ mod backend_regressions {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let router = Router::new()
-            .route("/api/thumb/:id", get(thumb))
+            .route("/api/thumb/{id}", get(thumb))
             .with_state(app);
         let server = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
         let head = tokio::task::spawn_blocking(move || {
             let response = ureq::head(&format!("http://{address}/api/thumb/1"))
+                .config().proxy(None).build()
                 .call()
                 .unwrap();
             (
-                response.status(),
-                response.header("Content-Length").unwrap().to_string(),
-                response.header("Content-Type").unwrap().to_string(),
+                response.status().as_u16(),
+                response.headers()["Content-Length"].to_str().unwrap().to_string(),
+                response.headers()["Content-Type"].to_str().unwrap().to_string(),
             )
         })
         .await
@@ -2769,8 +2764,8 @@ mod backend_regressions {
             let metadata = serde_json::json!({"pages": names, "synopsis": "keep"}).to_string();
             app.db.lock().unwrap().execute("UPDATE media SET meta_json=?1 WHERE id=1", [&metadata]).unwrap();
             let router = Router::new()
-                .route("/api/comic/:id/pages", get(comic_pages))
-                .route("/api/comic/:id/page/:n", get(comic_page)).with_state(app.clone());
+                .route("/api/comic/{id}/pages", get(comic_pages))
+                .route("/api/comic/{id}/page/{n}", get(comic_page)).with_state(app.clone());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
@@ -2779,13 +2774,13 @@ mod backend_regressions {
                 let routes = std::iter::once("pages".to_string())
                     .chain((0..=page_count).map(|index| format!("page/{index}")));
                 routes.map(|route| {
-                    let response = match ureq::get(&format!("http://{address}/api/comic/1/{route}")).call() {
-                        Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+                    let response = match ureq::get(&format!("http://{address}/api/comic/1/{route}")).config().proxy(None).http_status_as_error(false).build().call() {
+                        Ok(response) => response,
                         Err(error) => panic!("owned HTTP transport: {error}"),
                     };
                     let status = response.status();
                     let mut bytes = Vec::new();
-                    std::io::Read::read_to_end(&mut response.into_reader(), &mut bytes).unwrap();
+                    std::io::Read::read_to_end(&mut response.into_body().into_reader(), &mut bytes).unwrap();
                     (status, bytes)
                 }).collect::<Vec<_>>()
             }).await;
@@ -3014,10 +3009,11 @@ mod backend_regressions {
         });
         let statuses = tokio::task::spawn_blocking(move || {
             forwarded.into_iter().map(|value| {
-                let mut request = ureq::post(&format!("http://{address}/api/setup")).set("Content-Type", "application/json");
-                if let Some(value) = value { request = request.set("X-Forwarded-For", value); }
-                match request.send_string(r#"{"email":"owner@example.test","password":"x"}"#) {
-                    Ok(response) | Err(ureq::Error::Status(_, response)) => response.status(),
+                let mut request = ureq::post(&format!("http://{address}/api/setup")).config().proxy(None).build().header("Content-Type", "application/json");
+                if let Some(value) = value { request = request.header("X-Forwarded-For", value); }
+                match request.send(r#"{"email":"owner@example.test","password":"x"}"#) {
+                    Ok(response) => response.status().as_u16(),
+                    Err(ureq::Error::StatusCode(status)) => status,
                     Err(error) => panic!("owned HTTP transport: {error}"),
                 }
             }).collect::<Vec<_>>()
@@ -3940,6 +3936,9 @@ mod integration_regressions {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// Exercise library, search and permission-filtered HTTP responses with private paths.
+    /// Only recognized media-owned filenames may become artwork versions; missing or
+    /// mismatched names yield null, and neither source paths nor thumb_path may escape.
     #[tokio::test]
     async fn artwork_api_library_and_search_expose_only_opaque_versions() {
         let (root,app)=fixture();
@@ -3992,13 +3991,13 @@ mod integration_regressions {
         for (query,restricted,expected) in [("",false,7),("?q=Cover",false,4),("?q=Cover",true,2)] {
             let url=format!("http://{address}/api/library{query}");let token=session.clone();
             let body = tokio::task::spawn_blocking(move || {
-                let request = ureq::get(&url);
+                let request = ureq::get(&url).config().proxy(None).build();
                 let request = if restricted {
-                    request.set("Authorization", &format!("Bearer {token}"))
+                    request.header("Authorization", &format!("Bearer {token}"))
                 } else {
                     request
                 };
-                request.call().unwrap().into_string().unwrap()
+                request.call().unwrap().into_body().read_to_string().unwrap()
             })
             .await
             .unwrap();
@@ -5151,6 +5150,37 @@ mod direct_download_tests {
         let mut output=format!("HTTP/1.1 200 OK\r\n{headers}Connection: close\r\n\r\n").into_bytes();output.extend_from_slice(body);output
     }
 
+    /// Proxy settings belong only to the child, so parallel tests keep their environment.
+    #[test]
+    fn direct_download_ignores_environment_proxies() {
+        if std::env::var_os("FRAYD_TEST_DIRECT_PROXY").is_none() {
+            let proxy=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address=format!("http://{}",proxy.local_addr().unwrap());
+            proxy.set_nonblocking(true).unwrap();
+            let mut child=test_support::child("direct_download_tests::direct_download_ignores_environment_proxies");
+            child.env("FRAYD_TEST_DIRECT_PROXY","1").env("NO_PROXY","").env("no_proxy","");
+            for key in ["HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy"] {
+                child.env(key,&address);
+            }
+            test_support::assert_child_passes(&mut child);
+            assert_eq!(proxy.accept().unwrap_err().kind(),std::io::ErrorKind::WouldBlock,
+                "direct download connected to the synthetic proxy");
+            return;
+        }
+        let staging=std::env::temp_dir().join(format!("frayd-direct-proxy-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir(&staging).unwrap();
+        let bytes=include_bytes!("../../tests/fixtures/native-resume.mp4");
+        let (url,server)=response_server(response(bytes,&format!("Content-Length: {}\r\n",bytes.len())),None);
+        let limits=DirectDownloadLimits{max_bytes:bytes.len() as u64,
+            transfer_timeout:std::time::Duration::from_secs(2),connect_timeout:std::time::Duration::from_secs(1)};
+        let result=download_direct(&url,&staging,limits);
+        if result.is_err() {std::fs::remove_dir_all(&staging).unwrap();}
+        assert_eq!(result,Ok(()),"loopback download must ignore inherited proxy settings");
+        server.join().unwrap();
+        assert_eq!(std::fs::read(staging.join("owned.mp4")).unwrap(),bytes);
+        std::fs::remove_dir_all(staging).unwrap();
+    }
+
     /// Build and independently decode a small public MP4 gzip fixture using the system test tool.
     fn gzip_fixture(input:&[u8],decode:bool) -> Vec<u8> {
         let mut child=Command::new("gzip").args(if decode {vec!["-d","-c"]} else {vec!["-c"]})
@@ -5334,4 +5364,214 @@ mod direct_download_tests {
         assert_eq!(ingest(State(app),axum::http::HeaderMap::new(),query(),Json(IngestReq{url:"https://example.invalid/video".into()})).await,StatusCode::NOT_IMPLEMENTED);
     }
 
+}
+
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    /// Start the production router on loopback to catch route-construction and precedence
+    /// regressions. Check nested binary EPUB bytes, static ranges, CORS preflight, build
+    /// cache policy and missing-resource 404s through an HTTP client with proxies disabled.
+    #[tokio::test]
+    async fn production_router_serves_api_nested_epub_assets_and_static_files() {
+        let root = std::env::temp_dir().join(format!("frayd-router-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        struct RemoveDirectoryOnDrop(PathBuf);
+        impl Drop for RemoveDirectoryOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = RemoveDirectoryOnDrop(root.clone());
+        std::fs::write(root.join("index.html"), b"static root fixture").unwrap();
+        let book = root.join("fixture.epub");
+        let mut archive = zip::ZipWriter::new(std::fs::File::create(&book).unwrap());
+        archive
+            .start_file(
+                "OEBPS/images/pixel.png",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        let asset = b"nested asset bytes\0\xff";
+        archive.write_all(asset).unwrap();
+        archive.finish().unwrap();
+        let db = store::open(":memory:");
+        db.execute(
+            "INSERT INTO media (id, kind, path, title) VALUES (1, 'ebook', ?1, 'fixture')",
+            [book.to_str().unwrap()],
+        )
+        .unwrap();
+        let state = Arc::new(App::new(db, String::new(), LibraryConfig { roots: Vec::new(), locked: false }));
+        let router = app_router(state, root.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        tokio::task::spawn_blocking(move || {
+            let agent = ureq::Agent::config_builder()
+                .proxy(None)
+                .timeout_global(Some(std::time::Duration::from_secs(5)))
+                .build().new_agent();
+            let preflight = agent.options(format!("http://{address}/api/annotations"))
+                .header("Origin", "https://reader.example.invalid")
+                .header("Access-Control-Request-Method", "DELETE")
+                .header("Access-Control-Request-Headers", "authorization,content-type")
+                .call().unwrap();
+            assert!(preflight.status().is_success());
+            assert_eq!(preflight.headers()["access-control-allow-origin"], "*");
+            assert_eq!(preflight.headers()["access-control-allow-methods"], "GET,POST,DELETE");
+            assert_eq!(preflight.headers()["access-control-allow-headers"], "authorization,content-type");
+            let range = agent.get(format!("http://{address}/index.html"))
+                .header("Origin", "https://reader.example.invalid")
+                .header("Range", "bytes=0-5").call().unwrap();
+            assert_eq!(range.status(), 206);
+            assert_eq!(range.headers()["access-control-allow-origin"], "*");
+            assert_eq!(range.headers()["content-range"], "bytes 0-5/19");
+            assert_eq!(range.into_body().read_to_vec().unwrap(), b"static");
+            let health: serde_json::Value = serde_json::from_reader(
+                agent
+                    .get(&format!("http://{address}/api/health"))
+                    .call()
+                    .unwrap()
+                    .into_body().into_reader(),
+            )
+            .unwrap();
+            assert_eq!(health, serde_json::json!({"status": "ok"}));
+            let build_response = agent.get(&format!("http://{address}/api/build")).call().unwrap();
+            assert_eq!(build_response.headers().get("Cache-Control").and_then(|value|value.to_str().ok()), Some("no-store"));
+            let build: serde_json::Value = serde_json::from_reader(build_response.into_body().into_reader()).unwrap();
+            assert_eq!(build["version"], env!("CARGO_PKG_VERSION"));
+            for (path, expected) in [
+                ("/", b"static root fixture".as_slice()),
+                ("/api/epub/1/asset/OEBPS/images/pixel.png", asset.as_slice()),
+            ] {
+                let mut body = Vec::new();
+                agent
+                    .get(&format!("http://{address}{path}"))
+                    .call()
+                    .unwrap()
+                    .into_body().into_reader()
+                    .read_to_end(&mut body)
+                    .unwrap();
+                assert_eq!(body, expected, "{path}");
+            }
+            for path in [
+                "/missing",
+                "/api/epub/1/asset/OEBPS/images/missing.png",
+                "/api/epub/999/asset/OEBPS/images/pixel.png",
+            ] {
+                assert!(
+                    matches!(
+                        agent.get(&format!("http://{address}{path}")).call(),
+                        Err(ureq::Error::StatusCode(404))
+                    ),
+                    "{path}"
+                );
+            }
+        })
+        .await
+        .unwrap();
+        server.abort();
+        let _ = server.await;
+    }
+
+    /// Equal plaintexts must verify independently while producing distinct PHC salts;
+    /// wrong passwords and unknown accounts must fail verification. This checks stored
+    /// hash semantics without assuming a particular random salt value.
+    #[test]
+    fn account_passwords_verify_reject_invalid_logins_and_use_distinct_salts() {
+        let db = store::open(":memory:");
+        let password = uuid::Uuid::new_v4().to_string();
+        let wrong_password = uuid::Uuid::new_v4().to_string();
+        for key in ["first@example.invalid", "second@example.invalid"] {
+            auth::create_account(&db, key, &password).unwrap();
+            assert!(auth::verify_login(&db, key, &password).unwrap());
+            assert!(!auth::verify_login(&db, key, &wrong_password).unwrap());
+        }
+        assert!(!auth::verify_login(&db, "missing@example.invalid", &password).unwrap());
+        let hashes: Vec<String> = db
+            .prepare("SELECT secret_hash FROM identities ORDER BY key")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let first = argon2::password_hash::phc::PasswordHash::new(&hashes[0]).unwrap();
+        let second = argon2::password_hash::phc::PasswordHash::new(&hashes[1]).unwrap();
+        assert!(first.salt.is_some());
+        assert!(second.salt.is_some());
+        assert!(first.salt != second.salt);
+    }
+}
+
+
+#[cfg(test)]
+mod password_policy_tests {
+    use super::*;
+
+    fn fixture() -> Arc<App> {
+        test_support::app(store::open(":memory:"), String::new(), Vec::new())
+    }
+
+    fn peer() -> std::net::SocketAddr { "127.0.0.1:9".parse().unwrap() }
+
+    fn boundaries() -> Vec<(String, bool)> {
+        let ascii = test_support::fixture_password();
+        vec![
+            (ascii[..7].to_owned(), false), (ascii[..8].to_owned(), true),
+            ("🎵".repeat(7), false), ("🎵".repeat(8), true),
+            (format!("{}x", "e\u{301}".repeat(3)), false), ("e\u{301}".repeat(4), true),
+        ]
+    }
+
+    /// Compare seven/eight scalar-value boundaries using ASCII, emoji and combining
+    /// marks on both creation paths. Rejected input must leave identities, sessions and
+    /// permissions empty; accepted input must create exactly one row in each table.
+    #[test]
+    fn setup_and_auto_create_enforce_eight_unicode_code_points() {
+        for (password, accepted) in boundaries() {
+            for setup in [true, false] {
+                let app = fixture();
+                let email = "boundary@example.invalid".to_owned();
+                let response = if setup {
+                    auth_setup_blocking(app.clone(), peer(), Default::default(), SetupReq {email, password: password.clone()}).into_response()
+                } else {
+                    auth_login_blocking(app.clone(), peer(), Default::default(), LoginReq {email, password: password.clone()}).into_response()
+                };
+                assert_eq!(response.status(), if accepted {StatusCode::OK} else {StatusCode::BAD_REQUEST}, "setup={setup}, code points={}", password.chars().count());
+                let db = app.db.lock().unwrap();
+                for table in ["identities", "sessions", "user_perms"] {
+                    let count: i64 = db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap();
+                    assert_eq!(count, i64::from(accepted), "unexpected {table} mutation");
+                }
+            }
+        }
+    }
+
+    /// Seed a short legacy credential to separate login compatibility from replacement
+    /// policy. Rejection must preserve the old credential; acceptance must verify only
+    /// the replacement across the same ASCII, emoji and combining-mark boundaries.
+    #[test]
+    fn legacy_login_remains_valid_and_password_change_enforces_code_points() {
+        for (new, accepted) in boundaries() {
+            let app = fixture();
+            let old = test_support::fixture_password()[..3].to_owned();
+            let email = "legacy@example.invalid";
+            let mut headers = axum::http::HeaderMap::new();
+            {
+                let db = app.db.lock().unwrap();
+                auth::create_account(&db, email, &old).unwrap();
+                let id: i64 = db.query_row("SELECT id FROM identities WHERE key=?1", [email], |r| r.get(0)).unwrap();
+                let token = auth::create_session(&db, id).unwrap();
+                headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+            }
+            assert_eq!(auth_login_blocking(app.clone(), peer(), Default::default(), LoginReq {email: email.into(), password: old.clone()}).into_response().status(), StatusCode::OK);
+            let response = auth_change_password_blocking(app.clone(), peer(), headers, ChangePwReq {old: old.clone(), new: new.clone()}).into_response();
+            assert_eq!(response.status(), if accepted {StatusCode::NO_CONTENT} else {StatusCode::BAD_REQUEST});
+            let db = app.db.lock().unwrap();
+            assert!(auth::verify_login(&db, email, if accepted { &new } else { &old }).unwrap());
+            if accepted { assert!(!auth::verify_login(&db, email, &old).unwrap()); }
+        }
+    }
 }
