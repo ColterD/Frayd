@@ -303,7 +303,7 @@ function bindPassword(stage, generation) {
   button.onclick = async () => {
     if (!current() || button.disabled) return;
     const oldInput = stage.querySelector('.pw-old'), newInput = stage.querySelector('.pw-new');
-    if ([...newInput.value].length < 8) { button.textContent = 'Too short (min 8 characters)'; return; }
+    if ([...newInput.value].length < 8) { button.textContent = 'Password must contain at least 8 characters'; return; }
     button.disabled = true;
     try {
       const r = await fetch('/api/auth/password', {
